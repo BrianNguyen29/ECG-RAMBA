@@ -1,0 +1,42 @@
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data
+data/
+!data/README.md
+!data/.gitkeep
+*.csv
+*.mat
+*.hea
+*.zip
+*.tar.gz
+
+# Models
+models/
+!models/README.md
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.pkl
+*.h5
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

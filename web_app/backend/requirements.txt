@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+numpy
+scipy
+python-multipart
+pydantic
+pytest
+httpx

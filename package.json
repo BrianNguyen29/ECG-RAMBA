@@ -1,0 +1,8 @@
+{
+  "devDependencies": {
+    "anchi-kit": "^1.2.9"
+  },
+  "scripts": {
+    "kit": "anchi-kit"
+  }
+}
