@@ -11,6 +11,13 @@ _Hai Duong Nguyen, Xuan-The Tran (2025)_
 
 ---
 
+## 📢 News
+
+- **[2026-01-10]**: Code release for ECG-RAMBA.
+- **[2025-12-30]**: Paper available on ArXiv.
+
+---
+
 ## 📖 Abstract
 
 Deep learning has achieved strong performance for electrocardiogram (ECG) classification within individual datasets, yet dependable generalization across heterogeneous acquisition settings remains a major obstacle. A key limitation of many model architectures is the implicit entanglement of morphological waveform patterns and rhythm dynamics, which can promote shortcut learning.
@@ -61,7 +68,7 @@ Designed for **clinical reliability**:
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/anchii/ECG-RAMBA.git
+git clone https://github.com/BrianNguyen29/ECG-RAMBA.git
 cd ECG-RAMBA
 
 # 2. Install dependencies
@@ -69,41 +76,46 @@ cd ECG-RAMBA
 pip install -r requirements.txt
 ```
 
-**Note**: This project relies on `mamba-ssm` which requires CUDA. For CPU-only inference, the model will strictly use the fallback path (if configured) but GPU is recommended.
+> **Note**: This project relies on `mamba-ssm` which requires CUDA. For CPU-only inference, performance will be significantly slower and the fallback path will be used.
 
 ---
 
 ## 🚀 Usage
 
-### Data Preparation
+### 1. Data Preparation
 
-Download datasets from PhysioNet (see [data/README.md](data/README.md)) and organize them:
+Download datasets from PhysioNet (detailed instructions in `data/README.md`) and organize them:
 
-```
+```text
 data/
 ├── chapman/       # .mat and .hea files
-├── cpsc2021/      # For zero-shot eval
-└── ptbxl/         # For zero-shot eval
+├── cpsc2021/      # Extract CPSC-2021 here
+└── ptbxl/         # Extract PTB-XL here (must contain ptbxl_database.csv)
 ```
 
-### Training
+### 2. Training
+
+Train the model with 5-fold Cross-Validation (Subject-Aware):
 
 ```bash
 python scripts/train.py
 ```
 
-- Config: Models are configured in `configs/config.py`.
-- Outputs: Checkpoints saved to `models/`. Logs saved to `reports/logs/`.
+- **Configuration**: Modify hyperparameters in `configs/config.py`.
+- **Logging**: Metrics are saved to `reports/logs/`.
+- **Checkpoints**: Best models are saved to `models/`.
 
-### Evaluation
+### 3. Evaluation (OOF)
 
-**Out-of-Fold (OOF):**
+Run Out-of-Fold (OOF) evaluation to verify internal performance:
 
 ```bash
 python scripts/eval_oof.py
 ```
 
-**Zero-Shot Transfer:**
+### 4. Zero-Shot Transfer
+
+Test the trained model on unseen datasets (e.g., CPSC-2021, PTB-XL) without fine-tuning:
 
 ```bash
 python scripts/eval_zeroshot.py
@@ -115,15 +127,22 @@ python scripts/eval_zeroshot.py
 
 This repository follows the **Clean Core** principle to ensure reproducibility:
 
-- `src/`: Contains the model definition, layers, and feature engineering logic.
-- `configs/`: Centralized configuration (no hardcoded params in code).
-- `scripts/`: Executable recipes for training and evaluation.
-- `models/`: Storage for trained weights (Git-ignored).
-- `reports/`: Figures and experimental logs.
+```text
+ECG-RAMBA/
+├── configs/            # Centralized configuration (no hardcoded params).
+├── data/               # Dataset storage (Git-ignored).
+├── models/             # Pre-trained weights & checkpoints.
+├── reports/            # Figures and experimental logs.
+├── scripts/            # Executable recipes for training/evaluation.
+├── src/                # Core Source Code (Model, Layers, Features).
+└── web_app/            # Deployment Application (Backend/Frontend).
+```
 
 ---
 
 ## 📜 Citation
+
+If you use this code or model in your research, please cite our paper:
 
 ```bibtex
 @article{nguyen2025ecg,
@@ -138,3 +157,7 @@ This repository follows the **Clean Core** principle to ensure reproducibility:
 ## 📄 License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+## 🤝 Acknowledgements
+
+We thank the PhysioNet team for hosting the Chapman-Shaoxing, CPSC-2021, and PTB-XL datasets.

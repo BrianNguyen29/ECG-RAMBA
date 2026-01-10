@@ -143,6 +143,7 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
         base_dir = '/content/drive/MyDrive/ECG'
         
     paths = {
+        'data_dir': './data',
         'cache_dir': base_dir,
         'zip_path': f'{base_dir}/archive.zip',
         'extract_dir': './data/chapman',

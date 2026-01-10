@@ -17,6 +17,7 @@ data/
 # Models
 models/
 !models/README.md
+!models/.gitkeep
 *.pt
 *.pth
 *.ckpt
