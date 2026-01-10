@@ -1,7 +1,6 @@
 # ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.23347-b31b1b.svg)](https://arxiv.org/abs/2512.23347)
-[![PWC](https://img.shields.io/endpoint.svg?url=https://paperswithcode.com/badge/ecg-ramba-zero-shot-ecg-generalization-by/arrhythmia-detection-on-chapman-shaoxing)](https://paperswithcode.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -9,11 +8,13 @@ This is the **Official PyTorch Implementation** of the paper:
 **"ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling"**
 _Hai Duong Nguyen, Xuan-The Tran (2025)_
 
+📄 **[Paper (ArXiv)](https://arxiv.org/abs/2512.23347)** | 🤗 **[Model Weights](https://drive.google.com/drive/folders/1cVN8o8jVimZOrKIRFVXEm60RbIDx1zyU?usp=sharing)** | 📊 **[Experiments](EXPERIMENTS.md)**
+
 ---
 
 ## 📢 News
 
-- **[2026-01-10]**: Code release for ECG-RAMBA.
+- **[2026-01-10]**: Code and pre-trained weights released.
 - **[2025-12-30]**: Paper available on ArXiv.
 
 ---
@@ -66,17 +67,26 @@ Designed for **clinical reliability**:
 
 ## 🛠️ Installation
 
+### Requirements
+
+| Component | Requirement              |
+| :-------- | :----------------------- |
+| Python    | 3.10+                    |
+| CUDA      | 11.8+ (for `mamba-ssm`)  |
+| GPU VRAM  | 10GB+ (20GB recommended) |
+
+### Setup
+
 ```bash
 # 1. Clone repository
 git clone https://github.com/BrianNguyen29/ECG-RAMBA.git
 cd ECG-RAMBA
 
 # 2. Install dependencies
-# Recommended: Python 3.10+, CUDA 11.8+
 pip install -r requirements.txt
 ```
 
-> **Note**: This project relies on `mamba-ssm` which requires CUDA. For CPU-only inference, performance will be significantly slower and the fallback path will be used.
+> **Note**: The `mamba-ssm` library requires CUDA. For CPU-only inference, a fallback path is provided but performance will be significantly slower.
 
 ---
 
@@ -84,65 +94,63 @@ pip install -r requirements.txt
 
 ### 1. Data Preparation
 
-Download datasets from PhysioNet (detailed instructions in `data/README.md`) and organize them:
+Download datasets from PhysioNet (see [`data/README.md`](data/README.md)):
 
 ```text
 data/
-├── chapman/       # .mat and .hea files
-├── cpsc2021/      # Extract CPSC-2021 here
-└── ptbxl/         # Extract PTB-XL here (must contain ptbxl_database.csv)
+├── chapman/       # ~45k records (.mat and .hea files)
+├── cpsc2021/      # For zero-shot AF detection
+└── ptbxl/         # For zero-shot multi-class evaluation
 ```
 
 ### 2. Training
-
-Train the model with 5-fold Cross-Validation (Subject-Aware):
 
 ```bash
 python scripts/train.py
 ```
 
-- **Configuration**: Modify hyperparameters in `configs/config.py`.
-- **Logging**: Metrics are saved to `reports/logs/`.
-- **Checkpoints**: Best models are saved to `models/`.
+- **Config**: `configs/config.py`
+- **Logs**: `reports/logs/`
+- **Checkpoints**: `models/fold*_best.pt`
 
-### 3. Evaluation (OOF)
-
-Run Out-of-Fold (OOF) evaluation to verify internal performance:
+### 3. Evaluation
 
 ```bash
+# Out-of-Fold evaluation (Chapman)
 python scripts/eval_oof.py
-```
 
-### 4. Zero-Shot Transfer
-
-Test the trained model on unseen datasets (e.g., CPSC-2021, PTB-XL) without fine-tuning:
-
-```bash
+# Zero-Shot transfer (CPSC-2021, PTB-XL)
 python scripts/eval_zeroshot.py
 ```
+
+� For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
 ---
 
 ## 📂 Project Structure
 
-This repository follows the **Clean Core** principle to ensure reproducibility:
-
 ```text
 ECG-RAMBA/
-├── configs/            # Centralized configuration (no hardcoded params).
-├── data/               # Dataset storage (Git-ignored).
-├── models/             # Pre-trained weights & checkpoints.
-├── reports/            # Figures and experimental logs.
-├── scripts/            # Executable recipes for training/evaluation.
-├── src/                # Core Source Code (Model, Layers, Features).
-└── web_app/            # Deployment Application (Backend/Frontend).
+├── configs/            # Centralized configuration
+├── data/               # Dataset storage (Git-ignored)
+├── models/             # Pre-trained weights & checkpoints
+├── notebooks/          # Demo & exploratory notebooks
+├── reports/            # Figures and experimental logs
+├── scripts/            # Training and evaluation scripts
+├── src/                # Core source code
+│   ├── model.py        # ECGRambaV7Advanced
+│   ├── layers.py       # BiMamba, Perceiver, Fusion blocks
+│   ├── features.py     # MiniRocket, HRV extraction
+│   ├── data_loader.py  # Chapman data pipeline
+│   └── utils.py        # Metrics, losses, EMA
+└── web_app/            # Deployment application
 ```
 
 ---
 
 ## 📜 Citation
 
-If you use this code or model in your research, please cite our paper:
+If you use this code or model in your research, please cite:
 
 ```bibtex
 @article{nguyen2025ecg,
@@ -154,10 +162,20 @@ If you use this code or model in your research, please cite our paper:
 }
 ```
 
+---
+
 ## 📄 License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
-## 🤝 Acknowledgements
+---
+
+## 🤝 Contributing
+
+We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+---
+
+## 🙏 Acknowledgements
 
 We thank the PhysioNet team for hosting the Chapman-Shaoxing, CPSC-2021, and PTB-XL datasets.
