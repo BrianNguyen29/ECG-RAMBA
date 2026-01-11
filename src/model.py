@@ -199,7 +199,6 @@ class ECGRambaV7Advanced(nn.Module):
             else:
                 rocket_feat = None # Module structurally removed
 
-        # --- 4. HRV ---
         if self.hrv_proj is not None and use_hrv:
             with torch.amp.autocast('cuda', enabled=False):
               hrv_feat = self.hrv_proj(xhr.float()).unsqueeze(1)

@@ -25,6 +25,11 @@ models/
 *.pkl
 *.h5
 
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
@@ -32,6 +37,12 @@ models/
 venv/
 env/
 .env
+.env.local
+
+# Node.js
+node_modules/
+dist/
+.vercel/
 
 # IDEs
 .vscode/
@@ -41,3 +52,6 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test artifacts
+test_import.py

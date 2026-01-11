@@ -2,6 +2,66 @@
 @tailwind components;
 @tailwind utilities;
 
-body {
-  @apply bg-gray-50 text-gray-900;
+/* Tremor base styles */
+@layer base {
+  :root {
+    --tremor-default-font-family: ui-sans-serif, system-ui, sans-serif;
+  }
+
+  body {
+    @apply bg-gray-50 text-gray-900 antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+}
+
+/* Custom component styles */
+@layer components {
+  /* Medical-grade glass effect */
+  .glass {
+    @apply backdrop-blur-xl bg-white/70 border border-white/20;
+  }
+
+  /* Premium card hover effect */
+  .card-hover {
+    @apply transition-all duration-300 hover:shadow-xl hover:-translate-y-1;
+  }
+
+  /* ECG grid pattern */
+  .ecg-grid {
+    background-image: linear-gradient(
+        rgba(239, 68, 68, 0.1) 1px,
+        transparent 1px
+      ),
+      linear-gradient(90deg, rgba(239, 68, 68, 0.1) 1px, transparent 1px),
+      linear-gradient(rgba(239, 68, 68, 0.05) 0.5px, transparent 0.5px),
+      linear-gradient(90deg, rgba(239, 68, 68, 0.05) 0.5px, transparent 0.5px);
+    background-size: 40px 40px, 40px 40px, 8px 8px, 8px 8px;
+  }
+
+  /* Gradient text */
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600;
+  }
+
+  /* Animate on scroll */
+  .animate-in {
+    animation: slide-up 0.4s ease-out;
+  }
+}
+
+/* Tremor overrides for medical theme */
+@layer utilities {
+  /* Smooth scrollbar */
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-gray-100 rounded-full;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-gray-300 rounded-full hover:bg-gray-400;
+  }
 }

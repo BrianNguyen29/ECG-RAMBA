@@ -20,6 +20,8 @@ from configs.config import CONFIG, NUM_CLASSES # NUM_CLASSES imported for downst
 # MAMBA IMPORT
 # ============================================================
 
+MAMBA_SOURCE = None
+
 try:
     from mamba_ssm import Mamba2
     MAMBA_CLS = Mamba2
@@ -30,15 +32,7 @@ except ImportError:
         MAMBA_CLS = Mamba
         print("✅ Using Mamba (v1)")
     except ImportError:
-        # Fallback for when Mamba is not installed (e.g. dev environment)
-        print("⚠️ Mamba not found, defining dummy Mamba class")
-        class Mamba(nn.Module):
-             def __init__(self, d_model, **kwargs):
-                 super().__init__()
-                 self.layer = nn.Linear(d_model, d_model)
-             def forward(self, x):
-                 return self.layer(x)
-        MAMBA_CLS = Mamba
+        raise ImportError("❌ CRITICAL: mamba_ssm not installed")
 
 BIMAMBA_BWD_OFFSET = 1000 # Offset to ensure unique parameter namespace for backward Mamba
 
@@ -316,8 +310,8 @@ class BiMambaBlockV3(nn.Module):
         h = self.norm1(x)
         fwd = self.fwd(h)
         bwd = self.bwd(h.flip(1)).flip(1)
-
+        
         z = self.gate(torch.cat([fwd, bwd], dim=-1))
         x = x + self.drop(z * fwd + (1 - z) * bwd)
-
+        
         return x + self.drop(self.ffn(self.norm2(x)))
