@@ -5,42 +5,134 @@
 /* Tremor base styles */
 @layer base {
   :root {
-    --tremor-default-font-family: ui-sans-serif, system-ui, sans-serif;
+    --background: 0 0% 100%;
+    --foreground: 222.2 84% 4.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 222.2 84% 4.9%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222.2 84% 4.9%;
+    --primary: 221.2 83.2% 53.3%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 210 40% 96.1%;
+    --secondary-foreground: 222.2 47.4% 11.2%;
+    --muted: 210 40% 96.1%;
+    --muted-foreground: 215.4 16.3% 46.9%;
+    --accent: 210 40% 96.1%;
+    --accent-foreground: 222.2 47.4% 11.2%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214.3 31.8% 91.4%;
+    --input: 214.3 31.8% 91.4%;
+    --ring: 221.2 83.2% 53.3%;
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 222.2 84% 4.9%;
+    --foreground: 210 40% 98%;
+    --card: 222.2 84% 4.9%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222.2 84% 4.9%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 217.2 91.2% 59.8%;
+    --primary-foreground: 222.2 47.4% 11.2%;
+    --secondary: 217.2 32.6% 17.5%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217.2 32.6% 17.5%;
+    --muted-foreground: 215 20.2% 65.1%;
+    --accent: 217.2 32.6% 17.5%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217.2 32.6% 17.5%;
+    --input: 217.2 32.6% 17.5%;
+    --ring: 224.3 76.3% 48%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-family: "Inter", sans-serif;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: "Plus Jakarta Sans", sans-serif;
   }
 
   body {
-    @apply bg-gray-50 text-gray-900 antialiased;
-    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    @apply bg-slate-50 text-slate-900 overflow-hidden font-sans;
   }
 }
 
 /* Custom component styles */
 @layer components {
-  /* Medical-grade glass effect */
-  .glass {
-    @apply backdrop-blur-xl bg-white/70 border border-white/20;
+  /* Medical-grade glass effect (Light) */
+  .glass-light {
+    @apply backdrop-blur-xl bg-white/70 border border-slate-200 shadow-xl;
   }
 
   /* Premium card hover effect */
   .card-hover {
-    @apply transition-all duration-300 hover:shadow-xl hover:-translate-y-1;
+    @apply transition-all duration-300 hover:border-blue-400 hover:shadow-lg hover:shadow-blue-500/10;
   }
 
-  /* ECG grid pattern */
-  .ecg-grid {
-    background-image: linear-gradient(
-        rgba(239, 68, 68, 0.1) 1px,
-        transparent 1px
-      ),
-      linear-gradient(90deg, rgba(239, 68, 68, 0.1) 1px, transparent 1px),
-      linear-gradient(rgba(239, 68, 68, 0.05) 0.5px, transparent 0.5px),
-      linear-gradient(90deg, rgba(239, 68, 68, 0.05) 0.5px, transparent 0.5px);
-    background-size: 40px 40px, 40px 40px, 8px 8px, 8px 8px;
+  /* ECG grid pattern (Medical Paper - Light Mode) */
+  /* Standard: 5mm = 0.2s @ 25mm/s, 1mm = 0.04s */
+  /* 5mm major grid = 25px, 1mm minor grid = 5px */
+  .ecg-grid-light {
+    background-image: 
+      /* Major grid lines (5mm = 25px) */
+      linear-gradient(rgba(220, 38, 38, 0.35) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(220, 38, 38, 0.35) 1px, transparent 1px),
+      /* Minor grid lines (1mm = 5px) */
+      linear-gradient(rgba(244, 63, 94, 0.15) 0.5px, transparent 0.5px),
+      linear-gradient(90deg, rgba(244, 63, 94, 0.15) 0.5px, transparent 0.5px);
+    background-size: 
+      25px 25px, 25px 25px,  /* Major grid */
+      5px 5px, 5px 5px;       /* Minor grid */
+    background-color: #fff5f5; /* Standard ECG paper pink */
+  }
+
+  /* ECG grid pattern (Dark Mode - Hospital Monitor Style) */
+  .ecg-grid-dark {
+    background-image: 
+      /* Major grid lines (5mm = 25px) */
+      linear-gradient(rgba(14, 165, 233, 0.25) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(14, 165, 233, 0.25) 1px, transparent 1px),
+      /* Minor grid lines (1mm = 5px) */
+      linear-gradient(rgba(14, 165, 233, 0.1) 0.5px, transparent 0.5px),
+      linear-gradient(90deg, rgba(14, 165, 233, 0.1) 0.5px, transparent 0.5px);
+    background-size: 
+      25px 25px, 25px 25px,  /* Major grid */
+      5px 5px, 5px 5px;       /* Minor grid */
+    background-color: #0f172a; /* slate-900 */
+  }
+
+  /* Clinical ECG grid with calibration markers */
+  .ecg-grid-clinical {
+    background-image: 
+      /* Major grid lines (5mm = 0.2s) - darker */
+      linear-gradient(rgba(185, 28, 28, 0.4) 1.5px, transparent 1.5px),
+      linear-gradient(90deg, rgba(185, 28, 28, 0.4) 1.5px, transparent 1.5px),
+      /* Minor grid lines (1mm = 0.04s) - lighter */
+      linear-gradient(rgba(239, 68, 68, 0.2) 0.5px, transparent 0.5px),
+      linear-gradient(90deg, rgba(239, 68, 68, 0.2) 0.5px, transparent 0.5px);
+    background-size: 
+      25px 25px, 25px 25px,
+      5px 5px, 5px 5px;
+    background-color: #fef2f2; /* rose-50 */
   }
 
   /* Gradient text */
   .text-gradient {
-    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600;
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-cyan-500;
   }
 
   /* Animate on scroll */
@@ -51,17 +143,34 @@
 
 /* Tremor overrides for medical theme */
 @layer utilities {
-  /* Smooth scrollbar */
+  /* Smooth scrollbar (Light) */
   .scrollbar-thin::-webkit-scrollbar {
     width: 6px;
     height: 6px;
   }
 
   .scrollbar-thin::-webkit-scrollbar-track {
-    @apply bg-gray-100 rounded-full;
+    @apply bg-slate-50 rounded-full;
   }
 
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    @apply bg-gray-300 rounded-full hover:bg-gray-400;
+    @apply bg-slate-300 rounded-full hover:bg-slate-400;
+  }
+
+  /* Medical Glow */
+  .glow-cyan {
+    box-shadow: 0 0 20px -5px rgba(6, 182, 212, 0.5);
+  }
+}
+
+/* Accessibility: Respect reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
   }
 }

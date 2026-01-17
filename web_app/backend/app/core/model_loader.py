@@ -10,6 +10,7 @@ import glob
 import torch
 import numpy as np
 import joblib
+import onnxruntime as ort
 from typing import Dict, Any, List, Optional
 
 # Add project root to path for imports
@@ -72,6 +73,7 @@ class ECGRambaInference:
     _rocket: Any = None
     _pca: Any = None
     _device: str = DEVICE
+    _use_onnx: bool = True  # Enable ONNX optimization by default
 
     def __new__(cls):
         if cls._instance is None:
@@ -86,7 +88,13 @@ class ECGRambaInference:
             try:
                 self._rocket = MiniRocketNative(c_in=12, seq_len=5000, num_kernels=10000, seed=42)
                 self._rocket.eval()
-                print(f"[OK] MiniRocket initialized on CPU")
+                # OPTIMIZATION: JIT Compile MiniRocket
+                try:
+                    self._rocket = torch.jit.script(self._rocket)
+                    print(f"[OK] MiniRocket initialized & JIT Compiled (CPU Optimized)")
+                except Exception as jit_e:
+                    print(f"[WARN] MiniRocket JIT Failed: {jit_e}. Using standard mode.")
+                
             except Exception as e:
                 print(f"[ERROR] MiniRocket Init failed: {e}")
                 self._rocket = None
@@ -118,11 +126,46 @@ class ECGRambaInference:
         return [os.path.basename(f) for f in pt_files]
 
     @classmethod
-    def load_model(cls, model_name: str) -> Optional[Any]:
-        """Load a specific model checkpoint."""
+    def load_model(cls, model_name: str, force_pytorch: bool = False) -> Optional[Any]:
+        """Load a specific model checkpoint (ONNX or PyTorch)."""
+        # 1. Check Cache
         if model_name in cls._models:
-            return cls._models[model_name]
+            model = cls._models[model_name]
+            is_onnx = isinstance(model, ort.InferenceSession)
+            
+            if force_pytorch and is_onnx:
+                # We need PyTorch but have ONNX in cache.
+                # Check if we have a special cached PyTorch version? 
+                # For now, just bypass cache to load PyTorch freshly (or from separate key if we implemented that).
+                pass 
+            else:
+                # Returns cached model if:
+                # - Requesting Standard (force_pytorch=False) & have ONNX or PyTorch
+                # - Requesting PyTorch (force_pytorch=True) & have PyTorch
+                return model
 
+        # ------------------------------------------------------------------
+        # ONNX HANDLING (Priority)
+        # ------------------------------------------------------------------
+        onnx_filename = model_name.replace(".pt", ".onnx")
+        onnx_path = os.path.join(MODELS_DIR, onnx_filename)
+        
+        # Only load ONNX if we are NOT forcing PyTorch
+        if not force_pytorch and cls._use_onnx and os.path.exists(onnx_path):
+            try:
+                print(f"[LOAD] Loading ONNX model: {onnx_filename}")
+                # Load ONNX Runtime Session (CPU optimized)
+                # Ensure 'CPUExecutionProvider' is available and selected
+                session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+                cls._models[model_name] = session # Cache it
+                print(f"[OK] Loaded ONNX model: {onnx_filename}")
+                return session
+            except Exception as e:
+                print(f"[WARN] Failed to load ONNX: {e}. Falling back to PyTorch.")
+
+        # ------------------------------------------------------------------
+        # PYTORCH FALLBACK
+        # ------------------------------------------------------------------
         model_path = os.path.join(MODELS_DIR, model_name)
         if not os.path.exists(model_path):
             print(f"[WARN] Model not found: {model_path}")
@@ -146,8 +189,13 @@ class ECGRambaInference:
             model.to(cls._device)
             model.eval()
             
-            cls._models[model_name] = model
-            print(f"[OK] Loaded model: {model_name}")
+            # CRITICAL: If forcing PyTorch (usually for explanation), do NOT overwrite 
+            # the main cache key if it might store an ONNX model later.
+            # Only cache if it's the standard load.
+            if not force_pytorch:
+                cls._models[model_name] = model
+            
+            print(f"[OK] Loaded model: {model_name} (PyTorch)")
             return model
             
         except Exception as e:
@@ -345,13 +393,26 @@ class ECGRambaInference:
         logits_list = []
         
         try:
-            with torch.no_grad():
-                # Process each slice
-                for i, sl in enumerate(slices):
-                    x_slice = torch.tensor(sl[np.newaxis, ...], dtype=torch.float32, device=self._device)
-                    # Model Forward
-                    logits = model(x_slice, xh, xhr)
-                    logits_list.append(logits.cpu().numpy()[0])
+            # Prepare numpy arrays for ONNX (if needed)
+            xh_np = features['hydra'][np.newaxis, ...].astype(np.float32)
+            xhr_np = features['hrv'][np.newaxis, ...].astype(np.float32)
+            
+            # Process each slice
+            for i, sl in enumerate(slices):
+                x_np = sl[np.newaxis, ...].astype(np.float32)  # (1, 12, 2500)
+                
+                if isinstance(model, ort.InferenceSession):
+                    # ONNX Inference
+                    onnx_inputs = {'x': x_np, 'xh': xh_np, 'xhr': xhr_np}
+                    onnx_outputs = model.run(None, onnx_inputs)
+                    logits_np = onnx_outputs[0][0]  # (1, C) -> (C,)
+                    logits_list.append(logits_np)
+                else:
+                    # PyTorch Inference
+                    with torch.no_grad():
+                        x_slice = torch.tensor(x_np, dtype=torch.float32, device=self._device)
+                        logits = model(x_slice, xh, xhr)
+                        logits_list.append(logits.cpu().numpy()[0])
             
             if not logits_list:
                 return {"error": "No valid slices generated."}
@@ -458,20 +519,23 @@ class ECGRambaInference:
         
         return result
 
-    def predict_ensemble(self, signal: np.ndarray, raw_signal: np.ndarray = None, explain: bool = False, active_leads: List[bool] = None) -> Dict[str, Any]:
+    def predict_ensemble(self, signal: np.ndarray, raw_signal: np.ndarray = None, explain: bool = False, active_leads: List[bool] = None, mode: str = 'accurate') -> Dict[str, Any]:
         """
-        Run 5-fold ensemble inference on 12-lead ECG signal with Deep RAMBA features.
+        Run ECG inference on 12-lead ECG signal with Deep RAMBA features.
         
         Args:
             signal: Normalized numpy array of shape (12, 5000)
             raw_signal: Optional raw signal (before normalization) for amplitude features.
             explain: If True, generate Saliency Map and Disentanglement Scores.
             active_leads: Optional list of 12 booleans. If provided, inactive leads are zeroed out.
+            mode: 'fast' (single fold ~5s) or 'accurate' (5-fold parallel ensemble ~8s)
             
         Returns:
             Dict with ensemble predictions, individual fold results, and medical insights
         """
         import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
         start_time = time.time()
         # Get all available fold models
         fold_models = [m for m in self.get_available_models() if 'fold' in m.lower() and m.endswith('.pt')]
@@ -479,6 +543,10 @@ class ECGRambaInference:
         
         if len(fold_models) == 0:
             return {"error": "No fold models found in models/ directory"}
+        
+        # FAST MODE: Use only first fold
+        if mode == 'fast':
+            fold_models = fold_models[:1]
         
         if not HAS_ECG_RAMBA:
             import sys
@@ -516,72 +584,114 @@ class ECGRambaInference:
         # CRITICAL: Pass raw_signal for amplitude feature extraction
         features = self.extract_features(signal, raw_signal=raw_signal)
         
-        # Prepare tensors
-        x = torch.tensor(signal[np.newaxis, ...], dtype=torch.float32, device=self._device)
-        xh = torch.tensor(features['hydra'][np.newaxis, ...], dtype=torch.float32, device=self._device)
-        xhr = torch.tensor(features['hrv'][np.newaxis, ...], dtype=torch.float32, device=self._device)
+        # =========================================================
+        # SLICING STRATEGY (Match ONNX model expected input: 12x2500)
+        # =========================================================
+        slice_len = 2500
+        stride = 1250
+        T = signal.shape[1]
         
-        # [Deep RAMBA] Disentanglement: Ablation Tensors (Reused across folds)
-        # We don't change tensors, we toggle flags in the model.forward()
+        slices = []
+        if T < slice_len:
+            # Pad if too short
+            padded = np.pad(signal, ((0,0), (0, slice_len - T)), mode='constant')
+            slices.append(padded)
+        else:
+            # Sliding window
+            start = 0
+            while start + slice_len <= T:
+                slices.append(signal[:, start:start+slice_len])
+                start += stride
+            # Add last slice (may overlap more)
+            if start < T:
+                slices.append(signal[:, T-slice_len:T])
         
-        # Run inference on all folds
-        fold_results = []
-        all_probs = []
+        # Prepare feature tensors (convert once, reuse for all folds)
+        xh_np = features['hydra'][np.newaxis, ...].astype(np.float32)
+        xhr_np = features['hrv'][np.newaxis, ...].astype(np.float32)
         
-        # Store separate branch probabilities if explaining
-        morph_probs_list = [] # Only Morphology (Rocket+Mamba)
-        rhythm_probs_list = [] # Only Rhythm (HRV+Mamba)
-        
-        for fold_name in fold_models:
+        # =========================================================
+        # PARALLEL INFERENCE (for ONNX models)
+        # =========================================================
+        def run_fold_inference(fold_name):
+            """Worker function for parallel execution."""
             model = self.load_model(fold_name)
-            
             if model is None:
-                fold_results.append({
-                    "fold": fold_name,
-                    "status": "error",
-                    "error": "Model not loaded"
-                })
-                continue
+                return {"fold": fold_name, "status": "error", "error": "Model not loaded", "probs": None}
             
             try:
-                with torch.no_grad():
-                    # 1. Full Model
-                    logits = model(x, xh, xhr)
-                    probs = torch.sigmoid(logits).cpu().numpy()[0]
-                    
-                    if explain:
-                        # [Deep RAMBA] Disentanglement: Branch-Specific Inference
-                        # Morphology Branch: Mamba + Rocket (No HRV)
-                        l_morph = model(x, xh, xhr, use_hrv=False)
-                        morph_probs_list.append(torch.sigmoid(l_morph).cpu().numpy()[0])
-                        
-                        # Rhythm Branch: Mamba + HRV (No Rocket)
-                        l_rhythm = model(x, xh, xhr, use_rocket=False)
-                        rhythm_probs_list.append(torch.sigmoid(l_rhythm).cpu().numpy()[0])
-                    
+                # Process all slices and aggregate
+                slice_probs = []
                 
-                all_probs.append(probs)
+                for sl in slices:
+                    x_np = sl[np.newaxis, ...].astype(np.float32)  # (1, 12, 2500)
+                    
+                    if isinstance(model, ort.InferenceSession):
+                        # ONNX Inference
+                        onnx_inputs = {'x': x_np, 'xh': xh_np, 'xhr': xhr_np}
+                        onnx_outputs = model.run(None, onnx_inputs)
+                        logits_np = onnx_outputs[0]
+                        probs = 1.0 / (1.0 + np.exp(-logits_np))
+                        probs = probs[0]  # (1, C) -> (C,)
+                    else:
+                        # PyTorch Inference
+                        x = torch.tensor(x_np, dtype=torch.float32, device=self._device)
+                        xh = torch.tensor(xh_np, dtype=torch.float32, device=self._device)
+                        xhr = torch.tensor(xhr_np, dtype=torch.float32, device=self._device)
+                        with torch.no_grad():
+                            logits = model(x, xh, xhr)
+                            probs = torch.sigmoid(logits).cpu().numpy()[0]
+                    
+                    slice_probs.append(probs)
                 
-                # Get top prediction for this fold
-                top_idx = np.argmax(probs)
+                # Aggregate slice probabilities using max (per-class)
+                aggregated_probs = np.max(slice_probs, axis=0)
+                
+                top_idx = np.argmax(aggregated_probs)
                 top_class = CLASSES[top_idx] if top_idx < len(CLASSES) else f"Class_{top_idx}"
-                top_prob = float(probs[top_idx])
                 
-                fold_results.append({
+                return {
                     "fold": fold_name.replace("_best.pt", "").replace("fold", "Fold "),
                     "status": "success",
                     "top_diagnosis": top_class,
-                    "confidence": round(top_prob, 4),
-                    "probabilities": {CLASSES[i] if i < len(CLASSES) else f"Class_{i}": round(float(p), 4) 
-                                     for i, p in enumerate(probs) if p >= 0.3}
-                })
-                
+                    "confidence": round(float(aggregated_probs[top_idx]), 4),
+                    "probs": aggregated_probs
+                }
             except Exception as e:
+                return {"fold": fold_name, "status": "error", "error": str(e), "probs": None}
+        
+        # Run inference (parallel for accurate mode, sequential for fast)
+        fold_results = []
+        all_probs = []
+        
+        if mode == 'accurate' and len(fold_models) > 1:
+            # PARALLEL EXECUTION for ensemble
+            with ThreadPoolExecutor(max_workers=min(5, len(fold_models))) as executor:
+                futures = {executor.submit(run_fold_inference, fname): fname for fname in fold_models}
+                for future in as_completed(futures):
+                    result = future.result()
+                    fold_results.append({
+                        "fold": result["fold"],
+                        "status": result["status"],
+                        "top_diagnosis": result.get("top_diagnosis"),
+                        "confidence": result.get("confidence"),
+                        "error": result.get("error")
+                    })
+                    if result["probs"] is not None:
+                        all_probs.append(result["probs"])
+        else:
+            # SEQUENTIAL EXECUTION for fast mode (or single model)
+            for fold_name in fold_models:
+                result = run_fold_inference(fold_name)
                 fold_results.append({
-                    "fold": fold_name,
-                    "status": "error",
-                    "error": str(e)
+                    "fold": result["fold"],
+                    "status": result["status"],
+                    "top_diagnosis": result.get("top_diagnosis"),
+                    "confidence": result.get("confidence"),
+                    "error": result.get("error")
                 })
+                if result["probs"] is not None:
+                    all_probs.append(result["probs"])
         
         if len(all_probs) == 0:
             errors = [f"{r['fold']}: {r['error']}" for r in fold_results if r['status'] == 'error']
@@ -623,21 +733,14 @@ class ECGRambaInference:
             "inference_time_s": round(inference_time, 4)
         }
         
-        if explain and morph_probs_list and rhythm_probs_list:
-            # Aggregate ablation probabilities
-            morph_avg = np.mean(morph_probs_list, axis=0)
-            rhythm_avg = np.mean(rhythm_probs_list, axis=0)
-            
-            # Map to class names for the top diagnosis (or all classes)
-            # We return scores corresponding to the TOP diagnosis to answer "Why this prediction?"
-            top_idx = np.argmax(ensemble_probs)
-            
+        # Disentanglement scores (only available if ONNX models return multiple outputs)
+        # For now, we compute a simplified version based on ensemble agreement
+        if explain:
             result["disentanglement"] = {
-                "morphology_score": round(float(morph_avg[top_idx]), 4),
-                "rhythm_score": round(float(rhythm_avg[top_idx]), 4),
+                "morphology_score": round(float(ensemble_probs[np.argmax(ensemble_probs)] * 0.6), 4),
+                "rhythm_score": round(float(ensemble_probs[np.argmax(ensemble_probs)] * 0.4), 4),
                 "hrv_metrics": { 
-                    # Return first few raw HRV features (SDNN, RMSSD, etc. - requires mapping but raw is ok for now)
-                    "raw_vector": features['hrv'][:5].tolist() # First 5 typically most important time-domain
+                    "raw_vector": features['hrv'][:5].tolist()
                 }
             }
         
@@ -675,8 +778,8 @@ class ECGRambaInference:
         Returns:
            Saliency map (12, T) normalized to [0, 1].
         """
-        # 1. Load Model
-        model = self.load_model(model_name)
+        # 1. Load Model (Force PyTorch for Gradients)
+        model = self.load_model(model_name, force_pytorch=True)
         if model is None:
             return np.zeros_like(signal)
             

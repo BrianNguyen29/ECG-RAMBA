@@ -32,7 +32,7 @@ const PROCESSING_STEPS = [
   }
 ];
 
-const ScientificLoader = () => {
+const ScientificLoader = React.memo(() => {
   const [currentStep, setCurrentStep] = useState(0);
 
   useEffect(() => {
@@ -108,6 +108,6 @@ const ScientificLoader = () => {
       </div>
     </div>
   );
-};
+});
 
 export default ScientificLoader;

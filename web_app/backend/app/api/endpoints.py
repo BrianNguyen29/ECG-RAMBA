@@ -50,10 +50,13 @@ from functools import lru_cache
 limiter = Limiter(key_func=get_remote_address)
 
 # =============================================================================
-# P1.2: Request Caching
+# P1.2: Request Caching with TTL
 # =============================================================================
-_prediction_cache = {}
+import time as _time
+
+_prediction_cache = {}  # {hash: {"result": dict, "timestamp": float}}
 CACHE_MAX_SIZE = 50
+CACHE_TTL_SECONDS = 300  # 5 minutes
 
 def get_signal_hash(signal_data: list) -> str:
     """Generate SHA256 hash for signal data for caching."""
@@ -61,16 +64,48 @@ def get_signal_hash(signal_data: list) -> str:
     return hashlib.sha256(signal_str.encode()).hexdigest()[:16]
 
 def cache_prediction(signal_hash: str, result: dict):
-    """Store prediction result in cache."""
+    """Store prediction result in cache with timestamp."""
+    # Evict expired entries first
+    current_time = _time.time()
+    expired_keys = [k for k, v in _prediction_cache.items() 
+                    if current_time - v.get("timestamp", 0) > CACHE_TTL_SECONDS]
+    for k in expired_keys:
+        del _prediction_cache[k]
+    
+    # Evict oldest if still over limit
     if len(_prediction_cache) >= CACHE_MAX_SIZE:
-        # Remove oldest entry
-        oldest_key = next(iter(_prediction_cache))
+        oldest_key = min(_prediction_cache.keys(), 
+                         key=lambda k: _prediction_cache[k].get("timestamp", 0))
         del _prediction_cache[oldest_key]
-    _prediction_cache[signal_hash] = result
+    
+    _prediction_cache[signal_hash] = {"result": result, "timestamp": current_time}
 
 def get_cached_prediction(signal_hash: str) -> Optional[dict]:
-    """Retrieve cached prediction if exists."""
-    return _prediction_cache.get(signal_hash)
+    """Retrieve cached prediction if exists and not expired."""
+    entry = _prediction_cache.get(signal_hash)
+    if entry:
+        if _time.time() - entry.get("timestamp", 0) < CACHE_TTL_SECONDS:
+            return entry["result"]
+        else:
+            # Expired, remove it
+            del _prediction_cache[signal_hash]
+    return None
+
+def sanitize_for_json(obj: Any) -> Any:
+    """Recursively convert numpy types to python types for JSON serialization."""
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, tuple):
+        return tuple(sanitize_for_json(v) for v in obj)
+    return obj
 
 router = APIRouter()
 
@@ -127,12 +162,36 @@ async def predict(request: PredictionRequest, explain: bool = False):
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
             
-        # Optional: Saliency Map
+        # Optional: Saliency Map & Clinical Features
         if explain:
             # Re-run forward pass with gradients for explanation
-            # Note: This increases latency but provides interpretability
             saliency = ecg_ramba.explain_prediction(request.model_name, signal)
-            result["saliency_map"] = saliency.tolist() # Convert to list for JSON
+            result["saliency_map"] = saliency.tolist()
+
+            # --- CLINICAL FEATURES (Deep Analysis) ---
+            try:
+                from app.core.clinical_measurements import ClinicalMeasurer
+                
+                # Use Lead II (Index 1) for measurements if available, else Lead I
+                lead_idx = 1 if signal.shape[0] > 1 else 0
+                lead_sig = signal[lead_idx] # Normalized signal
+                
+                # Use raw signal if possible? Here we only have preprocessed 'signal'
+                # Peaks on normalized signal are fine for index locations
+                peaks = ClinicalMeasurer.detect_r_peaks(lead_sig)
+                waves = ClinicalMeasurer.delineate_waves(lead_sig, peaks)
+                st_analysis = ClinicalMeasurer.analyze_st_segment(lead_sig, waves)
+                
+                result["clinical_features"] = {
+                    "lead_used": "II" if lead_idx == 1 else "I",
+                    "r_peaks": peaks.tolist(), # Indices
+                    "wave_boundaries": waves, # List of dicts
+                    "st_findings": st_analysis,
+                    "heart_rate": len(peaks) * (60 / (signal.shape[1]/500)) if len(peaks) > 0 else 0
+                }
+            except Exception as e:
+                logger.warning(f"Clinical analysis failed: {e}")
+                result["clinical_error"] = str(e)
         
         return result
 
@@ -163,8 +222,14 @@ async def predict_simple(request: SimplePredictionRequest):
 
 @router.post("/predict/ensemble")
 @limiter.limit("30/minute")  # P1.1: Rate limit
-async def predict_ensemble(request: Request, body: EnsemblePredictionRequest, explain: bool = False):
-    """Run 5-fold ensemble inference on 12-lead ECG signal with caching."""
+async def predict_ensemble(request: Request, body: EnsemblePredictionRequest, explain: bool = False, mode: str = 'accurate'):
+    """
+    Run ECG inference on 12-lead ECG signal with caching.
+    
+    Args:
+        explain: If True, include saliency map and disentanglement scores.
+        mode: 'fast' (single fold ~5s) or 'accurate' (5-fold parallel ensemble ~8s)
+    """
     try:
         # P1.2: Check cache first
         signal_hash = get_signal_hash(body.signal_data)
@@ -188,7 +253,7 @@ async def predict_ensemble(request: Request, body: EnsemblePredictionRequest, ex
             if raw_signal.ndim == 1:
                 raw_signal = np.tile(raw_signal, (12, 1))
         
-        result = ecg_ramba.predict_ensemble(signal, raw_signal=raw_signal, explain=explain, active_leads=body.active_leads)
+        result = ecg_ramba.predict_ensemble(signal, raw_signal=raw_signal, explain=explain, active_leads=body.active_leads, mode=mode)
         
         if "error" in result:
             raise HTTPException(status_code=500, detail=result["error"])
@@ -198,7 +263,7 @@ async def predict_ensemble(request: Request, body: EnsemblePredictionRequest, ex
             cache_prediction(signal_hash, result)
             logger.info(f"Cached prediction for signal {signal_hash}")
         
-        return result
+        return sanitize_for_json(result)
 
     except HTTPException:
         raise
@@ -309,6 +374,29 @@ async def upload_file(
                     detected_fs = TARGET_FS
             else:
                 detected_fs = sample_rate
+        
+        # ===== EDF (EEG/Multi-modal) =====
+        elif ext == ".edf":
+            from app.core.signal_processing import parse_edf_file
+            signal, detected_fs, ch_names, parse_warnings = parse_edf_file(content)
+            
+            if signal is None:
+                return {
+                    "error": f"Lỗi đọc EDF: {parse_warnings[0] if parse_warnings else 'Unknown error'}",
+                    "details": parse_warnings
+                }
+            
+            # Return specialized EEG response (skip ECG pipeline)
+            return {
+                "modality": "EEG",
+                "signal": signal.tolist(),
+                "channels": ch_names,
+                "sample_rate": detected_fs,
+                "num_channels": int(signal.shape[0]),
+                "samples": int(signal.shape[1]),
+                "duration_s": float(signal.shape[1] / detected_fs),
+                "warnings": parse_warnings
+            }
         
         # ===== MAT (MATLAB) =====
         elif ext == ".mat":

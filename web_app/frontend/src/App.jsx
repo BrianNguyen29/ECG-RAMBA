@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard';
 import Story from './pages/Story';
 import History from './pages/History';
 import ErrorBoundary from './components/ErrorBoundary';
+import { Toaster } from './components/ui/toaster';
 
 function App() {
   return (
@@ -25,6 +26,7 @@ function App() {
           </Route>
         </Routes>
       </BrowserRouter>
+      <Toaster />
     </ErrorBoundary>
   );
 }

@@ -20,6 +20,7 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+from typing import List
 from scipy.signal import find_peaks
 import scipy.stats as stats
 from sklearn.decomposition import PCA
@@ -41,12 +42,7 @@ from configs.config import CONFIG, PATHS, SEQ_LEN, FS
 class MiniRocketNative(nn.Module):
     """
     Deterministic MiniRocket transform (Dempster et al.).
-
-    Properties:
-    - Non-trainable
-    - Fully deterministic (seeded)
-    - Fixed output dimensionality
-    - CPU-only for reproducibility
+    Optimized for TorchScript / JIT.
     """
 
     def __init__(
@@ -102,13 +98,17 @@ class MiniRocketNative(nn.Module):
             d *= 2
         return out if out else [1]
 
-    def forward(self, x):
-        feats = []
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats: List[torch.Tensor] = []
+        # JIT constraint: iterate via index if ModuleList issues, but standard iteration works
+        # JIT constraint: iterate via index if ModuleList issues, but standard iteration works
+        # Fix: Use zip to iterate ModuleList and ParameterList together to avoid JIT indexing error
         for conv, bias in zip(self.convs, self.biases):
             out = conv(x)
             maxv, _ = out.max(dim=-1)
             ppv = (out > bias.view(1, -1, 1)).float().mean(dim=-1)
-            feats.extend([maxv, ppv])
+            feats.append(maxv)
+            feats.append(ppv)
         return torch.cat(feats, dim=1)
 
 

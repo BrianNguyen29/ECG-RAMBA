@@ -138,13 +138,37 @@ ECG-RAMBA/
 ├── reports/            # Figures and experimental logs
 ├── scripts/            # Training and evaluation scripts
 ├── src/                # Core source code
-│   ├── model.py        # ECGRambaV7Advanced
+│   ├── model.py        # ECGRamba
 │   ├── layers.py       # BiMamba, Perceiver, Fusion blocks
 │   ├── features.py     # MiniRocket, HRV extraction
 │   ├── data_loader.py  # Chapman data pipeline
 │   └── utils.py        # Metrics, losses, EMA
 └── web_app/            # Deployment application
 ```
+
+---
+
+## 💻 Web Application
+
+The repository includes a modern React/FastAPI web application for real-time ECG analysis and clinical interaction.
+
+<div align="center">
+  <img src="reports/figures/Screenshot 2026-01-17 175832.png" alt="ECG-RAMBA Clinical Dashboard" width="800"/>
+</div>
+
+### Key Features:
+
+1.  **Clinical Cockpit**:
+    - **12-Lead Visualization**: High-fidelity rendering (500Hz) with medical grid system (5mm/1mm).
+    - **Focus Analysis**: Interactive zoom, pan, and single-lead detailed inspection.
+    - **Digital Calipers**: Precision measurement tools for $\Delta t$ (ms) and $\Delta V$ (mV).
+2.  **AI Integration**:
+    - **Real-time Inference**: Deployed Mamba2 backend for millisecond-latency classification.
+    - **Explainable AI**: Grad-CAM attention maps visualizing morphological saliency on the waveform.
+    - **Confidence Scoring**: Probability distribution over 4 diagnostic classes (Normal, AFib, GSVT, SB).
+3.  **Reporting & Workflow**:
+    - **PDF Export**: One-click generation of clinical-grade reports for patient files.
+    - **Patient Queue**: Drag-and-drop file upload (`.mat`, `.csv`, `.json`) and history tracking.
 
 ---
 

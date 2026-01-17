@@ -80,12 +80,15 @@ export const api = {
   },
 
   /**
-   * Run 5-fold ensemble inference on 12-lead ECG signal
+   * Run ECG inference on 12-lead ECG signal
    * @param {Array} signalData - 12-lead normalized signal [[lead1...], [lead2...], ...]
    * @param {Array} rawSignalData - Optional raw signal (before normalization) for amplitude features
-   * @returns {Object} Ensemble prediction with individual fold results
+   * @param {boolean} explain - If true, include saliency map and disentanglement
+   * @param {Array} activeLeads - Optional array of 12 booleans for lead dropout
+   * @param {string} mode - 'fast' (single fold) or 'accurate' (5-fold ensemble)
+   * @returns {Object} Prediction result with diagnoses and insights
    */
-  predictEnsemble: async (signalData, rawSignalData = null, explain = false, activeLeads = null) => {
+  predictEnsemble: async (signalData, rawSignalData = null, explain = false, activeLeads = null, mode = 'accurate') => {
     const payload = {
       signal_data: signalData
     };
@@ -95,7 +98,23 @@ export const api = {
     if (activeLeads) {
       payload.active_leads = activeLeads;
     }
-    const response = await axios.post(`${API_URL}/predict/ensemble?explain=${explain}`, payload);
+    const response = await axios.post(`${API_URL}/predict/ensemble?explain=${explain}&mode=${mode}`, payload);
+    return response.data;
+  },
+
+  /**
+   * AI LAB: Analyze signal frequency components (PSD)
+   */
+  analyzeSignal: async (signal, fs = 250) => {
+    const response = await axios.post(`${API_URL}/lab/analyze`, { signal, fs });
+    return response.data;
+  },
+
+  /**
+   * AI LAB: Apply digital filters
+   */
+  processSignal: async (signal, type, low, high, fs = 250) => {
+    const response = await axios.post(`${API_URL}/lab/process`, { signal, fs, type, low, high });
     return response.data;
   }
 };

@@ -33,7 +33,7 @@ const PatientForm = ({ onUpdate }) => {
               value={data.name}
               onChange={handleChange}
               placeholder="Ex: John Doe"
-              className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-sm"
+              className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 focus-visible:outline-none transition-all text-sm"
             />
           </div>
         </div>
@@ -49,7 +49,7 @@ const PatientForm = ({ onUpdate }) => {
               value={data.id}
               onChange={handleChange}
               placeholder="Ex: P-12345"
-              className="w-full pl-9 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-sm"
+              className="w-full pl-9 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 focus-visible:outline-none transition-all text-sm"
             />
           </div>
         </div>
@@ -64,7 +64,7 @@ const PatientForm = ({ onUpdate }) => {
               value={data.age}
               onChange={handleChange}
               placeholder="Ex: 45"
-              className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-sm"
+              className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 focus-visible:outline-none transition-all text-sm"
             />
           </div>
         </div>
@@ -76,7 +76,7 @@ const PatientForm = ({ onUpdate }) => {
             name="gender"
             value={data.gender}
             onChange={handleChange}
-            className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 outline-none transition-all text-sm"
+            className="w-full pl-3 pr-3 py-2 bg-gray-50 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-100 focus:border-blue-500 focus-visible:outline-none transition-all text-sm"
           >
             <option>Select</option>
             <option>Male</option>

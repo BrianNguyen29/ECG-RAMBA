@@ -16,6 +16,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ecg-ramba")
 
+# OPTIMIZATION: Limit PyTorch threads to avoid CPU contention
+import torch
+# 4 threads is often a sweet spot for latency vs throughput on standard instances
+torch.set_num_threads(4) 
+logger.info(f"PyTorch CPU threads set to: {torch.get_num_threads()}")
+
 # =============================================================================
 # P0.3: Model Preload at Startup
 # =============================================================================
@@ -27,6 +33,10 @@ async def lifespan(app: FastAPI):
     logger.info("ECG-RAMBA Backend Starting...")
     logger.info("=" * 60)
     
+    # DEBUG: Print all routes
+    for route in app.routes:
+        logger.info(f"Route: {route.path} [{route.name}]")
+
     try:
         # Phase 1: Initialize database
         from app.db.database import init_db, close_db
@@ -34,24 +44,31 @@ async def lifespan(app: FastAPI):
         logger.info("✓ Database initialized")
         
         from app.core.model_loader import ecg_ramba, DEVICE
+        from app.core.config import settings
         
-        # Preload all 5 fold models
-        logger.info("Preloading 5-fold ensemble models...")
+        # =========================================================
+        # MODEL LOADING STRATEGY (Configurable)
+        # =========================================================
         available = ecg_ramba.get_available_models()
         
-        if available:
-            for model_name in available[:5]:  # Load first 5 (fold models)
+        if settings.PRELOAD_MODELS:
+            # Eager loading: Load models at startup (slower boot, faster first request)
+            logger.info(f"Preloading {len(available)} models (PRELOAD_MODELS=True)...")
+            for model_name in available[:5]:
                 try:
                     ecg_ramba.load_model(model_name)
                     logger.info(f"  ✓ Loaded: {model_name}")
                 except Exception as e:
                     logger.warning(f"  ✗ Failed: {model_name} - {e}")
+        else:
+            # Lazy loading: Models load on first request (fast boot, slower first request)
+            logger.info(f"Available models: {len(available)} (Lazy Loading Enabled)")
         
         logger.info(f"Device: {DEVICE}")
         logger.info(f"PCA Loaded: {ecg_ramba._pca is not None}")
         logger.info(f"MiniRocket Loaded: {ecg_ramba._rocket is not None}")
         logger.info("=" * 60)
-        logger.info("Backend Ready!")
+        logger.info(f"Backend Ready! (Preload: {settings.PRELOAD_MODELS})")
         logger.info("=" * 60)
         
     except Exception as e:
@@ -152,12 +169,23 @@ from slowapi.errors import RateLimitExceeded
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Phase 8: DeepTutor Router (Start before generic API)
+from app.routers import tutor
+logger.info(f"DEBUG: Tutor Router Routes: {len(tutor.router.routes)}")
+for r in tutor.router.routes:
+    logger.info(f"DEBUG: Tutor Route: {r.path}")
+app.include_router(tutor.router, prefix="/api")
+
 # Main API router
 app.include_router(api_router, prefix="/api")
 
 # Phase 1: Auth & History routers
 app.include_router(auth_router, prefix="/api")
 app.include_router(history_router, prefix="/api")
+
+# Phase 9.3: AI Lab Assistant
+from app.api.lab import router as lab_router
+app.include_router(lab_router, prefix="/api/lab")
 
 # =============================================================================
 # P2.2: Prometheus Metrics

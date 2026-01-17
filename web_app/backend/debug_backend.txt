@@ -1,0 +1,36 @@
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable
+Inference Error: 'InferenceSession' object is not callable
+Traceback (most recent call last):
+  File "D:\WorkSpace\Web\clinical-ecg\web_app\backend\app\core\model_loader.py", line 401, in predict
+    logits = model(x_slice, xh, xhr)
+             ^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: 'InferenceSession' object is not callable

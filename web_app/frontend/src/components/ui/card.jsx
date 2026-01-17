@@ -7,7 +7,7 @@ const Card = React.forwardRef(({ className, ...props }, ref) => (
   <div
     ref={ref}
     className={cn(
-      "rounded-2xl border border-gray-100 bg-white text-gray-950 shadow-lg shadow-gray-200/50",
+      "rounded-2xl border border-slate-800 bg-slate-900 text-slate-100 shadow-xl shadow-black/20",
       className
     )}
     {...props}
@@ -20,7 +20,7 @@ const GlassCard = React.forwardRef(({ className, ...props }, ref) => (
   <div
     ref={ref}
     className={cn(
-      "rounded-2xl border border-white/20 bg-white/70 backdrop-blur-xl text-gray-950 shadow-xl shadow-gray-200/30",
+      "rounded-2xl border border-white/10 bg-slate-900/70 backdrop-blur-xl text-slate-100 shadow-xl shadow-black/30",
       className
     )}
     {...props}
@@ -35,9 +35,9 @@ const AnimatedCard = React.forwardRef(({ className, delay = 0, ...props }, ref) 
     initial={{ opacity: 0, y: 20 }}
     animate={{ opacity: 1, y: 0 }}
     transition={{ duration: 0.4, delay, ease: "easeOut" }}
-    whileHover={{ scale: 1.01, boxShadow: "0 20px 40px -10px rgba(0,0,0,0.1)" }}
+    whileHover={{ scale: 1.01, boxShadow: "0 20px 40px -10px rgba(0,0,0,0.3)" }}
     className={cn(
-      "rounded-2xl border border-gray-100 bg-white text-gray-950 shadow-lg shadow-gray-200/50 transition-all",
+      "rounded-2xl border border-slate-800 bg-slate-900 text-slate-100 shadow-xl shadow-black/20 transition-all",
       className
     )}
     {...props}
@@ -73,7 +73,7 @@ const MetricCard = React.forwardRef(({
       whileHover={{ scale: 1.02 }}
       transition={{ duration: 0.3 }}
       className={cn(
-        "relative overflow-hidden rounded-2xl bg-white border border-gray-100 p-6 shadow-lg",
+        "relative overflow-hidden rounded-2xl bg-slate-900 border border-slate-800 p-6 shadow-lg",
         className
       )}
       {...props}
@@ -83,13 +83,13 @@ const MetricCard = React.forwardRef(({
       
       <div className="flex items-start justify-between">
         <div>
-          <p className="text-sm font-medium text-gray-500 uppercase tracking-wider">{title}</p>
-          <p className="mt-2 text-3xl font-bold text-gray-900">{value}</p>
-          {subtitle && <p className="mt-1 text-sm text-gray-400">{subtitle}</p>}
+          <p className="text-xs font-bold text-slate-500 uppercase tracking-wider">{title}</p>
+          <p className="mt-2 text-2xl font-bold text-slate-100">{value}</p>
+          {subtitle && <p className="mt-1 text-xs text-slate-400">{subtitle}</p>}
         </div>
         {Icon && (
-          <div className={cn("p-3 rounded-xl bg-gradient-to-br text-white", colorMap[color])}>
-            <Icon className="w-6 h-6" />
+          <div className={cn("p-2 rounded-lg bg-gradient-to-br text-white shadow-lg", colorMap[color])}>
+            <Icon className="w-5 h-5" />
           </div>
         )}
       </div>
@@ -98,11 +98,11 @@ const MetricCard = React.forwardRef(({
         <div className="mt-4 flex items-center gap-2">
           <span className={cn(
             "text-sm font-semibold",
-            trend === "up" ? "text-emerald-600" : "text-rose-600"
+            trend === "up" ? "text-emerald-500" : "text-rose-500"
           )}>
             {trend === "up" ? "↑" : "↓"} {trendValue}
           </span>
-          <span className="text-xs text-gray-400">vs last period</span>
+          <span className="text-xs text-slate-500">vs last period</span>
         </div>
       )}
     </motion.div>
@@ -113,7 +113,7 @@ MetricCard.displayName = "MetricCard"
 const CardHeader = React.forwardRef(({ className, ...props }, ref) => (
   <div
     ref={ref}
-    className={cn("flex flex-col space-y-1.5 p-6 border-b border-gray-100/50", className)}
+    className={cn("flex flex-col space-y-1.5 p-6 border-b border-slate-800", className)}
     {...props}
   />
 ))
@@ -123,7 +123,7 @@ const CardTitle = React.forwardRef(({ className, ...props }, ref) => (
   <h3
     ref={ref}
     className={cn(
-      "text-lg font-semibold leading-none tracking-tight text-gray-900 flex items-center gap-2",
+      "text-lg font-semibold leading-none tracking-tight text-slate-100 flex items-center gap-2",
       className
     )}
     {...props}
@@ -134,21 +134,21 @@ CardTitle.displayName = "CardTitle"
 const CardDescription = React.forwardRef(({ className, ...props }, ref) => (
   <p
     ref={ref}
-    className={cn("text-sm text-gray-500", className)}
+    className={cn("text-sm text-slate-400", className)}
     {...props}
   />
 ))
 CardDescription.displayName = "CardDescription"
 
 const CardContent = React.forwardRef(({ className, ...props }, ref) => (
-  <div ref={ref} className={cn("p-6 pt-0", className)} {...props} />
+  <div ref={ref} className={cn("p-6 pt-0 mt-4", className)} {...props} />
 ))
 CardContent.displayName = "CardContent"
 
 const CardFooter = React.forwardRef(({ className, ...props }, ref) => (
   <div
     ref={ref}
-    className={cn("flex items-center p-6 pt-0", className)}
+    className={cn("flex items-center p-6 pt-0 border-t border-slate-800 mt-4", className)}
     {...props}
   />
 ))

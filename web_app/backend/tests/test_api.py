@@ -18,15 +18,17 @@ def test_get_models():
     assert isinstance(response.json(), list)
 
 def test_predict_mock():
-    # Test valid prediction with mock model
+    # Test valid prediction with actual model
+    # API expects signal_data as List[List[float]] (12 leads x samples)
+    # Use real model name from available models
     payload = {
-        "model_name": "TestModel",
-        "signal_data": [0.1, 0.2, 0.3, 0.4, 0.5]
+        "model_name": "fold1_best.onnx",
+        "signal_data": [[0.1 * (i % 10) for i in range(2500)] for _ in range(12)]  # 12-lead ECG, 2500 samples (5s @ 500Hz)
     }
     response = client.post("/api/predict", json=payload)
     assert response.status_code == 200
     data = response.json()
-    assert "diagnosis" in data
+    assert "top_diagnosis" in data  # API returns top_diagnosis, not diagnosis
     assert "confidence" in data
     assert "model_used" in data
 

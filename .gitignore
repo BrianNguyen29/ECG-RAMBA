@@ -1,4 +1,8 @@
 
+# Agent
+.agent/
+.gemini/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -8,6 +12,7 @@ __pycache__/
 data/
 !data/README.md
 !data/.gitkeep
+!web_app/backend/data/knowledge/
 *.csv
 *.mat
 *.hea

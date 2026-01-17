@@ -25,14 +25,14 @@ MAMBA_SOURCE = None
 try:
     from mamba_ssm import Mamba2
     MAMBA_CLS = Mamba2
-    print("✅ Using Mamba2")
+    print("[OK] Using Mamba2")
 except ImportError:
     try:
         from mamba_ssm import Mamba
         MAMBA_CLS = Mamba
-        print("✅ Using Mamba (v1)")
+        print("[OK] Using Mamba (v1)")
     except ImportError:
-        raise ImportError("❌ CRITICAL: mamba_ssm not installed")
+        raise ImportError("[CRITICAL] mamba_ssm not installed")
 
 BIMAMBA_BWD_OFFSET = 1000 # Offset to ensure unique parameter namespace for backward Mamba
 

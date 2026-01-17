@@ -58,7 +58,8 @@ SUPPORTED_FORMATS = {
     '.csv': 'CSV format (Universal - personal devices)',
     '.json': 'JSON format (Web-friendly)',
     '.npy': 'NumPy array',
-    '.npz': 'NumPy compressed'
+    '.npz': 'NumPy compressed',
+    '.edf': 'European Data Format (EEG/Bio-signals)'
 }
 
 
@@ -445,6 +446,57 @@ def parse_wfdb_zip(zip_content: bytes) -> Tuple[Optional[np.ndarray], int, List[
             
     except Exception as e:
         return None, TARGET_FS, [], [f"Lỗi đọc WFDB: {str(e)}"]
+
+
+# =============================================================================
+# E. EDF Support (MNE-Python)
+# =============================================================================
+
+def parse_edf_file(file_content: bytes) -> Tuple[Optional[np.ndarray], int, List[str], List[str]]:
+    """
+    Parse EDF files using MNE-Python.
+    
+    Args:
+        file_content: Raw bytes of EDF file
+        
+    Returns:
+        Tuple of (signal, sample_rate, channel_names, warnings)
+    """
+    warnings = []
+    
+    try:
+        import mne
+    except ImportError:
+        return None, TARGET_FS, [], ["MNE package không được cài đặt. Chạy: pip install mne"]
+    
+    try:
+        # Create temp file
+        with tempfile.NamedTemporaryFile(suffix='.edf', delete=False) as tmp:
+            tmp.write(file_content)
+            tmp_path = tmp.name
+        
+        try:
+            # Read EDF
+            raw = mne.io.read_raw_edf(tmp_path, preload=True, verbose=False)
+            
+            # Extract info
+            sfreq = int(raw.info['sfreq'])
+            ch_names = raw.ch_names
+            signal = raw.get_data()  # (channels, samples)
+            
+            # Warn if fs is low
+            if sfreq < 100:
+                warnings.append(f"Tần số lấy mẫu thấp: {sfreq} Hz")
+                
+            return signal, sfreq, ch_names, warnings
+            
+        finally:
+            # Cleanup
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+                
+    except Exception as e:
+        return None, TARGET_FS, [], [f"Lỗi đọc EDF: {str(e)}"]
 
 
 # Need io for BytesIO
