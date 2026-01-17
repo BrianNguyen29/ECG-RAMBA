@@ -8,7 +8,7 @@
 [![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.4-38B2AC?style=flat&logo=tailwind-css)](https://tailwindcss.com/)
 
 <div align="center">
-  <img src="../reports/figures/Screenshot 2026-01-17 175832.png" alt="ECG-RAMBA Clinical Dashboard" width="100%"/>
+  <img src="../reports/figures/Screenshot_2026-01-17_175832.png" alt="ECG-RAMBA Clinical Dashboard" width="100%"/>
 </div>
 
 ---

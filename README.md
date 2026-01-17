@@ -4,11 +4,21 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
+**Keywords:** ECG foundation model, zero-shot generalization, morphology-rhythm disentanglement, Mamba / SSM, MiniRocket, HRV, CPSC2021, PTB-XL.
+
 This is the **Official PyTorch Implementation** of the paper:
 **"ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling"**
 _Hai Duong Nguyen, Xuan-The Tran (2025)_
 
 📄 **[Paper (ArXiv)](https://arxiv.org/abs/2512.23347)** | 🤗 **[Model Weights](https://drive.google.com/drive/folders/1cVN8o8jVimZOrKIRFVXEm60RbIDx1zyU?usp=sharing)** | 📊 **[Experiments](EXPERIMENTS.md)**
+
+## 🤗 Model Weights
+
+Pretrained checkpoints are provided here:
+
+- Google Drive: https://drive.google.com/drive/folders/1cVN8o8jVimZOrKIRFVXEm60RbIDx1zyU
+
+**Recommended:** verify SHA256 checksums if you mirror weights to ensure integrity.
 
 ---
 
@@ -65,6 +75,17 @@ Designed for **clinical reliability**:
 
 ---
 
+---
+
+## ⚡ Quickstart (Inference)
+
+```bash
+git clone https://github.com/BrianNguyen29/ECG-RAMBA.git
+cd ECG-RAMBA
+pip install -r requirements.txt
+python scripts/eval_zeroshot.py --ckpt models/ecg_ramba.pt
+```
+
 ## 🛠️ Installation
 
 ### Requirements
@@ -103,6 +124,16 @@ data/
 └── ptbxl/         # For zero-shot multi-class evaluation
 ```
 
+## 📊 Datasets
+
+This repository supports standard ECG benchmarks:
+
+- **Chapman-Shaoxing** (large-scale 12-lead ECG)
+- **CPSC 2021** (AF detection / zero-shot transfer)
+- **PTB-XL** (multi-label ECG classification)
+
+See [`data/README.md`](data/README.md) for preprocessing steps and file structure.
+
 ### 2. Training
 
 ```bash
@@ -123,7 +154,7 @@ python scripts/eval_oof.py
 python scripts/eval_zeroshot.py
 ```
 
-� For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
+�📌 For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
 ---
 
@@ -153,7 +184,7 @@ ECG-RAMBA/
 The repository includes a modern React/FastAPI web application for real-time ECG analysis and clinical interaction.
 
 <div align="center">
-  <img src="reports/figures/Screenshot 2026-01-17 175832.png" alt="ECG-RAMBA Clinical Dashboard" width="800"/>
+  <img src="reports/figures/Screenshot_2026-01-17_175832.png" alt="ECG-RAMBA Clinical Dashboard" width="800"/>
 </div>
 
 ### Key Features:

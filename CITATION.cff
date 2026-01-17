@@ -1,21 +1,23 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-authors:
-  - family-names: "Nguyen"
-    given-names: "Hai Duong"
-  - family-names: "Tran"
-    given-names: "Xuan-The"
-title: "ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling"
+title: "ECG-RAMBA"
 version: 1.0.0
-date-released: 2025-12-30
+date-released: 2026-01-10
+repository-code: "https://github.com/BrianNguyen29/ECG-RAMBA"
 url: "https://arxiv.org/abs/2512.23347"
+authors:
+  - family-names: Nguyen
+    given-names: Hai Duong
+  - family-names: Tran
+    given-names: Xuan-The
 preferred-citation:
   type: article
-  authors:
-    - family-names: "Nguyen"
-      given-names: "Hai Duong"
-    - family-names: "Tran"
-      given-names: "Xuan-The"
   title: "ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling"
-  journal: "arXiv preprint arXiv:2512.23347"
+  authors:
+    - family-names: Nguyen
+      given-names: Hai Duong
+    - family-names: Tran
+      given-names: Xuan-The
+  journal: "arXiv"
   year: 2025
+  url: "https://arxiv.org/abs/2512.23347"
