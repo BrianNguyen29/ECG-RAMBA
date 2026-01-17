@@ -62,6 +62,24 @@ python -c "from src.model import run_sanity_check; run_sanity_check()"
 
 ---
 
+## Web App Development
+
+If you are contributing to the Clinical Dashboard (`web_app/`):
+
+### Backend (FastAPI)
+
+- Located in `web_app/backend/`
+- Run tests: `pytest web_app/backend/tests/`
+- Add new endpoints in `app/api/endpoints/`
+
+### Frontend (React)
+
+- Located in `web_app/frontend/`
+- Use Tailwind CSS for styling
+- Components must be responsive and support Dark Mode
+
+---
+
 ## Contribution Types
 
 ### 🐛 Bug Fixes

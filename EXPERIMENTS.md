@@ -30,6 +30,20 @@ This document provides exact commands to reproduce the results reported in our p
 
 ---
 
+## Interactive Experiments (Web App)
+
+For real-time inference and clinical visualization, we provide a full-stack web application.
+
+```bash
+# Start the Clinical Dashboard
+cd web_app
+run_app.bat
+```
+
+See [web_app/README.md](web_app/README.md) for detailed usage.
+
+---
+
 ## Table 1: Chapman-Shaoxing 5-Fold Cross-Validation
 
 **Expected Results:** Macro F1 ≈ 0.31, ROC-AUC ≈ 0.85

@@ -1,167 +1,142 @@
-# ECG-RAMBA Web Application
+# 🏥 ECG-RAMBA Clinical Dashboard
 
-A web-based interface for ECG analysis using the ECG-RAMBA deep learning model.
+**A Professional Web Interface for Zero-Shot ECG Classification & Analysis**
 
-## Features
+[![React](https://img.shields.io/badge/React-18.2-61DAFB?style=flat&logo=react)](https://react.dev/)
+[![Vite](https://img.shields.io/badge/Vite-5.0-646CFF?style=flat&logo=vite)](https://vitejs.dev/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.109-009688?style=flat&logo=fastapi)](https://fastapi.tiangolo.com/)
+[![Tailwind CSS](https://img.shields.io/badge/Tailwind-3.4-38B2AC?style=flat&logo=tailwind-css)](https://tailwindcss.com/)
 
-- 🩺 **12-Lead ECG Analysis**: Upload and visualize 12-lead ECG signals
-- 🤖 **ECG-RAMBA Model**: Multi-label classification with 27 SNOMED classes
-- 📊 **Probability Visualization**: See confidence scores for all predicted conditions
-- 💡 **Medical Insights**: Automated explanations and recommendations
-- 📜 **History Tracking**: Save and review past analyses
+<div align="center">
+  <img src="../reports/figures/Screenshot 2026-01-17 175832.png" alt="ECG-RAMBA Clinical Dashboard" width="100%"/>
+</div>
 
-## Architecture
+---
 
+## 📖 Overview
+
+The **ECG-RAMBA Clinical Dashboard** is a state-of-the-art web application designed to bridge the gap between advanced deep learning research and clinical practice. It provides physicians with a high-fidelity interface to visualize 12-lead ECGs, run real-time AI inference, and utilize digital tools for precise diagnosis.
+
+## ✨ Key Features
+
+### 🖥️ Clinical Cockpit
+
+- **High-Fidelity Rendering**: 500Hz sampling rate rendering with medical-grade grid systems (5mm/1mm).
+- **12-Lead Visualization**: Standard layout for comprehensive heart rhythm assessment.
+- **Focus Mode**: Interactive zoom and pan for detailed waveform inspection.
+
+### 🛠️ Doctor's Toolkit
+
+- **Digital Calipers**: Precision measurement tool for analyzing wave intervals ($\Delta t$) and amplitudes ($\Delta V$).
+- **PDF Reporting**: One-click generation of A4 clinical reports containing patient info, ECG traces, and AI findings.
+- **Dark Mode**: Optimized specific contrast modes for clinical environments (Dark/Light).
+
+### 🧠 AI Integration
+
+- **Real-Time Inference**: Powered by the **ECG-RAMBA (Bi-Mamba)** backend for sub-second classification.
+- **Explainable AI (XAI)**: Grad-CAM attention maps overlay capabilities to show _where_ the model is looking.
+- **Confidence Scoring**: Transparent probability distributions for 4 major diagnostic classes.
+
+### ⚙️ Workflow
+
+- **Patient Queue**: Drag-and-drop support for standard ECG formats (`.mat`, `.csv`, `.json`).
+- **History Tracking**: Local storage of recent patient analyses for quick review.
+
+---
+
+## 🏗️ Architecture
+
+The application follows a modern decoupled architecture:
+
+```mermaid
+graph LR
+    User[Physician] -->|HTTPS| Frontend[React + Vite]
+    Frontend -->|REST API| Backend[FastAPI Server]
+    Backend -->|Inference| Model[ECG-RAMBA (Mamba2)]
+    Backend -->|Storage| Cache[Local / SQLite]
 ```
-web_app/
-├── backend/              # FastAPI Server (Python)
-│   ├── main.py           # Entry point
-│   ├── app/
-│   │   ├── api/          # REST endpoints
-│   │   └── core/         # Model loader, signal processing
-│   └── requirements.txt
-│
-└── frontend/             # React + Vite (JavaScript)
-    ├── src/
-    │   ├── pages/        # Dashboard, History, Story
-    │   ├── components/   # ECGGraph, DiagnosisReport
-    │   └── services/     # API client
-    └── package.json
-```
 
-## Quick Start
+### Technology Stack
+
+| Component    | Technology       | Role                         |
+| :----------- | :--------------- | :--------------------------- |
+| **Frontend** | **React 18**     | UI Library                   |
+|              | **Vite**         | Build Tool & Dev Server      |
+|              | **Tailwind CSS** | Utility-First Styling        |
+|              | **Recharts**     | High-performance D3 charting |
+|              | **Lucide React** | Consistent Iconography       |
+| **Backend**  | **FastAPI**      | High-performance Python API  |
+|              | **Uvicorn**      | ASGI Server                  |
+|              | **PyTorch**      | Deep Learning Inference      |
+|              | **Mamba-SSM**    | State Space Model Backbone   |
+
+---
+
+## 🚀 Getting Started
 
 ### Prerequisites
 
-- Python 3.10+
-- Node.js 18+
-- Trained ECG-RAMBA model weights in `models/` directory
+- **Node.js**: v18+
+- **Python**: v3.10+ (with CUDA recommended)
 
-### Backend Setup
+### 1. Backend Setup (API)
 
 ```bash
 cd web_app/backend
 
-# Create virtual environment (recommended)
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
+# Windows: venv\Scripts\activate
+# Linux/Mac: source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Start server
+# Start Server
 uvicorn main:app --reload --port 8000
 ```
 
-The API will be available at: http://localhost:8000
+> The API documentation will be available at: http://localhost:8000/docs
 
-### Frontend Setup
+### 2. Frontend Setup (UI)
 
 ```bash
 cd web_app/frontend
 
-# Install dependencies
+# Install node modules
 npm install
 
-# Start development server
+# Start Dev Server
 npm run dev
 ```
 
-The UI will be available at: http://localhost:5173
+> The Dashboard will be accessible at: http://localhost:5173
 
-### Using the Launcher (Windows)
+---
 
-```bash
-cd web_app
-run_app.bat
+## 📂 Project Structure
+
+```text
+web_app/
+├── backend/                # FastAPI Server
+│   ├── app/
+│   │   ├── api/            # API Route Handlers
+│   │   ├── core/           # Business Logic & Model Loader
+│   │   └── models/         # Pydantic Schemas
+│   ├── scripts/            # Utility Scripts (Seed, Check Health)
+│   └── tests/              # Backend Unit Tests
+│
+└── frontend/               # React Client
+    ├── src/
+    │   ├── components/     # Reusable UI Components (ECGGraph, Calipers)
+    │   ├── pages/          # Main Views (Dashboard, History)
+    │   └── services/       # API Integration
+    └── dist/               # Production Build Output
 ```
 
-This will start both backend and frontend in separate terminals.
+## 🤝 Contribution
 
-## API Endpoints
+This web application is part of the **ECG-RAMBA** research project.
 
-| Method | Endpoint              | Description                      |
-| :----- | :-------------------- | :------------------------------- |
-| GET    | `/api/models`         | List available model checkpoints |
-| GET    | `/api/info`           | API and model information        |
-| GET    | `/api/classes`        | List of SNOMED classes           |
-| POST   | `/api/upload`         | Upload ECG file (JSON/CSV/MAT)   |
-| POST   | `/api/predict`        | Run 12-lead ECG inference        |
-| POST   | `/api/predict/simple` | Single-lead inference (demo)     |
-
-### Example: Prediction Request
-
-```bash
-curl -X POST http://localhost:8000/api/predict \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model_name": "fold1_best.pt",
-    "signal_data": [[...lead1...], [...lead2...], ...]
-  }'
-```
-
-### Example: Response
-
-```json
-{
-  "model_used": "fold1_best.pt",
-  "top_diagnosis": "AF",
-  "diagnosis_full_name": "Atrial Fibrillation",
-  "confidence": 0.87,
-  "predictions": [["AF", 0.87], ["PAC", 0.52]],
-  "all_probabilities": {"AF": 0.87, "SNR": 0.23, ...},
-  "explanation": "Irregular heart rhythm that can lead to blood clots.",
-  "recommendation": "Consult cardiologist. May require anticoagulants."
-}
-```
-
-## Supported File Formats
-
-| Format   | Description                                                  |
-| :------- | :----------------------------------------------------------- |
-| **JSON** | `{"leads": [[...], [...], ...]}` or `{"lead_1": [...], ...}` |
-| **CSV**  | 12 columns (one per lead) or single column                   |
-| **MAT**  | MATLAB file with `val` or `signal` field                     |
-
-## Development
-
-### Backend Testing
-
-```bash
-cd web_app/backend
-pytest
-```
-
-### Frontend Build
-
-```bash
-cd web_app/frontend
-npm run build
-```
-
-Production files will be in `frontend/dist/`.
-
-## Configuration
-
-### Backend
-
-- **CORS**: Configured in `main.py` for localhost ports
-- **Model Path**: Automatically uses project root `models/` directory
-
-### Frontend
-
-- **API URL**: Set `VITE_API_URL` in `.env` for production
-
-## Troubleshooting
-
-| Issue                     | Solution                                      |
-| :------------------------ | :-------------------------------------------- |
-| "ECG-RAMBA import failed" | Ensure project root is in PYTHONPATH          |
-| "Model not found"         | Check that `models/fold*_best.pt` exist       |
-| CORS error                | Verify frontend URL is in `main.py` origins   |
-| "mamba-ssm not found"     | Install with CUDA support or use CPU fallback |
-
-## License
-
-MIT License - See [LICENSE](../LICENSE)
+- **Lead Developer**: Hai Duong Nguyen
+- **License**: MIT
