@@ -18,6 +18,14 @@ Pretrained checkpoints are provided here:
 
 - Google Drive: https://drive.google.com/drive/folders/1cVN8o8jVimZOrKIRFVXEm60RbIDx1zyU
 
+**Expected files:**
+
+- `fold1_best.pt`
+- `fold2_best.pt`
+- `fold3_best.pt`
+- `fold4_best.pt`
+- `fold5_best.pt`
+
 **Recommended:** verify SHA256 checksums if you mirror weights to ensure integrity.
 
 ---
@@ -75,15 +83,14 @@ Designed for **clinical reliability**:
 
 ---
 
----
-
 ## ⚡ Quickstart (Inference)
 
 ```bash
 git clone https://github.com/BrianNguyen29/ECG-RAMBA.git
 cd ECG-RAMBA
 pip install -r requirements.txt
-python scripts/eval_zeroshot.py --ckpt models/ecg_ramba.pt
+# Inference with pre-trained weights (ensure models/fold1_best.pt exists)
+python scripts/eval_zeroshot.py --ckpt models/fold1_best.pt
 ```
 
 ## 🛠️ Installation
@@ -113,9 +120,9 @@ pip install -r requirements.txt
 
 ## 🚀 Usage
 
-### 1. Data Preparation
+## 📊 Datasets
 
-Download datasets from PhysioNet (see [`data/README.md`](data/README.md)):
+This repository supports standard ECG benchmarks. Download from PhysioNet and organize as follows:
 
 ```text
 data/
@@ -123,10 +130,6 @@ data/
 ├── cpsc2021/      # For zero-shot AF detection
 └── ptbxl/         # For zero-shot multi-class evaluation
 ```
-
-## 📊 Datasets
-
-This repository supports standard ECG benchmarks:
 
 - **Chapman-Shaoxing** (large-scale 12-lead ECG)
 - **CPSC 2021** (AF detection / zero-shot transfer)
@@ -152,6 +155,14 @@ python scripts/eval_oof.py
 
 # Zero-Shot transfer (CPSC-2021, PTB-XL)
 python scripts/eval_zeroshot.py
+```
+
+### CPU-only Inference
+
+If you do not have CUDA, you can still run inference on CPU (slower):
+
+```bash
+CUDA_VISIBLE_DEVICES="" python scripts/eval_zeroshot.py --ckpt models/fold1_best.pt
 ```
 
 �📌 For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
@@ -200,6 +211,21 @@ The repository includes a modern React/FastAPI web application for real-time ECG
 3.  **Reporting & Workflow**:
     - **PDF Export**: One-click generation of clinical-grade reports for patient files.
     - **Patient Queue**: Drag-and-drop file upload (`.mat`, `.csv`, `.json`) and history tracking.
+
+### Run Web App (Local)
+
+```bash
+cd web_app
+# backend
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload
+
+# frontend
+cd ../frontend
+npm install
+npm run dev
+```
 
 ---
 
