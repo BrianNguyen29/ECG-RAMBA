@@ -271,11 +271,14 @@ else:
         code(
             """INSTALL_MODEL_DEPS = True
 DOWNLOAD_MAMBA_WHEELS_IF_MISSING = True
+AUTO_PIN_TORCH_FOR_MAMBA = True
+RESTART_RUNTIME_AFTER_TORCH_PIN = True
 
 if INSTALL_MODEL_DEPS:
     import hashlib
     import json
     import os
+    import re
     import subprocess
     import sys
     import urllib.request
@@ -307,6 +310,11 @@ if INSTALL_MODEL_DEPS:
     print("  CXX11 ABI  :", abi_tag)
     print("  cache dir  :", wheel_cache_dir)
 
+    if cuda_tag is None:
+        raise RuntimeError("CUDA-enabled PyTorch is required. In Colab, select a GPU runtime before running this notebook.")
+
+    release_cache = {}
+
     def sha256_file(path: Path) -> str:
         h = hashlib.sha256()
         with path.open("rb") as f:
@@ -322,14 +330,15 @@ if INSTALL_MODEL_DEPS:
             return "mamba"
         return None
 
-    def compatible_wheel(path_or_name, role: str) -> bool:
+    def compatible_wheel(path_or_name, role: str, torch_minor: str | None = None) -> bool:
         name = Path(path_or_name).name
         if wheel_role(name) != role:
             return False
+        torch_minor = torch_minor or torch_major_minor
         required = [
             f"{py_tag}-{py_tag}",
             "linux_x86_64.whl",
-            f"torch{torch_major_minor}",
+            f"torch{torch_minor}",
             f"cxx11abi{abi_tag}",
         ]
         if cuda_tag:
@@ -357,10 +366,129 @@ if INSTALL_MODEL_DEPS:
         return (causal[0] if causal else None), (mamba[0] if mamba else None)
 
     def github_latest_release(repo: str) -> dict:
+        if repo in release_cache:
+            return release_cache[repo]
         url = f"https://api.github.com/repos/{repo}/releases/latest"
         req = urllib.request.Request(url, headers={"User-Agent": "ECG-RAMBA-Colab"})
         with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            release_cache[repo] = json.loads(resp.read().decode("utf-8"))
+        return release_cache[repo]
+
+    def asset_torch_minor(asset_name: str, role: str) -> str | None:
+        if wheel_role(asset_name) != role:
+            return None
+        required = [
+            f"{py_tag}-{py_tag}",
+            "linux_x86_64.whl",
+            f"cxx11abi{abi_tag}",
+        ]
+        if cuda_tag:
+            required.append(cuda_tag)
+        if not all(token in asset_name for token in required):
+            return None
+        m = re.search(r"torch([0-9]+\\.[0-9]+)", asset_name)
+        return m.group(1) if m else None
+
+    def release_supported_torch_minors(repo: str, role: str) -> set[str]:
+        rel = github_latest_release(repo)
+        minors = {
+            minor for asset in rel.get("assets", [])
+            if (minor := asset_torch_minor(asset["name"], role)) is not None
+        }
+        return minors
+
+    def torch_minor_key(minor: str) -> tuple[int, int]:
+        major, minor_part = minor.split(".", 1)
+        return int(major), int(minor_part)
+
+    def choose_supported_torch_minor() -> tuple[str | None, list[str]]:
+        causal_minors = release_supported_torch_minors("Dao-AILab/causal-conv1d", "causal")
+        mamba_minors = release_supported_torch_minors("state-spaces/mamba", "mamba")
+        common = sorted(causal_minors & mamba_minors, key=torch_minor_key)
+        common_stable = [m for m in common if m.startswith("2.")]
+        if torch_major_minor in common:
+            return torch_major_minor, common
+
+        requested = os.environ.get("ECG_RAMBA_TORCH_MINOR")
+        if requested:
+            if requested not in common:
+                raise RuntimeError(f"ECG_RAMBA_TORCH_MINOR={requested} is not supported by both Mamba wheel releases: {common}")
+            return requested, common
+
+        lower_or_equal = [
+            m for m in common_stable
+            if torch_minor_key(m) <= torch_minor_key(torch_major_minor)
+        ]
+        if lower_or_equal:
+            return lower_or_equal[-1], common
+        if common_stable:
+            return common_stable[-1], common
+        return None, common
+
+    def version_tuple(version: str) -> tuple[int, int, int]:
+        parts = version.split("+", 1)[0].split(".")
+        nums = [int(p) if p.isdigit() else 0 for p in parts[:3]]
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)
+
+    def latest_pypi_torch_version(target_minor: str) -> str:
+        url = "https://pypi.org/pypi/torch/json"
+        req = urllib.request.Request(url, headers={"User-Agent": "ECG-RAMBA-Colab"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        versions = [
+            version for version, files in payload.get("releases", {}).items()
+            if version.startswith(target_minor + ".")
+            and re.match(r"^[0-9]+\\.[0-9]+\\.[0-9]+$", version)
+            and files
+        ]
+        if not versions:
+            raise RuntimeError(f"No stable torch release found on PyPI for torch{target_minor}.")
+        return sorted(versions, key=version_tuple)[-1]
+
+    def pin_torch_if_needed() -> None:
+        target_minor, supported = choose_supported_torch_minor()
+        print("Mamba-supported torch minors:", supported)
+        if target_minor == torch_major_minor:
+            return
+        if target_minor is None:
+            raise RuntimeError(
+                f"No common Mamba wheel support found for {py_tag}, {cuda_tag}, cxx11abi{abi_tag}. "
+                "Use a different Colab runtime or build wheels manually."
+            )
+        if not AUTO_PIN_TORCH_FOR_MAMBA:
+            raise RuntimeError(
+                f"Current torch{torch_major_minor} has no matching Mamba wheels. "
+                f"Set AUTO_PIN_TORCH_FOR_MAMBA=True or install torch{target_minor} manually."
+            )
+
+        target_version = latest_pypi_torch_version(target_minor)
+        pin_manifest = {
+            "reason": "Current Colab torch minor has no matching Mamba release wheels.",
+            "current_torch_version": torch.__version__,
+            "current_torch_minor": torch_major_minor,
+            "target_torch_version": target_version,
+            "target_torch_minor": target_minor,
+            "supported_torch_minors": supported,
+            "python_tag": py_tag,
+            "cuda_tag": cuda_tag,
+            "cxx11abi": abi_tag,
+        }
+        wheel_cache_dir.mkdir(parents=True, exist_ok=True)
+        pin_path = wheel_cache_dir / "torch_runtime_pin.json"
+        pin_path.write_text(json.dumps(pin_manifest, indent=2), encoding="utf-8")
+        print(f"Current torch{torch_major_minor} has no compatible Mamba wheels.")
+        print(f"Installing torch=={target_version} so Mamba wheels can use torch{target_minor}.")
+        print(f"Wrote torch pin manifest: {pin_path}")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", f"torch=={target_version}"],
+            check=True,
+        )
+        print("Torch was changed in this runtime. Restarting now; after reconnect, rerun the notebook from the top.")
+        if RESTART_RUNTIME_AFTER_TORCH_PIN:
+            os.kill(os.getpid(), 9)
+        raise SystemExit("Restart runtime and rerun the notebook from the top.")
 
     def select_release_asset(repo: str, role: str) -> dict:
         rel = github_latest_release(repo)
@@ -403,6 +531,8 @@ if INSTALL_MODEL_DEPS:
                 f.write(chunk)
         os.replace(tmp_path, out_path)
         return out_path
+
+    pin_torch_if_needed()
 
     causal_wheel, mamba_wheel = select_cached_wheels()
     downloaded_assets = []
