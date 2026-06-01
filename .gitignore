@@ -63,5 +63,21 @@ Thumbs.db
 test_import.py
 
 # Revision experiment outputs
-reports/revision/*
+reports/revision/**
+!reports/revision/
 !reports/revision/.gitkeep
+!reports/revision/figures/
+!reports/revision/figures/.gitkeep
+!reports/revision/logs/
+!reports/revision/logs/.gitkeep
+!reports/revision/manifests/
+!reports/revision/manifests/.gitkeep
+!reports/revision/metrics/
+!reports/revision/metrics/.gitkeep
+!reports/revision/predictions/
+!reports/revision/predictions/.gitkeep
+!reports/revision/tables/
+!reports/revision/tables/.gitkeep
+
+# Revision planning files are part of the repo, not generated data.
+!docs/revision_plan/*.csv

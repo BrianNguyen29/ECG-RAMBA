@@ -1,8 +1,8 @@
 # ECG-RAMBA Revision Pipeline on Colab
 
 This folder contains lightweight scripts for the JBHI resubmission workflow.
-Keep `notebooks/01_exploratory.ipynb` as an archive. Use
-`notebooks/00_revision_runner.ipynb` to run reproducible steps from Colab.
+Keep `notebooks/01_exploratory.ipynb` as an archive. Use the numbered
+revision notebooks as the main Colab workflow.
 
 ## Recommended Drive Layout
 
@@ -71,10 +71,10 @@ Use this only when Git push/pull is not available.
 
 ## First Colab Run
 
-Run the lightweight notebook:
+Run the bootstrap notebook:
 
 ```text
-notebooks/00_revision_runner.ipynb
+notebooks/00_colab_bootstrap.ipynb
 ```
 
 Start with:
@@ -84,6 +84,31 @@ python scripts/revision/00_audit_protocol.py
 ```
 
 Do not launch full training/evaluation until the audit warnings are resolved.
+
+## Notebook Workflow
+
+```text
+notebooks/00_colab_bootstrap.ipynb
+notebooks/01_a0_protocol_audit.ipynb
+notebooks/02_predictions_and_external_eval.ipynb
+notebooks/03_calibration_and_ci.ipynb
+notebooks/04_baselines_and_component_checks.ipynb
+notebooks/05_hrv_domain_and_robustness.ipynb
+notebooks/06_pooling_and_representation.ipynb
+notebooks/07_results_freeze.ipynb
+```
+
+Planning metadata lives in:
+
+```text
+docs/revision_plan/
+```
+
+Final/generated experiment artifacts are written to:
+
+```text
+reports/revision/
+```
 
 ## Minimum Artifact Contract
 
