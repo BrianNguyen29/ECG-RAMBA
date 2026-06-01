@@ -260,15 +260,25 @@ def predictions_notebook() -> list[dict]:
         ),
         code(
             """INSTALL_BASE_DEPS = True
+RESTART_RUNTIME_AFTER_BASE_DEP_CHANGE = True
+REPAIR_BROKEN_NUMERIC_STACK = True
+
 if INSTALL_BASE_DEPS:
+    import importlib
+    import importlib.metadata as metadata
+    import json
+    import os
     import subprocess
     import sys
+    import time
 
-    packages = [
+    numeric_packages = [
         "numpy>=2.0,<2.6",
         "scipy>=1.14.1,<2.0",
-        "pandas",
         "scikit-learn",
+    ]
+    support_packages = [
+        "pandas",
         "threadpoolctl",
         "tqdm",
         "wfdb",
@@ -282,32 +292,108 @@ if INSTALL_BASE_DEPS:
         "einops",
         "ninja",
     ]
+    numeric_dists = {
+        "numpy": "numpy",
+        "scipy": "scipy",
+        "scikit-learn": "scikit-learn",
+    }
+    runtime_dir = DRIVE_ROOT / "colab_runtime"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    def dist_version(dist_name):
+        try:
+            return metadata.version(dist_name)
+        except metadata.PackageNotFoundError:
+            return None
+
+    def numeric_versions():
+        return {name: dist_version(dist) for name, dist in numeric_dists.items()}
+
+    def pip_install(extra_args, packages):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                *extra_args,
+                *packages,
+            ],
+            check=True,
+        )
+
+    def restart_runtime(reason):
+        print("")
+        print("=" * 80)
+        print("Intentional Colab runtime restart")
+        print("=" * 80)
+        print(reason)
+        print("After Colab reconnects, run this notebook again from the first cell.")
+        print("Base dependency state is stored under:", runtime_dir)
+        print("=" * 80)
+        sys.stdout.flush()
+        time.sleep(8)
+        try:
+            from google.colab import runtime
+            runtime.restart_runtime()
+        except Exception:
+            os.kill(os.getpid(), 9)
+
+    def sanity_import_numeric_stack():
+        import numpy as np
+        from numpy._core import strings as _np_strings  # catches mixed NumPy installs on Colab
+        import scipy
+        import sklearn
+        import wfdb
+        return {
+            "numpy": np.__version__,
+            "scipy": scipy.__version__,
+            "sklearn": sklearn.__version__,
+            "wfdb": wfdb.__version__,
+        }
+
     print("Python:", sys.version)
     print("Installing/updating ECG-RAMBA runtime dependencies without downgrading Colab numpy/scipy.")
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "--upgrade",
-            "--upgrade-strategy",
-            "only-if-needed",
-            *packages,
-        ],
-        check=True,
-    )
+    before_versions = numeric_versions()
+    pip_install(["--upgrade", "--upgrade-strategy", "only-if-needed"], numeric_packages + support_packages)
+    after_versions = numeric_versions()
+    changed_versions = {
+        name: {"before": before_versions.get(name), "after": after_versions.get(name)}
+        for name in numeric_dists
+        if before_versions.get(name) != after_versions.get(name)
+    }
+    if changed_versions and RESTART_RUNTIME_AFTER_BASE_DEP_CHANGE:
+        manifest = {
+            "reason": "Base numeric dependencies changed; restart required before importing sklearn/NumPy extensions.",
+            "changed_versions": changed_versions,
+            "python": sys.version,
+        }
+        manifest_path = runtime_dir / f"base_deps_restart_py{sys.version_info.major}{sys.version_info.minor}.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        restart_runtime("Base numeric dependencies changed: " + json.dumps(changed_versions))
 
-    import numpy as np
-    import scipy
-    import sklearn
-    import wfdb
+    try:
+        versions = sanity_import_numeric_stack()
+    except Exception as exc:
+        print("Numeric stack import sanity check failed:", repr(exc))
+        if REPAIR_BROKEN_NUMERIC_STACK:
+            print("Force-reinstalling NumPy/SciPy/scikit-learn once, then restarting runtime.")
+            pip_install(["--force-reinstall", "--no-cache-dir"], numeric_packages)
+            repair_manifest = {
+                "reason": "Numeric stack import failed after pip install; repaired with force-reinstall.",
+                "error": repr(exc),
+                "versions_before_repair": after_versions,
+                "versions_after_repair": numeric_versions(),
+                "python": sys.version,
+            }
+            repair_path = runtime_dir / f"numeric_stack_repair_py{sys.version_info.major}{sys.version_info.minor}.json"
+            repair_path.write_text(json.dumps(repair_manifest, indent=2), encoding="utf-8")
+            restart_runtime("NumPy/SciPy/scikit-learn were force-reinstalled after an import failure.")
+        raise
 
-    print("numpy :", np.__version__)
-    print("scipy :", scipy.__version__)
-    print("sklearn:", sklearn.__version__)
-    print("wfdb  :", wfdb.__version__)
+    for name, version in versions.items():
+        print(f"{name:8s}: {version}")
 
     check = subprocess.run(
         [sys.executable, "-m", "pip", "check"],
