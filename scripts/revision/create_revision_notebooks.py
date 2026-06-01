@@ -699,6 +699,28 @@ print('- reports/revision/predictions/cpsc_full_predictions.npz')
         ),
         markdown("## Re-run Inventory"),
         code("!python scripts/revision/05_artifact_inventory.py\n"),
+        markdown("## Mirror Artifacts To Stable Drive Cache"),
+        code(
+            """import shutil
+
+source_root = Path('reports/revision')
+mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
+mirror_root.mkdir(parents=True, exist_ok=True)
+
+copied = []
+for src in sorted(source_root.rglob('*')):
+    if not src.is_file() or src.name == '.gitkeep':
+        continue
+    dst = mirror_root / src.relative_to(source_root)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    copied.append((src, dst))
+
+print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
+for src, dst in copied:
+    print(f' - {src} -> {dst}')
+"""
+        ),
     ]
 
 
@@ -746,6 +768,7 @@ else:
         markdown("## Run Calibration And Bootstrap CI"),
         code(
             """import os
+import shutil
 import numpy as np
 
 N_BOOT = 1000
@@ -753,21 +776,27 @@ N_BINS = 15
 THRESHOLD = 0.5
 OVERWRITE_METRICS = True
 
+drive_root = Path(globals().get('DRIVE_ROOT', '/content/drive/MyDrive/ECG-Ramba'))
 repo_dir = Path(globals().get('REPO_DIR', '/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA'))
 if repo_dir.exists() and (repo_dir / 'configs' / 'config.py').exists() and Path.cwd() != repo_dir:
     os.chdir(repo_dir)
 
 print('cwd:', Path.cwd())
+print('drive_root:', drive_root)
 
 candidate_pred_dirs = []
 for path in [
     Path('reports/revision/predictions'),
     repo_dir / 'reports' / 'revision' / 'predictions',
+    drive_root / 'revision_artifacts' / 'reports' / 'revision' / 'predictions',
     Path('/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA/reports/revision/predictions'),
+    Path('/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision/predictions'),
 ]:
     if path not in candidate_pred_dirs:
         candidate_pred_dirs.append(path)
 
+canonical_pred_dir = Path('reports/revision/predictions')
+canonical_pred_dir.mkdir(parents=True, exist_ok=True)
 metric_dir = Path('reports/revision/metrics')
 metric_dir.mkdir(parents=True, exist_ok=True)
 
@@ -775,24 +804,46 @@ metric_prediction_files = []
 skipped_prediction_files = []
 seen_predictions = set()
 
+def inspect_prediction(pred):
+    try:
+        with np.load(pred, allow_pickle=True) as data:
+            keys = set(data.files)
+            if {'y_true', 'y_prob'}.issubset(keys):
+                return True, sorted(keys)
+            return False, sorted(keys)
+    except Exception as exc:
+        return False, [f'load_error={type(exc).__name__}: {exc}']
+
+def register_prediction(pred, source='candidate'):
+    pred_key = str(pred.resolve()) if pred.exists() else str(pred)
+    if pred_key in seen_predictions:
+        return
+    seen_predictions.add(pred_key)
+    ok, keys = inspect_prediction(pred)
+    if not ok:
+        skipped_prediction_files.append((pred, keys))
+        return
+    canonical = canonical_pred_dir / pred.name
+    if pred.resolve() != canonical.resolve():
+        canonical.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(pred, canonical)
+        print(f'Copied {source} prediction to canonical repo path: {canonical}')
+        pred = canonical
+    metric_prediction_files.append(pred)
+
 print('Prediction directories checked:')
 for pred_dir in candidate_pred_dirs:
     files = sorted(pred_dir.glob('*.npz')) if pred_dir.exists() else []
     print(f' - {pred_dir} | exists={pred_dir.exists()} | npz={len(files)}')
     for pred in files:
-        pred_key = str(pred.resolve()) if pred.exists() else str(pred)
-        if pred_key in seen_predictions:
+        register_prediction(pred)
+
+if not metric_prediction_files and drive_root.exists():
+    print(f'No candidate prediction files found. Searching under {drive_root} for *_predictions.npz ...')
+    for pred in sorted(drive_root.rglob('*_predictions.npz'))[:80]:
+        if '.ipynb_checkpoints' in pred.as_posix():
             continue
-        seen_predictions.add(pred_key)
-        try:
-            with np.load(pred, allow_pickle=True) as data:
-                keys = set(data.files)
-                if {'y_true', 'y_prob'}.issubset(keys):
-                    metric_prediction_files.append(pred)
-                else:
-                    skipped_prediction_files.append((pred, sorted(keys)))
-        except Exception as exc:
-            skipped_prediction_files.append((pred, [f'load_error={type(exc).__name__}: {exc}']))
+        register_prediction(pred, source='recovered')
 
 if skipped_prediction_files:
     print('Skipping NPZ files that are not record-level metric predictions:')
@@ -903,6 +954,28 @@ display(pd.DataFrame(bootstrap_rows))
 """
         ),
         code("!python scripts/revision/05_artifact_inventory.py\n"),
+        markdown("## Mirror Metrics To Stable Drive Cache"),
+        code(
+            """import shutil
+
+source_root = Path('reports/revision')
+mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
+mirror_root.mkdir(parents=True, exist_ok=True)
+
+copied = []
+for src in sorted(source_root.rglob('*')):
+    if not src.is_file() or src.name == '.gitkeep':
+        continue
+    dst = mirror_root / src.relative_to(source_root)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    copied.append((src, dst))
+
+print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
+for src, dst in copied:
+    print(f' - {src} -> {dst}')
+"""
+        ),
     ]
 
 
