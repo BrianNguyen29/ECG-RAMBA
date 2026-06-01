@@ -221,6 +221,15 @@ def predictions_notebook() -> list[dict]:
     return [
         markdown("## Setup"),
         code(SETUP_CODE + "\n" + RUN_HELPER_CODE),
+        markdown("## Install Model Dependencies"),
+        code(
+            """INSTALL_MODEL_DEPS = True
+if INSTALL_MODEL_DEPS:
+    !pip install -q mamba-ssm causal-conv1d>=1.2.0
+else:
+    print('Skipping mamba-ssm install. Ensure it is already available before prediction generation.')
+"""
+        ),
         markdown(
             "## Prediction Contract\n\n"
             "Every downstream metric script expects NPZ files with `y_true` and "
@@ -242,20 +251,27 @@ for path in sorted(pred_dir.glob('*.npz')):
         print('  y_true:', data['y_true'].shape, 'y_prob:', data['y_prob'].shape)
 """
         ),
-        markdown("## OOF And External Evaluation Commands"),
+        markdown("## Generate OOF Predictions"),
         code(
             """RUN_HEAVY = False
 
-commands = [
-    ('scripts/eval_oof.py', 'python scripts/eval_oof.py'),
-    ('scripts/eval_zeroshot.py', 'python scripts/eval_zeroshot.py'),
-]
+command = (
+    'python scripts/revision/01_generate_predictions.py '
+    '--dataset oof --checkpoint-kind best'
+)
 
-for script, command in commands:
-    if RUN_HEAVY:
-        run_script_if_exists(script, command)
-    else:
-        print(f'Heavy run disabled. Set RUN_HEAVY=True to execute: {command}')
+if RUN_HEAVY:
+    run(command)
+else:
+    print(f'Heavy run disabled. Set RUN_HEAVY=True to execute: {command}')
+"""
+        ),
+        markdown("## External Prediction Commands"),
+        code(
+            """print('PTB-XL and CPSC/Georgia prediction exporters are the next implementation step.')
+print('Expected future outputs:')
+print('- reports/revision/predictions/ptbxl_full_predictions.npz')
+print('- reports/revision/predictions/cpsc_full_predictions.npz')
 """
         ),
         markdown("## Re-run Inventory"),
