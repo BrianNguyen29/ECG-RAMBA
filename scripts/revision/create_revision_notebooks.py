@@ -261,8 +261,66 @@ def predictions_notebook() -> list[dict]:
         code(
             """INSTALL_BASE_DEPS = True
 if INSTALL_BASE_DEPS:
-    !python --version
-    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl tqdm wfdb joblib matplotlib seaborn packaging neurokit2 iterative-stratification thop einops ninja
+    import subprocess
+    import sys
+
+    packages = [
+        "numpy>=2.0,<2.6",
+        "scipy>=1.14.1,<2.0",
+        "pandas",
+        "scikit-learn",
+        "threadpoolctl",
+        "tqdm",
+        "wfdb",
+        "joblib",
+        "matplotlib",
+        "seaborn",
+        "packaging",
+        "neurokit2",
+        "iterative-stratification",
+        "thop",
+        "einops",
+        "ninja",
+    ]
+    print("Python:", sys.version)
+    print("Installing/updating ECG-RAMBA runtime dependencies without downgrading Colab numpy/scipy.")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--upgrade",
+            "--upgrade-strategy",
+            "only-if-needed",
+            *packages,
+        ],
+        check=True,
+    )
+
+    import numpy as np
+    import scipy
+    import sklearn
+    import wfdb
+
+    print("numpy :", np.__version__)
+    print("scipy :", scipy.__version__)
+    print("sklearn:", sklearn.__version__)
+    print("wfdb  :", wfdb.__version__)
+
+    check = subprocess.run(
+        [sys.executable, "-m", "pip", "check"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if check.returncode:
+        print("pip check reported remaining non-ECG Colab package conflicts:")
+        print(check.stdout)
+        print("Continue only if the ECG-RAMBA imports above succeeded; unused Colab packages can still report conflicts.")
+    else:
+        print("pip check: OK")
 else:
     print('Skipping base dependency install.')
 """
