@@ -136,19 +136,69 @@ CONFIG_HASH = hashlib.md5(
     json.dumps(CONFIG, sort_keys=True).encode()
 ).hexdigest()[:8]
 
+def first_existing_path(candidates: list[str]) -> str:
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
 def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: bool = True) -> dict:
-    # Update cache dir to be relative to the project if not in colab
-    base_dir = './ecg_cache' 
-    if os.path.exists('/content/drive/MyDrive/ECG'):
-        base_dir = '/content/drive/MyDrive/ECG'
+    # Update cache dir to be relative to the project if not in Colab.
+    # ECG_RAMBA_DRIVE_ROOT lets Colab users keep the project under a custom
+    # Drive folder such as /content/drive/MyDrive/ECG-Ramba.
+    base_dir = './ecg_cache'
+    drive_candidates = [
+        os.environ.get('ECG_RAMBA_DRIVE_ROOT'),
+        '/content/drive/MyDrive/ECG',
+        '/content/drive/MyDrive/ECG-Ramba',
+    ]
+    for candidate in drive_candidates:
+        if candidate and os.path.exists(candidate):
+            base_dir = candidate
+            break
         
+    model_candidates = [
+        './models',
+        './model',
+        f'{base_dir}/model',
+        f'{base_dir}/models',
+    ]
+    model_dir = './models'
+    for candidate in model_candidates:
+        if (
+            os.path.exists(candidate)
+            and any(name.startswith('fold') and name.endswith('_best.pt') for name in os.listdir(candidate))
+        ):
+            model_dir = candidate
+            break
+
+    chapman_zip = first_existing_path([
+        f'{base_dir}/archive.zip',
+        f'{base_dir}/WFDB-ChapmanShaoxing.zip',
+        f'{base_dir}/WFDB_ChapmanShaoxing.zip',
+        f'{base_dir}/chapman.zip',
+    ])
+    ptb_zip = first_existing_path([
+        f'{base_dir}/PTB-XL.zip',
+        f'{base_dir}/ptb-xl.zip',
+        f'{base_dir}/ptbxl.zip',
+    ])
+    cpsc_zip = first_existing_path([
+        f'{base_dir}/cpsc2021.zip',
+        f'{base_dir}/CPSC2021.zip',
+        f'{base_dir}/Georgia.zip',
+    ])
+
     paths = {
         'data_dir': './data',
         'cache_dir': base_dir,
-        'zip_path': f'{base_dir}/archive.zip',
+        'zip_path': chapman_zip,
+        'ptb_zip': ptb_zip,
+        'cpsc_zip': cpsc_zip,
+        'georgia_zip': f'{base_dir}/Georgia.zip',
         'extract_dir': './data/chapman',
         'data_cache': f'{base_dir}/ecg_data_{num_classes}c_subject.npz',
-        'model_dir': './models',
+        'model_dir': model_dir,
     }
     os.makedirs(base_dir, exist_ok=True)
     os.makedirs(paths['model_dir'], exist_ok=True)
