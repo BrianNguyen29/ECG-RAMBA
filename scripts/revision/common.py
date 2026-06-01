@@ -19,6 +19,11 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REVISION_DIR = PROJECT_ROOT / "reports" / "revision"
 FIGURE_DIR = REVISION_DIR / "figures"
+LOG_DIR = REVISION_DIR / "logs"
+MANIFEST_DIR = REVISION_DIR / "manifests"
+METRIC_DIR = REVISION_DIR / "metrics"
+PREDICTION_DIR = REVISION_DIR / "predictions"
+TABLE_DIR = REVISION_DIR / "tables"
 
 
 CURRENT_HRV36_SCHEMA = [
@@ -94,8 +99,16 @@ PTB_SUPERCLASS_MAPPING = {
 
 
 def ensure_revision_dirs() -> None:
-    REVISION_DIR.mkdir(parents=True, exist_ok=True)
-    FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in [
+        REVISION_DIR,
+        FIGURE_DIR,
+        LOG_DIR,
+        MANIFEST_DIR,
+        METRIC_DIR,
+        PREDICTION_DIR,
+        TABLE_DIR,
+    ]:
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def save_json(path: os.PathLike[str] | str, payload: dict) -> None:
