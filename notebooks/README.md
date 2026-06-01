@@ -15,8 +15,8 @@ code, notebooks, and planning metadata.
 7. `06_pooling_and_representation.ipynb`
 8. `07_results_freeze.ipynb`
 
-`01_exploratory.ipynb` is retained as an archive of the original exploratory
-run. Avoid adding more reviewer-revision work to that notebook.
+Original exploratory/demo notebooks are retained under `notebooks/archive/`.
+Avoid adding reviewer-revision work to those legacy notebooks.
 
 Legacy direct-runner notebooks were removed to avoid running the wrong setup
 path. Use the numbered suite above for revision work.
