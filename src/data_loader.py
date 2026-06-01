@@ -11,6 +11,8 @@ Design goals:
 """
 
 import os
+import tempfile
+import time
 import zipfile
 import numpy as np
 import torch
@@ -25,6 +27,25 @@ from configs.config import (
     SNOMED_MAPPING
 )
 from src.features import extract_amplitude_features
+
+
+def reset_or_relocate_extract_dir(extract_dir: str) -> str:
+    """Remove an incomplete extract dir, or move extraction to local scratch if Drive I/O is broken."""
+    if not os.path.exists(extract_dir):
+        return extract_dir
+
+    try:
+        shutil.rmtree(extract_dir)
+        return extract_dir
+    except OSError as exc:
+        local_root = os.environ.get("ECG_RAMBA_LOCAL_ROOT")
+        if not local_root:
+            local_root = "/content/ecg_ramba_runtime" if os.path.exists("/content") else tempfile.gettempdir()
+        fallback = os.path.join(local_root, f"chapman_extract_{int(time.time())}")
+        print(f"⚠️  Could not remove incomplete extract dir: {extract_dir}")
+        print(f"    Reason: {exc}")
+        print(f"    Falling back to local extract dir: {fallback}")
+        return fallback
 
 
 # ============================================================
@@ -134,7 +155,8 @@ def load_chapman_multilabel(paths: dict = None):
             print(f"📂 Raw directory looks complete ({num_files} records).")
         else:
             print(f"⚠️  Raw directory incomplete ({num_files} records). Re-extracting...")
-            shutil.rmtree(extract_dir)
+            extract_dir = reset_or_relocate_extract_dir(extract_dir)
+            paths['extract_dir'] = extract_dir
 
     if should_extract:
         if not os.path.exists(zip_path):
@@ -144,6 +166,7 @@ def load_chapman_multilabel(paths: dict = None):
              raise FileNotFoundError(f"Dataset archive not found at {zip_path}")
 
         print(f"📦 Extracting dataset from ZIP: {zip_path}")
+        os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as z:
             z.extractall(extract_dir)
 

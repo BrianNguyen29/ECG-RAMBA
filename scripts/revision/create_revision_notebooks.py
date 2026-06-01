@@ -33,8 +33,11 @@ DRIVE_ROOT = Path('/content/drive/MyDrive/ECG-Ramba')
 REPO_URL = 'https://github.com/BrianNguyen29/ECG-RAMBA.git'
 BRANCH = os.environ.get('ECG_RAMBA_BRANCH', 'main')
 REPO_DIR = DRIVE_ROOT / 'ECG-RAMBA'
+LOCAL_RUNTIME_ROOT = Path('/content/ecg_ramba_runtime')
 
 os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)
+os.environ.setdefault('ECG_RAMBA_LOCAL_ROOT', str(LOCAL_RUNTIME_ROOT))
+os.environ.setdefault('ECG_RAMBA_EXTRACT_DIR', str(LOCAL_RUNTIME_ROOT / 'chapman'))
 
 def _run_setup(cmd, cwd=None, check=True):
     print(f'$ {cmd}')
