@@ -273,6 +273,7 @@ else:
 DOWNLOAD_MAMBA_WHEELS_IF_MISSING = True
 AUTO_PIN_TORCH_FOR_MAMBA = True
 RESTART_RUNTIME_AFTER_TORCH_PIN = True
+UNINSTALL_TORCH_COMPANION_PACKAGES = True
 
 if INSTALL_MODEL_DEPS:
     import hashlib
@@ -281,6 +282,7 @@ if INSTALL_MODEL_DEPS:
     import re
     import subprocess
     import sys
+    import time
     import urllib.request
 
     import torch
@@ -314,6 +316,24 @@ if INSTALL_MODEL_DEPS:
         raise RuntimeError("CUDA-enabled PyTorch is required. In Colab, select a GPU runtime before running this notebook.")
 
     release_cache = {}
+    torch_companion_packages = ["torchvision", "torchaudio", "torchtext"]
+
+    def restart_runtime_after_pin() -> None:
+        print("")
+        print("=" * 80)
+        print("Intentional Colab runtime restart")
+        print("=" * 80)
+        print("Torch was changed to a Mamba-compatible version.")
+        print("After Colab reconnects, run this notebook again from the first cell.")
+        print("The downloaded/pinned artifacts are stored on Drive and will be reused.")
+        print("=" * 80)
+        sys.stdout.flush()
+        time.sleep(8)
+        try:
+            from google.colab import runtime
+            runtime.restart_runtime()
+        except Exception:
+            os.kill(os.getpid(), 9)
 
     def sha256_file(path: Path) -> str:
         h = hashlib.sha256()
@@ -474,6 +494,9 @@ if INSTALL_MODEL_DEPS:
             "python_tag": py_tag,
             "cuda_tag": cuda_tag,
             "cxx11abi": abi_tag,
+            "uninstalled_torch_companion_packages": (
+                torch_companion_packages if UNINSTALL_TORCH_COMPANION_PACKAGES else []
+            ),
         }
         wheel_cache_dir.mkdir(parents=True, exist_ok=True)
         pin_path = wheel_cache_dir / "torch_runtime_pin.json"
@@ -481,13 +504,19 @@ if INSTALL_MODEL_DEPS:
         print(f"Current torch{torch_major_minor} has no compatible Mamba wheels.")
         print(f"Installing torch=={target_version} so Mamba wheels can use torch{target_minor}.")
         print(f"Wrote torch pin manifest: {pin_path}")
+        if UNINSTALL_TORCH_COMPANION_PACKAGES:
+            print("Removing Torch companion packages that can pin a different torch version:")
+            print("  " + ", ".join(torch_companion_packages))
+            subprocess.run(
+                [sys.executable, "-m", "pip", "uninstall", "-y", *torch_companion_packages],
+                check=False,
+            )
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "--force-reinstall", f"torch=={target_version}"],
             check=True,
         )
-        print("Torch was changed in this runtime. Restarting now; after reconnect, rerun the notebook from the top.")
         if RESTART_RUNTIME_AFTER_TORCH_PIN:
-            os.kill(os.getpid(), 9)
+            restart_runtime_after_pin()
         raise SystemExit("Restart runtime and rerun the notebook from the top.")
 
     def select_release_asset(repo: str, role: str) -> dict:
