@@ -16,6 +16,7 @@ reports/revision/
     cpsc_full_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
+    oof_full_prediction_summary.json
     calibration_ci_<dataset>.json
     baseline_summary.csv
     hrv_domain_summary.csv
@@ -26,6 +27,7 @@ reports/revision/
     robustness_<dataset>.png
     representation_umap.png
   tables/
+    oof_full_class_summary.csv
     table_baselines.csv
     table_calibration.csv
     table_bootstrap_ci.csv
@@ -34,6 +36,7 @@ reports/revision/
   logs/
     <notebook_or_script>_<timestamp>.log
   manifests/
+    oof_full_prediction_run_manifest.json
     artifacts_manifest.json
     artifacts_manifest.csv
 ```
@@ -54,7 +57,18 @@ record_id: shape (N,)
 class_names: shape (C,)
 dataset: scalar/string
 protocol: scalar/string
-slice_prob: shape (N, S, C), if pooling sensitivity is needed
+config_hash: scalar/string
+git_commit: scalar/string
+created_utc: scalar/string
+fold_id: shape (N,)
+slice_count: shape (N,)
+valid_record_mask: shape (N,)
+checkpoint_kind: scalar/string
+batch_size: scalar/integer
+aggregation_method: scalar/string
+aggregation_q: scalar/float
+slice_prob: shape (total_slices, C), paired with record_id and slice_index
+slice_index: shape (total_slices,)
 ```
 
 ## Minimum Metric Contract

@@ -18,9 +18,13 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
+import platform
+import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import joblib
@@ -33,15 +37,171 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import CLASSES, CONFIG, PATHS, DEVICE  # noqa: E402
+from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
+    MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
+    TABLE_DIR,
     ensure_revision_dirs,
     multilabel_metrics,
     power_mean,
+    save_csv,
     save_json,
 )
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def path_info(path: str | os.PathLike[str], *, with_sha256: bool = False) -> dict:
+    p = Path(path)
+    payload = {
+        "path": str(p),
+        "exists": p.exists(),
+        "is_dir": p.is_dir() if p.exists() else False,
+        "size_bytes": p.stat().st_size if p.exists() and p.is_file() else None,
+        "modified_utc": datetime.fromtimestamp(
+            p.stat().st_mtime, tz=timezone.utc
+        ).isoformat() if p.exists() and p.is_file() else None,
+    }
+    if with_sha256 and p.exists() and p.is_file():
+        payload["sha256"] = sha256_file(p)
+    return payload
+
+
+def git_output(args: list[str]) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def runtime_metadata(args: argparse.Namespace, created_utc: str) -> dict:
+    cuda_available = torch.cuda.is_available()
+    return {
+        "created_utc": created_utc,
+        "command": " ".join([Path(sys.executable).name, *sys.argv]),
+        "args": vars(args),
+        "project_root": str(PROJECT_ROOT),
+        "cwd": str(Path.cwd()),
+        "git": {
+            "commit": git_output(["rev-parse", "HEAD"]),
+            "branch": git_output(["branch", "--show-current"]),
+            "status_short": git_output(["status", "--short", "--branch"]),
+        },
+        "python": sys.version,
+        "platform": platform.platform(),
+        "torch": {
+            "version": torch.__version__,
+            "cuda_version": torch.version.cuda,
+            "cuda_available": cuda_available,
+            "cudnn_version": torch.backends.cudnn.version(),
+            "device": DEVICE,
+            "gpu_name": torch.cuda.get_device_name(0) if cuda_available else None,
+            "gpu_count": torch.cuda.device_count() if cuda_available else 0,
+        },
+    }
+
+
+def config_snapshot() -> dict:
+    keys = [
+        "d_model",
+        "n_layers",
+        "hydra_dim",
+        "hrv_dim",
+        "slice_length",
+        "slice_stride",
+        "max_slices_per_record",
+        "default_threshold",
+        "aggregation_method",
+        "n_folds",
+        "cv_strategy",
+        "group_key",
+        "hydra_pca_mode",
+        "use_hrv",
+        "use_rocket",
+        "use_cross_attention_fusion",
+    ]
+    return {
+        "config_hash": CONFIG_HASH,
+        "core": {key: CONFIG.get(key) for key in keys},
+        "classes": CLASSES,
+        "paths": {key: path_info(value) for key, value in PATHS.items()},
+    }
+
+
+def slice_ordinals(record_ids: np.ndarray) -> np.ndarray:
+    counts: dict[int, int] = {}
+    out = np.zeros(len(record_ids), dtype=np.int16)
+    for i, rid in enumerate(record_ids):
+        rid_int = int(rid)
+        out[i] = counts.get(rid_int, 0)
+        counts[rid_int] = int(out[i]) + 1
+    return out
+
+
+def summarize_slice_counts(slice_counts: np.ndarray) -> dict:
+    counts = np.asarray(slice_counts)
+    nonzero = counts[counts > 0]
+    hist = {str(int(k)): int(v) for k, v in zip(*np.unique(counts, return_counts=True))}
+    return {
+        "min": int(counts.min()) if len(counts) else 0,
+        "max": int(counts.max()) if len(counts) else 0,
+        "mean": float(counts.mean()) if len(counts) else 0.0,
+        "median": float(np.median(counts)) if len(counts) else 0.0,
+        "nonzero_mean": float(nonzero.mean()) if len(nonzero) else 0.0,
+        "zero_slice_records": int(np.sum(counts == 0)),
+        "histogram": hist,
+    }
+
+
+def per_class_summary_rows(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    class_names: list[str],
+    threshold: float,
+) -> list[dict]:
+    from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score, roc_auc_score
+
+    y_pred = (y_prob >= threshold).astype(np.float32)
+    rows = []
+    for idx, name in enumerate(class_names):
+        yt = y_true[:, idx]
+        yp = y_prob[:, idx]
+        pred = y_pred[:, idx]
+        has_both = len(np.unique(yt)) >= 2
+        rows.append(
+            {
+                "class_index": idx,
+                "class_name": name,
+                "n_records": int(len(yt)),
+                "n_positive": int(np.sum(yt)),
+                "prevalence": float(np.mean(yt)),
+                "predicted_positive": int(np.sum(pred)),
+                "predicted_positive_rate": float(np.mean(pred)),
+                "prob_mean": float(np.mean(yp)),
+                "prob_min": float(np.min(yp)),
+                "prob_max": float(np.max(yp)),
+                "roc_auc": float(roc_auc_score(yt, yp)) if has_both else np.nan,
+                "pr_auc": float(average_precision_score(yt, yp)) if has_both else np.nan,
+                "f1": float(f1_score(yt, pred, zero_division=0)),
+                "precision": float(precision_score(yt, pred, zero_division=0)),
+                "recall": float(recall_score(yt, pred, zero_division=0)),
+            }
+        )
+    return rows
+
 
 class ECGSliceDatasetInfer(Dataset):
     def __init__(self, xs: np.ndarray, xh: np.ndarray, xhr: np.ndarray, rids: np.ndarray):
@@ -130,10 +290,14 @@ def checkpoint_path(fold: int, checkpoint_kind: str) -> Path:
     raise FileNotFoundError(f"Missing checkpoint for fold {fold}: {preferred} or {fallback}")
 
 
-def load_model_for_fold(fold: int, checkpoint_kind: str) -> torch.nn.Module:
+def load_model_for_fold(
+    fold: int,
+    checkpoint_kind: str,
+    checkpoint_file: Path | None = None,
+) -> torch.nn.Module:
     from src.model import ECGRambaV7Advanced
 
-    path = checkpoint_path(fold, checkpoint_kind)
+    path = checkpoint_file or checkpoint_path(fold, checkpoint_kind)
     print(f"Loading checkpoint: {path}")
     checkpoint = torch.load(path, map_location=DEVICE)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
@@ -247,6 +411,9 @@ def generate_oof(args: argparse.Namespace) -> None:
 
     ensure_revision_dirs()
     set_seed(CONFIG["seeds"][0])
+    created_utc = datetime.now(timezone.utc).isoformat()
+    run_meta = runtime_metadata(args, created_utc)
+    config_meta = config_snapshot()
 
     X, y, X_raw_amp, subjects = prepare_clean_chapman(limit_records=args.limit_records)
     n_records, n_classes = y.shape
@@ -271,8 +438,12 @@ def generate_oof(args: argparse.Namespace) -> None:
     fold_id = np.zeros(n_records, dtype=np.int16) - 1
     record_slice_count = np.zeros(n_records, dtype=np.int16)
     pca_variance = []
+    fold_summaries = []
+    checkpoint_infos = []
     slice_probs_all = []
     slice_record_index_all = []
+    slice_index_all = []
+    slice_fold_id_all = []
 
     for fold_num, fold in enumerate(folds, start=1):
         tr_idx = fold["tr_idx"]
@@ -304,8 +475,20 @@ def generate_oof(args: argparse.Namespace) -> None:
         for rid, count in slice_counts.items():
             record_slice_count[rid] = count
 
+        fold_summary = {
+            "fold": fold_num,
+            "n_train": int(len(tr_idx)),
+            "n_validation": int(len(va_idx)),
+            "n_slices": int(len(rids)),
+            "n_records_with_slices": int(sum(count > 0 for count in slice_counts.values())),
+            "n_zero_slice_records": int(sum(count == 0 for count in slice_counts.values())),
+            "pca_explained_variance": pca_var,
+        }
+
         if len(rids) == 0:
             print(f"Fold {fold_num}: no slices generated; skipping")
+            fold_summary["n_predicted_records"] = 0
+            fold_summaries.append(fold_summary)
             continue
 
         loader = DataLoader(
@@ -316,7 +499,12 @@ def generate_oof(args: argparse.Namespace) -> None:
             pin_memory=DEVICE == "cuda",
         )
 
-        model = load_model_for_fold(fold_num, args.checkpoint_kind)
+        ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
+        ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
+        checkpoint_infos.append(ckpt_info)
+        fold_summary["checkpoint"] = ckpt_info
+
+        model = load_model_for_fold(fold_num, args.checkpoint_kind, checkpoint_file=ckpt_path)
         slice_probs, slice_rids = infer_slices(model, loader)
 
         for rid in va_idx:
@@ -330,9 +518,18 @@ def generate_oof(args: argparse.Namespace) -> None:
             oof_probs[int(rid)] = power_mean(preds, q=3.0, axis=0)
             fold_id[int(rid)] = fold_num
 
+        fold_summary["n_predicted_records"] = int(np.sum(fold_id[va_idx] >= 0))
+        fold_summary["slice_prob_shape"] = list(slice_probs.shape)
+        fold_summary["slice_prob_nan_count"] = int(np.isnan(slice_probs).sum())
+        fold_summary["slice_prob_min"] = float(np.nanmin(slice_probs))
+        fold_summary["slice_prob_max"] = float(np.nanmax(slice_probs))
+        fold_summaries.append(fold_summary)
+
         if args.save_slice_probs:
             slice_probs_all.append(slice_probs.astype(np.float16))
             slice_record_index_all.append(slice_rids.astype(np.int64))
+            slice_index_all.append(slice_ordinals(slice_rids))
+            slice_fold_id_all.append(np.full(len(slice_rids), fold_num, dtype=np.int16))
 
         del model
         torch.cuda.empty_cache()
@@ -343,6 +540,11 @@ def generate_oof(args: argparse.Namespace) -> None:
         missing = int(np.sum(~valid_records))
         print(f"Warning: {missing} records did not receive predictions")
 
+    git_commit = run_meta["git"]["commit"] or ""
+    protocol = "fold_best_power_mean_q3_threshold_0.5"
+    threshold = 0.5
+    aggregation_q = 3.0
+
     out_path = PREDICTION_DIR / "oof_full_predictions.npz"
     np.savez_compressed(
         out_path,
@@ -351,9 +553,18 @@ def generate_oof(args: argparse.Namespace) -> None:
         record_id=np.arange(n_records, dtype=np.int64),
         class_names=np.asarray(CLASSES),
         dataset=np.asarray("chapman_oof"),
-        protocol=np.asarray("fold_best_power_mean_q3_threshold_0.5"),
+        protocol=np.asarray(protocol),
         fold_id=fold_id,
         slice_count=record_slice_count,
+        valid_record_mask=valid_records.astype(np.bool_),
+        config_hash=np.asarray(CONFIG_HASH),
+        git_commit=np.asarray(git_commit),
+        created_utc=np.asarray(created_utc),
+        checkpoint_kind=np.asarray(args.checkpoint_kind),
+        batch_size=np.asarray(args.batch_size, dtype=np.int32),
+        aggregation_method=np.asarray("power_mean"),
+        aggregation_q=np.asarray(aggregation_q, dtype=np.float32),
+        threshold=np.asarray(threshold, dtype=np.float32),
     )
     print(f"Wrote: {out_path}")
 
@@ -364,31 +575,103 @@ def generate_oof(args: argparse.Namespace) -> None:
             slice_out_path,
             slice_prob=np.concatenate(slice_probs_all, axis=0),
             record_id=np.concatenate(slice_record_index_all, axis=0),
+            slice_index=np.concatenate(slice_index_all, axis=0),
+            fold_id=np.concatenate(slice_fold_id_all, axis=0),
             class_names=np.asarray(CLASSES),
             dataset=np.asarray("chapman_oof"),
             protocol=np.asarray("slice_level_fold_best"),
+            config_hash=np.asarray(CONFIG_HASH),
+            git_commit=np.asarray(git_commit),
+            created_utc=np.asarray(created_utc),
         )
         print(f"Wrote: {slice_out_path}")
 
-    metrics = multilabel_metrics(y[valid_records], oof_probs[valid_records], threshold=0.5)
+    metrics = multilabel_metrics(y[valid_records], oof_probs[valid_records], threshold=threshold)
+    class_summary_path = TABLE_DIR / "oof_full_class_summary.csv"
+    class_rows = per_class_summary_rows(
+        y[valid_records],
+        oof_probs[valid_records],
+        CLASSES,
+        threshold=threshold,
+    )
+    save_csv(class_summary_path, class_rows)
+    print(f"Wrote: {class_summary_path}")
+
+    manifest_path = MANIFEST_DIR / "oof_full_prediction_run_manifest.json"
+    summary_path = METRIC_DIR / "oof_full_prediction_summary.json"
+
+    output_paths = {
+        "prediction_file": out_path,
+        "slice_prediction_file": slice_out_path,
+        "prediction_summary_json": summary_path,
+        "class_summary_csv": class_summary_path,
+    }
+
     summary = {
         "dataset": "chapman_oof",
+        "created_utc": created_utc,
+        "git_commit": git_commit,
+        "config_hash": CONFIG_HASH,
         "prediction_file": str(out_path),
         "slice_prediction_file": str(slice_out_path) if slice_out_path else None,
+        "class_summary_csv": str(class_summary_path),
+        "run_manifest_json": str(manifest_path),
+        "protocol": protocol,
         "n_records": int(n_records),
         "n_valid_predictions": int(np.sum(valid_records)),
+        "n_missing_predictions": int(np.sum(~valid_records)),
         "n_classes": int(n_classes),
         "class_names": CLASSES,
         "checkpoint_kind_requested": args.checkpoint_kind,
-        "aggregation": {"method": "power_mean", "q": 3.0},
-        "threshold": 0.5,
+        "batch_size": int(args.batch_size),
+        "limit_records": int(args.limit_records),
+        "save_slice_probs": bool(args.save_slice_probs),
+        "aggregation": {"method": "power_mean", "q": aggregation_q},
+        "threshold": threshold,
+        "slice_count_summary": summarize_slice_counts(record_slice_count),
         "pca_variance": pca_variance,
+        "fold_summaries": fold_summaries,
+        "checkpoints": checkpoint_infos,
         "metrics": metrics,
     }
-    summary_path = METRIC_DIR / "oof_full_prediction_summary.json"
     save_json(summary_path, summary)
+
+    output_info = {
+        name: path_info(path, with_sha256=True)
+        for name, path in output_paths.items()
+        if path is not None and Path(path).exists()
+    }
+    run_manifest = {
+        "dataset": "chapman_oof",
+        "created_utc": created_utc,
+        "protocol": protocol,
+        "runtime": run_meta,
+        "config": config_meta,
+        "inputs": {
+            "dataset_paths": {
+                key: path_info(PATHS[key])
+                for key in ["zip_path", "data_cache", "model_dir"]
+                if key in PATHS
+            },
+            "checkpoints": checkpoint_infos,
+        },
+        "outputs": output_info,
+        "fold_summaries": fold_summaries,
+        "slice_count_summary": summarize_slice_counts(record_slice_count),
+        "prediction_quality": {
+            "y_prob_shape": list(oof_probs.shape),
+            "y_prob_min": float(np.nanmin(oof_probs[valid_records])),
+            "y_prob_max": float(np.nanmax(oof_probs[valid_records])),
+            "y_prob_nan_count": int(np.isnan(oof_probs).sum()),
+            "valid_record_count": int(np.sum(valid_records)),
+            "missing_record_count": int(np.sum(~valid_records)),
+        },
+    }
+    save_json(manifest_path, run_manifest)
+
     print(json.dumps(summary, indent=2, sort_keys=True))
     print(f"Wrote: {summary_path}")
+    print(f"Wrote: {manifest_path}")
 
 
 def main() -> None:
