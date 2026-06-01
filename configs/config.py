@@ -196,7 +196,7 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
         'ptb_zip': ptb_zip,
         'cpsc_zip': cpsc_zip,
         'georgia_zip': f'{base_dir}/Georgia.zip',
-        'extract_dir': './data/chapman',
+        'extract_dir': os.environ.get('ECG_RAMBA_EXTRACT_DIR', './data/chapman'),
         'data_cache': f'{base_dir}/ecg_data_{num_classes}c_subject.npz',
         'model_dir': model_dir,
     }
