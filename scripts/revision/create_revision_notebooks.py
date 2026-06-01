@@ -262,7 +262,7 @@ def predictions_notebook() -> list[dict]:
             """INSTALL_BASE_DEPS = True
 if INSTALL_BASE_DEPS:
     !python --version
-    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl tqdm wfdb joblib matplotlib seaborn packaging neurokit2 iterative-stratification thop
+    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl tqdm wfdb joblib matplotlib seaborn packaging neurokit2 iterative-stratification thop einops ninja
 else:
     print('Skipping base dependency install.')
 """
@@ -270,64 +270,204 @@ else:
         markdown("## Install Model Dependencies"),
         code(
             """INSTALL_MODEL_DEPS = True
+DOWNLOAD_MAMBA_WHEELS_IF_MISSING = True
+
 if INSTALL_MODEL_DEPS:
-    import importlib.util
+    import hashlib
+    import json
+    import os
     import subprocess
     import sys
+    import urllib.request
 
-    explicit_wheel_dirs = [
-        Path('/content/drive/MyDrive/mamba_wheels_py312'),
-        DRIVE_ROOT / 'mamba_wheels_py312',
+    import torch
+
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    torch_major_minor = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+    cuda_version = torch.version.cuda or ""
+    cuda_tag = f"cu{cuda_version.split('.')[0]}" if cuda_version else None
+    abi_tag = "TRUE" if torch._C._GLIBCXX_USE_CXX11_ABI else "FALSE"
+
+    wheel_cache_dir = DRIVE_ROOT / f"mamba_wheels_py{sys.version_info.major}{sys.version_info.minor}"
+    legacy_dirs = [
+        Path("/content/drive/MyDrive") / wheel_cache_dir.name,
+        Path("/content/drive/MyDrive/mamba_wheels_py312"),
+        DRIVE_ROOT / "mamba_wheels_py312",
     ]
+    explicit_wheel_dirs = []
+    for p in [wheel_cache_dir, *legacy_dirs]:
+        if p not in explicit_wheel_dirs:
+            explicit_wheel_dirs.append(p)
 
-    def find_wheels():
+    print("Mamba wheel environment")
+    print("  Python tag :", py_tag)
+    print("  torch      :", torch.__version__)
+    print("  CUDA       :", cuda_version or "CPU")
+    print("  CUDA tag   :", cuda_tag or "none")
+    print("  CXX11 ABI  :", abi_tag)
+    print("  cache dir  :", wheel_cache_dir)
+
+    def sha256_file(path: Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def wheel_role(path_or_name) -> str | None:
+        name = Path(path_or_name).name
+        if name.startswith("causal_conv1d-"):
+            return "causal"
+        if name.startswith("mamba_ssm-"):
+            return "mamba"
+        return None
+
+    def compatible_wheel(path_or_name, role: str) -> bool:
+        name = Path(path_or_name).name
+        if wheel_role(name) != role:
+            return False
+        required = [
+            f"{py_tag}-{py_tag}",
+            "linux_x86_64.whl",
+            f"torch{torch_major_minor}",
+            f"cxx11abi{abi_tag}",
+        ]
+        if cuda_tag:
+            required.append(cuda_tag)
+        return all(token in name for token in required)
+
+    def list_wheels():
+        wheels = []
         for wheel_dir in explicit_wheel_dirs:
-            if not wheel_dir.exists():
-                continue
-            wheels = sorted(wheel_dir.glob('*.whl'))
-            causal = [p for p in wheels if 'causal_conv1d' in p.name]
-            mamba = [p for p in wheels if 'mamba_ssm' in p.name]
-            if causal and mamba:
-                return causal[0], mamba[0], wheel_dir
+            if wheel_dir.exists():
+                wheels.extend(sorted(wheel_dir.glob("*.whl")))
+        return sorted(set(wheels))
 
-        search_roots = [DRIVE_ROOT, Path('/content/drive/MyDrive')]
-        seen = set()
-        for root in search_roots:
-            if not root.exists() or root in seen:
-                continue
-            seen.add(root)
-            print(f'Searching for Mamba wheels under: {root}')
-            causal = sorted(root.rglob('causal_conv1d*.whl'))
-            mamba = sorted(root.rglob('mamba_ssm*.whl'))
-            if causal and mamba:
-                return causal[0], mamba[0], causal[0].parent
-        return None, None, None
+    def select_cached_wheels():
+        wheels = list_wheels()
+        if wheels:
+            print(f"Found {len(wheels)} wheel file(s) in configured Drive cache folders.")
+            for p in wheels[:60]:
+                flag = "compatible" if compatible_wheel(p, wheel_role(p) or "") else "present"
+                print(f"  - {p.name} [{flag}]")
+            if len(wheels) > 60:
+                print(f"  ... {len(wheels) - 60} more wheel(s)")
+        causal = [p for p in wheels if compatible_wheel(p, "causal")]
+        mamba = [p for p in wheels if compatible_wheel(p, "mamba")]
+        return (causal[0] if causal else None), (mamba[0] if mamba else None)
 
-    if importlib.util.find_spec('mamba_ssm') is not None:
-        print('mamba-ssm already installed.')
-    else:
-        causal_wheel, mamba_wheel, wheel_dir = find_wheels()
-        if causal_wheel is None or mamba_wheel is None:
-            print('No local Mamba wheels found.')
-            print('Expected directory examples:')
-            for p in explicit_wheel_dirs:
-                print('-', p)
-            raise FileNotFoundError(
-                'Missing causal_conv1d*.whl and/or mamba_ssm*.whl on Drive. '
-                'Do not pip-build mamba-ssm on Colab; upload/copy prebuilt wheels first.'
-            )
+    def github_latest_release(repo: str) -> dict:
+        url = f"https://api.github.com/repos/{repo}/releases/latest"
+        req = urllib.request.Request(url, headers={"User-Agent": "ECG-RAMBA-Colab"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
-        print(f'Installing Mamba wheels from: {wheel_dir}')
-        print('causal-conv1d:', causal_wheel.name)
-        print('mamba-ssm   :', mamba_wheel.name)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', str(causal_wheel), '-q'], check=True)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', str(mamba_wheel), '-q'], check=True)
-        print('Installed causal-conv1d and mamba-ssm from local wheels.')
+    def select_release_asset(repo: str, role: str) -> dict:
+        rel = github_latest_release(repo)
+        assets = rel.get("assets", [])
+        matches = [a for a in assets if compatible_wheel(a["name"], role)]
+        if matches:
+            print(f"Selected {role} wheel from {repo} {rel.get('tag_name')}: {matches[0]['name']}")
+            return matches[0]
+
+        candidates = [
+            a["name"] for a in assets
+            if wheel_role(a["name"]) == role and py_tag in a["name"] and "linux_x86_64.whl" in a["name"]
+        ]
+        print(f"No compatible {role} wheel found in latest release {repo} {rel.get('tag_name')}.")
+        print("Closest cp/linux candidates:")
+        for name in candidates[:30]:
+            print("  -", name)
+        raise RuntimeError(
+            f"Missing compatible {role} wheel for {py_tag}, torch{torch_major_minor}, "
+            f"{cuda_tag}, cxx11abi{abi_tag}. Runtime and wheel tags must match."
+        )
+
+    def download_asset(asset: dict, out_dir: Path) -> Path:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        name = asset["name"]
+        out_path = out_dir / name
+        if out_path.exists() and out_path.stat().st_size == int(asset.get("size", 0)):
+            print(f"Reusing cached download: {out_path}")
+            return out_path
+
+        tmp_path = out_path.with_suffix(out_path.suffix + ".partial")
+        print(f"Downloading {name}")
+        print(f"  -> {out_path}")
+        req = urllib.request.Request(asset["browser_download_url"], headers={"User-Agent": "ECG-RAMBA-Colab"})
+        with urllib.request.urlopen(req, timeout=900) as resp, tmp_path.open("wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+        os.replace(tmp_path, out_path)
+        return out_path
+
+    causal_wheel, mamba_wheel = select_cached_wheels()
+    downloaded_assets = []
+
+    if (causal_wheel is None or mamba_wheel is None) and DOWNLOAD_MAMBA_WHEELS_IF_MISSING:
+        print("Compatible cached Mamba wheels are missing; downloading release wheels to Drive.")
+        if causal_wheel is None:
+            asset = select_release_asset("Dao-AILab/causal-conv1d", "causal")
+            causal_wheel = download_asset(asset, wheel_cache_dir)
+            downloaded_assets.append(asset)
+        if mamba_wheel is None:
+            asset = select_release_asset("state-spaces/mamba", "mamba")
+            mamba_wheel = download_asset(asset, wheel_cache_dir)
+            downloaded_assets.append(asset)
+
+    if causal_wheel is None or mamba_wheel is None:
+        raise FileNotFoundError(
+            "Missing compatible causal_conv1d*.whl and/or mamba_ssm*.whl. "
+            "Set DOWNLOAD_MAMBA_WHEELS_IF_MISSING=True or place matching wheels in the Drive cache."
+        )
+
+    manifest = {
+        "python_tag": py_tag,
+        "torch_version": torch.__version__,
+        "torch_major_minor": torch_major_minor,
+        "cuda_version": cuda_version,
+        "cuda_tag": cuda_tag,
+        "cxx11abi": abi_tag,
+        "wheel_cache_dir": str(wheel_cache_dir),
+        "causal_wheel": {
+            "path": str(causal_wheel),
+            "name": causal_wheel.name,
+            "sha256": sha256_file(causal_wheel),
+            "bytes": causal_wheel.stat().st_size,
+        },
+        "mamba_wheel": {
+            "path": str(mamba_wheel),
+            "name": mamba_wheel.name,
+            "sha256": sha256_file(mamba_wheel),
+            "bytes": mamba_wheel.stat().st_size,
+        },
+        "downloaded_assets": [
+            {
+                "name": a.get("name"),
+                "url": a.get("browser_download_url"),
+                "size": a.get("size"),
+                "digest": a.get("digest"),
+            }
+            for a in downloaded_assets
+        ],
+    }
+    manifest_path = wheel_cache_dir / "wheel_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Wrote wheel manifest: {manifest_path}")
+
+    print("Installing Mamba wheels from Drive cache")
+    print("  causal-conv1d:", causal_wheel.name)
+    print("  mamba-ssm    :", mamba_wheel.name)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", str(causal_wheel), "-q"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "--no-deps", str(mamba_wheel), "-q"], check=True)
 
     import mamba_ssm
-    print('mamba_ssm import OK:', mamba_ssm.__file__)
+    print("mamba_ssm import OK:", mamba_ssm.__file__)
 else:
-    print('Skipping mamba-ssm install. Ensure it is already available before prediction generation.')
+    print("Skipping mamba-ssm install. Ensure it is already available before prediction generation.")
 """
         ),
         markdown(
