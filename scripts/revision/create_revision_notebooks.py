@@ -706,30 +706,134 @@ def calibration_notebook() -> list[dict]:
     return [
         markdown("## Setup"),
         code(SETUP_CODE + "\n" + RUN_HELPER_CODE),
+        markdown("## Install Metric Dependencies"),
+        code(
+            """INSTALL_METRIC_DEPS = True
+if INSTALL_METRIC_DEPS:
+    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl matplotlib python-dateutil
+else:
+    print('Skipping metric dependency install.')
+"""
+        ),
         markdown("## Run Calibration And Bootstrap CI"),
         code(
-            """pred_dir = Path('reports/revision/predictions')
+            """import numpy as np
+
+N_BOOT = 1000
+N_BINS = 15
+THRESHOLD = 0.5
+OVERWRITE_METRICS = True
+
+pred_dir = Path('reports/revision/predictions')
 metric_dir = Path('reports/revision/metrics')
 metric_dir.mkdir(parents=True, exist_ok=True)
 
-prediction_files = sorted(pred_dir.glob('*.npz'))
-if not prediction_files:
-    print(f'No prediction NPZ files found under {pred_dir}. Run notebook 02 first.')
+metric_prediction_files = []
+skipped_prediction_files = []
 
-for pred in prediction_files:
+for pred in sorted(pred_dir.glob('*.npz')):
+    try:
+        with np.load(pred, allow_pickle=True) as data:
+            keys = set(data.files)
+            if {'y_true', 'y_prob'}.issubset(keys):
+                metric_prediction_files.append(pred)
+            else:
+                skipped_prediction_files.append((pred, sorted(keys)))
+    except Exception as exc:
+        skipped_prediction_files.append((pred, [f'load_error={type(exc).__name__}: {exc}']))
+
+if skipped_prediction_files:
+    print('Skipping NPZ files that are not record-level metric predictions:')
+    for path, keys in skipped_prediction_files:
+        print(' -', path, 'keys=', keys)
+
+if not metric_prediction_files:
+    raise FileNotFoundError(f'No metric-ready prediction NPZ files found under {pred_dir}. Run notebook 02 first.')
+
+for pred in metric_prediction_files:
     out = metric_dir / f'calibration_ci_{pred.stem}.json'
-    cmd = f'python scripts/revision/04_calibration_ci.py --predictions {pred} --out {out} --n-boot 1000'
+    if out.exists() and not OVERWRITE_METRICS:
+        print(f'SKIP existing: {out}')
+        continue
+    cmd = (
+        f'python scripts/revision/04_calibration_ci.py '
+        f'--predictions {pred} --out {out} '
+        f'--threshold {THRESHOLD} --n-bins {N_BINS} --n-boot {N_BOOT}'
+    )
     run(cmd)
 """
         ),
         markdown("## Summarize Metric Files"),
         code(
-            """for path in sorted(Path('reports/revision/metrics').glob('calibration_ci_*.json')):
+            """metric_jsons = sorted(Path('reports/revision/metrics').glob('calibration_ci_*.json'))
+if not metric_jsons:
+    raise FileNotFoundError('No calibration_ci_*.json files found.')
+
+for path in metric_jsons:
     payload = json.loads(path.read_text(encoding='utf-8'))
     print('\\n' + str(path))
+    print('dataset:', payload.get('dataset'))
     print('shape:', payload.get('shape'))
     print('metrics:', payload.get('metrics'))
     print('calibration:', payload.get('calibration'))
+    print('bootstrap_ci:', payload.get('bootstrap_ci'))
+    print('artifacts:', payload.get('artifacts'))
+"""
+        ),
+        markdown("## Build Reviewer Tables"),
+        code(
+            """import pandas as pd
+from IPython.display import display
+
+table_dir = Path('reports/revision/tables')
+table_dir.mkdir(parents=True, exist_ok=True)
+
+calibration_rows = []
+bootstrap_rows = []
+
+for path in sorted(Path('reports/revision/metrics').glob('calibration_ci_*.json')):
+    payload = json.loads(path.read_text(encoding='utf-8'))
+    metrics = payload.get('metrics', {})
+    calibration = payload.get('calibration', {})
+    shape = payload.get('shape', {})
+    row = {
+        'dataset': payload.get('dataset') or Path(payload.get('predictions', path.stem)).stem,
+        'predictions': payload.get('predictions'),
+        'protocol': payload.get('protocol'),
+        'git_commit': payload.get('git_commit'),
+        'n_records': shape.get('y_true', [None, None])[0],
+        'n_classes': shape.get('y_true', [None, None])[1],
+        'threshold': payload.get('threshold'),
+        'n_bins': payload.get('n_bins'),
+        'n_boot': payload.get('n_boot'),
+    }
+    row.update(metrics)
+    row.update(calibration)
+    calibration_rows.append(row)
+
+    for metric_name, ci in payload.get('bootstrap_ci', {}).items():
+        bootstrap_rows.append({
+            'dataset': row['dataset'],
+            'metric': metric_name,
+            'mean': ci.get('mean'),
+            'ci_low': ci.get('lo'),
+            'ci_high': ci.get('hi'),
+            'n_boot_valid': ci.get('n_boot_valid'),
+            'predictions': row['predictions'],
+            'git_commit': row['git_commit'],
+        })
+
+table_calibration = table_dir / 'table_calibration.csv'
+table_bootstrap = table_dir / 'table_bootstrap_ci.csv'
+pd.DataFrame(calibration_rows).to_csv(table_calibration, index=False)
+pd.DataFrame(bootstrap_rows).to_csv(table_bootstrap, index=False)
+
+print('Wrote:', table_calibration)
+print('Wrote:', table_bootstrap)
+print('\\nCalibration table preview:')
+display(pd.DataFrame(calibration_rows))
+print('\\nBootstrap CI table preview:')
+display(pd.DataFrame(bootstrap_rows))
 """
         ),
         code("!python scripts/revision/05_artifact_inventory.py\n"),
