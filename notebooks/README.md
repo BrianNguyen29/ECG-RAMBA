@@ -18,5 +18,5 @@ code, notebooks, and planning metadata.
 `01_exploratory.ipynb` is retained as an archive of the original exploratory
 run. Avoid adding more reviewer-revision work to that notebook.
 
-`00_revision_runner.ipynb` is a compact legacy runner. The numbered suite above
-is the preferred workflow for organized resubmission work.
+Legacy direct-runner notebooks were removed to avoid running the wrong setup
+path. Use the numbered suite above for revision work.

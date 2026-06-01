@@ -229,32 +229,54 @@ if INSTALL_MODEL_DEPS:
     import subprocess
     import sys
 
-    wheel_candidates = [
+    explicit_wheel_dirs = [
         Path('/content/drive/MyDrive/mamba_wheels_py312'),
         DRIVE_ROOT / 'mamba_wheels_py312',
     ]
-    wheel_dir = next((p for p in wheel_candidates if p.exists()), None)
+
+    def find_wheels():
+        for wheel_dir in explicit_wheel_dirs:
+            if not wheel_dir.exists():
+                continue
+            wheels = sorted(wheel_dir.glob('*.whl'))
+            causal = [p for p in wheels if 'causal_conv1d' in p.name]
+            mamba = [p for p in wheels if 'mamba_ssm' in p.name]
+            if causal and mamba:
+                return causal[0], mamba[0], wheel_dir
+
+        search_roots = [DRIVE_ROOT, Path('/content/drive/MyDrive')]
+        seen = set()
+        for root in search_roots:
+            if not root.exists() or root in seen:
+                continue
+            seen.add(root)
+            print(f'Searching for Mamba wheels under: {root}')
+            causal = sorted(root.rglob('causal_conv1d*.whl'))
+            mamba = sorted(root.rglob('mamba_ssm*.whl'))
+            if causal and mamba:
+                return causal[0], mamba[0], causal[0].parent
+        return None, None, None
 
     if importlib.util.find_spec('mamba_ssm') is not None:
         print('mamba-ssm already installed.')
-    elif wheel_dir is not None:
-        print(f'Installing Mamba wheels from: {wheel_dir}')
-        wheels = sorted(wheel_dir.glob('*.whl'))
-        causal_wheels = [p for p in wheels if 'causal_conv1d' in p.name]
-        mamba_wheels = [p for p in wheels if 'mamba_ssm' in p.name]
-        if not causal_wheels:
-            raise FileNotFoundError(f'No causal_conv1d wheel found in {wheel_dir}')
-        if not mamba_wheels:
-            raise FileNotFoundError(f'No mamba_ssm wheel found in {wheel_dir}')
-        subprocess.run([sys.executable, '-m', 'pip', 'install', str(causal_wheels[0]), '-q'], check=True)
-        subprocess.run([sys.executable, '-m', 'pip', 'install', str(mamba_wheels[0]), '-q'], check=True)
-        print('Installed causal-conv1d and mamba-ssm from local wheels.')
     else:
-        print('No local Mamba wheel directory found.')
-        print('Expected one of:')
-        for p in wheel_candidates:
-            print('-', p)
-        print('Do not pip-build mamba-ssm on Colab here; upload/copy prebuilt wheels instead.')
+        causal_wheel, mamba_wheel, wheel_dir = find_wheels()
+        if causal_wheel is None or mamba_wheel is None:
+            print('No local Mamba wheels found.')
+            print('Expected directory examples:')
+            for p in explicit_wheel_dirs:
+                print('-', p)
+            raise FileNotFoundError(
+                'Missing causal_conv1d*.whl and/or mamba_ssm*.whl on Drive. '
+                'Do not pip-build mamba-ssm on Colab; upload/copy prebuilt wheels first.'
+            )
+
+        print(f'Installing Mamba wheels from: {wheel_dir}')
+        print('causal-conv1d:', causal_wheel.name)
+        print('mamba-ssm   :', mamba_wheel.name)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', str(causal_wheel), '-q'], check=True)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', str(mamba_wheel), '-q'], check=True)
+        print('Installed causal-conv1d and mamba-ssm from local wheels.')
 
     import mamba_ssm
     print('mamba_ssm import OK:', mamba_ssm.__file__)
