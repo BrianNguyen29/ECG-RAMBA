@@ -745,30 +745,54 @@ else:
         ),
         markdown("## Run Calibration And Bootstrap CI"),
         code(
-            """import numpy as np
+            """import os
+import numpy as np
 
 N_BOOT = 1000
 N_BINS = 15
 THRESHOLD = 0.5
 OVERWRITE_METRICS = True
 
-pred_dir = Path('reports/revision/predictions')
+repo_dir = Path(globals().get('REPO_DIR', '/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA'))
+if repo_dir.exists() and (repo_dir / 'configs' / 'config.py').exists() and Path.cwd() != repo_dir:
+    os.chdir(repo_dir)
+
+print('cwd:', Path.cwd())
+
+candidate_pred_dirs = []
+for path in [
+    Path('reports/revision/predictions'),
+    repo_dir / 'reports' / 'revision' / 'predictions',
+    Path('/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA/reports/revision/predictions'),
+]:
+    if path not in candidate_pred_dirs:
+        candidate_pred_dirs.append(path)
+
 metric_dir = Path('reports/revision/metrics')
 metric_dir.mkdir(parents=True, exist_ok=True)
 
 metric_prediction_files = []
 skipped_prediction_files = []
+seen_predictions = set()
 
-for pred in sorted(pred_dir.glob('*.npz')):
-    try:
-        with np.load(pred, allow_pickle=True) as data:
-            keys = set(data.files)
-            if {'y_true', 'y_prob'}.issubset(keys):
-                metric_prediction_files.append(pred)
-            else:
-                skipped_prediction_files.append((pred, sorted(keys)))
-    except Exception as exc:
-        skipped_prediction_files.append((pred, [f'load_error={type(exc).__name__}: {exc}']))
+print('Prediction directories checked:')
+for pred_dir in candidate_pred_dirs:
+    files = sorted(pred_dir.glob('*.npz')) if pred_dir.exists() else []
+    print(f' - {pred_dir} | exists={pred_dir.exists()} | npz={len(files)}')
+    for pred in files:
+        pred_key = str(pred.resolve()) if pred.exists() else str(pred)
+        if pred_key in seen_predictions:
+            continue
+        seen_predictions.add(pred_key)
+        try:
+            with np.load(pred, allow_pickle=True) as data:
+                keys = set(data.files)
+                if {'y_true', 'y_prob'}.issubset(keys):
+                    metric_prediction_files.append(pred)
+                else:
+                    skipped_prediction_files.append((pred, sorted(keys)))
+        except Exception as exc:
+            skipped_prediction_files.append((pred, [f'load_error={type(exc).__name__}: {exc}']))
 
 if skipped_prediction_files:
     print('Skipping NPZ files that are not record-level metric predictions:')
@@ -776,7 +800,21 @@ if skipped_prediction_files:
         print(' -', path, 'keys=', keys)
 
 if not metric_prediction_files:
-    raise FileNotFoundError(f'No metric-ready prediction NPZ files found under {pred_dir}. Run notebook 02 first.')
+    revision_root = repo_dir / 'reports' / 'revision'
+    nearby = sorted(revision_root.glob('**/*.npz')) if revision_root.exists() else []
+    if nearby:
+        print('Nearby NPZ files under revision root:')
+        for path in nearby[:30]:
+            print(' -', path)
+    raise FileNotFoundError(
+        'No metric-ready prediction NPZ files found. Expected a file such as '
+        f'{repo_dir / "reports" / "revision" / "predictions" / "oof_full_predictions.npz"}. '
+        'Run notebook 02 first, or run notebook 03 from the setup cell so cwd points to the Drive repo.'
+    )
+
+print('Metric-ready prediction files:')
+for pred in metric_prediction_files:
+    print(' -', pred)
 
 for pred in metric_prediction_files:
     out = metric_dir / f'calibration_ci_{pred.stem}.json'
