@@ -710,7 +710,35 @@ def calibration_notebook() -> list[dict]:
         code(
             """INSTALL_METRIC_DEPS = True
 if INSTALL_METRIC_DEPS:
-    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl matplotlib python-dateutil
+    import importlib.util
+    import subprocess
+    import sys
+
+    required = {
+        'numpy': 'numpy',
+        'pandas': 'pandas',
+        'scipy': 'scipy',
+        'sklearn': 'scikit-learn',
+        'threadpoolctl': 'threadpoolctl',
+        'matplotlib': 'matplotlib',
+        'dateutil': 'python-dateutil',
+    }
+    missing = [pkg for module, pkg in required.items() if importlib.util.find_spec(module) is None]
+    print('Python:', sys.version)
+    if missing:
+        print('Installing missing metric dependencies:', missing)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', *missing], check=True)
+    else:
+        print('Metric dependencies already available; no pip install needed.')
+
+    import matplotlib
+    import numpy as np
+    import scipy
+    import sklearn
+    print('numpy     :', np.__version__)
+    print('scipy     :', scipy.__version__)
+    print('sklearn   :', sklearn.__version__)
+    print('matplotlib:', matplotlib.__version__)
 else:
     print('Skipping metric dependency install.')
 """
