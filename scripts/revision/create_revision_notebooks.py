@@ -675,6 +675,8 @@ else:
     Path('reports/revision/predictions/oof_full_predictions.npz'),
     Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
     Path('reports/revision/metrics/oof_full_prediction_summary.json'),
+    Path('reports/revision/tables/oof_full_class_summary.csv'),
+    Path('reports/revision/manifests/oof_full_prediction_run_manifest.json'),
 ]
 
 for path in expected:
@@ -687,6 +689,25 @@ if pred_path.exists():
     print('y_true:', data['y_true'].shape)
     print('y_prob:', data['y_prob'].shape)
     print('classes:', list(data['class_names'])[:5], '...', len(data['class_names']))
+    for key in ['dataset', 'protocol', 'config_hash', 'git_commit', 'batch_size', 'aggregation_method', 'aggregation_q']:
+        if key in data.files:
+            value = data[key]
+            print(f'{key}:', value.item() if value.ndim == 0 else value)
+
+summary_path = Path('reports/revision/metrics/oof_full_prediction_summary.json')
+if summary_path.exists():
+    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    print('\\nSummary keys:', sorted(summary.keys()))
+    print('metrics:', summary.get('metrics'))
+    print('slice_count_summary:', summary.get('slice_count_summary'))
+
+manifest_path = Path('reports/revision/manifests/oof_full_prediction_run_manifest.json')
+if manifest_path.exists():
+    manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    print('\\nManifest runtime:', manifest.get('runtime', {}).get('torch'))
+    print('Manifest outputs:')
+    for name, info in manifest.get('outputs', {}).items():
+        print(' -', name, info.get('path'), info.get('size_bytes'), info.get('sha256', '')[:12])
 """
         ),
         markdown("## External Prediction Commands"),
@@ -701,7 +722,17 @@ print('- reports/revision/predictions/cpsc_full_predictions.npz')
         code("!python scripts/revision/05_artifact_inventory.py\n"),
         markdown("## Mirror Artifacts To Stable Drive Cache"),
         code(
-            """import shutil
+            """import hashlib
+import json
+import shutil
+from datetime import datetime, timezone
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 source_root = Path('reports/revision')
 mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
@@ -714,11 +745,28 @@ for src in sorted(source_root.rglob('*')):
     dst = mirror_root / src.relative_to(source_root)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    copied.append((src, dst))
+    copied.append({
+        'source': str(src),
+        'mirror': str(dst),
+        'size_bytes': dst.stat().st_size,
+        'sha256': sha256_file(dst),
+    })
 
 print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
-for src, dst in copied:
-    print(f' - {src} -> {dst}')
+for row in copied:
+    print(f\" - {row['source']} -> {row['mirror']} | {row['size_bytes']} bytes\")
+
+mirror_manifest = {
+    'created_utc': datetime.now(timezone.utc).isoformat(),
+    'source_root': str(source_root),
+    'mirror_root': str(mirror_root),
+    'artifact_count': len(copied),
+    'artifacts': copied,
+}
+mirror_manifest_path = mirror_root / 'manifests' / 'mirror_manifest.json'
+mirror_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+mirror_manifest_path.write_text(json.dumps(mirror_manifest, indent=2), encoding='utf-8')
+print('Wrote mirror manifest:', mirror_manifest_path)
 """
         ),
     ]
@@ -956,7 +1004,17 @@ display(pd.DataFrame(bootstrap_rows))
         code("!python scripts/revision/05_artifact_inventory.py\n"),
         markdown("## Mirror Metrics To Stable Drive Cache"),
         code(
-            """import shutil
+            """import hashlib
+import json
+import shutil
+from datetime import datetime, timezone
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 source_root = Path('reports/revision')
 mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
@@ -969,11 +1027,28 @@ for src in sorted(source_root.rglob('*')):
     dst = mirror_root / src.relative_to(source_root)
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
-    copied.append((src, dst))
+    copied.append({
+        'source': str(src),
+        'mirror': str(dst),
+        'size_bytes': dst.stat().st_size,
+        'sha256': sha256_file(dst),
+    })
 
 print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
-for src, dst in copied:
-    print(f' - {src} -> {dst}')
+for row in copied:
+    print(f\" - {row['source']} -> {row['mirror']} | {row['size_bytes']} bytes\")
+
+mirror_manifest = {
+    'created_utc': datetime.now(timezone.utc).isoformat(),
+    'source_root': str(source_root),
+    'mirror_root': str(mirror_root),
+    'artifact_count': len(copied),
+    'artifacts': copied,
+}
+mirror_manifest_path = mirror_root / 'manifests' / 'mirror_manifest.json'
+mirror_manifest_path.parent.mkdir(parents=True, exist_ok=True)
+mirror_manifest_path.write_text(json.dumps(mirror_manifest, indent=2), encoding='utf-8')
+print('Wrote mirror manifest:', mirror_manifest_path)
 """
         ),
     ]
