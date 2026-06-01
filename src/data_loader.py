@@ -29,6 +29,13 @@ from configs.config import (
 from src.features import extract_amplitude_features
 
 
+def env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def reset_or_relocate_extract_dir(extract_dir: str) -> str:
     """Remove an incomplete extract dir, or move extraction to local scratch if Drive I/O is broken."""
     if not os.path.exists(extract_dir):
@@ -245,15 +252,27 @@ def load_chapman_multilabel(paths: dict = None):
     # --------------------------------------------------------
     # 5️⃣ SAVE CACHE (CONFIG-HASH SAFE)
     # --------------------------------------------------------
-    np.savez_compressed(
-        cache_path,
-        X=X,
-        y=y,
-        X_raw_amp=X_raw_amp,
-        subjects=subjects
-    )
-
-    print(f"💾 Cached cleaned dataset to: {cache_path}")
+    if env_flag("ECG_RAMBA_SAVE_CLEAN_CACHE", default=True):
+        approx_gib = (X.nbytes + y.nbytes + X_raw_amp.nbytes + subjects.nbytes) / (1024 ** 3)
+        print(
+            f"💾 Saving cleaned raw ECG cache (~{approx_gib:.2f} GiB before compression) to: {cache_path}",
+            flush=True,
+        )
+        print("   This can take a long time on Google Drive.", flush=True)
+        np.savez_compressed(
+            cache_path,
+            X=X,
+            y=y,
+            X_raw_amp=X_raw_amp,
+            subjects=subjects
+        )
+        print(f"💾 Cached cleaned dataset to: {cache_path}")
+    else:
+        print(
+            "⏭️  Skipping cleaned raw ECG cache because ECG_RAMBA_SAVE_CLEAN_CACHE=0. "
+            "Feature/prediction artifacts will still be saved.",
+            flush=True,
+        )
     print("✅ DATA LOADING COMPLETE")
     print("=" * 80)
 
