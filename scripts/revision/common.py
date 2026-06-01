@@ -154,6 +154,22 @@ def ece_binary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> floa
     return ece
 
 
+def mce_binary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
+    """Maximum calibration error for one binary label."""
+    y_true = np.asarray(y_true).astype(float)
+    y_prob = np.asarray(y_prob).astype(float)
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    gaps = []
+    for lo, hi in zip(bins[:-1], bins[1:]):
+        mask = (y_prob >= lo) & (y_prob < hi if hi < 1.0 else y_prob <= hi)
+        if not np.any(mask):
+            continue
+        conf = float(np.mean(y_prob[mask]))
+        acc = float(np.mean(y_true[mask]))
+        gaps.append(abs(acc - conf))
+    return float(np.max(gaps)) if gaps else math.nan
+
+
 def calibration_summary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> dict:
     """Macro calibration summary for multi-label predictions."""
     from sklearn.metrics import brier_score_loss
@@ -163,16 +179,19 @@ def calibration_summary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15
     if y_true.shape != y_prob.shape:
         raise ValueError(f"Shape mismatch: {y_true.shape} vs {y_prob.shape}")
 
-    eces, briers = [], []
+    eces, mces, briers = [], [], []
     for c in range(y_true.shape[1]):
         if len(np.unique(y_true[:, c])) < 2:
             continue
         eces.append(ece_binary(y_true[:, c], y_prob[:, c], n_bins=n_bins))
+        mces.append(mce_binary(y_true[:, c], y_prob[:, c], n_bins=n_bins))
         briers.append(brier_score_loss(y_true[:, c], y_prob[:, c]))
 
     return {
         "ece_macro": float(np.mean(eces)) if eces else math.nan,
         "ece_max": float(np.max(eces)) if eces else math.nan,
+        "mce_macro": float(np.mean(mces)) if mces else math.nan,
+        "mce_max": float(np.max(mces)) if mces else math.nan,
         "brier_macro": float(np.mean(briers)) if briers else math.nan,
         "n_classes_evaluated": int(len(eces)),
     }
@@ -193,17 +212,36 @@ def multilabel_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float 
     y_pred = (y_prob >= threshold).astype(np.float32)
 
     roc_scores, pr_scores = [], []
+    sensitivity_scores, specificity_scores, ppv_scores, npv_scores = [], [], [], []
     for c in range(y_true.shape[1]):
         if len(np.unique(y_true[:, c])) < 2:
             continue
         roc_scores.append(roc_auc_score(y_true[:, c], y_prob[:, c]))
         pr_scores.append(average_precision_score(y_true[:, c], y_prob[:, c]))
+        yt = y_true[:, c].astype(bool)
+        yp = y_pred[:, c].astype(bool)
+        tp = float(np.sum(yt & yp))
+        tn = float(np.sum(~yt & ~yp))
+        fp = float(np.sum(~yt & yp))
+        fn = float(np.sum(yt & ~yp))
+        if tp + fn > 0:
+            sensitivity_scores.append(tp / (tp + fn))
+        if tn + fp > 0:
+            specificity_scores.append(tn / (tn + fp))
+        if tp + fp > 0:
+            ppv_scores.append(tp / (tp + fp))
+        if tn + fn > 0:
+            npv_scores.append(tn / (tn + fn))
 
     return {
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
         "f1_micro": float(f1_score(y_true, y_pred, average="micro", zero_division=0)),
         "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
         "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "sensitivity_macro": float(np.mean(sensitivity_scores)) if sensitivity_scores else math.nan,
+        "specificity_macro": float(np.mean(specificity_scores)) if specificity_scores else math.nan,
+        "ppv_macro": float(np.mean(ppv_scores)) if ppv_scores else math.nan,
+        "npv_macro": float(np.mean(npv_scores)) if npv_scores else math.nan,
         "roc_auc_macro": float(np.mean(roc_scores)) if roc_scores else math.nan,
         "pr_auc_macro": float(np.mean(pr_scores)) if pr_scores else math.nan,
     }

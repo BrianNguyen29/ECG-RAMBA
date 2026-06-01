@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -23,7 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    FIGURE_DIR,
     REVISION_DIR,
+    TABLE_DIR,
     bootstrap_ci,
     calibration_summary,
     macro_pr_auc,
@@ -31,6 +34,104 @@ from scripts.revision.common import (  # noqa: E402
     multilabel_metrics,
     save_json,
 )
+
+
+def scalar_from_npz(data: np.lib.npyio.NpzFile, key: str, default: str | None = None) -> str | None:
+    if key not in data.files:
+        return default
+    value = data[key]
+    if np.ndim(value) == 0:
+        return str(value.item())
+    return str(value)
+
+
+def current_git_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+
+def reliability_bins(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int) -> list[dict]:
+    y_true_flat = np.asarray(y_true, dtype=float).ravel()
+    y_prob_flat = np.asarray(y_prob, dtype=float).ravel()
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    rows = []
+    for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+        mask = (y_prob_flat >= lo) & (y_prob_flat < hi if hi < 1.0 else y_prob_flat <= hi)
+        if not np.any(mask):
+            rows.append(
+                {
+                    "bin": i,
+                    "lo": float(lo),
+                    "hi": float(hi),
+                    "count": 0,
+                    "confidence": float("nan"),
+                    "empirical_rate": float("nan"),
+                    "abs_gap": float("nan"),
+                }
+            )
+            continue
+        confidence = float(np.mean(y_prob_flat[mask]))
+        empirical_rate = float(np.mean(y_true_flat[mask]))
+        rows.append(
+            {
+                "bin": i,
+                "lo": float(lo),
+                "hi": float(hi),
+                "count": int(np.sum(mask)),
+                "confidence": confidence,
+                "empirical_rate": empirical_rate,
+                "abs_gap": abs(empirical_rate - confidence),
+            }
+        )
+    return rows
+
+
+def save_csv_rows(path: Path, rows: list[dict]) -> None:
+    import csv
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_reliability_figure(rows: list[dict], out_path: Path, title: str) -> None:
+    import matplotlib.pyplot as plt
+
+    plotted = [r for r in rows if r["count"] > 0]
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5.5, 4.5), dpi=160)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="0.45", linewidth=1, label="Perfect calibration")
+    if plotted:
+        ax.plot(
+            [r["confidence"] for r in plotted],
+            [r["empirical_rate"] for r in plotted],
+            marker="o",
+            linewidth=1.5,
+            color="#1f77b4",
+            label="Observed",
+        )
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_xlabel("Mean predicted probability")
+    ax.set_ylabel("Empirical positive rate")
+    ax.set_title(title)
+    ax.grid(True, linewidth=0.4, alpha=0.4)
+    ax.legend(loc="best", frameon=False)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,8 +152,14 @@ def main() -> None:
         raise FileNotFoundError(pred_path)
 
     data = np.load(pred_path, allow_pickle=True)
+    missing_keys = {"y_true", "y_prob"} - set(data.files)
+    if missing_keys:
+        raise KeyError(f"{pred_path} is not a metric prediction file; missing keys: {sorted(missing_keys)}")
+
     y_true = data["y_true"].astype(np.float32)
     y_prob = data["y_prob"].astype(np.float32)
+    if y_true.shape != y_prob.shape:
+        raise ValueError(f"Shape mismatch: y_true {y_true.shape}, y_prob {y_prob.shape}")
 
     metrics = multilabel_metrics(y_true, y_prob, threshold=args.threshold)
     calibration = calibration_summary(y_true, y_prob, n_bins=args.n_bins)
@@ -71,9 +178,21 @@ def main() -> None:
             seed=args.seed,
         ),
     }
+    dataset = scalar_from_npz(data, "dataset", pred_path.stem)
+    protocol = scalar_from_npz(data, "protocol", None)
+    class_names = data["class_names"].astype(str).tolist() if "class_names" in data.files else None
+    reliability = reliability_bins(y_true, y_prob, n_bins=args.n_bins)
+    reliability_csv = TABLE_DIR / f"reliability_bins_{pred_path.stem}.csv"
+    reliability_fig = FIGURE_DIR / f"reliability_{pred_path.stem}.png"
+    save_csv_rows(reliability_csv, reliability)
+    write_reliability_figure(reliability, reliability_fig, title=f"Reliability: {dataset}")
 
     payload = {
         "predictions": str(pred_path),
+        "dataset": dataset,
+        "protocol": protocol,
+        "class_names": class_names,
+        "git_commit": current_git_commit(),
         "shape": {"y_true": list(y_true.shape), "y_prob": list(y_prob.shape)},
         "threshold": args.threshold,
         "n_bins": args.n_bins,
@@ -81,6 +200,10 @@ def main() -> None:
         "metrics": metrics,
         "calibration": calibration,
         "bootstrap_ci": ci,
+        "artifacts": {
+            "reliability_bins_csv": str(reliability_csv),
+            "reliability_figure": str(reliability_fig),
+        },
     }
 
     save_json(args.out, payload)

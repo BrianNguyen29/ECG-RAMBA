@@ -29,6 +29,7 @@ reports/revision/
     table_baselines.csv
     table_calibration.csv
     table_bootstrap_ci.csv
+    reliability_bins_<dataset>.csv
     table_robustness.csv
   logs/
     <notebook_or_script>_<timestamp>.log
