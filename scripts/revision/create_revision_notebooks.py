@@ -30,16 +30,48 @@ except Exception as exc:
     print(f'Drive mount skipped or already mounted: {exc}')
 
 DRIVE_ROOT = Path('/content/drive/MyDrive/ECG-Ramba')
+REPO_URL = 'https://github.com/BrianNguyen29/ECG-RAMBA.git'
+BRANCH = 'revision/colab-pipeline'
 REPO_DIR = DRIVE_ROOT / 'ECG-RAMBA'
-if not (REPO_DIR / 'configs' / 'config.py').exists():
-    REPO_DIR = Path.cwd()
 
 os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)
+
+def _run_setup(cmd, cwd=None, check=True):
+    print(f'$ {cmd}')
+    return subprocess.run(cmd, shell=True, cwd=str(cwd) if cwd else None, check=check)
+
+if (REPO_DIR / '.git').exists():
+    os.chdir(REPO_DIR)
+    _run_setup('git fetch origin')
+    current_branch = subprocess.check_output(
+        'git branch --show-current',
+        shell=True,
+        text=True,
+    ).strip()
+    if current_branch != BRANCH:
+        _run_setup(f'git checkout {BRANCH}')
+    _run_setup(f'git pull --ff-only --autostash origin {BRANCH}')
+elif (REPO_DIR / 'configs' / 'config.py').exists():
+    os.chdir(REPO_DIR)
+    print('Repo directory exists but is not a git checkout; skipping git pull.')
+elif Path.cwd().joinpath('configs', 'config.py').exists():
+    REPO_DIR = Path.cwd()
+    os.chdir(REPO_DIR)
+    if (REPO_DIR / '.git').exists():
+        _run_setup('git fetch origin')
+        _run_setup(f'git pull --ff-only --autostash origin {BRANCH}', check=False)
+else:
+    DRIVE_ROOT.mkdir(parents=True, exist_ok=True)
+    _run_setup(f'git clone -b {BRANCH} {REPO_URL} {REPO_DIR}')
+    os.chdir(REPO_DIR)
+
 os.chdir(REPO_DIR)
+_run_setup('git status --short --branch', check=False)
 
 print('cwd       :', Path.cwd())
 print('drive_root:', DRIVE_ROOT)
 print('repo_dir  :', REPO_DIR)
+print('branch    :', BRANCH)
 """
 
 
@@ -221,6 +253,20 @@ def predictions_notebook() -> list[dict]:
     return [
         markdown("## Setup"),
         code(SETUP_CODE + "\n" + RUN_HELPER_CODE),
+        markdown(
+            "## Install Base Dependencies\n\n"
+            "This notebook can run directly after opening in Colab. These packages "
+            "cover data loading, feature extraction, metrics, and artifact checks."
+        ),
+        code(
+            """INSTALL_BASE_DEPS = True
+if INSTALL_BASE_DEPS:
+    !python --version
+    !pip install -q numpy==1.26.4 scipy==1.11.4 pandas scikit-learn threadpoolctl tqdm wfdb joblib matplotlib seaborn packaging neurokit2 iterative-stratification thop
+else:
+    print('Skipping base dependency install.')
+"""
+        ),
         markdown("## Install Model Dependencies"),
         code(
             """INSTALL_MODEL_DEPS = True
@@ -307,17 +353,41 @@ for path in sorted(pred_dir.glob('*.npz')):
         ),
         markdown("## Generate OOF Predictions"),
         code(
-            """RUN_HEAVY = False
+            """RUN_OOF_EXPORT = True
+BATCH_SIZE = 32
+DEBUG_LIMIT_RECORDS = 0
 
 command = (
     'python scripts/revision/01_generate_predictions.py '
-    '--dataset oof --checkpoint-kind best'
+    f'--dataset oof --checkpoint-kind best --batch-size {BATCH_SIZE}'
 )
+if DEBUG_LIMIT_RECORDS:
+    command += f' --limit-records {DEBUG_LIMIT_RECORDS}'
 
-if RUN_HEAVY:
+if RUN_OOF_EXPORT:
     run(command)
 else:
-    print(f'Heavy run disabled. Set RUN_HEAVY=True to execute: {command}')
+    print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')
+"""
+        ),
+        markdown("## Verify OOF Prediction Outputs"),
+        code(
+            """expected = [
+    Path('reports/revision/predictions/oof_full_predictions.npz'),
+    Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
+    Path('reports/revision/metrics/oof_full_prediction_summary.json'),
+]
+
+for path in expected:
+    print(path, 'exists=', path.exists(), 'size=', path.stat().st_size if path.exists() else None)
+
+pred_path = expected[0]
+if pred_path.exists():
+    data = np.load(pred_path, allow_pickle=True)
+    print('keys:', sorted(data.files))
+    print('y_true:', data['y_true'].shape)
+    print('y_prob:', data['y_prob'].shape)
+    print('classes:', list(data['class_names'])[:5], '...', len(data['class_names']))
 """
         ),
         markdown("## External Prediction Commands"),
