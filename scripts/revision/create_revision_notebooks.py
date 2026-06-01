@@ -75,9 +75,45 @@ print('branch    :', BRANCH)
 """
 
 
-RUN_HELPER_CODE = """def run(cmd, check=True):
-    print(f'$ {cmd}')
-    return subprocess.run(cmd, shell=True, check=check)
+RUN_HELPER_CODE = """def run(cmd, check=True, log_path=None, tail_lines=160):
+    import time
+
+    print(f'$ {cmd}', flush=True)
+    if log_path is None:
+        log_dir = Path('reports/revision/logs')
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        log_path = log_dir / f'notebook_command_{stamp}.log'
+    else:
+        log_path = Path(log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with log_path.open('w', encoding='utf-8') as log_file:
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            print(line, end='')
+            log_file.write(line)
+            log_file.flush()
+        return_code = proc.wait()
+
+    print(f'Command log: {log_path}')
+    if check and return_code:
+        lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+        print(f'Command failed with exit code {return_code}. Last {min(tail_lines, len(lines))} log lines:')
+        for line in lines[-tail_lines:]:
+            print(line)
+        raise subprocess.CalledProcessError(return_code, cmd)
+    return subprocess.CompletedProcess(cmd, return_code)
 
 
 def run_script_if_exists(script_path, command):
@@ -797,18 +833,19 @@ for path in sorted(pred_dir.glob('*.npz')):
         markdown("## Generate OOF Predictions"),
         code(
             """RUN_OOF_EXPORT = True
-BATCH_SIZE = 32
+BATCH_SIZE = 64
+NUM_WORKERS = 2
 DEBUG_LIMIT_RECORDS = 0
 
 command = (
-    'python scripts/revision/01_generate_predictions.py '
-    f'--dataset oof --checkpoint-kind best --batch-size {BATCH_SIZE}'
+    'python -u scripts/revision/01_generate_predictions.py '
+    f'--dataset oof --checkpoint-kind best --batch-size {BATCH_SIZE} --num-workers {NUM_WORKERS}'
 )
 if DEBUG_LIMIT_RECORDS:
     command += f' --limit-records {DEBUG_LIMIT_RECORDS}'
 
 if RUN_OOF_EXPORT:
-    run(command)
+    run(command, log_path='reports/revision/logs/oof_generate_predictions.log')
 else:
     print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')
 """

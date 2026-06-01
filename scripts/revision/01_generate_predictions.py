@@ -24,6 +24,7 @@ import os
 import platform
 import subprocess
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +40,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
+    LOG_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
@@ -227,6 +229,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=["oof"], default="oof")
     parser.add_argument("--checkpoint-kind", choices=["best", "final"], default="best")
     parser.add_argument("--batch-size", type=int, default=max(1, int(CONFIG["batch_size"])))
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=min(max(0, int(CONFIG.get("num_workers", 0))), 4),
+        help="DataLoader workers for inference. Colab Drive runs are usually more stable with 0-4.",
+    )
     parser.add_argument("--limit-records", type=int, default=0, help="Debug only. 0 means all records.")
     parser.add_argument("--save-slice-probs", action="store_true", default=True)
     parser.add_argument("--no-save-slice-probs", dest="save_slice_probs", action="store_false")
@@ -400,6 +408,86 @@ def infer_slices(model: torch.nn.Module, loader: DataLoader) -> tuple[np.ndarray
     return np.concatenate(all_probs, axis=0), np.concatenate(all_rids, axis=0)
 
 
+def make_inference_loader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "pin_memory": DEVICE == "cuda",
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **kwargs)
+
+
+def infer_with_retries(
+    model: torch.nn.Module,
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+) -> tuple[np.ndarray, np.ndarray, int, int, list[dict]]:
+    """Run inference with conservative fallbacks for Colab GPU/DataLoader failures."""
+    current_batch = max(1, int(batch_size))
+    current_workers = max(0, int(num_workers))
+    attempts: list[dict] = []
+
+    while True:
+        print(f"Inference attempt: batch_size={current_batch} | num_workers={current_workers}")
+        loader = make_inference_loader(
+            dataset,
+            batch_size=current_batch,
+            num_workers=current_workers,
+        )
+        try:
+            probs, rids = infer_slices(model, loader)
+            return probs, rids, current_batch, current_workers, attempts
+        except RuntimeError as exc:
+            msg = str(exc)
+            msg_lower = msg.lower()
+            is_cuda_oom = DEVICE == "cuda" and (
+                isinstance(exc, torch.cuda.OutOfMemoryError)
+                or "cuda out of memory" in msg_lower
+                or "out of memory" in msg_lower
+            )
+            is_worker_error = "dataloader worker" in msg_lower or "worker exited unexpectedly" in msg_lower
+            attempts.append(
+                {
+                    "batch_size": int(current_batch),
+                    "num_workers": int(current_workers),
+                    "error_type": type(exc).__name__,
+                    "message": msg[:1000],
+                }
+            )
+            del loader
+            if DEVICE == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            if is_cuda_oom and current_batch > 1:
+                next_batch = max(1, current_batch // 2)
+                print(
+                    f"CUDA OOM at batch_size={current_batch}. "
+                    f"Retrying with batch_size={next_batch}."
+                )
+                current_batch = next_batch
+                continue
+            if is_worker_error and current_workers > 0:
+                print(
+                    f"DataLoader worker failure with num_workers={current_workers}. "
+                    "Retrying with num_workers=0."
+                )
+                current_workers = 0
+                continue
+            raise
+
+
 def generate_oof(args: argparse.Namespace) -> None:
     from src.features import (
         apply_pca,
@@ -491,21 +579,19 @@ def generate_oof(args: argparse.Namespace) -> None:
             fold_summaries.append(fold_summary)
             continue
 
-        loader = DataLoader(
-            ECGSliceDatasetInfer(xs, xh, xhr, rids),
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=CONFIG["num_workers"],
-            pin_memory=DEVICE == "cuda",
-        )
-
         ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
         ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
         checkpoint_infos.append(ckpt_info)
         fold_summary["checkpoint"] = ckpt_info
 
         model = load_model_for_fold(fold_num, args.checkpoint_kind, checkpoint_file=ckpt_path)
-        slice_probs, slice_rids = infer_slices(model, loader)
+        infer_dataset = ECGSliceDatasetInfer(xs, xh, xhr, rids)
+        slice_probs, slice_rids, actual_batch_size, actual_num_workers, inference_attempts = infer_with_retries(
+            model,
+            infer_dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
 
         for rid in va_idx:
             mask = slice_rids == int(rid)
@@ -523,6 +609,11 @@ def generate_oof(args: argparse.Namespace) -> None:
         fold_summary["slice_prob_nan_count"] = int(np.isnan(slice_probs).sum())
         fold_summary["slice_prob_min"] = float(np.nanmin(slice_probs))
         fold_summary["slice_prob_max"] = float(np.nanmax(slice_probs))
+        fold_summary["requested_batch_size"] = int(args.batch_size)
+        fold_summary["actual_batch_size"] = int(actual_batch_size)
+        fold_summary["requested_num_workers"] = int(args.num_workers)
+        fold_summary["actual_num_workers"] = int(actual_num_workers)
+        fold_summary["inference_retry_attempts"] = inference_attempts
         fold_summaries.append(fold_summary)
 
         if args.save_slice_probs:
@@ -624,6 +715,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         "class_names": CLASSES,
         "checkpoint_kind_requested": args.checkpoint_kind,
         "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
         "limit_records": int(args.limit_records),
         "save_slice_probs": bool(args.save_slice_probs),
         "aggregation": {"method": "power_mean", "q": aggregation_q},
@@ -682,5 +774,41 @@ def main() -> None:
         raise ValueError(args.dataset)
 
 
+def write_exception_report(exc: BaseException) -> None:
+    try:
+        ensure_revision_dirs()
+        created_utc = datetime.now(timezone.utc).isoformat()
+        stamp = created_utc.replace(":", "").replace("+", "_")
+        trace = traceback.format_exc()
+        text_path = LOG_DIR / "01_generate_predictions_last_error.txt"
+        json_path = LOG_DIR / "01_generate_predictions_last_error.json"
+        stamped_path = LOG_DIR / f"01_generate_predictions_error_{stamp}.txt"
+        text_path.write_text(trace, encoding="utf-8")
+        stamped_path.write_text(trace, encoding="utf-8")
+        save_json(
+            json_path,
+            {
+                "created_utc": created_utc,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "command": " ".join([Path(sys.executable).name, *sys.argv]),
+                "traceback_txt": str(text_path),
+                "stamped_traceback_txt": str(stamped_path),
+            },
+        )
+        print("")
+        print("=" * 80)
+        print("Prediction script failed. Error report written:")
+        print(f"  {text_path}")
+        print(f"  {json_path}")
+        print("=" * 80)
+    except Exception as report_exc:
+        print(f"Failed to write exception report: {report_exc}")
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        write_exception_report(exc)
+        raise
