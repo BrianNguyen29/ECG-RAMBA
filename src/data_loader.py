@@ -36,6 +36,22 @@ def env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def quarantine_file(path: str, reason: str) -> None:
+    if not os.path.exists(path):
+        return
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    target = f"{path}.corrupt_{stamp}"
+    try:
+        os.replace(path, target)
+        print(f"⚠️  Quarantined corrupt cache: {path}")
+        print(f"    -> {target}")
+        print(f"    Reason: {reason}")
+    except OSError as exc:
+        print(f"⚠️  Could not quarantine corrupt cache: {path}")
+        print(f"    Reason: {reason}")
+        print(f"    Rename error: {exc}")
+
+
 def reset_or_relocate_extract_dir(extract_dir: str) -> str:
     """Remove an incomplete extract dir, or move extraction to local scratch if Drive I/O is broken."""
     if not os.path.exists(extract_dir):
@@ -141,9 +157,21 @@ def load_chapman_multilabel(paths: dict = None):
     # 1️⃣ LOAD CACHE (ONLY IF VALID & COMPLETE)
     # --------------------------------------------------------
     if os.path.exists(cache_path):
-        print(f"⚠️  Loading cached data: {cache_path}")
-        d = np.load(cache_path, allow_pickle=True)
-        return d['X'], d['y'], d['X_raw_amp'], d['subjects']
+        if env_flag("ECG_RAMBA_USE_CLEAN_CACHE", default=True):
+            print(f"⚠️  Loading cached data: {cache_path}")
+            try:
+                d = np.load(cache_path, allow_pickle=True)
+                X_cached = d['X']
+                y_cached = d['y']
+                X_raw_amp_cached = d['X_raw_amp']
+                subjects_cached = d['subjects']
+                print(f"✅ Loaded cleaned data cache: {X_cached.shape}")
+                return X_cached, y_cached, X_raw_amp_cached, subjects_cached
+            except Exception as exc:
+                quarantine_file(cache_path, repr(exc))
+                print("⚠️  Cache load failed. Rebuilding from ZIP/raw files.")
+        else:
+            print(f"⏭️  Ignoring cleaned data cache because ECG_RAMBA_USE_CLEAN_CACHE=0: {cache_path}")
 
     extract_dir = paths['extract_dir']
     zip_path = paths['zip_path']
