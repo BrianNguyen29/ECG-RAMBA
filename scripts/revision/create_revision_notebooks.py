@@ -225,7 +225,39 @@ def predictions_notebook() -> list[dict]:
         code(
             """INSTALL_MODEL_DEPS = True
 if INSTALL_MODEL_DEPS:
-    !pip install -q mamba-ssm causal-conv1d>=1.2.0
+    import importlib.util
+    import subprocess
+    import sys
+
+    wheel_candidates = [
+        Path('/content/drive/MyDrive/mamba_wheels_py312'),
+        DRIVE_ROOT / 'mamba_wheels_py312',
+    ]
+    wheel_dir = next((p for p in wheel_candidates if p.exists()), None)
+
+    if importlib.util.find_spec('mamba_ssm') is not None:
+        print('mamba-ssm already installed.')
+    elif wheel_dir is not None:
+        print(f'Installing Mamba wheels from: {wheel_dir}')
+        wheels = sorted(wheel_dir.glob('*.whl'))
+        causal_wheels = [p for p in wheels if 'causal_conv1d' in p.name]
+        mamba_wheels = [p for p in wheels if 'mamba_ssm' in p.name]
+        if not causal_wheels:
+            raise FileNotFoundError(f'No causal_conv1d wheel found in {wheel_dir}')
+        if not mamba_wheels:
+            raise FileNotFoundError(f'No mamba_ssm wheel found in {wheel_dir}')
+        subprocess.run([sys.executable, '-m', 'pip', 'install', str(causal_wheels[0]), '-q'], check=True)
+        subprocess.run([sys.executable, '-m', 'pip', 'install', str(mamba_wheels[0]), '-q'], check=True)
+        print('Installed causal-conv1d and mamba-ssm from local wheels.')
+    else:
+        print('No local Mamba wheel directory found.')
+        print('Expected one of:')
+        for p in wheel_candidates:
+            print('-', p)
+        print('Do not pip-build mamba-ssm on Colab here; upload/copy prebuilt wheels instead.')
+
+    import mamba_ssm
+    print('mamba_ssm import OK:', mamba_ssm.__file__)
 else:
     print('Skipping mamba-ssm install. Ensure it is already available before prediction generation.')
 """
