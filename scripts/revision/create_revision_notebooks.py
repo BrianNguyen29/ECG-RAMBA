@@ -38,6 +38,7 @@ LOCAL_RUNTIME_ROOT = Path('/content/ecg_ramba_runtime')
 os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)
 os.environ.setdefault('ECG_RAMBA_LOCAL_ROOT', str(LOCAL_RUNTIME_ROOT))
 os.environ.setdefault('ECG_RAMBA_EXTRACT_DIR', str(LOCAL_RUNTIME_ROOT / 'chapman'))
+os.environ.setdefault('ECG_RAMBA_SAVE_CLEAN_CACHE', '0')
 
 def _run_setup(cmd, cwd=None, check=True):
     print(f'$ {cmd}')

@@ -160,12 +160,13 @@ def generate_raw_rocket_cache(X: np.ndarray) -> np.ndarray:
     bs = 64
 
     with torch.no_grad():
-        for i in range(0, len(X), bs):
+        for i in tqdm(range(0, len(X), bs), desc="MiniRocket", unit="batch"):
             xb = torch.tensor(X[i:i+bs], dtype=torch.float32, device="cpu")
             feats.append(model(xb).numpy())
 
     X_rocket = np.vstack(feats).astype(np.float32)
 
+    print(f"💾 Saving RAW MiniRocket cache to: {cache_path}", flush=True)
     np.savez_compressed(cache_path, X=X_rocket.astype(np.float16))
     print(f"✅ Saved RAW MiniRocket cache: {X_rocket.shape}")
     print(f"📦 Cache path: {cache_path}")
@@ -311,6 +312,7 @@ def generate_hrv_cache(X: np.ndarray, X_raw_amp: np.ndarray) -> np.ndarray:
     assert feats.shape[1] == CONFIG["hrv_dim"], \
         f"HRV dim mismatch: got {feats.shape[1]}, expected {CONFIG['hrv_dim']}"
 
+    print(f"💾 Saving HRV36 cache to: {cache_path}", flush=True)
     np.savez_compressed(cache_path, X=feats.astype(np.float16))
     print(f"✅ Saved HRV36 cache: {feats.shape}")
     print(f"📦 Cache path: {cache_path}")
