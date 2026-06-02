@@ -42,20 +42,55 @@ os.environ.setdefault('ECG_RAMBA_USE_CLEAN_CACHE', '0')
 os.environ.setdefault('ECG_RAMBA_SAVE_CLEAN_CACHE', '0')
 
 def _run_setup(cmd, cwd=None, check=True):
-    print(f'$ {cmd}')
-    return subprocess.run(cmd, shell=True, cwd=str(cwd) if cwd else None, check=check)
+    print(f'$ {cmd}', flush=True)
+    result = subprocess.run(
+        cmd,
+        shell=True,
+        cwd=str(cwd) if cwd else None,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if check and result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+    return result
+
+def _git_setup(cmd, check=True):
+    return _run_setup(cmd, cwd=REPO_DIR, check=check)
+
+def _pull_or_continue(branch):
+    before = subprocess.check_output('git rev-parse --short HEAD', shell=True, text=True).strip()
+    status = subprocess.check_output('git status --porcelain', shell=True, text=True).strip()
+    if status:
+        print('Local repo has changes before pull:')
+        print(status[:4000])
+    result = _git_setup(f'git pull --ff-only --autostash origin {branch}', check=False)
+    after = subprocess.check_output('git rev-parse --short HEAD', shell=True, text=True).strip()
+    if result.returncode:
+        print('')
+        print('=' * 80)
+        print('WARNING: git pull failed; continuing with the currently checked-out repo.')
+        print('This avoids deleting Drive files while long-running artifacts may exist.')
+        print(f'Current commit: {after} (before pull: {before})')
+        print('To force a clean code checkout later, rename the Drive repo folder or use a fresh clone.')
+        print('=' * 80)
+    else:
+        print(f'Git update OK: {before} -> {after}')
 
 if (REPO_DIR / '.git').exists():
     os.chdir(REPO_DIR)
-    _run_setup('git fetch origin')
+    _git_setup('git fetch origin')
     current_branch = subprocess.check_output(
         'git branch --show-current',
         shell=True,
         text=True,
     ).strip()
     if current_branch != BRANCH:
-        _run_setup(f'git checkout {BRANCH}')
-    _run_setup(f'git pull --ff-only --autostash origin {BRANCH}')
+        _git_setup(f'git checkout {BRANCH}')
+    _pull_or_continue(BRANCH)
 elif (REPO_DIR / 'configs' / 'config.py').exists():
     os.chdir(REPO_DIR)
     print('Repo directory exists but is not a git checkout; skipping git pull.')
@@ -64,7 +99,7 @@ elif Path.cwd().joinpath('configs', 'config.py').exists():
     os.chdir(REPO_DIR)
     if (REPO_DIR / '.git').exists():
         _run_setup('git fetch origin')
-        _run_setup(f'git pull --ff-only --autostash origin {BRANCH}', check=False)
+        _pull_or_continue(BRANCH)
 else:
     DRIVE_ROOT.mkdir(parents=True, exist_ok=True)
     _run_setup(f'git clone -b {BRANCH} {REPO_URL} {REPO_DIR}')
