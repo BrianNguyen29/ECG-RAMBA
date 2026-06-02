@@ -904,6 +904,8 @@ for path in sorted(pred_dir.glob('*.npz')):
         code(
             """RUN_OOF_EXPORT = True
 FORCE_RERUN_OOF = False
+RESUME_FOLD_CACHE = True
+FORCE_RERUN_FOLDS = False
 BATCH_SIZE = 64
 NUM_WORKERS = 2
 DEBUG_LIMIT_RECORDS = 0
@@ -925,6 +927,10 @@ command = (
     'python -u scripts/revision/01_generate_predictions.py '
     f'--dataset oof --checkpoint-kind best --batch-size {BATCH_SIZE} --num-workers {NUM_WORKERS}'
 )
+if not RESUME_FOLD_CACHE:
+    command += ' --no-resume-fold-cache'
+if FORCE_RERUN_FOLDS:
+    command += ' --force-rerun-folds'
 if DEBUG_LIMIT_RECORDS:
     command += f' --limit-records {DEBUG_LIMIT_RECORDS}'
 
@@ -948,6 +954,12 @@ else:
 
 for path in expected:
     print(path, 'exists=', path.exists(), 'size=', path.stat().st_size if path.exists() else None)
+
+fold_cache_dir = Path('reports/revision/predictions/folds')
+fold_cache_files = sorted(fold_cache_dir.glob('oof_fold*.npz')) if fold_cache_dir.exists() else []
+print('\\nFold cache files:', len(fold_cache_files))
+for path in fold_cache_files:
+    print(' -', path, path.stat().st_size, 'bytes')
 
 pred_path = expected[0]
 if pred_path.exists():
