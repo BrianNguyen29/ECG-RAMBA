@@ -276,6 +276,107 @@ def load_or_compute_fold_hydra(
     return hydra_va.astype(np.float32), pca_var, cache_path, False
 
 
+def fold_prediction_cache_path(fold_num: int, checkpoint_kind: str) -> Path:
+    return PREDICTION_DIR / "folds" / f"oof_fold{fold_num}_{checkpoint_kind}_{CONFIG_HASH}.npz"
+
+
+def load_fold_prediction_cache(
+    *,
+    path: Path,
+    fold_num: int,
+    va_idx: np.ndarray,
+    n_classes: int,
+    oof_probs: np.ndarray,
+    fold_id: np.ndarray,
+    record_slice_count: np.ndarray,
+    save_slice_probs: bool,
+    slice_probs_all: list[np.ndarray],
+    slice_record_index_all: list[np.ndarray],
+    slice_index_all: list[np.ndarray],
+    slice_fold_id_all: list[np.ndarray],
+) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = np.load(path, allow_pickle=False)
+        record_id = data["record_id"].astype(np.int64)
+        y_prob = data["y_prob"].astype(np.float32)
+        valid_mask = data["valid_record_mask"].astype(bool)
+        slice_count = data["slice_count"].astype(np.int16)
+        summary = json.loads(str(data["fold_summary_json"].item()))
+        if (
+            record_id.shape != va_idx.shape
+            or not np.array_equal(record_id, va_idx.astype(np.int64))
+            or y_prob.shape != (len(va_idx), n_classes)
+            or valid_mask.shape != va_idx.shape
+        ):
+            print(f"⚠️  Fold cache shape/index mismatch; recomputing fold {fold_num}: {path}", flush=True)
+            return None
+
+        oof_probs[record_id] = y_prob
+        fold_id[record_id[valid_mask]] = fold_num
+        record_slice_count[record_id] = slice_count
+
+        if save_slice_probs and "slice_prob" in data.files and len(data["slice_prob"]):
+            slice_probs_all.append(data["slice_prob"].astype(np.float16))
+            slice_record_index_all.append(data["slice_record_id"].astype(np.int64))
+            slice_index_all.append(data["slice_index"].astype(np.int16))
+            slice_fold_id_all.append(data["slice_fold_id"].astype(np.int16))
+
+        print(f"✅ Loaded cached predictions for fold {fold_num}: {path}", flush=True)
+        return summary
+    except Exception as exc:
+        print(f"⚠️  Could not load fold prediction cache for fold {fold_num}: {exc}. Recomputing.", flush=True)
+        return None
+
+
+def save_fold_prediction_cache(
+    *,
+    path: Path,
+    fold_num: int,
+    va_idx: np.ndarray,
+    oof_probs: np.ndarray,
+    fold_id: np.ndarray,
+    record_slice_count: np.ndarray,
+    fold_summary: dict,
+    slice_probs: np.ndarray | None,
+    slice_rids: np.ndarray | None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    valid_mask = fold_id[va_idx] >= 0
+    payload = {
+        "record_id": va_idx.astype(np.int64),
+        "y_prob": oof_probs[va_idx].astype(np.float32),
+        "valid_record_mask": valid_mask.astype(np.bool_),
+        "slice_count": record_slice_count[va_idx].astype(np.int16),
+        "fold": np.asarray(fold_num, dtype=np.int16),
+        "config_hash": np.asarray(CONFIG_HASH),
+        "fold_summary_json": np.asarray(json.dumps(fold_summary, sort_keys=True)),
+    }
+    if slice_probs is not None and slice_rids is not None:
+        payload.update(
+            {
+                "slice_prob": slice_probs.astype(np.float16),
+                "slice_record_id": slice_rids.astype(np.int64),
+                "slice_index": slice_ordinals(slice_rids),
+                "slice_fold_id": np.full(len(slice_rids), fold_num, dtype=np.int16),
+            }
+        )
+    else:
+        payload.update(
+            {
+                "slice_prob": np.empty((0, len(CLASSES)), dtype=np.float16),
+                "slice_record_id": np.empty((0,), dtype=np.int64),
+                "slice_index": np.empty((0,), dtype=np.int16),
+                "slice_fold_id": np.empty((0,), dtype=np.int16),
+            }
+        )
+    tmp_path = path.with_name(path.name + ".partial.npz")
+    np.savez_compressed(tmp_path, **payload)
+    os.replace(tmp_path, path)
+    print(f"💾 Saved fold prediction cache for fold {fold_num}: {path}", flush=True)
+
+
 class ECGSliceDatasetInfer(Dataset):
     def __init__(self, xs: np.ndarray, xh: np.ndarray, xhr: np.ndarray, rids: np.ndarray):
         self.xs = xs
@@ -309,6 +410,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-records", type=int, default=0, help="Debug only. 0 means all records.")
     parser.add_argument("--save-slice-probs", action="store_true", default=True)
     parser.add_argument("--no-save-slice-probs", dest="save_slice_probs", action="store_false")
+    parser.add_argument("--resume-fold-cache", action="store_true", default=True)
+    parser.add_argument("--no-resume-fold-cache", dest="resume_fold_cache", action="store_false")
+    parser.add_argument("--force-rerun-folds", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -615,6 +719,38 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Fold {fold_num}/{len(folds)} | train={len(tr_idx)} | val={len(va_idx)}")
         print("=" * 80)
 
+        fold_cache_path = fold_prediction_cache_path(fold_num, args.checkpoint_kind)
+        if args.resume_fold_cache and not args.force_rerun_folds:
+            cached_summary = load_fold_prediction_cache(
+                path=fold_cache_path,
+                fold_num=fold_num,
+                va_idx=va_idx,
+                n_classes=n_classes,
+                oof_probs=oof_probs,
+                fold_id=fold_id,
+                record_slice_count=record_slice_count,
+                save_slice_probs=args.save_slice_probs,
+                slice_probs_all=slice_probs_all,
+                slice_record_index_all=slice_record_index_all,
+                slice_index_all=slice_index_all,
+                slice_fold_id_all=slice_fold_id_all,
+            )
+            if cached_summary is not None:
+                fold_summaries.append(cached_summary)
+                if "pca_explained_variance" in cached_summary:
+                    pca_variance.append(
+                        {
+                            "fold": fold_num,
+                            "explained_variance": cached_summary.get("pca_explained_variance"),
+                            "cache_path": cached_summary.get("pca_cache_path"),
+                            "cache_hit": True,
+                            "prediction_cache_hit": True,
+                        }
+                    )
+                if cached_summary.get("checkpoint"):
+                    checkpoint_infos.append(cached_summary["checkpoint"])
+                continue
+
         hydra_va, pca_var, pca_cache_path, pca_cache_hit = load_or_compute_fold_hydra(
             fold_num=fold_num,
             X_rocket_raw=X_rocket_raw,
@@ -660,6 +796,17 @@ def generate_oof(args: argparse.Namespace) -> None:
             print(f"Fold {fold_num}: no slices generated; skipping")
             fold_summary["n_predicted_records"] = 0
             fold_summaries.append(fold_summary)
+            save_fold_prediction_cache(
+                path=fold_cache_path,
+                fold_num=fold_num,
+                va_idx=va_idx,
+                oof_probs=oof_probs,
+                fold_id=fold_id,
+                record_slice_count=record_slice_count,
+                fold_summary=fold_summary,
+                slice_probs=None,
+                slice_rids=None,
+            )
             continue
 
         ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
@@ -704,6 +851,18 @@ def generate_oof(args: argparse.Namespace) -> None:
             slice_record_index_all.append(slice_rids.astype(np.int64))
             slice_index_all.append(slice_ordinals(slice_rids))
             slice_fold_id_all.append(np.full(len(slice_rids), fold_num, dtype=np.int16))
+
+        save_fold_prediction_cache(
+            path=fold_cache_path,
+            fold_num=fold_num,
+            va_idx=va_idx,
+            oof_probs=oof_probs,
+            fold_id=fold_id,
+            record_slice_count=record_slice_count,
+            fold_summary=fold_summary,
+            slice_probs=slice_probs if args.save_slice_probs else None,
+            slice_rids=slice_rids if args.save_slice_probs else None,
+        )
 
         del model
         torch.cuda.empty_cache()
