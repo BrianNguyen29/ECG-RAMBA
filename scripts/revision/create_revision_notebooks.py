@@ -61,14 +61,19 @@ def _run_setup(cmd, cwd=None, check=True):
 def _git_setup(cmd, check=True):
     return _run_setup(cmd, cwd=REPO_DIR, check=check)
 
+def _git_current_commit():
+    result = _git_setup('git rev-parse --short HEAD', check=False)
+    return result.stdout.strip() if result.returncode == 0 and result.stdout else 'unknown'
+
 def _pull_or_continue(branch):
-    before = subprocess.check_output('git rev-parse --short HEAD', shell=True, text=True).strip()
-    status = subprocess.check_output('git status --porcelain', shell=True, text=True).strip()
+    before = _git_current_commit()
+    status_result = _git_setup('git status --porcelain', check=False)
+    status = status_result.stdout.strip() if status_result.stdout else ''
     if status:
         print('Local repo has changes before pull:')
         print(status[:4000])
     result = _git_setup(f'git pull --ff-only --autostash origin {branch}', check=False)
-    after = subprocess.check_output('git rev-parse --short HEAD', shell=True, text=True).strip()
+    after = _git_current_commit()
     if result.returncode:
         print('')
         print('=' * 80)
@@ -82,15 +87,19 @@ def _pull_or_continue(branch):
 
 if (REPO_DIR / '.git').exists():
     os.chdir(REPO_DIR)
-    _git_setup('git fetch origin')
-    current_branch = subprocess.check_output(
-        'git branch --show-current',
-        shell=True,
-        text=True,
-    ).strip()
+    fetch_result = _git_setup('git fetch origin', check=False)
+    if fetch_result.returncode:
+        print('WARNING: git fetch failed; continuing with the currently checked-out repo.')
+    current_branch_result = _git_setup('git branch --show-current', check=False)
+    current_branch = current_branch_result.stdout.strip() if current_branch_result.stdout else ''
     if current_branch != BRANCH:
-        _git_setup(f'git checkout {BRANCH}')
-    _pull_or_continue(BRANCH)
+        checkout_result = _git_setup(f'git checkout {BRANCH}', check=False)
+        if checkout_result.returncode:
+            print(f'WARNING: git checkout {BRANCH} failed; continuing on branch {current_branch or "<detached>"}')
+        else:
+            current_branch = BRANCH
+    if fetch_result.returncode == 0:
+        _pull_or_continue(BRANCH)
 elif (REPO_DIR / 'configs' / 'config.py').exists():
     os.chdir(REPO_DIR)
     print('Repo directory exists but is not a git checkout; skipping git pull.')
@@ -98,8 +107,11 @@ elif Path.cwd().joinpath('configs', 'config.py').exists():
     REPO_DIR = Path.cwd()
     os.chdir(REPO_DIR)
     if (REPO_DIR / '.git').exists():
-        _run_setup('git fetch origin')
-        _pull_or_continue(BRANCH)
+        fetch_result = _run_setup('git fetch origin', check=False)
+        if fetch_result.returncode == 0:
+            _pull_or_continue(BRANCH)
+        else:
+            print('WARNING: git fetch failed; continuing with the currently checked-out repo.')
 else:
     DRIVE_ROOT.mkdir(parents=True, exist_ok=True)
     _run_setup(f'git clone -b {BRANCH} {REPO_URL} {REPO_DIR}')
@@ -891,9 +903,23 @@ for path in sorted(pred_dir.glob('*.npz')):
         markdown("## Generate OOF Predictions"),
         code(
             """RUN_OOF_EXPORT = True
+FORCE_RERUN_OOF = False
 BATCH_SIZE = 64
 NUM_WORKERS = 2
 DEBUG_LIMIT_RECORDS = 0
+
+oof_expected = [
+    Path('reports/revision/predictions/oof_full_predictions.npz'),
+    Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
+    Path('reports/revision/metrics/oof_full_prediction_summary.json'),
+    Path('reports/revision/tables/oof_full_class_summary.csv'),
+    Path('reports/revision/manifests/oof_full_prediction_run_manifest.json'),
+]
+oof_ready = all(path.exists() and path.stat().st_size > 0 for path in oof_expected)
+if oof_ready:
+    print('OOF artifacts already exist:')
+    for path in oof_expected:
+        print(' -', path, path.stat().st_size, 'bytes')
 
 command = (
     'python -u scripts/revision/01_generate_predictions.py '
@@ -902,8 +928,10 @@ command = (
 if DEBUG_LIMIT_RECORDS:
     command += f' --limit-records {DEBUG_LIMIT_RECORDS}'
 
-if RUN_OOF_EXPORT:
+if RUN_OOF_EXPORT and (FORCE_RERUN_OOF or not oof_ready):
     run(command, log_path='reports/revision/logs/oof_generate_predictions.log')
+elif oof_ready and not FORCE_RERUN_OOF:
+    print('Skipping OOF export because complete artifacts are already present. Set FORCE_RERUN_OOF=True to rerun.')
 else:
     print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')
 """
