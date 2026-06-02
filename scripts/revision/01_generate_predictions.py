@@ -24,6 +24,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -203,6 +204,76 @@ def per_class_summary_rows(
             }
         )
     return rows
+
+
+def index_fingerprint(indices: np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(indices, dtype=np.int64))
+    return hashlib.sha256(arr.view(np.uint8)).hexdigest()[:16]
+
+
+def hydra_fold_cache_path(fold_num: int, tr_idx: np.ndarray, va_idx: np.ndarray) -> Path:
+    cache_dir = Path(PATHS["cache_dir"]) / "revision_feature_cache"
+    train_hash = index_fingerprint(tr_idx)
+    val_hash = index_fingerprint(va_idx)
+    name = (
+        f"hydra_oof_{CONFIG_HASH}_fold{fold_num}_"
+        f"train{len(tr_idx)}_{train_hash}_val{len(va_idx)}_{val_hash}_"
+        f"D{CONFIG['hydra_dim']}.npz"
+    )
+    return cache_dir / name
+
+
+def load_or_compute_fold_hydra(
+    *,
+    fold_num: int,
+    X_rocket_raw: np.ndarray,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
+) -> tuple[np.ndarray, float, Path, bool]:
+    from src.features import apply_pca, fit_pca_on_train
+
+    cache_path = hydra_fold_cache_path(fold_num, tr_idx, va_idx)
+    expected_shape = (len(va_idx), int(CONFIG["hydra_dim"]))
+    if cache_path.exists():
+        try:
+            cached = np.load(cache_path, allow_pickle=False)
+            hydra_va = cached["hydra_va"]
+            pca_var = float(cached["pca_explained_variance"])
+            if hydra_va.shape == expected_shape:
+                print(f"✅ Loaded fold-aware Hydra/PCA cache for fold {fold_num}: {cache_path}", flush=True)
+                return hydra_va.astype(np.float32), pca_var, cache_path, True
+            print(
+                f"⚠️  Hydra cache shape mismatch for fold {fold_num}: "
+                f"{hydra_va.shape} vs {expected_shape}. Recomputing.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"⚠️  Could not load Hydra cache for fold {fold_num}: {exc}. Recomputing.", flush=True)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        f"Fitting fold-aware PCA for fold {fold_num}: "
+        f"train={len(tr_idx)} x {X_rocket_raw.shape[1]} -> D={CONFIG['hydra_dim']}",
+        flush=True,
+    )
+    start = time.time()
+    pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
+    print(f"Transforming validation Hydra features for fold {fold_num}: val={len(va_idx)}", flush=True)
+    hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
+    pca_var = float(pca.explained_variance_ratio_.sum())
+    elapsed = time.time() - start
+    print(f"PCA fold {fold_num} finished in {elapsed / 60:.1f} min | variance={pca_var:.6f}", flush=True)
+    print(f"Saving fold-aware Hydra/PCA cache: {cache_path}", flush=True)
+    np.savez_compressed(
+        cache_path,
+        hydra_va=hydra_va.astype(np.float16),
+        pca_explained_variance=np.asarray(pca_var, dtype=np.float32),
+        fold=np.asarray(fold_num, dtype=np.int16),
+        config_hash=np.asarray(CONFIG_HASH),
+        train_index_hash=np.asarray(index_fingerprint(tr_idx)),
+        val_index_hash=np.asarray(index_fingerprint(va_idx)),
+    )
+    return hydra_va.astype(np.float32), pca_var, cache_path, False
 
 
 class ECGSliceDatasetInfer(Dataset):
@@ -544,10 +615,20 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Fold {fold_num}/{len(folds)} | train={len(tr_idx)} | val={len(va_idx)}")
         print("=" * 80)
 
-        pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
-        hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
-        pca_var = float(pca.explained_variance_ratio_.sum())
-        pca_variance.append({"fold": fold_num, "explained_variance": pca_var})
+        hydra_va, pca_var, pca_cache_path, pca_cache_hit = load_or_compute_fold_hydra(
+            fold_num=fold_num,
+            X_rocket_raw=X_rocket_raw,
+            tr_idx=tr_idx,
+            va_idx=va_idx,
+        )
+        pca_variance.append(
+            {
+                "fold": fold_num,
+                "explained_variance": pca_var,
+                "cache_path": str(pca_cache_path),
+                "cache_hit": bool(pca_cache_hit),
+            }
+        )
         print(f"PCA variance retained: {pca_var:.6f}")
 
         hydra_va_by_record = {
@@ -571,6 +652,8 @@ def generate_oof(args: argparse.Namespace) -> None:
             "n_records_with_slices": int(sum(count > 0 for count in slice_counts.values())),
             "n_zero_slice_records": int(sum(count == 0 for count in slice_counts.values())),
             "pca_explained_variance": pca_var,
+            "pca_cache_path": str(pca_cache_path),
+            "pca_cache_hit": bool(pca_cache_hit),
         }
 
         if len(rids) == 0:
