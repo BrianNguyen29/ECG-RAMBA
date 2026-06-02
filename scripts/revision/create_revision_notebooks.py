@@ -77,6 +77,24 @@ print('cwd       :', Path.cwd())
 print('drive_root:', DRIVE_ROOT)
 print('repo_dir  :', REPO_DIR)
 print('branch    :', BRANCH)
+
+cache_status = {
+    'clean_raw_cache': DRIVE_ROOT / 'ecg_data_27c_subject.npz',
+    'raw_minirocket_cache': DRIVE_ROOT / 'rocket_raw_N44186_C12_L5000_K10000_S42.npz',
+    'hrv36_cache': DRIVE_ROOT / 'hrv36_N44186_C12_L5000.npz',
+    'fold_pca_cache_dir': DRIVE_ROOT / 'revision_feature_cache',
+}
+print('cache policy:')
+print('  ECG_RAMBA_USE_CLEAN_CACHE =', os.environ.get('ECG_RAMBA_USE_CLEAN_CACHE'))
+print('  ECG_RAMBA_SAVE_CLEAN_CACHE=', os.environ.get('ECG_RAMBA_SAVE_CLEAN_CACHE'))
+print('  ECG_RAMBA_EXTRACT_DIR     =', os.environ.get('ECG_RAMBA_EXTRACT_DIR'))
+print('cache status:')
+for name, path in cache_status.items():
+    if path.is_dir():
+        count = len(list(path.glob('*.npz')))
+        print(f'  {name}: exists=True npz_count={count} path={path}')
+    else:
+        print(f'  {name}: exists={path.exists()} size={path.stat().st_size if path.exists() else None} path={path}')
 """
 
 
