@@ -38,10 +38,15 @@ Run in this order on Colab:
 2. `notebooks/01_a0_protocol_audit.ipynb`
 3. `notebooks/02_predictions_and_external_eval.ipynb`
 4. `notebooks/03_calibration_and_ci.ipynb`
-5. `notebooks/04_baselines_and_component_checks.ipynb`
-6. `notebooks/05_hrv_domain_and_robustness.ipynb`
-7. `notebooks/06_pooling_and_representation.ipynb`
-8. `notebooks/07_results_freeze.ipynb`
+5. `notebooks/06_pooling_and_representation.ipynb` (pooling sensitivity)
+6. `notebooks/04_baselines_and_component_checks.ipynb`
+7. `notebooks/05_hrv_domain_and_robustness.ipynb`
+8. Revisit `notebooks/06_pooling_and_representation.ipynb` for representation work.
+9. `notebooks/07_results_freeze.ipynb`
+
+Notebook 03 and pooling sensitivity consume only the checksum-verified
+`oof_freeze_manifest.json`. External outputs remain experimental until their
+separate readiness restrictions are resolved.
 
 The current priority is A-level work: consistency audit, calibration,
 baseline expansion, bootstrap CI, method clarity, and minimum robustness.

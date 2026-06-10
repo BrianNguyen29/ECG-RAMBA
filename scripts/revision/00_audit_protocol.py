@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.revision.common import (  # noqa: E402
     CURRENT_HRV36_SCHEMA,
+    MANIFEST_DIR,
     POWER_MEAN_IMPLEMENTATION,
     PTB_SUPERCLASS_MAPPING,
     REVISION_DIR,
@@ -58,6 +59,7 @@ def main() -> None:
         model_dir / "global_pca_zeroshot.pkl",
         PROJECT_ROOT / "global_pca_zeroshot.pkl",
     ]
+    fold_pca_manifest = MANIFEST_DIR / "fold_pca_manifest.json"
     dataset_keys = ["zip_path", "ptb_zip", "cpsc_zip", "georgia_zip"]
     dataset_paths = {key: path_info(PATHS[key]) for key in dataset_keys if key in PATHS}
 
@@ -69,8 +71,11 @@ def main() -> None:
         )
     if not fold_ckpts:
         warnings.append("No fold*_best.pt checkpoints found under configured model_dir.")
-    if not any(p.exists() for p in global_pca_candidates):
-        warnings.append("No global_pca_zeroshot.pkl found for zero-shot evaluation.")
+    if not fold_pca_manifest.exists():
+        warnings.append(
+            "No fold_pca_manifest.json found. External evaluation remains blocked until "
+            "08_build_fold_pca.py creates and checksums all five fold-specific PCA objects."
+        )
     amplitude_training_mismatch = (
         "amp_list.append(amp_feats)" in data_loader_source
         and "extract_amplitude_features(X_raw_amp[i])" in hrv_source
@@ -122,6 +127,7 @@ def main() -> None:
         "artifacts": {
             "fold_checkpoints": fold_ckpts,
             "global_pca_candidates": [path_info(p) for p in global_pca_candidates],
+            "fold_pca_manifest": path_info(fold_pca_manifest),
             "dataset_paths": dataset_paths,
             "reports_revision_dir": str(REVISION_DIR),
         },

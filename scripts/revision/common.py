@@ -7,9 +7,11 @@ small runner scripts. Heavy model/data loading stays in the experiment scripts.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import os
+import subprocess
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -24,6 +26,7 @@ MANIFEST_DIR = REVISION_DIR / "manifests"
 METRIC_DIR = REVISION_DIR / "metrics"
 PREDICTION_DIR = REVISION_DIR / "predictions"
 TABLE_DIR = REVISION_DIR / "tables"
+EXPERIMENTAL_DIR = REVISION_DIR / "experimental"
 
 POWER_MEAN_IMPLEMENTATION = "power_mean_v2"
 CACHE_SCHEMA_VERSION = 2
@@ -110,6 +113,7 @@ def ensure_revision_dirs() -> None:
         METRIC_DIR,
         PREDICTION_DIR,
         TABLE_DIR,
+        EXPERIMENTAL_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)
 
@@ -132,6 +136,33 @@ def save_csv(path: os.PathLike[str] | str, rows: Iterable[dict]) -> None:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def sha256_file(path: os.PathLike[str] | str, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=PROJECT_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return ""
+
+
+def npz_scalar(data: np.lib.npyio.NpzFile, key: str, default=None):
+    if key not in data.files:
+        return default
+    value = data[key]
+    return value.item() if np.ndim(value) == 0 else value
 
 
 def power_mean(probs: np.ndarray, q: float = 3.0, axis: int = 0, eps: float = 1e-6) -> np.ndarray:

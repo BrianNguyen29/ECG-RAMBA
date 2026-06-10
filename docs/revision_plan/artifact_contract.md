@@ -38,8 +38,14 @@ reports/revision/
     <notebook_or_script>_<timestamp>.log
   manifests/
     oof_full_prediction_run_manifest.json
+    oof_freeze_manifest.json
+    mirror_manifest.json
     artifacts_manifest.json
     artifacts_manifest.csv
+  experimental/
+    external/
+      <dataset>/
+        <dataset>_full_predictions.npz
 ```
 
 ## Prediction NPZ Contract
@@ -59,6 +65,8 @@ class_names: shape (C,)
 dataset: scalar/string
 protocol: scalar/string
 config_hash: scalar/string
+source_config_hash: scalar/string
+evaluation_config_hash: scalar/string
 git_commit: scalar/string
 created_utc: scalar/string
 fold_id: shape (N,)
@@ -70,6 +78,7 @@ aggregation_method: scalar/string
 aggregation_q: scalar/float
 aggregation_implementation: scalar/string
 cache_schema_version: scalar/integer
+checkpoint_fingerprints_json: scalar/JSON string
 slice_prob: shape (total_slices, C), paired with record_id and slice_index
 slice_index: shape (total_slices,)
 ```
@@ -77,6 +86,15 @@ slice_index: shape (total_slices,)
 Legacy OOF artifacts without `aggregation_implementation=power_mean_v2` and
 `cache_schema_version>=2` are invalid. Georgia and CPSC2021 are distinct
 datasets and must never share a dataset label.
+
+The canonical OOF artifact is reusable only when `oof_freeze_manifest.json`
+confirms 44,186 records, all five folds, Q=3 re-aggregation equivalence,
+matching checkpoint SHA256 fingerprints, and checksums for the prediction,
+slice, summary, class table, run manifest, and OOF logs.
+
+External outputs are stored under `reports/revision/experimental/` with
+`manuscript_ready=false` until dataset-specific protocol review, fold-specific
+PCA provenance, fair baselines, and uncertainty analysis are complete.
 
 ## Minimum Metric Contract
 

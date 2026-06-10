@@ -38,12 +38,10 @@ from configs.config import (  # noqa: E402
 )
 from scripts.revision.common import (  # noqa: E402
     CACHE_SCHEMA_VERSION,
+    EXPERIMENTAL_DIR,
     MANIFEST_DIR,
-    METRIC_DIR,
     POWER_MEAN_IMPLEMENTATION,
-    PREDICTION_DIR,
     PTB_SUPERCLASS_MAPPING,
-    TABLE_DIR,
     aggregate_record_probabilities,
     ensure_revision_dirs,
     multilabel_metrics,
@@ -68,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-kind", choices=["best", "final"], default="best")
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--force-features", action="store_true")
+    parser.add_argument(
+        "--allow-experimental",
+        action="store_true",
+        help="Required acknowledgement: external outputs are not manuscript-ready.",
+    )
     parser.add_argument("--extract-root", type=Path, default=Path("/content/ecg_ramba_runtime/external"))
     return parser.parse_args()
 
@@ -179,7 +182,7 @@ def checkpoint_compatible_hrv36(normalized: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
-def ptb_metadata(root: Path, limit: int) -> list[dict]:
+def ptb_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     database_candidates = list(root.rglob("ptbxl_database.csv"))
     statement_candidates = list(root.rglob("scp_statements.csv"))
     if not database_candidates or not statement_candidates:
@@ -192,15 +195,29 @@ def ptb_metadata(root: Path, limit: int) -> list[dict]:
         test = test.iloc[:limit]
     data_root = database_candidates[0].parent
     rows = []
+    unmapped_codes: dict[str, int] = {}
+    unsupported_superclasses: dict[str, int] = {}
     for ecg_id, row in test.iterrows():
         codes = ast.literal_eval(row["scp_codes"]) if isinstance(row["scp_codes"], str) else row["scp_codes"]
         diagnostic_classes = set()
         for code, likelihood in codes.items():
-            if float(likelihood) < 100 or str(code) not in statements.index:
+            if float(likelihood) <= 0:
                 continue
-            value = statements.loc[str(code)].get("diagnostic_class")
-            if isinstance(value, str):
-                diagnostic_classes.add(value.upper())
+            code = str(code)
+            if code not in statements.index:
+                unmapped_codes[code] = unmapped_codes.get(code, 0) + 1
+                continue
+            statement = statements.loc[code]
+            diagnostic = statement.get("diagnostic", 0)
+            if not pd.notna(diagnostic) or int(diagnostic) != 1:
+                continue
+            value = statement.get("diagnostic_class")
+            if isinstance(value, str) and value:
+                value = value.upper()
+                if value in PTB_SUPERCLASS_MAPPING:
+                    diagnostic_classes.add(value)
+                else:
+                    unsupported_superclasses[value] = unsupported_superclasses.get(value, 0) + 1
         y = np.asarray(
             [float(name in diagnostic_classes) for name in PTB_SUPERCLASS_MAPPING],
             dtype=np.float32,
@@ -212,7 +229,13 @@ def ptb_metadata(root: Path, limit: int) -> list[dict]:
                 "y_true": y,
             }
         )
-    return rows
+    return rows, {
+        "label_protocol": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
+        "supported_superclasses": list(PTB_SUPERCLASS_MAPPING),
+        "unsupported_superclasses": unsupported_superclasses,
+        "unmapped_scp_codes": unmapped_codes,
+        "records_without_supported_superclass": int(sum(not np.any(row["y_true"]) for row in rows)),
+    }
 
 
 def dx_codes(header: Path) -> list[str]:
@@ -222,17 +245,27 @@ def dx_codes(header: Path) -> list[str]:
     return []
 
 
-def georgia_metadata(root: Path, limit: int) -> list[dict]:
+def georgia_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     headers = sorted(root.rglob("*.hea"))
     if limit:
         headers = headers[:limit]
     rows = []
+    skipped_unmapped_records = 0
+    unmapped_codes: dict[str, int] = {}
     for header in headers:
         y = np.zeros(len(CLASSES), dtype=np.float32)
-        for code in dx_codes(header):
+        source_codes = dx_codes(header)
+        mapped_count = 0
+        for code in source_codes:
             mapped = SNOMED_MAPPING.get(code)
             if isinstance(mapped, int):
                 y[mapped] = 1.0
+                mapped_count += 1
+            else:
+                unmapped_codes[code] = unmapped_codes.get(code, 0) + 1
+        if mapped_count == 0:
+            skipped_unmapped_records += 1
+            continue
         rows.append(
             {
                 "record_id": header.stem,
@@ -240,37 +273,153 @@ def georgia_metadata(root: Path, limit: int) -> list[dict]:
                 "y_true": y,
             }
         )
-    return rows
+    return rows, {
+        "label_protocol": "chapman_27_class_snomed_intersection",
+        "skipped_records_without_mapped_label": skipped_unmapped_records,
+        "unmapped_snomed_codes": unmapped_codes,
+    }
 
 
-def cpsc_af_label(record_path: Path) -> float:
-    try:
-        annotation = wfdb.rdann(str(record_path), "atr")
-        notes = [str(note).strip("\x00").upper() for note in annotation.aux_note]
-        return float(any("AFIB" in note or "AFL" in note for note in notes))
-    except Exception:
-        return 0.0
+def cpsc_af_intervals(record_path: Path, signal_length: int) -> list[tuple[int, int]]:
+    annotation = wfdb.rdann(str(record_path), "atr")
+    events = []
+    for sample, note in zip(annotation.sample, annotation.aux_note):
+        normalized = str(note).strip("\x00").strip().upper()
+        if "AFIB" in normalized or "AFL" in normalized:
+            events.append((int(sample), True))
+        elif normalized in {"(N", "N", "(NSR", "NSR"}:
+            events.append((int(sample), False))
+    if not events:
+        raise ValueError("CPSC annotation has no recognized AF/AFL/normal rhythm boundaries")
+    events.sort(key=lambda item: item[0])
+    intervals = []
+    for idx, (start, is_af) in enumerate(events):
+        stop = events[idx + 1][0] if idx + 1 < len(events) else signal_length
+        start = max(0, min(start, signal_length))
+        stop = max(start, min(stop, signal_length))
+        if is_af and stop > start:
+            intervals.append((start, stop))
+    return intervals
 
 
-def cpsc_metadata(root: Path, limit: int) -> list[dict]:
+def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     headers = sorted(root.rglob("*.hea"))
     if limit:
         headers = headers[:limit]
-    return [
+    return (
+        [
+            {
+                "record_id": header.stem,
+                "record_path": header.with_suffix(""),
+            }
+            for header in headers
+        ],
         {
-            "record_id": header.stem,
-            "record_path": header.with_suffix(""),
-            "y_true": np.asarray([cpsc_af_label(header.with_suffix(""))], dtype=np.float32),
-        }
-        for header in headers
-    ]
+            "label_protocol": "annotation_aligned_nonoverlapping_10s_windows_majority_af",
+        },
+    )
+
+
+def interval_overlap(intervals: list[tuple[int, int]], start: int, stop: int) -> int:
+    return sum(max(0, min(stop, right) - max(start, left)) for left, right in intervals)
+
+
+def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    metadata, metadata_summary = cpsc_metadata(root, limit)
+    signals, labels, record_ids = [], [], []
+    skipped_annotation = 0
+    skipped_signal = 0
+    transition_windows = 0
+    positive_windows = 0
+    missing_leads = []
+    for row in tqdm(metadata, desc="Loading cpsc2021 windows"):
+        try:
+            record = wfdb.rdrecord(str(row["record_path"]))
+            raw = record.p_signal.T if record.p_signal is not None else record.d_signal.T.astype(np.float32)
+            raw, missing = align_leads(raw, list(record.sig_name) if record.sig_name else None)
+        except Exception as exc:
+            skipped_signal += 1
+            if skipped_annotation + skipped_signal <= 10:
+                print(f"Skipping signal {row['record_id']}: {exc}")
+            continue
+
+        try:
+            intervals = cpsc_af_intervals(row["record_path"], raw.shape[-1])
+        except Exception as exc:
+            skipped_annotation += 1
+            if skipped_annotation + skipped_signal <= 10:
+                print(f"Skipping annotation {row['record_id']}: {exc}")
+            continue
+
+        try:
+            record_signals = []
+            record_labels = []
+            record_ids_for_windows = []
+            record_transition_windows = 0
+            record_positive_windows = 0
+            source_fs = float(record.fs)
+            if source_fs != FS:
+                raw = resample_poly(raw, int(FS), int(round(source_fs)), axis=-1).astype(np.float32)
+            filtered = bandpass_filter(raw, fs=FS).astype(np.float32)
+            scale = FS / source_fs
+            target_intervals = [
+                (int(round(start * scale)), int(round(stop * scale)))
+                for start, stop in intervals
+            ]
+            for start in range(0, filtered.shape[-1], 5000):
+                stop = min(start + 5000, filtered.shape[-1])
+                valid_length = stop - start
+                if valid_length < 2500:
+                    continue
+                af_samples = interval_overlap(target_intervals, start, stop)
+                af_fraction = af_samples / valid_length
+                if 0.0 < af_fraction < 1.0:
+                    record_transition_windows += 1
+                label = float(af_fraction >= 0.5)
+                record_positive_windows += int(label)
+                segment = pad_or_truncate(filtered[:, start:stop], target_len=5000).astype(np.float32)
+                normalized = normalize_signal(segment).astype(np.float32)
+                if not np.isfinite(normalized).all():
+                    raise ValueError("non-finite signal")
+                record_signals.append(normalized)
+                record_labels.append(np.asarray([label], dtype=np.float32))
+                record_ids_for_windows.append(f"{row['record_id']}:{start}:{stop}")
+            signals.extend(record_signals)
+            labels.extend(record_labels)
+            record_ids.extend(record_ids_for_windows)
+            missing_leads.extend([missing] * len(record_signals))
+            transition_windows += record_transition_windows
+            positive_windows += record_positive_windows
+        except Exception as exc:
+            skipped_signal += 1
+            if skipped_annotation + skipped_signal <= 10:
+                print(f"Skipping preprocessing {row['record_id']}: {exc}")
+    if not signals:
+        raise RuntimeError("No usable CPSC2021 annotation-aligned windows were loaded")
+    return (
+        np.asarray(signals, dtype=np.float32),
+        np.asarray(labels, dtype=np.float32),
+        np.asarray(record_ids),
+        {
+            **metadata_summary,
+            "metadata_records": len(metadata),
+            "loaded_windows": len(signals),
+            "positive_windows": positive_windows,
+            "transition_windows": transition_windows,
+            "skipped_annotation_records": skipped_annotation,
+            "skipped_signal_records": skipped_signal,
+            "missing_leads_mean": float(np.mean(missing_leads)),
+            "windows_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
+        },
+    )
 
 
 def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
-    metadata = {
+    if dataset == "cpsc2021":
+        return load_cpsc_windows(root, limit)
+    metadata, metadata_summary = {
         "ptbxl": ptb_metadata,
         "georgia": georgia_metadata,
-        "cpsc2021": cpsc_metadata,
     }[dataset](root, limit)
     signals, labels, record_ids = [], [], []
     skipped = 0
@@ -296,6 +445,7 @@ def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.n
         np.asarray(labels, dtype=np.float32),
         np.asarray(record_ids),
         {
+            **metadata_summary,
             "metadata_records": len(metadata),
             "loaded_records": len(signals),
             "skipped_records": skipped,
@@ -313,14 +463,17 @@ def record_id_fingerprint(record_ids: np.ndarray) -> str:
 def feature_cache_path(
     dataset: str,
     archive: Path,
-    pca_path: Path,
+    pca_paths: list[Path],
     record_ids: np.ndarray,
 ) -> Path:
     cache_dir = Path(PATHS["cache_dir"]) / "revision_external_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
+    pca_fingerprint = hashlib.sha256(
+        ":".join(file_fingerprint(path) for path in pca_paths).encode()
+    ).hexdigest()[:16]
     return cache_dir / (
         f"{dataset}_features_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
-        f"{file_fingerprint(archive)}_{file_fingerprint(pca_path)}_"
+        f"{file_fingerprint(archive)}_{pca_fingerprint}_"
         f"N{len(record_ids)}_{record_id_fingerprint(record_ids)}.npz"
     )
 
@@ -330,56 +483,60 @@ def generate_features(
     archive: Path,
     signals: np.ndarray,
     record_ids: np.ndarray,
-    pca_path: Path,
+    pca_paths: list[Path],
     force: bool,
-) -> tuple[np.ndarray, np.ndarray, Path, bool]:
-    cache_path = feature_cache_path(dataset, archive, pca_path, record_ids)
+) -> tuple[list[np.ndarray], np.ndarray, Path, bool]:
+    cache_path = feature_cache_path(dataset, archive, pca_paths, record_ids)
+    hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
     if cache_path.exists() and not force:
         with np.load(cache_path, allow_pickle=False) as data:
             schema = int(data["cache_schema_version"]) if "cache_schema_version" in data.files else 0
-            hydra = data["X_hydra"]
+            hydra = [data[key] for key in hydra_keys] if all(key in data.files for key in hydra_keys) else []
             hrv = data["X_hrv"]
             if (
                 schema == CACHE_SCHEMA_VERSION
-                and hydra.dtype == np.float32
+                and len(hydra) == len(pca_paths)
+                and all(values.dtype == np.float32 for values in hydra)
                 and hrv.dtype == np.float32
-                and len(hydra) == len(signals)
+                and all(len(values) == len(signals) for values in hydra)
             ):
                 print(f"Loaded float32 external feature cache: {cache_path}")
                 return hydra, hrv, cache_path, True
 
-    pca = joblib.load(pca_path)
     rocket = MiniRocketNative(c_in=12, seq_len=5000, seed=42).cpu().eval()
     raw_features = []
     with torch.no_grad():
         for start in tqdm(range(0, len(signals), 64), desc="MiniRocket"):
             batch = torch.from_numpy(signals[start : start + 64])
             raw_features.append(rocket(batch).numpy())
-    hydra = pca.transform(np.concatenate(raw_features, axis=0)).astype(np.float32)
+    raw_features = np.concatenate(raw_features, axis=0)
+    hydra = [
+        joblib.load(path).transform(raw_features).astype(np.float32)
+        for path in pca_paths
+    ]
     hrv = np.asarray(
         [checkpoint_compatible_hrv36(signal) for signal in tqdm(signals, desc="HRV36")],
         dtype=np.float32,
     )
-    np.savez_compressed(
-        cache_path,
-        X_hydra=hydra,
-        X_hrv=hrv,
-        cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
-        config_hash=np.asarray(CONFIG_HASH),
-        pca_path=np.asarray(str(pca_path)),
-        pca_sha256=np.asarray(sha256_file(pca_path)),
-        hrv_semantics=np.asarray("checkpoint_compatible_amplitude_slots_zero"),
-        record_id_fingerprint=np.asarray(record_id_fingerprint(record_ids)),
-    )
+    payload = {
+        "X_hrv": hrv,
+        "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        "config_hash": np.asarray(CONFIG_HASH),
+        "pca_paths": np.asarray([str(path) for path in pca_paths]),
+        "pca_sha256": np.asarray([sha256_file(path) for path in pca_paths]),
+        "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
+        "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
+    }
+    payload.update({key: values for key, values in zip(hydra_keys, hydra)})
+    np.savez_compressed(cache_path, **payload)
     return hydra, hrv, cache_path, False
 
 
 def build_slices(
     signals: np.ndarray,
-    hydra: np.ndarray,
     hrv: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    xs, xh, xhr, record_index, slice_index = [], [], [], [], []
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    xs, xhr, record_index, slice_index = [], [], [], []
     for rid, signal in enumerate(signals):
         ordinal = 0
         for start in range(
@@ -388,7 +545,6 @@ def build_slices(
             CONFIG["slice_stride"],
         ):
             xs.append(signal[:, start : start + CONFIG["slice_length"]])
-            xh.append(hydra[rid])
             xhr.append(hrv[rid])
             record_index.append(rid)
             slice_index.append(ordinal)
@@ -397,7 +553,6 @@ def build_slices(
                 break
     return (
         np.asarray(xs, dtype=np.float32),
-        np.asarray(xh, dtype=np.float32),
         np.asarray(xhr, dtype=np.float32),
         np.asarray(record_index, dtype=np.int64),
         np.asarray(slice_index, dtype=np.int16),
@@ -416,16 +571,46 @@ def checkpoint_paths(kind: str) -> list[Path]:
     return paths
 
 
+def fold_pca_paths(expected_folds: int) -> list[Path]:
+    manifest_path = MANIFEST_DIR / "fold_pca_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"Fold PCA manifest not found: {manifest_path}. "
+            "Run scripts/revision/08_build_fold_pca.py before external evaluation."
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    folds_path = Path(PATHS["model_dir"]) / "folds.pkl"
+    if not folds_path.exists():
+        raise FileNotFoundError(folds_path)
+    if payload.get("folds_path_sha256") != sha256_file(folds_path):
+        raise RuntimeError("Fold PCA manifest was built from a different folds.pkl")
+    rows = {int(row["fold"]): row for row in payload.get("fold_pca", [])}
+    if set(rows) != set(range(1, expected_folds + 1)):
+        raise ValueError("Fold PCA manifest is incomplete")
+    paths = []
+    for fold in range(1, expected_folds + 1):
+        path = Path(rows[fold]["path"])
+        if not path.exists():
+            raise FileNotFoundError(f"Fold {fold} PCA missing: {path}")
+        if sha256_file(path) != rows[fold]["sha256"]:
+            raise RuntimeError(f"Fold {fold} PCA checksum mismatch: {path}")
+        paths.append(path)
+    return paths
+
+
 def infer_ensemble(
     xs: np.ndarray,
-    xh: np.ndarray,
     xhr: np.ndarray,
+    slice_record_index: np.ndarray,
+    hydra_by_fold: list[np.ndarray],
     checkpoints: list[Path],
     batch_size: int,
 ) -> np.ndarray:
     from src.model import ECGRambaV7Advanced
 
     probability_sum = np.zeros((len(xs), len(CLASSES)), dtype=np.float64)
+    if len(hydra_by_fold) != len(checkpoints):
+        raise ValueError("One fold-specific PCA feature matrix is required per checkpoint")
     for fold, checkpoint in enumerate(checkpoints, start=1):
         print(f"Inference checkpoint {fold}/{len(checkpoints)}: {checkpoint}")
         state = torch.load(checkpoint, map_location=DEVICE)
@@ -437,7 +622,8 @@ def infer_ensemble(
             for start in tqdm(range(0, len(xs), batch_size), desc=f"Fold {fold}", leave=False):
                 stop = start + batch_size
                 xb = torch.from_numpy(xs[start:stop]).to(DEVICE)
-                hb = torch.from_numpy(xh[start:stop]).to(DEVICE)
+                record_batch = slice_record_index[start:stop]
+                hb = torch.from_numpy(hydra_by_fold[fold - 1][record_batch]).to(DEVICE)
                 rb = torch.from_numpy(xhr[start:stop]).to(DEVICE)
                 with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
                     probability_sum[start:stop] += torch.sigmoid(model(xb, hb, rb)).float().cpu().numpy()
@@ -485,7 +671,7 @@ def class_summary(dataset: str, y_true: np.ndarray, y_prob: np.ndarray, names: n
 
 
 def update_external_summary(dataset: str, protocol: str, n_records: int, metrics: dict) -> Path:
-    path = METRIC_DIR / "external_summary.csv"
+    path = EXPERIMENTAL_DIR / "external" / "external_summary_experimental.csv"
     rows = []
     if path.exists():
         rows = pd.read_csv(path).to_dict(orient="records")
@@ -495,6 +681,8 @@ def update_external_summary(dataset: str, protocol: str, n_records: int, metrics
             "dataset": dataset,
             "protocol": protocol,
             "n_records": n_records,
+            "evidence_status": "experimental",
+            "manuscript_ready": False,
             **metrics,
         }
     )
@@ -505,6 +693,14 @@ def update_external_summary(dataset: str, protocol: str, n_records: int, metrics
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
+    if not args.allow_experimental:
+        raise RuntimeError(
+            "External evaluation is intentionally blocked from manuscript use. "
+            "Re-run with --allow-experimental only after acknowledging that outputs "
+            "will be stored under reports/revision/experimental with manuscript_ready=false."
+        )
+    pca_paths = fold_pca_paths(int(CONFIG["n_folds"]))
+    checkpoints = checkpoint_paths(args.checkpoint_kind)
     created_utc = datetime.now(timezone.utc).isoformat()
     archive = archive_path(args.dataset)
     root = extract_archive(args.dataset, archive, args.extract_root)
@@ -514,20 +710,23 @@ def main() -> None:
         args.limit_records,
     )
 
-    pca_path = Path(PATHS["model_dir"]) / "global_pca_zeroshot.pkl"
-    if not pca_path.exists():
-        raise FileNotFoundError(f"Chapman global PCA not found: {pca_path}")
-    hydra, hrv, feature_cache, feature_cache_hit = generate_features(
+    hydra_by_fold, hrv, feature_cache, feature_cache_hit = generate_features(
         args.dataset,
         archive,
         signals,
         record_ids,
-        pca_path,
+        pca_paths,
         args.force_features,
     )
-    xs, xh, xhr, slice_record_index, slice_index = build_slices(signals, hydra, hrv)
-    checkpoints = checkpoint_paths(args.checkpoint_kind)
-    model_slice_probs = infer_ensemble(xs, xh, xhr, checkpoints, args.batch_size)
+    xs, xhr, slice_record_index, slice_index = build_slices(signals, hrv)
+    model_slice_probs = infer_ensemble(
+        xs,
+        xhr,
+        slice_record_index,
+        hydra_by_fold,
+        checkpoints,
+        args.batch_size,
+    )
     mapped_slice_probs, class_names = map_model_probabilities(args.dataset, model_slice_probs)
     y_prob, valid_mask, slice_count = aggregate_record_probabilities(
         mapped_slice_probs,
@@ -542,20 +741,49 @@ def main() -> None:
         raise ValueError(f"{int(np.sum(~valid_mask))} external records have no slices")
     threshold = 0.5
     metrics = multilabel_metrics(y_true, y_prob, threshold=threshold)
-    prediction_path = PREDICTION_DIR / f"{args.dataset}_full_predictions.npz"
-    slice_path = PREDICTION_DIR / f"{args.dataset}_full_slice_predictions.npz"
-    summary_path = METRIC_DIR / f"{args.dataset}_full_prediction_summary.json"
-    class_path = TABLE_DIR / f"{args.dataset}_full_class_summary.csv"
-    manifest_path = MANIFEST_DIR / f"{args.dataset}_full_prediction_run_manifest.json"
+    output_root = EXPERIMENTAL_DIR / "external" / args.dataset
+    output_root.mkdir(parents=True, exist_ok=True)
+    prediction_path = output_root / f"{args.dataset}_full_predictions.npz"
+    slice_path = output_root / f"{args.dataset}_full_slice_predictions.npz"
+    summary_path = output_root / f"{args.dataset}_full_prediction_summary.json"
+    class_path = output_root / f"{args.dataset}_full_class_summary.csv"
+    manifest_path = output_root / f"{args.dataset}_full_prediction_run_manifest.json"
     checkpoint_info = [
-        {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
-        for path in checkpoints
+        {
+            "fold": fold,
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+        }
+        for fold, path in enumerate(checkpoints, start=1)
+    ]
+    pca_info = [
+        {
+            "fold": fold,
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+            "scope": "chapman_training_fold_only",
+        }
+        for fold, path in enumerate(pca_paths, start=1)
     ]
     aggregation_q = float(CONFIG["power_mean_q"])
     protocol = (
-        f"external_{args.checkpoint_kind}_ensemble5_{POWER_MEAN_IMPLEMENTATION}_"
+        f"experimental_external_{args.checkpoint_kind}_fold_pca_ensemble5_{POWER_MEAN_IMPLEMENTATION}_"
         f"q{aggregation_q:g}_threshold_0.5"
     )
+    restrictions = [
+        "External outputs remain experimental until fair baselines, bootstrap CI, and dataset-specific protocol review are complete.",
+        "Current checkpoints use zero amplitude slots 25:30 because of the training feature bug.",
+    ]
+    if args.dataset == "ptbxl":
+        restrictions.append(
+            "PTB predictions are Chapman-class proxies for four supported PTB-XL diagnostic superclasses; HYP is unsupported."
+        )
+    if args.dataset == "cpsc2021":
+        restrictions.append(
+            "CPSC2021 is evaluated as annotation-aligned 10-second majority-rhythm windows, not as the official episode-boundary challenge score."
+        )
 
     np.savez_compressed(
         prediction_path,
@@ -567,12 +795,19 @@ def main() -> None:
         protocol=np.asarray(protocol),
         slice_count=slice_count,
         config_hash=np.asarray(CONFIG_HASH),
+        source_config_hash=np.asarray(CONFIG_HASH),
+        evaluation_config_hash=np.asarray(CONFIG_HASH),
         git_commit=np.asarray(git_commit()),
         created_utc=np.asarray(created_utc),
         aggregation_method=np.asarray("power_mean"),
         aggregation_q=np.asarray(aggregation_q, dtype=np.float32),
         aggregation_implementation=np.asarray(POWER_MEAN_IMPLEMENTATION),
         cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        checkpoint_fingerprints_json=np.asarray(json.dumps(checkpoint_info, sort_keys=True)),
+        pca_fingerprints_json=np.asarray(json.dumps(pca_info, sort_keys=True)),
+        evidence_status=np.asarray("experimental"),
+        manuscript_ready=np.asarray(False),
+        restrictions_json=np.asarray(json.dumps(restrictions)),
         threshold=np.asarray(threshold, dtype=np.float32),
     )
     np.savez_compressed(
@@ -585,6 +820,8 @@ def main() -> None:
         dataset=np.asarray(args.dataset),
         protocol=np.asarray("external_slice_ensemble5"),
         cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        evidence_status=np.asarray("experimental"),
+        manuscript_ready=np.asarray(False),
     )
     save_csv(class_path, class_summary(args.dataset, y_true, y_prob, class_names))
     external_summary_path = update_external_summary(
@@ -596,6 +833,9 @@ def main() -> None:
     summary = {
         "dataset": args.dataset,
         "created_utc": created_utc,
+        "evidence_status": "experimental",
+        "manuscript_ready": False,
+        "restrictions": restrictions,
         "protocol": protocol,
         "n_records": len(y_true),
         "n_classes": y_true.shape[1],
@@ -630,9 +870,8 @@ def main() -> None:
                 "fingerprint": file_fingerprint(archive),
             },
             "pca": {
-                "path": str(pca_path),
-                "sha256": sha256_file(pca_path),
-                "scope": "global_chapman_zero_shot",
+                "scope": "fold_specific_chapman_training_only",
+                "folds": pca_info,
             },
             "checkpoints": checkpoint_info,
             "outputs": {
@@ -644,7 +883,7 @@ def main() -> None:
                 for path in output_paths
             },
             "warnings": [
-                "Global Chapman PCA is shared across fold checkpoints because fold-specific PCA objects were not saved.",
+                *restrictions,
                 "Amplitude slots 25:30 are zero to match the feature bug used by the current Chapman checkpoints.",
                 "CPSC2021 records with fewer than 12 leads are zero-padded and reported in load_summary.",
             ],

@@ -225,6 +225,15 @@ def hydra_fold_cache_path(fold_num: int, tr_idx: np.ndarray, va_idx: np.ndarray)
     return cache_dir / name
 
 
+def fold_pca_model_path(fold_num: int, tr_idx: np.ndarray) -> Path:
+    cache_dir = Path(PATHS["cache_dir"]) / "revision_pca_models"
+    train_hash = index_fingerprint(tr_idx)
+    return cache_dir / (
+        f"fold{fold_num}_pca_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
+        f"train{len(tr_idx)}_{train_hash}_D{CONFIG['hydra_dim']}.joblib"
+    )
+
+
 def load_or_compute_fold_hydra(
     *,
     fold_num: int,
@@ -266,6 +275,10 @@ def load_or_compute_fold_hydra(
     )
     start = time.time()
     pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
+    pca_model_path = fold_pca_model_path(fold_num, tr_idx)
+    pca_model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(pca, pca_model_path)
+    print(f"Saved fold-aware PCA object: {pca_model_path}", flush=True)
     print(f"Transforming validation Hydra features for fold {fold_num}: val={len(va_idx)}", flush=True)
     hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
     pca_var = float(pca.explained_variance_ratio_.sum())
@@ -850,12 +863,15 @@ def generate_oof(args: argparse.Namespace) -> None:
             tr_idx=tr_idx,
             va_idx=va_idx,
         )
+        pca_object_path = fold_pca_model_path(fold_num, tr_idx)
         pca_variance.append(
             {
                 "fold": fold_num,
                 "explained_variance": pca_var,
                 "cache_path": str(pca_cache_path),
                 "cache_hit": bool(pca_cache_hit),
+                "pca_object_path": str(pca_object_path) if pca_object_path.exists() else None,
+                "pca_object_sha256": sha256_file(pca_object_path) if pca_object_path.exists() else None,
             }
         )
         print(f"PCA variance retained: {pca_var:.6f}")
@@ -883,6 +899,8 @@ def generate_oof(args: argparse.Namespace) -> None:
             "pca_explained_variance": pca_var,
             "pca_cache_path": str(pca_cache_path),
             "pca_cache_hit": bool(pca_cache_hit),
+            "pca_object_path": str(pca_object_path) if pca_object_path.exists() else None,
+            "pca_object_sha256": sha256_file(pca_object_path) if pca_object_path.exists() else None,
             "checkpoint": ckpt_info,
         }
 
@@ -975,6 +993,10 @@ def generate_oof(args: argparse.Namespace) -> None:
     )
     threshold = 0.5
     aggregation_q = float(CONFIG["power_mean_q"])
+    checkpoint_fingerprints_json = json.dumps(
+        sorted(checkpoint_infos, key=lambda row: int(row["fold"])),
+        sort_keys=True,
+    )
 
     out_path = PREDICTION_DIR / "oof_full_predictions.npz"
     np.savez_compressed(
@@ -989,6 +1011,8 @@ def generate_oof(args: argparse.Namespace) -> None:
         slice_count=record_slice_count,
         valid_record_mask=valid_records.astype(np.bool_),
         config_hash=np.asarray(CONFIG_HASH),
+        source_config_hash=np.asarray(CONFIG_HASH),
+        evaluation_config_hash=np.asarray(CONFIG_HASH),
         git_commit=np.asarray(git_commit),
         created_utc=np.asarray(created_utc),
         checkpoint_kind=np.asarray(args.checkpoint_kind),
@@ -997,6 +1021,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         aggregation_q=np.asarray(aggregation_q, dtype=np.float32),
         aggregation_implementation=np.asarray(POWER_MEAN_IMPLEMENTATION),
         cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        checkpoint_fingerprints_json=np.asarray(checkpoint_fingerprints_json),
         threshold=np.asarray(threshold, dtype=np.float32),
     )
     print(f"Wrote: {out_path}")
@@ -1014,10 +1039,13 @@ def generate_oof(args: argparse.Namespace) -> None:
             dataset=np.asarray("chapman_oof"),
             protocol=np.asarray(f"slice_level_fold_{args.checkpoint_kind}"),
             config_hash=np.asarray(CONFIG_HASH),
+            source_config_hash=np.asarray(CONFIG_HASH),
+            evaluation_config_hash=np.asarray(CONFIG_HASH),
             git_commit=np.asarray(git_commit),
             created_utc=np.asarray(created_utc),
             probability_dtype=np.asarray("float32"),
             cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+            checkpoint_fingerprints_json=np.asarray(checkpoint_fingerprints_json),
         )
         print(f"Wrote: {slice_out_path}")
 
