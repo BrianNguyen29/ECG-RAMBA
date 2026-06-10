@@ -897,6 +897,34 @@ else:
 """
         ),
         markdown(
+            "## Restore Stable Drive Artifacts\n\n"
+            "Restore previously mirrored artifacts into a fresh Drive checkout. "
+            "Existing repo artifacts are never overwritten."
+        ),
+        code(
+            """import shutil
+
+stable_mirror = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
+repo_revision = Path('reports/revision')
+restored = []
+if stable_mirror.exists():
+    for src in sorted(stable_mirror.rglob('*')):
+        if not src.is_file() or src.name == '.gitkeep':
+            continue
+        dst = repo_revision / src.relative_to(stable_mirror)
+        if dst.exists():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+        restored.append(dst)
+print(f'Restored {len(restored)} artifact(s) from: {stable_mirror}')
+for path in restored[:50]:
+    print(' -', path)
+if len(restored) > 50:
+    print(f' ... {len(restored) - 50} more')
+"""
+        ),
+        markdown(
             "## Prediction Contract\n\n"
             "Every downstream metric script expects NPZ files with `y_true` and "
             "`y_prob`, both shaped `(N, C)`. Store prediction files under "
