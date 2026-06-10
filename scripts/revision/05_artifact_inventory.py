@@ -44,7 +44,7 @@ def main() -> None:
     for path in sorted(REVISION_DIR.rglob("*")):
         if not path.is_file():
             continue
-        if path.name == ".gitkeep":
+        if path.name in {".gitkeep", "artifacts_manifest.json", "artifacts_manifest.csv"}:
             continue
         rel = path.relative_to(PROJECT_ROOT).as_posix()
         rows.append(

@@ -279,15 +279,12 @@ for name in required_files:
 
 model_dir = DRIVE_ROOT / 'model'
 fold_ckpts = sorted(model_dir.glob('fold*_best.pt'))
-pca_path = model_dir / 'global_pca_zeroshot.pkl'
 print('\\nmodel_dir       :', model_dir)
 print('fold checkpoints:', len(fold_ckpts))
-print('global PCA      :', pca_path.exists())
+print('fold PCA manifest:', Path('reports/revision/manifests/fold_pca_manifest.json').exists())
 
 if len(fold_ckpts) < 5:
     missing.append(f'Expected 5 fold*_best.pt files under {model_dir}')
-if not pca_path.exists():
-    missing.append(str(pca_path))
 if missing:
     raise FileNotFoundError('Missing required Drive artifacts:\\n' + '\\n'.join(missing))
 """
@@ -356,7 +353,10 @@ for key, info in audit['artifacts'].get('dataset_paths', {}).items():
         markdown("## Inspect A0 Completion Gate"),
         code(
             """a0_status = json.loads(Path('reports/revision/a0_resolution_status.json').read_text(encoding='utf-8'))
-print('A0 audit complete:', a0_status['a0_audit_complete'])
+print('A0 status        :', a0_status['status'])
+print('Audit complete   :', a0_status['audit_complete'])
+print('Protocol ready   :', a0_status['protocol_ready'])
+print('Deferred blockers:', a0_status['deferred_blocker_ids'])
 print('Meaning:', a0_status['meaning'])
 for blocker in a0_status['blockers']:
     print(
@@ -897,31 +897,24 @@ else:
 """
         ),
         markdown(
-            "## Restore Stable Drive Artifacts\n\n"
-            "Restore previously mirrored artifacts into a fresh Drive checkout. "
-            "Existing repo artifacts are never overwritten."
+            "## Restore And Verify Stable Drive Artifacts\n\n"
+            "Restore only files declared by the Drive mirror manifest. Every source "
+            "and destination is verified by SHA256 before it can be reused."
         ),
         code(
-            """import shutil
-
+            """
 stable_mirror = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
-repo_revision = Path('reports/revision')
-restored = []
 if stable_mirror.exists():
-    for src in sorted(stable_mirror.rglob('*')):
-        if not src.is_file() or src.name == '.gitkeep':
-            continue
-        dst = repo_revision / src.relative_to(stable_mirror)
-        if dst.exists():
-            continue
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-        restored.append(dst)
-print(f'Restored {len(restored)} artifact(s) from: {stable_mirror}')
-for path in restored[:50]:
-    print(' -', path)
-if len(restored) > 50:
-    print(f' ... {len(restored) - 50} more')
+    restore_result = run(
+        f'python -u scripts/revision/artifact_mirror.py restore '
+        f'--mirror-root "{stable_mirror}" --replace-mismatched',
+        check=False,
+        log_path='reports/revision/logs/oof_mirror_restore.log',
+    )
+    if restore_result.returncode:
+        print('Verified restore unavailable. OOF validation will decide whether inference is required.')
+else:
+    print('Stable mirror does not exist yet:', stable_mirror)
 """
         ),
         markdown(
@@ -994,36 +987,18 @@ except Exception:
     gpu_name, gpu_ram_gb = 'unknown', 0.0
 print(f'GPU        : {gpu_name} ({gpu_ram_gb:.1f} GiB)')
 
-oof_expected = [
-    Path('reports/revision/predictions/oof_full_predictions.npz'),
-    Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
-    Path('reports/revision/metrics/oof_full_prediction_summary.json'),
-    Path('reports/revision/tables/oof_full_class_summary.csv'),
-    Path('reports/revision/manifests/oof_full_prediction_run_manifest.json'),
-]
-oof_ready = all(path.exists() and path.stat().st_size > 0 for path in oof_expected)
+freeze_command = (
+    'python -u scripts/revision/06_freeze_oof.py '
+    '--expected-records 44186 --expected-folds 5 --q 3'
+)
+freeze_result = run(
+    freeze_command,
+    check=False,
+    log_path='reports/revision/logs/oof_freeze_validation.log',
+)
+oof_ready = freeze_result.returncode == 0
 if oof_ready:
-    with np.load(oof_expected[0], allow_pickle=False) as existing:
-        implementation = (
-            str(existing['aggregation_implementation'].item())
-            if 'aggregation_implementation' in existing.files
-            else ''
-        )
-        schema_version = (
-            int(existing['cache_schema_version'])
-            if 'cache_schema_version' in existing.files
-            else 0
-        )
-    oof_ready = implementation == 'power_mean_v2' and schema_version >= 2
-    if not oof_ready:
-        print(
-            'Existing OOF record artifact uses a legacy aggregation/cache contract and '
-            'will not be reused.'
-        )
-if oof_ready:
-    print('OOF artifacts already exist:')
-    for path in oof_expected:
-        print(' -', path, path.stat().st_size, 'bytes')
+    print('OOF passed checksum, five-fold, 44,186-record, Q=3, and checkpoint validation.')
 
 command = (
     'python -u scripts/revision/01_generate_predictions.py '
@@ -1046,8 +1021,9 @@ if RUN_OOF_EXPORT and (FORCE_RERUN_OOF or not oof_ready):
             'Do not reduce numerical precision for manuscript predictions.'
         )
     run(command, log_path='reports/revision/logs/oof_generate_predictions.log')
+    run(freeze_command, log_path='reports/revision/logs/oof_freeze_validation.log')
 elif oof_ready and not FORCE_RERUN_OOF:
-    print('Skipping OOF export because complete artifacts are already present. Set FORCE_RERUN_OOF=True to rerun.')
+    print('Skipping OOF inference because the frozen artifact contract passed.')
 else:
     print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')
 """
@@ -1060,6 +1036,7 @@ else:
     Path('reports/revision/metrics/oof_full_prediction_summary.json'),
     Path('reports/revision/tables/oof_full_class_summary.csv'),
     Path('reports/revision/manifests/oof_full_prediction_run_manifest.json'),
+    Path('reports/revision/manifests/oof_freeze_manifest.json'),
 ]
 
 for path in expected:
@@ -1089,6 +1066,8 @@ if pred_path.exists():
         'aggregation_implementation',
         'cache_schema_version',
         'source_slice_dtype',
+        'source_config_hash',
+        'evaluation_config_hash',
     ]:
         if key in data.files:
             value = data[key]
@@ -1108,15 +1087,37 @@ if manifest_path.exists():
     print('Manifest outputs:')
     for name, info in manifest.get('outputs', {}).items():
         print(' -', name, info.get('path'), info.get('size_bytes'), info.get('sha256', '')[:12])
+
+freeze_path = Path('reports/revision/manifests/oof_freeze_manifest.json')
+if freeze_path.exists():
+    freeze = json.loads(freeze_path.read_text(encoding='utf-8'))
+    print('\\nFreeze status:', freeze.get('status'))
+    print('Manuscript ready:', freeze.get('manuscript_ready'))
+    print('Validated records:', freeze.get('validated_records'))
+    print('Fold counts:', freeze.get('fold_counts'))
+    print('Checkpoint match:', freeze.get('checkpoint_fingerprints_match'))
 """
         ),
-        markdown("## External Prediction Commands"),
+        markdown(
+            "## Experimental External Prediction Commands\n\n"
+            "External inference is disabled until five fold-specific PCA objects exist. "
+            "All outputs remain isolated with `manuscript_ready=false`."
+        ),
         code(
-            """RUN_PTBXL_EXPORT = False
+            """BUILD_FOLD_PCA = False
+RUN_PTBXL_EXPORT = False
 RUN_GEORGIA_EXPORT = False
 RUN_CPSC2021_EXPORT = False
 EXTERNAL_BATCH_SIZE = 64
 EXTERNAL_LIMIT_RECORDS = 0
+
+if BUILD_FOLD_PCA:
+    run(
+        'python -u scripts/revision/08_build_fold_pca.py',
+        log_path='reports/revision/logs/build_fold_pca.log',
+    )
+else:
+    print('Fold PCA build disabled. External exporter will refuse to run without a complete PCA manifest.')
 
 external_jobs = [
     ('ptbxl', RUN_PTBXL_EXPORT),
@@ -1126,7 +1127,8 @@ external_jobs = [
 for dataset, enabled in external_jobs:
     command = (
         'python -u scripts/revision/03_generate_external_predictions.py '
-        f'--dataset {dataset} --checkpoint-kind best --batch-size {EXTERNAL_BATCH_SIZE}'
+        f'--dataset {dataset} --checkpoint-kind best --batch-size {EXTERNAL_BATCH_SIZE} '
+        '--allow-experimental'
     )
     if EXTERNAL_LIMIT_RECORDS:
         command += f' --limit-records {EXTERNAL_LIMIT_RECORDS}'
@@ -1138,58 +1140,19 @@ for dataset, enabled in external_jobs:
     else:
         print(f'{dataset}: disabled; set RUN_{dataset.upper()}_EXPORT=True to run')
 
-print('Georgia and CPSC2021 are intentionally separate dataset identities.')
+print('Experimental outputs are written under reports/revision/experimental.')
 """
         ),
         markdown("## Re-run Inventory"),
         code("!python scripts/revision/05_artifact_inventory.py\n"),
         markdown("## Mirror Artifacts To Stable Drive Cache"),
         code(
-            """import hashlib
-import json
-import shutil
-from datetime import datetime, timezone
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-source_root = Path('reports/revision')
+            """source_root = Path('reports/revision')
 mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
-mirror_root.mkdir(parents=True, exist_ok=True)
-
-copied = []
-for src in sorted(source_root.rglob('*')):
-    if not src.is_file() or src.name == '.gitkeep':
-        continue
-    dst = mirror_root / src.relative_to(source_root)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    copied.append({
-        'source': str(src),
-        'mirror': str(dst),
-        'size_bytes': dst.stat().st_size,
-        'sha256': sha256_file(dst),
-    })
-
-print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
-for row in copied:
-    print(f\" - {row['source']} -> {row['mirror']} | {row['size_bytes']} bytes\")
-
-mirror_manifest = {
-    'created_utc': datetime.now(timezone.utc).isoformat(),
-    'source_root': str(source_root),
-    'mirror_root': str(mirror_root),
-    'artifact_count': len(copied),
-    'artifacts': copied,
-}
-mirror_manifest_path = mirror_root / 'manifests' / 'mirror_manifest.json'
-mirror_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-mirror_manifest_path.write_text(json.dumps(mirror_manifest, indent=2), encoding='utf-8')
-print('Wrote mirror manifest:', mirror_manifest_path)
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish --mirror-root "{mirror_root}"',
+    log_path='reports/revision/logs/oof_mirror_publish.log',
+)
 """
         ),
     ]
@@ -1238,117 +1201,28 @@ else:
         ),
         markdown("## Run Calibration And Bootstrap CI"),
         code(
-            """import os
-import shutil
-import numpy as np
-
-N_BOOT = 1000
+            """N_BOOT = 1000
 N_BINS = 15
 THRESHOLD = 0.5
 OVERWRITE_METRICS = True
 
-drive_root = Path(globals().get('DRIVE_ROOT', '/content/drive/MyDrive/ECG-Ramba'))
-repo_dir = Path(globals().get('REPO_DIR', '/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA'))
-if repo_dir.exists() and (repo_dir / 'configs' / 'config.py').exists() and Path.cwd() != repo_dir:
-    os.chdir(repo_dir)
+pred = Path('reports/revision/predictions/oof_full_predictions.npz')
+freeze = Path('reports/revision/manifests/oof_freeze_manifest.json')
+out = Path('reports/revision/metrics/calibration_ci_oof_full_predictions.json')
 
-print('cwd:', Path.cwd())
-print('drive_root:', drive_root)
+if not pred.exists() or not freeze.exists():
+    raise FileNotFoundError('Notebook 02 must produce and freeze the canonical OOF artifacts first.')
 
-candidate_pred_dirs = []
-for path in [
-    Path('reports/revision/predictions'),
-    repo_dir / 'reports' / 'revision' / 'predictions',
-    drive_root / 'revision_artifacts' / 'reports' / 'revision' / 'predictions',
-    Path('/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA/reports/revision/predictions'),
-    Path('/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision/predictions'),
-]:
-    if path not in candidate_pred_dirs:
-        candidate_pred_dirs.append(path)
-
-canonical_pred_dir = Path('reports/revision/predictions')
-canonical_pred_dir.mkdir(parents=True, exist_ok=True)
-metric_dir = Path('reports/revision/metrics')
-metric_dir.mkdir(parents=True, exist_ok=True)
-
-metric_prediction_files = []
-skipped_prediction_files = []
-seen_predictions = set()
-
-def inspect_prediction(pred):
-    try:
-        with np.load(pred, allow_pickle=True) as data:
-            keys = set(data.files)
-            if {'y_true', 'y_prob'}.issubset(keys):
-                return True, sorted(keys)
-            return False, sorted(keys)
-    except Exception as exc:
-        return False, [f'load_error={type(exc).__name__}: {exc}']
-
-def register_prediction(pred, source='candidate'):
-    pred_key = str(pred.resolve()) if pred.exists() else str(pred)
-    if pred_key in seen_predictions:
-        return
-    seen_predictions.add(pred_key)
-    ok, keys = inspect_prediction(pred)
-    if not ok:
-        skipped_prediction_files.append((pred, keys))
-        return
-    canonical = canonical_pred_dir / pred.name
-    if pred.resolve() != canonical.resolve():
-        canonical.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(pred, canonical)
-        print(f'Copied {source} prediction to canonical repo path: {canonical}')
-        pred = canonical
-    metric_prediction_files.append(pred)
-
-print('Prediction directories checked:')
-for pred_dir in candidate_pred_dirs:
-    files = sorted(pred_dir.glob('*.npz')) if pred_dir.exists() else []
-    print(f' - {pred_dir} | exists={pred_dir.exists()} | npz={len(files)}')
-    for pred in files:
-        register_prediction(pred)
-
-if not metric_prediction_files and drive_root.exists():
-    print(f'No candidate prediction files found. Searching under {drive_root} for *_predictions.npz ...')
-    for pred in sorted(drive_root.rglob('*_predictions.npz'))[:80]:
-        if '.ipynb_checkpoints' in pred.as_posix():
-            continue
-        register_prediction(pred, source='recovered')
-
-if skipped_prediction_files:
-    print('Skipping NPZ files that are not record-level metric predictions:')
-    for path, keys in skipped_prediction_files:
-        print(' -', path, 'keys=', keys)
-
-if not metric_prediction_files:
-    revision_root = repo_dir / 'reports' / 'revision'
-    nearby = sorted(revision_root.glob('**/*.npz')) if revision_root.exists() else []
-    if nearby:
-        print('Nearby NPZ files under revision root:')
-        for path in nearby[:30]:
-            print(' -', path)
-    raise FileNotFoundError(
-        'No metric-ready prediction NPZ files found. Expected a file such as '
-        f'{repo_dir / "reports" / "revision" / "predictions" / "oof_full_predictions.npz"}. '
-        'Run notebook 02 first, or run notebook 03 from the setup cell so cwd points to the Drive repo.'
-    )
-
-print('Metric-ready prediction files:')
-for pred in metric_prediction_files:
-    print(' -', pred)
-
-for pred in metric_prediction_files:
-    out = metric_dir / f'calibration_ci_{pred.stem}.json'
-    if out.exists() and not OVERWRITE_METRICS:
-        print(f'SKIP existing: {out}')
-        continue
-    cmd = (
-        f'python scripts/revision/04_calibration_ci.py '
-        f'--predictions {pred} --out {out} '
-        f'--threshold {THRESHOLD} --n-bins {N_BINS} --n-boot {N_BOOT}'
-    )
-    run(cmd)
+cmd = (
+    f'python -u scripts/revision/04_calibration_ci.py '
+    f'--predictions "{pred}" --out "{out}" '
+    f'--freeze-manifest "{freeze}" --require-manuscript-ready '
+    f'--threshold {THRESHOLD} --n-bins {N_BINS} --n-boot {N_BOOT}'
+)
+if out.exists() and not OVERWRITE_METRICS:
+    print('SKIP existing:', out)
+else:
+    run(cmd, log_path='reports/revision/logs/oof_calibration_ci.log')
 """
         ),
         markdown("## Summarize Metric Files"),
@@ -1427,51 +1301,12 @@ display(pd.DataFrame(bootstrap_rows))
         code("!python scripts/revision/05_artifact_inventory.py\n"),
         markdown("## Mirror Metrics To Stable Drive Cache"),
         code(
-            """import hashlib
-import json
-import shutil
-from datetime import datetime, timezone
-
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b''):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-source_root = Path('reports/revision')
+            """source_root = Path('reports/revision')
 mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
-mirror_root.mkdir(parents=True, exist_ok=True)
-
-copied = []
-for src in sorted(source_root.rglob('*')):
-    if not src.is_file() or src.name == '.gitkeep':
-        continue
-    dst = mirror_root / src.relative_to(source_root)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-    copied.append({
-        'source': str(src),
-        'mirror': str(dst),
-        'size_bytes': dst.stat().st_size,
-        'sha256': sha256_file(dst),
-    })
-
-print(f'Mirrored {len(copied)} revision artifact(s) to: {mirror_root}')
-for row in copied:
-    print(f\" - {row['source']} -> {row['mirror']} | {row['size_bytes']} bytes\")
-
-mirror_manifest = {
-    'created_utc': datetime.now(timezone.utc).isoformat(),
-    'source_root': str(source_root),
-    'mirror_root': str(mirror_root),
-    'artifact_count': len(copied),
-    'artifacts': copied,
-}
-mirror_manifest_path = mirror_root / 'manifests' / 'mirror_manifest.json'
-mirror_manifest_path.parent.mkdir(parents=True, exist_ok=True)
-mirror_manifest_path.write_text(json.dumps(mirror_manifest, indent=2), encoding='utf-8')
-print('Wrote mirror manifest:', mirror_manifest_path)
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish --mirror-root "{mirror_root}"',
+    log_path='reports/revision/logs/calibration_mirror_publish.log',
+)
 """
         ),
     ]
@@ -1588,20 +1423,42 @@ for path in [
     print(path, 'exists=', Path(path).exists())
 """
         ),
-        markdown("## Placeholder Commands"),
+        markdown(
+            "## Run Pooling Sensitivity\n\n"
+            "This uses only the frozen OOF slice probabilities. No model inference is performed."
+        ),
         code(
-            """RUN_HEAVY = False
+            """RUN_POOLING_SENSITIVITY = True
 
-planned = {
-    'Pooling sensitivity': 'python scripts/revision/TBD_pooling_sensitivity.py',
-    'Representation probing': 'python scripts/revision/TBD_representation_probe.py',
-}
+if RUN_POOLING_SENSITIVITY:
+    run(
+        'python -u scripts/revision/07_pooling_sensitivity.py',
+        log_path='reports/revision/logs/oof_pooling_sensitivity.log',
+    )
+else:
+    print('Pooling sensitivity disabled.')
 
-for name, command in planned.items():
-    if RUN_HEAVY:
-        run(command, check=False)
-    else:
-        print(f'{name}: planned command -> {command}')
+print('Representation probing remains a separate task and is not inferred from pooling results.')
+"""
+        ),
+        markdown("## Inspect Pooling Results"),
+        code(
+            """pooling_csv = Path('reports/revision/metrics/pooling_sensitivity.csv')
+pooling_json = Path('reports/revision/metrics/pooling_sensitivity.json')
+print(pooling_csv, 'exists=', pooling_csv.exists())
+print(pooling_json, 'exists=', pooling_json.exists())
+if pooling_csv.exists():
+    display(pd.read_csv(pooling_csv))
+"""
+        ),
+        markdown("## Inventory And Mirror Pooling Artifacts"),
+        code(
+            """run('python -u scripts/revision/05_artifact_inventory.py')
+mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish --mirror-root "{mirror_root}"',
+    log_path='reports/revision/logs/pooling_mirror_publish.log',
+)
 """
         ),
     ]

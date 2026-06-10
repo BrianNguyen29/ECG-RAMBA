@@ -1,0 +1,195 @@
+import importlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+
+from configs.config import CLASSES
+from scripts.revision import artifact_mirror
+from scripts.revision.common import aggregate_record_probabilities, sha256_file
+
+
+freeze_oof = importlib.import_module("scripts.revision.06_freeze_oof")
+pooling = importlib.import_module("scripts.revision.07_pooling_sensitivity")
+a0_gate = importlib.import_module("scripts.revision.00_a0_resolution_gate")
+
+
+class RevisionArtifactContractTests(unittest.TestCase):
+    def test_legacy_mirror_manifest_is_normalized(self):
+        payload = {
+            "mirror_root": "/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision",
+            "artifacts": [
+                {
+                    "mirror": (
+                        "/content/drive/MyDrive/ECG-Ramba/revision_artifacts/"
+                        "reports/revision/predictions/oof_full_predictions.npz"
+                    ),
+                    "size_bytes": 123,
+                    "sha256": "abc",
+                }
+            ],
+        }
+        rows = artifact_mirror.normalize_manifest_rows(payload, Path("/different/local/root"))
+        self.assertEqual(rows[0]["relative_path"], "predictions/oof_full_predictions.npz")
+
+    def test_mirror_restore_verifies_checksum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            source = revision / "predictions" / "oof_full_predictions.npz"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"verified-oof")
+            with patch.object(artifact_mirror, "REVISION_DIR", revision), patch.object(
+                artifact_mirror,
+                "ensure_revision_dirs",
+                return_value=None,
+            ):
+                artifact_mirror.publish(mirror)
+                source.unlink()
+                artifact_mirror.restore(mirror, replace_mismatched=True)
+                self.assertEqual(source.read_bytes(), b"verified-oof")
+                (mirror / "predictions" / source.name).write_bytes(b"corrupt")
+                with self.assertRaises(RuntimeError):
+                    artifact_mirror.restore(mirror, replace_mismatched=True)
+
+    def test_a0_update_preserves_other_task_board_rows(self):
+        original = (
+            "id,status,notes\n"
+            'A0,completed,"old note"\n'
+            'A1,pending,"preserve, quoted note"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "task_board.csv"
+            path.write_text(original, encoding="utf-8")
+
+            a0_gate.update_a0_task_board(
+                path,
+                "audit_complete_with_deferred_blockers",
+                "new note",
+            )
+
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                (
+                    "id,status,notes\n"
+                    'A0,audit_complete_with_deferred_blockers,"new note"\n'
+                    'A1,pending,"preserve, quoted note"\n'
+                ),
+            )
+
+    def test_max_pooling_groups_by_record(self):
+        probs = np.asarray([[0.1, 0.8], [0.9, 0.2], [0.4, 0.5]], dtype=np.float32)
+        record_ids = np.asarray([0, 0, 1], dtype=np.int64)
+        result, valid, counts = pooling.aggregate_max(probs, record_ids, 2)
+        np.testing.assert_allclose(result, [[0.9, 0.8], [0.4, 0.5]])
+        np.testing.assert_array_equal(valid, [True, True])
+        np.testing.assert_array_equal(counts, [2, 1])
+
+    def test_freeze_validates_reaggregation_and_checkpoint_evidence(self):
+        with tempfile.TemporaryDirectory(dir=freeze_oof.PROJECT_ROOT) as tmp:
+            root = Path(tmp)
+            pred_dir = root / "predictions"
+            metric_dir = root / "metrics"
+            table_dir = root / "tables"
+            manifest_dir = root / "manifests"
+            log_dir = root / "logs"
+            for path in [pred_dir, metric_dir, table_dir, manifest_dir, log_dir]:
+                path.mkdir()
+
+            n_records = 4
+            n_classes = len(CLASSES)
+            rng = np.random.default_rng(42)
+            slice_prob = rng.uniform(0.05, 0.95, size=(8, n_classes)).astype(np.float32)
+            slice_record_id = np.repeat(np.arange(n_records), 2)
+            slice_fold_id = np.repeat([1, 2, 1, 2], 2).astype(np.int16)
+            y_prob, valid, counts = aggregate_record_probabilities(
+                slice_prob,
+                slice_record_id,
+                n_records,
+                q=3.0,
+            )
+            y_true = (rng.uniform(size=(n_records, n_classes)) > 0.8).astype(np.float32)
+            checkpoint_rows = [
+                {"fold": 1, "path": "fold1_best.pt", "sha256": "sha1", "size_bytes": 1},
+                {"fold": 2, "path": "fold2_best.pt", "sha256": "sha2", "size_bytes": 1},
+            ]
+
+            record_file = pred_dir / "oof_full_predictions.npz"
+            slice_file = pred_dir / "oof_full_slice_predictions.npz"
+            np.savez_compressed(
+                record_file,
+                y_true=y_true,
+                y_prob=y_prob,
+                record_id=np.arange(n_records),
+                class_names=np.asarray(CLASSES),
+                fold_id=np.asarray([1, 2, 1, 2], dtype=np.int16),
+                valid_record_mask=valid,
+                slice_count=counts,
+                aggregation_q=np.asarray(3.0, dtype=np.float32),
+                aggregation_implementation=np.asarray("power_mean_v2"),
+                cache_schema_version=np.asarray(2, dtype=np.int16),
+                checkpoint_kind=np.asarray("best"),
+                source_config_hash=np.asarray("source"),
+                evaluation_config_hash=np.asarray(freeze_oof.CONFIG_HASH),
+            )
+            np.savez_compressed(
+                slice_file,
+                slice_prob=slice_prob,
+                record_id=slice_record_id,
+                fold_id=slice_fold_id,
+                class_names=np.asarray(CLASSES),
+            )
+            summary_file = metric_dir / "oof_full_prediction_summary.json"
+            class_table = table_dir / "oof_full_class_summary.csv"
+            run_manifest = manifest_dir / "oof_full_prediction_run_manifest.json"
+            summary_file.write_text(
+                json.dumps(
+                    {
+                        "dataset": "chapman_oof",
+                        "n_records": n_records,
+                        "n_valid_predictions": n_records,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            class_table.write_text(
+                "class_name\n" + "\n".join(CLASSES) + "\n",
+                encoding="utf-8",
+            )
+            run_manifest.write_text(
+                json.dumps({"inputs": {"checkpoints": checkpoint_rows}}),
+                encoding="utf-8",
+            )
+            (log_dir / "oof_reaggregate.log").write_text("reaggregated", encoding="utf-8")
+
+            args = SimpleNamespace(
+                record_file=record_file,
+                slice_file=slice_file,
+                summary_file=summary_file,
+                class_table=class_table,
+                run_manifest=run_manifest,
+                freeze_manifest=manifest_dir / "oof_freeze_manifest.json",
+                expected_records=n_records,
+                expected_folds=2,
+                q=3.0,
+                check_only=True,
+                allow_missing_log=False,
+            )
+            with patch.object(freeze_oof, "LOG_DIR", log_dir), patch.object(
+                freeze_oof,
+                "current_checkpoint_rows",
+                return_value=checkpoint_rows,
+            ):
+                payload = freeze_oof.validate_oof(args)
+            self.assertEqual(payload["status"], "frozen")
+            self.assertTrue(payload["checkpoint_fingerprints_match"])
+            self.assertEqual(payload["validated_records"], n_records)
+
+
+if __name__ == "__main__":
+    unittest.main()

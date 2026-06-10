@@ -33,6 +33,7 @@ from scripts.revision.common import (  # noqa: E402
     macro_roc_auc,
     multilabel_metrics,
     save_json,
+    sha256_file,
 )
 
 
@@ -142,6 +143,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-bins", type=int, default=15)
     parser.add_argument("--n-boot", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        help="Require the prediction checksum to match this freeze manifest.",
+    )
+    parser.add_argument(
+        "--require-manuscript-ready",
+        action="store_true",
+        help="Reject prediction files explicitly marked manuscript_ready=false.",
+    )
     return parser.parse_args()
 
 
@@ -155,6 +166,21 @@ def main() -> None:
     missing_keys = {"y_true", "y_prob"} - set(data.files)
     if missing_keys:
         raise KeyError(f"{pred_path} is not a metric prediction file; missing keys: {sorted(missing_keys)}")
+    if args.require_manuscript_ready and "manuscript_ready" in data.files:
+        if not bool(data["manuscript_ready"].item()):
+            raise ValueError(f"Prediction artifact is not manuscript-ready: {pred_path}")
+    freeze_manifest_sha256 = None
+    if args.freeze_manifest:
+        freeze = json.loads(args.freeze_manifest.read_text(encoding="utf-8"))
+        if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
+            raise ValueError(f"Invalid OOF freeze manifest: {args.freeze_manifest}")
+        relative = pred_path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+        frozen = {row["path"]: row for row in freeze.get("artifacts", [])}
+        if relative not in frozen:
+            raise ValueError(f"Freeze manifest does not contain prediction file: {relative}")
+        if sha256_file(pred_path) != frozen[relative]["sha256"]:
+            raise RuntimeError(f"Prediction checksum changed after freeze: {relative}")
+        freeze_manifest_sha256 = sha256_file(args.freeze_manifest)
 
     y_true = data["y_true"].astype(np.float32)
     y_prob = data["y_prob"].astype(np.float32)
@@ -189,6 +215,9 @@ def main() -> None:
 
     payload = {
         "predictions": str(pred_path),
+        "predictions_sha256": sha256_file(pred_path),
+        "freeze_manifest": str(args.freeze_manifest) if args.freeze_manifest else None,
+        "freeze_manifest_sha256": freeze_manifest_sha256,
         "dataset": dataset,
         "protocol": protocol,
         "class_names": class_names,

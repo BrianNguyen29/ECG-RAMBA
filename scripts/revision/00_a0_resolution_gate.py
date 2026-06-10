@@ -32,11 +32,20 @@ def read_rows(path: Path) -> list[dict]:
         return list(csv.DictReader(f))
 
 
-def write_rows(path: Path, rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+def update_a0_task_board(path: Path, status: str, notes: str) -> None:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    updated = []
+    found = False
+    escaped_notes = notes.replace('"', '""')
+    for line in lines:
+        if line.startswith("A0,"):
+            prefix, _, _ = line.rsplit(",", 2)
+            line = f'{prefix},{status},"{escaped_notes}"'
+            found = True
+        updated.append(line)
+    if not found:
+        raise ValueError("A0 row not found in task_board.csv")
+    path.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
 
 def evidence_status(value: str) -> tuple[list[str], list[str]]:
@@ -64,17 +73,29 @@ def main() -> None:
         if not valid:
             invalid.append(item)
 
-    complete = bool(rows) and not invalid
+    audit_complete = bool(rows) and not invalid
+    deferred = [item for item in checked if item["resolution_status"] == "deferred"]
+    protocol_ready = audit_complete and not deferred
+    if protocol_ready:
+        gate_status = "protocol_ready"
+    elif audit_complete:
+        gate_status = "audit_complete_with_deferred_blockers"
+    else:
+        gate_status = "in_progress"
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "checklist_path": str(CHECKLIST_PATH),
         "allowed_resolution_statuses": sorted(ALLOWED_STATUSES),
         "blocker_count": len(rows),
         "valid_blocker_count": len(rows) - len(invalid),
-        "a0_audit_complete": complete,
+        "status": gate_status,
+        "audit_complete": audit_complete,
+        "protocol_ready": protocol_ready,
+        "deferred_blocker_count": len(deferred),
+        "deferred_blocker_ids": [item["blocker_id"] for item in deferred],
         "meaning": (
-            "A0 completion means every mismatch has a recorded resolution, deferral, "
-            "or manuscript correction. Deferred experiment claims remain blocked."
+            "audit_complete means every mismatch has a recorded decision and evidence path. "
+            "protocol_ready is true only when no blocker remains deferred."
         ),
         "blockers": checked,
     }
@@ -83,19 +104,22 @@ def main() -> None:
 
     if args.update_task_board:
         tasks = read_rows(TASK_BOARD_PATH)
-        found = False
+        notes = ""
         for task in tasks:
             if task["id"] == "A0":
-                task["status"] = "completed" if complete else "in_progress"
-                task["notes"] = (
-                    "A0 decision gate passed; deferred claims remain blocked by their owner tasks."
-                    if complete
-                    else f"A0 decision gate failed for {len(invalid)} blocker(s)."
-                )
-                found = True
-        if not found:
+                if protocol_ready:
+                    notes = "A0 audit and protocol gates passed."
+                elif audit_complete:
+                    notes = (
+                        "A0 decisions are complete, but deferred blockers still "
+                        "prevent protocol-ready status."
+                    )
+                else:
+                    notes = f"A0 decision gate failed for {len(invalid)} blocker(s)."
+                break
+        if not notes:
             raise ValueError("A0 row not found in task_board.csv")
-        write_rows(TASK_BOARD_PATH, tasks)
+        update_a0_task_board(TASK_BOARD_PATH, gate_status, notes)
 
     print(json.dumps(payload, indent=2, ensure_ascii=False))
     print(f"Wrote: {output}")
