@@ -413,7 +413,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-fold-cache", action="store_true", default=True)
     parser.add_argument("--no-resume-fold-cache", dest="resume_fold_cache", action="store_false")
     parser.add_argument("--force-rerun-folds", action="store_true", default=False)
+    parser.add_argument("--min-system-ram-gb", type=float, default=24.0)
+    parser.add_argument("--allow-low-ram", action="store_true", default=False)
     return parser.parse_args()
+
+
+def system_ram_gb() -> float:
+    if hasattr(os, "sysconf"):
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        physical_pages = os.sysconf("SC_PHYS_PAGES")
+        return float(page_size * physical_pages / (1024 ** 3))
+    return 0.0
+
+
+def validate_runtime_memory(args: argparse.Namespace) -> None:
+    ram_gb = system_ram_gb()
+    print(f"System RAM detected: {ram_gb:.1f} GiB", flush=True)
+    if ram_gb and ram_gb < args.min_system_ram_gb and not args.allow_low_ram:
+        raise RuntimeError(
+            f"Insufficient system RAM for full OOF export: {ram_gb:.1f} GiB detected, "
+            f"{args.min_system_ram_gb:.1f} GiB required. Standard Colab T4 runtimes can be "
+            "killed with exit code 137 because raw ECG, MiniRocket, PCA, and fold slices coexist "
+            "in host RAM. Use a High-RAM/A100 runtime. Batch size mainly controls GPU memory. "
+            "Pass --allow-low-ram only for controlled debugging, not manuscript prediction export."
+        )
 
 
 def slice_record(x: np.ndarray) -> list[np.ndarray]:
@@ -1010,6 +1033,7 @@ def generate_oof(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    validate_runtime_memory(args)
     if args.dataset == "oof":
         generate_oof(args)
     else:

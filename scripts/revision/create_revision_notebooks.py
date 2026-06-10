@@ -906,9 +906,41 @@ for path in sorted(pred_dir.glob('*.npz')):
 FORCE_RERUN_OOF = False
 RESUME_FOLD_CACHE = True
 FORCE_RERUN_FOLDS = False
+REQUIRE_HIGH_RAM = True
+MIN_SYSTEM_RAM_GB = 24
 BATCH_SIZE = 64
-NUM_WORKERS = 2
+NUM_WORKERS = 0
 DEBUG_LIMIT_RECORDS = 0
+
+import os
+import shutil
+
+page_size = os.sysconf('SC_PAGE_SIZE')
+physical_pages = os.sysconf('SC_PHYS_PAGES')
+system_ram_gb = page_size * physical_pages / (1024 ** 3)
+disk = shutil.disk_usage('/content')
+print(f'System RAM : {system_ram_gb:.1f} GiB')
+print(f'Local disk : {disk.free / (1024 ** 3):.1f} GiB free')
+
+try:
+    import torch
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
+    gpu_ram_gb = (
+        torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        if torch.cuda.is_available() else 0.0
+    )
+except Exception:
+    gpu_name, gpu_ram_gb = 'unknown', 0.0
+print(f'GPU        : {gpu_name} ({gpu_ram_gb:.1f} GiB)')
+
+if REQUIRE_HIGH_RAM and system_ram_gb < MIN_SYSTEM_RAM_GB:
+    raise RuntimeError(
+        f'Insufficient system RAM: {system_ram_gb:.1f} GiB available, '
+        f'but the full OOF pipeline requires at least {MIN_SYSTEM_RAM_GB} GiB. '
+        'Exit code 137 on a standard T4 runtime is a host-RAM kill, not a CUDA batch-size issue. '
+        'Select a High-RAM runtime/A100, then rerun from the setup cell. '
+        'Do not reduce numerical precision for manuscript predictions.'
+    )
 
 oof_expected = [
     Path('reports/revision/predictions/oof_full_predictions.npz'),
