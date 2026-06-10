@@ -16,7 +16,6 @@ inference task and are not executed here.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import math
 import os
@@ -60,6 +59,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-boot", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit-records", type=int, default=0)
+    parser.add_argument(
+        "--oof-predictions",
+        type=Path,
+        default=PREDICTION_DIR / "oof_full_predictions.npz",
+        help="Frozen OOF NPZ used for y_true, class order, and fold_id.",
+    )
+    parser.add_argument(
+        "--chapman-hrv-cache",
+        type=Path,
+        default=None,
+        help="Optional explicit HRV36 NPZ path. Defaults to cache_dir/hrv36_N{N}_C12_L5000.npz.",
+    )
+    parser.add_argument(
+        "--allow-raw-chapman-fallback",
+        action="store_true",
+        help="Allow loading raw Chapman signals to generate HRV36 if cache is missing. Off by default to avoid Colab OOM.",
+    )
     parser.add_argument("--domain-max-per-domain", type=int, default=2000)
     parser.add_argument("--domain-n-splits", type=int, default=5)
     parser.add_argument(
@@ -264,21 +280,139 @@ def _save_csv(path: Path, rows: Iterable[dict]) -> None:
         writer.writerows(rows)
 
 
-def load_chapman_hrv_and_folds(limit_records: int) -> tuple[np.ndarray, np.ndarray, list[dict[str, np.ndarray]], dict]:
+def folds_from_fold_id(fold_id: np.ndarray) -> list[dict[str, np.ndarray]]:
+    fold_id = np.asarray(fold_id, dtype=np.int16)
+    folds = []
+    for fold in sorted(int(x) for x in np.unique(fold_id) if int(x) > 0):
+        va_idx = np.where(fold_id == fold)[0].astype(np.int64)
+        tr_idx = np.where((fold_id > 0) & (fold_id != fold))[0].astype(np.int64)
+        if len(va_idx) and len(tr_idx):
+            folds.append({"tr_idx": tr_idx, "va_idx": va_idx})
+    if not folds:
+        raise ValueError("Could not derive folds from OOF fold_id.")
+    return folds
+
+
+def default_chapman_hrv_cache_path(n_records: int) -> Path:
+    return Path(PATHS["cache_dir"]) / f"hrv36_N{n_records}_C12_L5000.npz"
+
+
+def load_oof_labels_and_folds(oof_predictions: Path, limit_records: int) -> tuple[np.ndarray, list[dict[str, np.ndarray]], dict]:
+    if not oof_predictions.exists():
+        raise FileNotFoundError(
+            f"Missing frozen OOF predictions: {oof_predictions}. "
+            "Run/restore notebook 02 artifacts before notebook 05."
+        )
+    with np.load(oof_predictions, allow_pickle=False) as data:
+        required = {"y_true", "fold_id", "class_names", "record_id"}
+        missing = required - set(data.files)
+        if missing:
+            raise KeyError(f"{oof_predictions} is missing required keys: {sorted(missing)}")
+        y = np.asarray(data["y_true"], dtype=np.float32)
+        fold_id = np.asarray(data["fold_id"], dtype=np.int16)
+        record_id = np.asarray(data["record_id"], dtype=np.int64)
+        class_names = np.asarray(data["class_names"]).astype(str).tolist()
+
+    if y.ndim != 2 or y.shape[1] != len(CLASSES):
+        raise ValueError(f"Unexpected y_true shape in {oof_predictions}: {y.shape}")
+    if len(fold_id) != len(y) or len(record_id) != len(y):
+        raise ValueError("OOF y_true/fold_id/record_id length mismatch.")
+    if not np.array_equal(record_id, np.arange(len(y), dtype=np.int64)):
+        raise ValueError("OOF record_id must be exactly 0..N-1.")
+    if class_names != CLASSES:
+        raise ValueError("OOF class_names differ from configs.config.CLASSES.")
+
+    if limit_records > 0:
+        y = y[:limit_records]
+        fold_id = fold_id[:limit_records]
+
+    folds = folds_from_fold_id(fold_id)
+    info = {
+        "oof_predictions": str(oof_predictions),
+        "oof_predictions_sha256": sha256_file(oof_predictions),
+        "oof_records_total": int(len(record_id)),
+        "oof_records_used": int(len(y)),
+        "fold_count": int(len(folds)),
+        "fold_counts": {str(fold): int(np.sum(fold_id == fold)) for fold in sorted(np.unique(fold_id)) if int(fold) > 0},
+    }
+    return y, folds, info
+
+
+def load_cached_chapman_hrv(
+    *,
+    n_records: int,
+    explicit_cache: Path | None,
+    limit_records: int,
+    allow_raw_fallback: bool,
+) -> tuple[np.ndarray, dict]:
+    candidates = []
+    if explicit_cache is not None:
+        candidates.append(explicit_cache)
+    candidates.append(default_chapman_hrv_cache_path(n_records))
+    candidates.append(PROJECT_ROOT / f"hrv36_N{n_records}_C12_L5000.npz")
+
+    checked = []
+    for path in candidates:
+        path = Path(path)
+        checked.append(str(path))
+        if not path.exists():
+            continue
+        X_hrv = load_hrv_npz(path, expected_dim=int(CONFIG["hrv_dim"]))
+        if len(X_hrv) < n_records:
+            raise ValueError(f"HRV cache has fewer records than OOF labels: {X_hrv.shape} vs {n_records}")
+        if len(X_hrv) != n_records:
+            raise ValueError(f"HRV cache record count must match OOF labels: {X_hrv.shape} vs {n_records}")
+        if limit_records > 0:
+            X_hrv = X_hrv[:limit_records]
+        return X_hrv, {
+            "chapman_hrv_cache": str(path),
+            "chapman_hrv_cache_sha256": sha256_file(path),
+            "hrv_shape": list(X_hrv.shape),
+            "raw_chapman_loaded": False,
+            "checked_cache_paths": checked,
+        }
+
+    if not allow_raw_fallback:
+        raise FileNotFoundError(
+            "Missing Chapman HRV36 cache and raw fallback is disabled to avoid Colab OOM. "
+            "Expected one of: " + "; ".join(checked)
+        )
+
+    # Explicit opt-in fallback for local debugging only. Notebook 05 does not use this path.
+    import importlib
+
     pred_mod = importlib.import_module("scripts.revision.01_generate_predictions")
     from src.features import generate_hrv_cache
 
-    X, y, X_raw_amp, subjects = pred_mod.prepare_clean_chapman(limit_records=limit_records)
+    X, _y, X_raw_amp, _subjects = pred_mod.prepare_clean_chapman(limit_records=limit_records)
     X_hrv = generate_hrv_cache(X, X_raw_amp)
-    folds = pred_mod.load_folds(y, subjects)
-    if limit_records > 0:
-        folds = filter_folds_to_limit(folds, len(y))
+    return sanitize_features(X_hrv), {
+        "chapman_hrv_cache": None,
+        "chapman_hrv_cache_sha256": None,
+        "hrv_shape": list(X_hrv.shape),
+        "raw_chapman_loaded": True,
+        "checked_cache_paths": checked,
+    }
+
+
+def load_chapman_hrv_and_folds(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[dict[str, np.ndarray]], dict]:
+    y, folds, oof_info = load_oof_labels_and_folds(args.oof_predictions, args.limit_records)
+    X_hrv, hrv_info = load_cached_chapman_hrv(
+        n_records=oof_info["oof_records_total"],
+        explicit_cache=args.chapman_hrv_cache,
+        limit_records=args.limit_records,
+        allow_raw_fallback=args.allow_raw_chapman_fallback,
+    )
+    if len(X_hrv) != len(y):
+        raise ValueError(f"HRV/y length mismatch after loading: {len(X_hrv)} vs {len(y)}")
     load_info = {
         "chapman_records": int(len(y)),
         "chapman_classes": int(y.shape[1]),
         "hrv_shape": list(X_hrv.shape),
         "fold_count": int(len(folds)),
-        "limit_records": int(limit_records),
+        "limit_records": int(args.limit_records),
+        **oof_info,
+        **hrv_info,
     }
     return sanitize_features(X_hrv), y.astype(np.float32), folds, load_info
 
@@ -328,6 +462,24 @@ def load_hrv_npz(path: Path, *, expected_dim: int = 36) -> np.ndarray:
     if X.ndim != 2 or X.shape[1] != expected_dim:
         raise ValueError(f"{path} expected shape (N, {expected_dim}), got {X.shape}")
     return X
+
+
+def resolve_hrv_feature_file(path: Path, filename: str) -> Path:
+    candidates = [
+        Path(path),
+        Path(PATHS["model_dir"]) / filename,
+        PROJECT_ROOT / "model" / filename,
+        PROJECT_ROOT / "models" / filename,
+        Path(PATHS["cache_dir"]) / "model" / filename,
+        Path(PATHS["cache_dir"]) / "models" / filename,
+    ]
+    checked = []
+    for candidate in candidates:
+        candidate = Path(candidate)
+        checked.append(str(candidate))
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(f"Missing {filename}. Checked: " + "; ".join(checked))
 
 
 def balanced_domain_arrays(
@@ -660,7 +812,7 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
-    X_hrv, y, folds, load_info = load_chapman_hrv_and_folds(args.limit_records)
+    X_hrv, y, folds, load_info = load_chapman_hrv_and_folds(args)
     baseline = compute_hrv_baseline(
         X_hrv,
         y,
@@ -676,8 +828,8 @@ def main() -> None:
     if not args.skip_domain_classifier:
         features_by_domain = {
             "chapman": X_hrv,
-            "ptbxl": load_hrv_npz(args.ptbxl_hrv),
-            "cpsc2021": load_hrv_npz(args.cpsc2021_hrv),
+            "ptbxl": load_hrv_npz(resolve_hrv_feature_file(args.ptbxl_hrv, "ptbxl_hrv36.npz")),
+            "cpsc2021": load_hrv_npz(resolve_hrv_feature_file(args.cpsc2021_hrv, "cpsc2021_hrv36.npz")),
         }
         domain_result = run_domain_classifier_cv(
             features_by_domain,

@@ -1,5 +1,6 @@
 import importlib
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -67,6 +68,39 @@ class HRVDomainAnalysisTests(unittest.TestCase):
             {row["sampled_records"] for row in result["sample_rows"]},
             {18},
         )
+
+    def test_lightweight_oof_and_cached_hrv_loader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oof_path = root / "oof_full_predictions.npz"
+            hrv_path = root / "hrv36_N12_C12_L5000.npz"
+            y = np.zeros((12, 27), dtype=np.float32)
+            y[::2, 0] = 1.0
+            y[1::3, 1] = 1.0
+            fold_id = np.asarray([1, 2, 3] * 4, dtype=np.int16)
+            np.savez_compressed(
+                oof_path,
+                y_true=y,
+                fold_id=fold_id,
+                record_id=np.arange(12, dtype=np.int64),
+                class_names=np.asarray(hrv_analysis.CLASSES),
+            )
+            X_hrv = np.arange(12 * 36, dtype=np.float32).reshape(12, 36)
+            np.savez_compressed(hrv_path, X=X_hrv)
+
+            y_loaded, folds, oof_info = hrv_analysis.load_oof_labels_and_folds(oof_path, limit_records=0)
+            X_loaded, hrv_info = hrv_analysis.load_cached_chapman_hrv(
+                n_records=12,
+                explicit_cache=hrv_path,
+                limit_records=0,
+                allow_raw_fallback=False,
+            )
+
+            np.testing.assert_array_equal(y_loaded, y)
+            self.assertEqual(len(folds), 3)
+            self.assertEqual(oof_info["oof_records_total"], 12)
+            np.testing.assert_array_equal(X_loaded, X_hrv)
+            self.assertFalse(hrv_info["raw_chapman_loaded"])
 
 
 if __name__ == "__main__":
