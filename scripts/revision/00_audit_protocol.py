@@ -10,6 +10,7 @@ checked before using any result in the manuscript/rebuttal.
 from __future__ import annotations
 
 import glob
+import csv
 import os
 import platform
 import sys
@@ -21,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.revision.common import (  # noqa: E402
     CURRENT_HRV36_SCHEMA,
+    POWER_MEAN_IMPLEMENTATION,
     PTB_SUPERCLASS_MAPPING,
     REVISION_DIR,
     ensure_revision_dirs,
@@ -45,6 +47,7 @@ def main() -> None:
     from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS  # noqa: WPS433
 
     hrv_source = (PROJECT_ROOT / "src" / "features.py").read_text(encoding="utf-8")
+    data_loader_source = (PROJECT_ROOT / "src" / "data_loader.py").read_text(encoding="utf-8")
     zero_filled_slots = [
         idx for name, idx in CURRENT_HRV36_SCHEMA if name.startswith("reserved_zero_")
     ]
@@ -68,10 +71,19 @@ def main() -> None:
         warnings.append("No fold*_best.pt checkpoints found under configured model_dir.")
     if not any(p.exists() for p in global_pca_candidates):
         warnings.append("No global_pca_zeroshot.pkl found for zero-shot evaluation.")
-    if CONFIG.get("aggregation_method") == "mean":
+    amplitude_training_mismatch = (
+        "amp_list.append(amp_feats)" in data_loader_source
+        and "extract_amplitude_features(X_raw_amp[i])" in hrv_source
+    )
+    if amplitude_training_mismatch:
         warnings.append(
-            "CONFIG['aggregation_method'] is 'mean' while manuscript protocol uses Power Mean Q=3. "
-            "Use a shared aggregation helper in revision scripts."
+            "Chapman training passes precomputed 5-D amplitude features into a function that expects "
+            "a 12xT signal, causing amplitude slots 25:29 to become zero. Preserve this behavior for "
+            "current checkpoints and retrain before claiming amplitude contribution."
+        )
+    if CONFIG.get("aggregation_method") != "power_mean" or float(CONFIG.get("power_mean_q", 0)) != 3.0:
+        warnings.append(
+            "CONFIG aggregation does not match the revision protocol Power Mean Q=3."
         )
     if "zip_path" in PATHS and not Path(PATHS["zip_path"]).exists():
         warnings.append(
@@ -83,7 +95,7 @@ def main() -> None:
         )
     if "cpsc_zip" in PATHS and not Path(PATHS["cpsc_zip"]).exists():
         warnings.append(
-            f"CPSC/Georgia ZIP not found at configured cpsc_zip: {PATHS['cpsc_zip']}."
+            f"CPSC2021 ZIP not found at configured cpsc_zip: {PATHS['cpsc_zip']}."
         )
 
     payload = {
@@ -103,6 +115,8 @@ def main() -> None:
             "max_slices_per_record": CONFIG.get("max_slices_per_record"),
             "default_threshold": CONFIG.get("default_threshold"),
             "aggregation_method": CONFIG.get("aggregation_method"),
+            "power_mean_q": CONFIG.get("power_mean_q"),
+            "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
         },
         "paths": {k: path_info(v) for k, v in PATHS.items()},
         "artifacts": {
@@ -117,10 +131,16 @@ def main() -> None:
             "sdnn": "sdnn" in hrv_source.lower(),
             "lf_hf": ("lf" in hrv_source.lower() and "hf" in hrv_source.lower()),
             "reserved_zero_slots": zero_filled_slots,
+            "amplitude_training_mismatch": amplitude_training_mismatch,
         },
         "ptb_superclass_mapping": PTB_SUPERCLASS_MAPPING,
         "warnings": warnings,
     }
+
+    checklist_path = PROJECT_ROOT / "docs" / "revision_plan" / "a0_resolution_checklist.csv"
+    if checklist_path.exists():
+        with checklist_path.open(newline="", encoding="utf-8") as f:
+            payload["a0_resolution_checklist"] = list(csv.DictReader(f))
 
     save_json(REVISION_DIR / "audit_protocol.json", payload)
     save_csv(REVISION_DIR / "hrv36_schema.csv", payload["hrv36_schema"])

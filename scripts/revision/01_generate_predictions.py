@@ -41,10 +41,12 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
+    CACHE_SCHEMA_VERSION,
     LOG_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
+    POWER_MEAN_IMPLEMENTATION,
     TABLE_DIR,
     ensure_revision_dirs,
     multilabel_metrics,
@@ -216,7 +218,7 @@ def hydra_fold_cache_path(fold_num: int, tr_idx: np.ndarray, va_idx: np.ndarray)
     train_hash = index_fingerprint(tr_idx)
     val_hash = index_fingerprint(va_idx)
     name = (
-        f"hydra_oof_{CONFIG_HASH}_fold{fold_num}_"
+        f"hydra_oof_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_fold{fold_num}_"
         f"train{len(tr_idx)}_{train_hash}_val{len(va_idx)}_{val_hash}_"
         f"D{CONFIG['hydra_dim']}.npz"
     )
@@ -239,12 +241,18 @@ def load_or_compute_fold_hydra(
             cached = np.load(cache_path, allow_pickle=False)
             hydra_va = cached["hydra_va"]
             pca_var = float(cached["pca_explained_variance"])
-            if hydra_va.shape == expected_shape:
+            schema_version = int(cached["cache_schema_version"]) if "cache_schema_version" in cached.files else 0
+            if (
+                hydra_va.shape == expected_shape
+                and hydra_va.dtype == np.float32
+                and schema_version == CACHE_SCHEMA_VERSION
+            ):
                 print(f"✅ Loaded fold-aware Hydra/PCA cache for fold {fold_num}: {cache_path}", flush=True)
-                return hydra_va.astype(np.float32), pca_var, cache_path, True
+                return hydra_va, pca_var, cache_path, True
             print(
-                f"⚠️  Hydra cache shape mismatch for fold {fold_num}: "
-                f"{hydra_va.shape} vs {expected_shape}. Recomputing.",
+                f"⚠️  Hydra cache contract mismatch for fold {fold_num}: "
+                f"shape={hydra_va.shape}, dtype={hydra_va.dtype}, schema={schema_version}. "
+                "Recomputing as float32.",
                 flush=True,
             )
         except Exception as exc:
@@ -266,8 +274,9 @@ def load_or_compute_fold_hydra(
     print(f"Saving fold-aware Hydra/PCA cache: {cache_path}", flush=True)
     np.savez_compressed(
         cache_path,
-        hydra_va=hydra_va.astype(np.float16),
+        hydra_va=hydra_va.astype(np.float32),
         pca_explained_variance=np.asarray(pca_var, dtype=np.float32),
+        cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         fold=np.asarray(fold_num, dtype=np.int16),
         config_hash=np.asarray(CONFIG_HASH),
         train_index_hash=np.asarray(index_fingerprint(tr_idx)),
@@ -276,8 +285,19 @@ def load_or_compute_fold_hydra(
     return hydra_va.astype(np.float32), pca_var, cache_path, False
 
 
-def fold_prediction_cache_path(fold_num: int, checkpoint_kind: str) -> Path:
-    return PREDICTION_DIR / "folds" / f"oof_fold{fold_num}_{checkpoint_kind}_{CONFIG_HASH}.npz"
+def fold_prediction_cache_path(
+    fold_num: int,
+    checkpoint_kind: str,
+    checkpoint_sha256: str,
+) -> Path:
+    return (
+        PREDICTION_DIR
+        / "folds"
+        / (
+            f"oof_fold{fold_num}_{checkpoint_kind}_{CONFIG_HASH}_"
+            f"{checkpoint_sha256[:12]}_v{CACHE_SCHEMA_VERSION}.npz"
+        )
+    )
 
 
 def load_fold_prediction_cache(
@@ -294,23 +314,43 @@ def load_fold_prediction_cache(
     slice_record_index_all: list[np.ndarray],
     slice_index_all: list[np.ndarray],
     slice_fold_id_all: list[np.ndarray],
+    checkpoint_sha256: str,
 ) -> dict | None:
     if not path.exists():
         return None
     try:
         data = np.load(path, allow_pickle=False)
         record_id = data["record_id"].astype(np.int64)
-        y_prob = data["y_prob"].astype(np.float32)
+        cached_y_prob = data["y_prob"]
+        y_prob = cached_y_prob.astype(np.float32)
         valid_mask = data["valid_record_mask"].astype(bool)
         slice_count = data["slice_count"].astype(np.int16)
         summary = json.loads(str(data["fold_summary_json"].item()))
+        schema_version = int(data["cache_schema_version"]) if "cache_schema_version" in data.files else 0
+        cached_checkpoint_sha = (
+            str(data["checkpoint_sha256"].item())
+            if "checkpoint_sha256" in data.files
+            else ""
+        )
+        aggregation_implementation = (
+            str(data["aggregation_implementation"].item())
+            if "aggregation_implementation" in data.files
+            else ""
+        )
         if (
             record_id.shape != va_idx.shape
             or not np.array_equal(record_id, va_idx.astype(np.int64))
             or y_prob.shape != (len(va_idx), n_classes)
             or valid_mask.shape != va_idx.shape
+            or cached_y_prob.dtype != np.float32
+            or schema_version != CACHE_SCHEMA_VERSION
+            or cached_checkpoint_sha != checkpoint_sha256
+            or aggregation_implementation != POWER_MEAN_IMPLEMENTATION
         ):
-            print(f"⚠️  Fold cache shape/index mismatch; recomputing fold {fold_num}: {path}", flush=True)
+            print(
+                f"⚠️  Fold cache contract/fingerprint mismatch; recomputing fold {fold_num}: {path}",
+                flush=True,
+            )
             return None
 
         oof_probs[record_id] = y_prob
@@ -318,10 +358,27 @@ def load_fold_prediction_cache(
         record_slice_count[record_id] = slice_count
 
         if save_slice_probs and "slice_prob" in data.files and len(data["slice_prob"]):
-            slice_probs_all.append(data["slice_prob"].astype(np.float16))
-            slice_record_index_all.append(data["slice_record_id"].astype(np.int64))
-            slice_index_all.append(data["slice_index"].astype(np.int16))
-            slice_fold_id_all.append(data["slice_fold_id"].astype(np.int16))
+            cached_slice_prob = data["slice_prob"]
+            cached_slice_record_id = data["slice_record_id"]
+            cached_slice_index = data["slice_index"]
+            cached_slice_fold_id = data["slice_fold_id"]
+            if (
+                cached_slice_prob.dtype != np.float32
+                or cached_slice_prob.ndim != 2
+                or cached_slice_prob.shape[1] != n_classes
+                or len(cached_slice_prob) != len(cached_slice_record_id)
+                or len(cached_slice_prob) != len(cached_slice_index)
+                or len(cached_slice_prob) != len(cached_slice_fold_id)
+                or not np.isfinite(cached_slice_prob).all()
+                or not np.all(cached_slice_fold_id == fold_num)
+                or not set(np.unique(cached_slice_record_id)).issubset(set(va_idx))
+            ):
+                print(f"⚠️  Fold slice cache is not float32; recomputing fold {fold_num}: {path}", flush=True)
+                return None
+            slice_probs_all.append(cached_slice_prob)
+            slice_record_index_all.append(cached_slice_record_id.astype(np.int64))
+            slice_index_all.append(cached_slice_index.astype(np.int16))
+            slice_fold_id_all.append(cached_slice_fold_id.astype(np.int16))
 
         print(f"✅ Loaded cached predictions for fold {fold_num}: {path}", flush=True)
         return summary
@@ -341,6 +398,7 @@ def save_fold_prediction_cache(
     fold_summary: dict,
     slice_probs: np.ndarray | None,
     slice_rids: np.ndarray | None,
+    checkpoint_sha256: str,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     valid_mask = fold_id[va_idx] >= 0
@@ -351,12 +409,15 @@ def save_fold_prediction_cache(
         "slice_count": record_slice_count[va_idx].astype(np.int16),
         "fold": np.asarray(fold_num, dtype=np.int16),
         "config_hash": np.asarray(CONFIG_HASH),
+        "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        "checkpoint_sha256": np.asarray(checkpoint_sha256),
+        "aggregation_implementation": np.asarray(POWER_MEAN_IMPLEMENTATION),
         "fold_summary_json": np.asarray(json.dumps(fold_summary, sort_keys=True)),
     }
     if slice_probs is not None and slice_rids is not None:
         payload.update(
             {
-                "slice_prob": slice_probs.astype(np.float16),
+                "slice_prob": slice_probs.astype(np.float32),
                 "slice_record_id": slice_rids.astype(np.int64),
                 "slice_index": slice_ordinals(slice_rids),
                 "slice_fold_id": np.full(len(slice_rids), fold_num, dtype=np.int16),
@@ -365,7 +426,7 @@ def save_fold_prediction_cache(
     else:
         payload.update(
             {
-                "slice_prob": np.empty((0, len(CLASSES)), dtype=np.float16),
+                "slice_prob": np.empty((0, len(CLASSES)), dtype=np.float32),
                 "slice_record_id": np.empty((0,), dtype=np.int64),
                 "slice_index": np.empty((0,), dtype=np.int16),
                 "slice_fold_id": np.empty((0,), dtype=np.int16),
@@ -742,7 +803,14 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Fold {fold_num}/{len(folds)} | train={len(tr_idx)} | val={len(va_idx)}")
         print("=" * 80)
 
-        fold_cache_path = fold_prediction_cache_path(fold_num, args.checkpoint_kind)
+        ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
+        ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
+        checkpoint_sha256 = ckpt_info["sha256"]
+        fold_cache_path = fold_prediction_cache_path(
+            fold_num,
+            args.checkpoint_kind,
+            checkpoint_sha256,
+        )
         if args.resume_fold_cache and not args.force_rerun_folds:
             cached_summary = load_fold_prediction_cache(
                 path=fold_cache_path,
@@ -757,6 +825,7 @@ def generate_oof(args: argparse.Namespace) -> None:
                 slice_record_index_all=slice_record_index_all,
                 slice_index_all=slice_index_all,
                 slice_fold_id_all=slice_fold_id_all,
+                checkpoint_sha256=checkpoint_sha256,
             )
             if cached_summary is not None:
                 fold_summaries.append(cached_summary)
@@ -774,6 +843,7 @@ def generate_oof(args: argparse.Namespace) -> None:
                     checkpoint_infos.append(cached_summary["checkpoint"])
                 continue
 
+        checkpoint_infos.append(ckpt_info)
         hydra_va, pca_var, pca_cache_path, pca_cache_hit = load_or_compute_fold_hydra(
             fold_num=fold_num,
             X_rocket_raw=X_rocket_raw,
@@ -813,6 +883,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             "pca_explained_variance": pca_var,
             "pca_cache_path": str(pca_cache_path),
             "pca_cache_hit": bool(pca_cache_hit),
+            "checkpoint": ckpt_info,
         }
 
         if len(rids) == 0:
@@ -829,13 +900,9 @@ def generate_oof(args: argparse.Namespace) -> None:
                 fold_summary=fold_summary,
                 slice_probs=None,
                 slice_rids=None,
+                checkpoint_sha256=checkpoint_sha256,
             )
             continue
-
-        ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
-        ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
-        checkpoint_infos.append(ckpt_info)
-        fold_summary["checkpoint"] = ckpt_info
 
         model = load_model_for_fold(fold_num, args.checkpoint_kind, checkpoint_file=ckpt_path)
         infer_dataset = ECGSliceDatasetInfer(xs, xh, xhr, rids)
@@ -854,7 +921,11 @@ def generate_oof(args: argparse.Namespace) -> None:
             preds = preds[np.isfinite(preds).all(axis=1)]
             if len(preds) == 0:
                 continue
-            oof_probs[int(rid)] = power_mean(preds, q=3.0, axis=0)
+            oof_probs[int(rid)] = power_mean(
+                preds,
+                q=float(CONFIG["power_mean_q"]),
+                axis=0,
+            )
             fold_id[int(rid)] = fold_num
 
         fold_summary["n_predicted_records"] = int(np.sum(fold_id[va_idx] >= 0))
@@ -870,7 +941,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         fold_summaries.append(fold_summary)
 
         if args.save_slice_probs:
-            slice_probs_all.append(slice_probs.astype(np.float16))
+            slice_probs_all.append(slice_probs.astype(np.float32))
             slice_record_index_all.append(slice_rids.astype(np.int64))
             slice_index_all.append(slice_ordinals(slice_rids))
             slice_fold_id_all.append(np.full(len(slice_rids), fold_num, dtype=np.int16))
@@ -885,6 +956,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             fold_summary=fold_summary,
             slice_probs=slice_probs if args.save_slice_probs else None,
             slice_rids=slice_rids if args.save_slice_probs else None,
+            checkpoint_sha256=checkpoint_sha256,
         )
 
         del model
@@ -897,9 +969,12 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Warning: {missing} records did not receive predictions")
 
     git_commit = run_meta["git"]["commit"] or ""
-    protocol = "fold_best_power_mean_q3_threshold_0.5"
+    protocol = (
+        f"fold_{args.checkpoint_kind}_{POWER_MEAN_IMPLEMENTATION}_"
+        f"q{float(CONFIG['power_mean_q']):g}_threshold_0.5"
+    )
     threshold = 0.5
-    aggregation_q = 3.0
+    aggregation_q = float(CONFIG["power_mean_q"])
 
     out_path = PREDICTION_DIR / "oof_full_predictions.npz"
     np.savez_compressed(
@@ -920,6 +995,8 @@ def generate_oof(args: argparse.Namespace) -> None:
         batch_size=np.asarray(args.batch_size, dtype=np.int32),
         aggregation_method=np.asarray("power_mean"),
         aggregation_q=np.asarray(aggregation_q, dtype=np.float32),
+        aggregation_implementation=np.asarray(POWER_MEAN_IMPLEMENTATION),
+        cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         threshold=np.asarray(threshold, dtype=np.float32),
     )
     print(f"Wrote: {out_path}")
@@ -935,10 +1012,12 @@ def generate_oof(args: argparse.Namespace) -> None:
             fold_id=np.concatenate(slice_fold_id_all, axis=0),
             class_names=np.asarray(CLASSES),
             dataset=np.asarray("chapman_oof"),
-            protocol=np.asarray("slice_level_fold_best"),
+            protocol=np.asarray(f"slice_level_fold_{args.checkpoint_kind}"),
             config_hash=np.asarray(CONFIG_HASH),
             git_commit=np.asarray(git_commit),
             created_utc=np.asarray(created_utc),
+            probability_dtype=np.asarray("float32"),
+            cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         )
         print(f"Wrote: {slice_out_path}")
 
@@ -984,6 +1063,8 @@ def generate_oof(args: argparse.Namespace) -> None:
         "limit_records": int(args.limit_records),
         "save_slice_probs": bool(args.save_slice_probs),
         "aggregation": {"method": "power_mean", "q": aggregation_q},
+        "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
         "threshold": threshold,
         "slice_count_summary": summarize_slice_counts(record_slice_count),
         "pca_variance": pca_variance,
