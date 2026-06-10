@@ -35,7 +35,8 @@ BASE_CONFIG = {
     'slice_length': 2500,
     'slice_stride': 1250,
     'max_slices_per_record': 6,
-    'aggregation_method': 'mean',
+    'aggregation_method': 'power_mean',
+    'power_mean_q': 3.0,
 
     # ================= TRAINING ======================
     'batch_size': 192,
@@ -186,7 +187,6 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
     cpsc_zip = first_existing_path([
         f'{base_dir}/cpsc2021.zip',
         f'{base_dir}/CPSC2021.zip',
-        f'{base_dir}/Georgia.zip',
     ])
 
     paths = {

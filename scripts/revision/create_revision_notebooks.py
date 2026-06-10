@@ -331,6 +331,7 @@ for path in [
     'docs/revision_plan/task_board.csv',
     'docs/revision_plan/claim_evidence_map.csv',
     'docs/revision_plan/experiment_registry.csv',
+    'docs/revision_plan/a0_resolution_checklist.csv',
 ]:
     print('\\n' + path)
     display(pd.read_csv(path).head(20))
@@ -348,6 +349,22 @@ for warning in audit.get('warnings', []):
 print('\\nDataset paths:')
 for key, info in audit['artifacts'].get('dataset_paths', {}).items():
     print(f\"{key}: exists={info['exists']} path={info['path']}\")
+"""
+        ),
+        markdown("## Validate A0 Resolution Decisions"),
+        code("!python scripts/revision/00_a0_resolution_gate.py\n"),
+        markdown("## Inspect A0 Completion Gate"),
+        code(
+            """a0_status = json.loads(Path('reports/revision/a0_resolution_status.json').read_text(encoding='utf-8'))
+print('A0 audit complete:', a0_status['a0_audit_complete'])
+print('Meaning:', a0_status['meaning'])
+for blocker in a0_status['blockers']:
+    print(
+        blocker['blocker_id'],
+        blocker['resolution_status'],
+        'valid=' + str(blocker['valid']),
+        blocker['restriction'],
+    )
 """
         ),
         markdown("## Inventory Current Artifacts"),
@@ -900,6 +917,22 @@ for path in sorted(pred_dir.glob('*.npz')):
         print('  y_true:', data['y_true'].shape, 'y_prob:', data['y_prob'].shape)
 """
         ),
+        markdown(
+            "## Repair Legacy OOF Aggregation\n\n"
+            "This step reuses saved slice probabilities only when all five folds and "
+            "all valid records are present. Otherwise it leaves artifacts untouched."
+        ),
+        code(
+            """REAGGREGATE_SAVED_SLICES = True
+
+if REAGGREGATE_SAVED_SLICES:
+    run(
+        'python -u scripts/revision/02_reaggregate_oof.py --if-possible',
+        check=False,
+        log_path='reports/revision/logs/oof_reaggregate.log',
+    )
+"""
+        ),
         markdown("## Generate OOF Predictions"),
         code(
             """RUN_OOF_EXPORT = True
@@ -933,15 +966,6 @@ except Exception:
     gpu_name, gpu_ram_gb = 'unknown', 0.0
 print(f'GPU        : {gpu_name} ({gpu_ram_gb:.1f} GiB)')
 
-if REQUIRE_HIGH_RAM and system_ram_gb < MIN_SYSTEM_RAM_GB:
-    raise RuntimeError(
-        f'Insufficient system RAM: {system_ram_gb:.1f} GiB available, '
-        f'but the full OOF pipeline requires at least {MIN_SYSTEM_RAM_GB} GiB. '
-        'Exit code 137 on a standard T4 runtime is a host-RAM kill, not a CUDA batch-size issue. '
-        'Select a High-RAM runtime/A100, then rerun from the setup cell. '
-        'Do not reduce numerical precision for manuscript predictions.'
-    )
-
 oof_expected = [
     Path('reports/revision/predictions/oof_full_predictions.npz'),
     Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
@@ -950,6 +974,24 @@ oof_expected = [
     Path('reports/revision/manifests/oof_full_prediction_run_manifest.json'),
 ]
 oof_ready = all(path.exists() and path.stat().st_size > 0 for path in oof_expected)
+if oof_ready:
+    with np.load(oof_expected[0], allow_pickle=False) as existing:
+        implementation = (
+            str(existing['aggregation_implementation'].item())
+            if 'aggregation_implementation' in existing.files
+            else ''
+        )
+        schema_version = (
+            int(existing['cache_schema_version'])
+            if 'cache_schema_version' in existing.files
+            else 0
+        )
+    oof_ready = implementation == 'power_mean_v2' and schema_version >= 2
+    if not oof_ready:
+        print(
+            'Existing OOF record artifact uses a legacy aggregation/cache contract and '
+            'will not be reused.'
+        )
 if oof_ready:
     print('OOF artifacts already exist:')
     for path in oof_expected:
@@ -967,6 +1009,14 @@ if DEBUG_LIMIT_RECORDS:
     command += f' --limit-records {DEBUG_LIMIT_RECORDS}'
 
 if RUN_OOF_EXPORT and (FORCE_RERUN_OOF or not oof_ready):
+    if REQUIRE_HIGH_RAM and system_ram_gb < MIN_SYSTEM_RAM_GB:
+        raise RuntimeError(
+            f'Insufficient system RAM: {system_ram_gb:.1f} GiB available, '
+            f'but the full OOF pipeline requires at least {MIN_SYSTEM_RAM_GB} GiB. '
+            'Exit code 137 on a standard T4 runtime is a host-RAM kill, not a CUDA batch-size issue. '
+            'Select a High-RAM runtime/A100, then rerun from the setup cell. '
+            'Do not reduce numerical precision for manuscript predictions.'
+        )
     run(command, log_path='reports/revision/logs/oof_generate_predictions.log')
 elif oof_ready and not FORCE_RERUN_OOF:
     print('Skipping OOF export because complete artifacts are already present. Set FORCE_RERUN_OOF=True to rerun.')
@@ -1000,7 +1050,18 @@ if pred_path.exists():
     print('y_true:', data['y_true'].shape)
     print('y_prob:', data['y_prob'].shape)
     print('classes:', list(data['class_names'])[:5], '...', len(data['class_names']))
-    for key in ['dataset', 'protocol', 'config_hash', 'git_commit', 'batch_size', 'aggregation_method', 'aggregation_q']:
+    for key in [
+        'dataset',
+        'protocol',
+        'config_hash',
+        'git_commit',
+        'batch_size',
+        'aggregation_method',
+        'aggregation_q',
+        'aggregation_implementation',
+        'cache_schema_version',
+        'source_slice_dtype',
+    ]:
         if key in data.files:
             value = data[key]
             print(f'{key}:', value.item() if value.ndim == 0 else value)
@@ -1023,10 +1084,33 @@ if manifest_path.exists():
         ),
         markdown("## External Prediction Commands"),
         code(
-            """print('PTB-XL and CPSC/Georgia prediction exporters are the next implementation step.')
-print('Expected future outputs:')
-print('- reports/revision/predictions/ptbxl_full_predictions.npz')
-print('- reports/revision/predictions/cpsc_full_predictions.npz')
+            """RUN_PTBXL_EXPORT = False
+RUN_GEORGIA_EXPORT = False
+RUN_CPSC2021_EXPORT = False
+EXTERNAL_BATCH_SIZE = 64
+EXTERNAL_LIMIT_RECORDS = 0
+
+external_jobs = [
+    ('ptbxl', RUN_PTBXL_EXPORT),
+    ('georgia', RUN_GEORGIA_EXPORT),
+    ('cpsc2021', RUN_CPSC2021_EXPORT),
+]
+for dataset, enabled in external_jobs:
+    command = (
+        'python -u scripts/revision/03_generate_external_predictions.py '
+        f'--dataset {dataset} --checkpoint-kind best --batch-size {EXTERNAL_BATCH_SIZE}'
+    )
+    if EXTERNAL_LIMIT_RECORDS:
+        command += f' --limit-records {EXTERNAL_LIMIT_RECORDS}'
+    if enabled:
+        run(
+            command,
+            log_path=f'reports/revision/logs/{dataset}_generate_predictions.log',
+        )
+    else:
+        print(f'{dataset}: disabled; set RUN_{dataset.upper()}_EXPORT=True to run')
+
+print('Georgia and CPSC2021 are intentionally separate dataset identities.')
 """
         ),
         markdown("## Re-run Inventory"),

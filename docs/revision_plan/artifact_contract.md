@@ -13,7 +13,8 @@ reports/revision/
   predictions/
     oof_full_predictions.npz
     ptbxl_full_predictions.npz
-    cpsc_full_predictions.npz
+    georgia_full_predictions.npz
+    cpsc2021_full_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
     oof_full_prediction_summary.json
@@ -67,9 +68,15 @@ checkpoint_kind: scalar/string
 batch_size: scalar/integer
 aggregation_method: scalar/string
 aggregation_q: scalar/float
+aggregation_implementation: scalar/string
+cache_schema_version: scalar/integer
 slice_prob: shape (total_slices, C), paired with record_id and slice_index
 slice_index: shape (total_slices,)
 ```
+
+Legacy OOF artifacts without `aggregation_implementation=power_mean_v2` and
+`cache_schema_version>=2` are invalid. Georgia and CPSC2021 are distinct
+datasets and must never share a dataset label.
 
 ## Minimum Metric Contract
 

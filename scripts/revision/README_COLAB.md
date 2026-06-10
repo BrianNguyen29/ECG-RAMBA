@@ -115,12 +115,13 @@ reports/revision/
 Revision scripts should write artifacts to:
 
 ```text
-reports/revision/
+  reports/revision/
   audit_protocol.json
   hrv36_schema.csv
-  oof_predictions.npz
-  ptbxl_predictions.npz
-  cpsc_predictions.npz
+  predictions/oof_full_predictions.npz
+  predictions/ptbxl_full_predictions.npz
+  predictions/georgia_full_predictions.npz
+  predictions/cpsc2021_full_predictions.npz
   calibration_ci.json
   ablation_results.csv
   robustness_results.csv
@@ -137,11 +138,16 @@ y_prob: shape (N, C)
 ## Blockers to Resolve Before Manuscript Numbers
 
 - HRV36 currently contains 5 RR summary slots, 20 reserved zero slots,
-  5 amplitude slots, and 6 global signal-stat slots. Do not describe it as
+  5 intended amplitude slots, and 6 global signal-stat slots. The current
+  Chapman checkpoints received zero amplitude slots because of a training
+  feature-input mismatch. Do not describe it as
   full HRV with RMSSD/SDNN/LF-HF unless those features are implemented and
   the model is retrained.
-- CPSC cells in the exploratory notebook use different sources/protocols.
-  Build one canonical manifest and use it everywhere.
+- Georgia and CPSC2021 are distinct datasets. Never label `Georgia.zip`
+  results as CPSC2021.
+- Legacy OOF artifacts without `aggregation_implementation=power_mean_v2`
+  and `cache_schema_version>=2` must be re-aggregated from complete saved
+  slice probabilities or regenerated.
 - Use the PTB superclass mapping in `scripts.revision.common.PTB_SUPERCLASS_MAPPING`.
 - Treat inference ablation as diagnostic. Reviewer-facing component claims need
   retrained or protocol-fair baselines where possible.
