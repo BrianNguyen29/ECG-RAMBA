@@ -3,6 +3,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import json
 
 import numpy as np
 
@@ -101,6 +105,83 @@ class HRVDomainAnalysisTests(unittest.TestCase):
             self.assertEqual(oof_info["oof_records_total"], 12)
             np.testing.assert_array_equal(X_loaded, X_hrv)
             self.assertFalse(hrv_info["raw_chapman_loaded"])
+
+    def test_write_outputs_records_blocked_domain_classifier(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pred_dir = root / "predictions"
+            metric_dir = root / "metrics"
+            table_dir = root / "tables"
+            manifest_dir = root / "manifests"
+            args = SimpleNamespace(
+                threshold=0.5,
+                n_bins=15,
+                n_boot=3,
+                seed=42,
+                limit_records=0,
+                domain_max_per_domain=10,
+                domain_n_splits=2,
+                skip_domain_classifier=False,
+                oof_predictions=root / "oof.npz",
+                chapman_hrv_cache=root / "hrv.npz",
+                ptbxl_hrv=root / "missing_ptbxl.npz",
+                cpsc2021_hrv=root / "missing_cpsc.npz",
+                allow_raw_chapman_fallback=False,
+            )
+            y = np.zeros((4, 27), dtype=np.float32)
+            y[0, 0] = 1.0
+            y[1, 1] = 1.0
+            y_prob = np.full_like(y, 0.25)
+            baseline = {
+                "y_true": y,
+                "y_prob": y_prob,
+                "fold_id": np.asarray([1, 2, 1, 2], dtype=np.int16),
+                "fold_rows": [{"fold": 1}, {"fold": 2}],
+                "metrics": {"roc_auc_macro": 0.5, "pr_auc_macro": 0.2, "f1_macro": 0.1},
+                "calibration": {},
+                "bootstrap_ci": {},
+                "per_class_rows": [
+                    {
+                        "class_index": idx,
+                        "class_name": name,
+                        "n_records": 4,
+                        "n_positive": int(y[:, idx].sum()),
+                        "prevalence": float(y[:, idx].mean()),
+                        "predicted_positive": 0,
+                        "predicted_positive_rate": 0.0,
+                        "roc_auc": float("nan"),
+                        "pr_auc": float("nan"),
+                        "f1": 0.0,
+                        "precision": 0.0,
+                        "recall": 0.0,
+                    }
+                    for idx, name in enumerate(hrv_analysis.CLASSES)
+                ],
+            }
+            with patch.object(hrv_analysis, "PREDICTION_DIR", pred_dir), patch.object(
+                hrv_analysis,
+                "METRIC_DIR",
+                metric_dir,
+            ), patch.object(hrv_analysis, "TABLE_DIR", table_dir), patch.object(
+                hrv_analysis,
+                "MANIFEST_DIR",
+                manifest_dir,
+            ):
+                summary = hrv_analysis.write_outputs(
+                    args,
+                    {"chapman_records": 4},
+                    baseline,
+                    domain_result=None,
+                    domain_blocker="missing external HRV",
+                )
+
+            domain_summary_path = metric_dir / "hrv_domain_classifier_summary.json"
+            self.assertTrue(domain_summary_path.exists())
+            domain_summary = json.loads(domain_summary_path.read_text(encoding="utf-8"))
+            self.assertEqual(domain_summary["status"], "blocked_external_hrv_missing")
+            self.assertIn("missing external HRV", domain_summary["blocker"])
+            self.assertEqual(summary["domain_status"], "blocked_external_hrv_missing")
+            self.assertTrue((metric_dir / "hrv_domain_summary.csv").exists())
 
 
 if __name__ == "__main__":

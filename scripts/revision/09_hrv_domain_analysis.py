@@ -611,8 +611,16 @@ def interpretation_for_domain_auc(domain_auc: float | None) -> str:
     return "low_to_moderate_domain_sensitivity"
 
 
-def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, domain_result: dict | None) -> dict:
+def write_outputs(
+    args: argparse.Namespace,
+    load_info: dict,
+    baseline: dict,
+    domain_result: dict | None,
+    domain_blocker: str | None = None,
+) -> dict:
     ensure_revision_dirs()
+    for directory in [PREDICTION_DIR, METRIC_DIR, TABLE_DIR, MANIFEST_DIR]:
+        Path(directory).mkdir(parents=True, exist_ok=True)
     created_utc = _now_utc()
     y = baseline["y_true"]
     y_prob = baseline["y_prob"]
@@ -668,6 +676,7 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
     domain_confusion_path = None
     domain_prediction_path = None
     domain_auc = None
+    domain_summary_path = METRIC_DIR / "hrv_domain_classifier_summary.json"
     if domain_result is not None:
         domain_prediction_path = PREDICTION_DIR / "hrv_domain_oof_predictions.npz"
         np.savez_compressed(
@@ -701,7 +710,27 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
                 "fold_summary_table": str(domain_fold_path),
             },
         }
-        domain_summary_path = METRIC_DIR / "hrv_domain_classifier_summary.json"
+        save_json(domain_summary_path, _json_safe(domain_summary))
+    else:
+        domain_summary = {
+            "created_utc": created_utc,
+            "git_commit": _git_output(["rev-parse", "HEAD"]),
+            "protocol": DOMAIN_PROTOCOL,
+            "feature_contract": "hrv36",
+            "model": "standardized_multiclass_logistic_regression",
+            "status": "blocked_external_hrv_missing",
+            "blocker": domain_blocker or "External HRV36 domain feature files were unavailable.",
+            "domains": [],
+            "sample_rows": [],
+            "fold_rows": [],
+            "metrics": {},
+            "interpretation": "domain_classifier_blocked_external_hrv_missing",
+            "artifacts": {
+                "predictions_npz": None,
+                "confusion_table": None,
+                "fold_summary_table": None,
+            },
+        }
         save_json(domain_summary_path, _json_safe(domain_summary))
 
     hrv_rows = [
@@ -725,8 +754,8 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
             "metric_value": domain_auc if domain_auc is not None else math.nan,
             "secondary_metric_name": "balanced_accuracy",
             "secondary_metric_value": domain_result["metrics"]["balanced_accuracy"] if domain_result is not None else math.nan,
-            "evidence_path": str(domain_summary_path) if domain_summary_path else "",
-            "blocker": "" if domain_result is not None else "External HRV36 domain feature files were unavailable.",
+            "evidence_path": str(domain_summary_path),
+            "blocker": "" if domain_result is not None else (domain_blocker or "External HRV36 domain feature files were unavailable."),
             "safe_wording": (
                 "If domain AUC is high, present HRV as domain-sensitive and keep robustness/domain-generalization wording limited."
                 if domain_result is not None
@@ -756,6 +785,7 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
         per_class_path,
         fold_path,
         baseline_summary_path,
+        domain_summary_path,
         hrv_summary_csv,
         hrv_summary_table,
     ]
@@ -797,9 +827,12 @@ def write_outputs(args: argparse.Namespace, load_info: dict, baseline: dict, dom
         "hrv_only_pr_auc_macro": baseline["metrics"]["pr_auc_macro"],
         "hrv_only_f1_macro": baseline["metrics"]["f1_macro"],
         "domain_roc_auc_ovr_macro": domain_auc,
+        "domain_status": "complete" if domain_result is not None else "blocked_external_hrv_missing",
+        "domain_blocker": domain_blocker,
         "domain_interpretation": interpretation_for_domain_auc(domain_auc),
         "outputs": {
             "hrv_only_summary_json": str(baseline_summary_path),
+            "hrv_domain_classifier_summary_json": str(domain_summary_path),
             "hrv_domain_summary_csv": str(hrv_summary_csv),
             "hrv_domain_summary_table": str(hrv_summary_table),
             "manifest_json": str(manifest_path),
@@ -825,20 +858,27 @@ def main() -> None:
     baseline["y_true"] = y
 
     domain_result = None
+    domain_blocker = None
     if not args.skip_domain_classifier:
-        features_by_domain = {
-            "chapman": X_hrv,
-            "ptbxl": load_hrv_npz(resolve_hrv_feature_file(args.ptbxl_hrv, "ptbxl_hrv36.npz")),
-            "cpsc2021": load_hrv_npz(resolve_hrv_feature_file(args.cpsc2021_hrv, "cpsc2021_hrv36.npz")),
-        }
-        domain_result = run_domain_classifier_cv(
-            features_by_domain,
-            max_per_domain=args.domain_max_per_domain,
-            n_splits=args.domain_n_splits,
-            seed=args.seed,
-        )
+        try:
+            features_by_domain = {
+                "chapman": X_hrv,
+                "ptbxl": load_hrv_npz(resolve_hrv_feature_file(args.ptbxl_hrv, "ptbxl_hrv36.npz")),
+                "cpsc2021": load_hrv_npz(resolve_hrv_feature_file(args.cpsc2021_hrv, "cpsc2021_hrv36.npz")),
+            }
+            domain_result = run_domain_classifier_cv(
+                features_by_domain,
+                max_per_domain=args.domain_max_per_domain,
+                n_splits=args.domain_n_splits,
+                seed=args.seed,
+            )
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            domain_blocker = str(exc)
+            print(f"WARNING: HRV domain classifier blocked: {domain_blocker}", flush=True)
+    else:
+        domain_blocker = "Domain classifier skipped by --skip-domain-classifier."
 
-    final_summary = write_outputs(args, load_info, baseline, domain_result)
+    final_summary = write_outputs(args, load_info, baseline, domain_result, domain_blocker=domain_blocker)
     print(json.dumps(_json_safe(final_summary), indent=2, sort_keys=True))
 
 
