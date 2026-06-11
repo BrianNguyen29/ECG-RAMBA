@@ -42,6 +42,21 @@ REPO_DIR = DRIVE_ROOT / 'ECG-RAMBA'
 LOCAL_RUNTIME_ROOT = Path('/content/ecg_ramba_runtime')
 
 os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)
+chapman_candidates = [
+    DRIVE_ROOT / 'WFDB-ChapmanShaoxing.zip',
+    DRIVE_ROOT / 'WFDB_ChapmanShaoxing.zip',
+    DRIVE_ROOT / 'chapman.zip',
+    DRIVE_ROOT / 'archive.zip',
+]
+chapman_zip = next((path for path in chapman_candidates if path.is_file()), None)
+if chapman_zip is None:
+    visible_zips = sorted(path.name for path in DRIVE_ROOT.glob('*.zip')) if DRIVE_ROOT.exists() else []
+    raise FileNotFoundError(
+        'Chapman dataset ZIP was not found. Checked: '
+        + ', '.join(str(path) for path in chapman_candidates)
+        + f'. ZIP files currently visible under {DRIVE_ROOT}: {visible_zips}'
+    )
+os.environ['ECG_RAMBA_CHAPMAN_ZIP'] = str(chapman_zip)
 os.environ.setdefault('ECG_RAMBA_LOCAL_ROOT', str(LOCAL_RUNTIME_ROOT))
 os.environ.setdefault('ECG_RAMBA_EXTRACT_DIR', str(LOCAL_RUNTIME_ROOT / 'chapman'))
 os.environ.setdefault('ECG_RAMBA_USE_CLEAN_CACHE', '0')
@@ -129,6 +144,7 @@ _run_setup('git status --short --branch', check=False)
 print('cwd       :', Path.cwd())
 print('drive_root:', DRIVE_ROOT)
 print('repo_dir  :', REPO_DIR)
+print('chapman_zip:', chapman_zip, '| size=', chapman_zip.stat().st_size)
 print('branch    :', BRANCH)
 
 cache_status = {

@@ -1,7 +1,11 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import numpy as np
 
+from configs.config import setup_paths
 from scripts.revision.common import aggregate_record_probabilities, power_mean
 
 
@@ -74,6 +78,44 @@ class PowerMeanTests(unittest.TestCase):
         np.testing.assert_allclose(y_prob[1], slice_prob[2], rtol=1e-6)
         np.testing.assert_array_equal(valid, [True, True])
         np.testing.assert_array_equal(counts, [2, 1])
+
+
+class DatasetPathTests(unittest.TestCase):
+    def test_named_chapman_archive_precedes_legacy_archive(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            named = root / "WFDB-ChapmanShaoxing.zip"
+            legacy = root / "archive.zip"
+            named.touch()
+            legacy.touch()
+            with patch.dict(
+                "os.environ",
+                {
+                    "ECG_RAMBA_DRIVE_ROOT": str(root),
+                    "ECG_RAMBA_CHAPMAN_ZIP": "",
+                },
+                clear=False,
+            ):
+                paths = setup_paths(27, 3072, "test")
+            self.assertEqual(Path(paths["zip_path"]), named)
+
+    def test_explicit_chapman_archive_overrides_named_candidates(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            named = root / "WFDB-ChapmanShaoxing.zip"
+            explicit = root / "custom-chapman.zip"
+            named.touch()
+            explicit.touch()
+            with patch.dict(
+                "os.environ",
+                {
+                    "ECG_RAMBA_DRIVE_ROOT": str(root),
+                    "ECG_RAMBA_CHAPMAN_ZIP": str(explicit),
+                },
+                clear=False,
+            ):
+                paths = setup_paths(27, 3072, "test")
+            self.assertEqual(Path(paths["zip_path"]), explicit)
 
 
 if __name__ == "__main__":

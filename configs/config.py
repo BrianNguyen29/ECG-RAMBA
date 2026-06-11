@@ -173,12 +173,16 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
             model_dir = candidate
             break
 
-    chapman_zip = first_existing_path([
-        f'{base_dir}/archive.zip',
+    explicit_chapman_zip = os.environ.get('ECG_RAMBA_CHAPMAN_ZIP')
+    chapman_candidates = [
         f'{base_dir}/WFDB-ChapmanShaoxing.zip',
         f'{base_dir}/WFDB_ChapmanShaoxing.zip',
         f'{base_dir}/chapman.zip',
-    ])
+        f'{base_dir}/archive.zip',
+    ]
+    if explicit_chapman_zip:
+        chapman_candidates.insert(0, explicit_chapman_zip)
+    chapman_zip = first_existing_path(chapman_candidates)
     ptb_zip = first_existing_path([
         f'{base_dir}/PTB-XL.zip',
         f'{base_dir}/ptb-xl.zip',
