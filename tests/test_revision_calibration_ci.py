@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -81,6 +82,48 @@ class CalibrationCITests(unittest.TestCase):
         self.assertIn("ece_micro", micro)
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["evaluated"] for row in rows))
+
+    def test_main_writes_metrics_from_loaded_dict_payload(self):
+        with tempfile.TemporaryDirectory(dir=calibration_ci.PROJECT_ROOT) as tmp:
+            root = Path(tmp)
+            pred = root / "predictions.npz"
+            out = root / "calibration.json"
+            y_true = np.asarray(
+                [[0, 1], [1, 0], [1, 1], [0, 0], [1, 0], [0, 1]],
+                dtype=np.float32,
+            )
+            y_prob = np.asarray(
+                [[0.1, 0.8], [0.9, 0.2], [0.6, 0.7], [0.3, 0.1], [0.7, 0.4], [0.2, 0.9]],
+                dtype=np.float32,
+            )
+            np.savez_compressed(
+                pred,
+                y_true=y_true,
+                y_prob=y_prob,
+                class_names=np.asarray(["A", "B"]),
+                dataset=np.asarray("unit_test"),
+                protocol=np.asarray("unit_protocol"),
+            )
+            with patch(
+                "sys.argv",
+                [
+                    "04_calibration_ci.py",
+                    "--predictions",
+                    str(pred),
+                    "--out",
+                    str(out),
+                    "--n-boot",
+                    "3",
+                    "--n-bins",
+                    "3",
+                ],
+            ):
+                calibration_ci.main()
+            payload = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(payload["dataset"], "unit_test")
+            self.assertEqual(payload["protocol"], "unit_protocol")
+            self.assertIn("calibration_micro", payload)
+            self.assertIn("ece_macro", payload["bootstrap_ci"])
 
 
 if __name__ == "__main__":

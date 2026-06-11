@@ -39,8 +39,12 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-def scalar_from_npz(data: np.lib.npyio.NpzFile, key: str, default: str | None = None) -> str | None:
-    if key not in data.files:
+def scalar_from_npz(
+    data: np.lib.npyio.NpzFile | dict[str, np.ndarray],
+    key: str,
+    default: str | None = None,
+) -> str | None:
+    if key not in data:
         return default
     value = data[key]
     if np.ndim(value) == 0:
