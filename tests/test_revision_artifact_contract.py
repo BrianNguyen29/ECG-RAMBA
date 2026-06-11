@@ -20,6 +20,10 @@ generate_predictions = importlib.import_module("scripts.revision.01_generate_pre
 
 
 class RevisionArtifactContractTests(unittest.TestCase):
+    def test_oof_artifact_stem_separates_best_and_final_outputs(self):
+        self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
+        self.assertEqual(generate_predictions.oof_artifact_stem("final"), "oof_final")
+
     def test_fold_cache_without_complete_slice_coverage_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fold.npz"

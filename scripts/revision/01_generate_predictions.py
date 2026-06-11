@@ -313,6 +313,12 @@ def fold_prediction_cache_path(
     )
 
 
+def oof_artifact_stem(checkpoint_kind: str) -> str:
+    if checkpoint_kind == "best":
+        return "oof_full"
+    return f"oof_{checkpoint_kind}"
+
+
 def load_fold_prediction_cache(
     *,
     path: Path,
@@ -1024,7 +1030,8 @@ def generate_oof(args: argparse.Namespace) -> None:
         sort_keys=True,
     )
 
-    out_path = PREDICTION_DIR / "oof_full_predictions.npz"
+    artifact_stem = oof_artifact_stem(args.checkpoint_kind)
+    out_path = PREDICTION_DIR / f"{artifact_stem}_predictions.npz"
     np.savez_compressed(
         out_path,
         y_true=y,
@@ -1054,7 +1061,7 @@ def generate_oof(args: argparse.Namespace) -> None:
 
     slice_out_path = None
     if args.save_slice_probs and slice_probs_all:
-        slice_out_path = PREDICTION_DIR / "oof_full_slice_predictions.npz"
+        slice_out_path = PREDICTION_DIR / f"{artifact_stem}_slice_predictions.npz"
         np.savez_compressed(
             slice_out_path,
             slice_prob=np.concatenate(slice_probs_all, axis=0),
@@ -1076,7 +1083,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Wrote: {slice_out_path}")
 
     metrics = multilabel_metrics(y[valid_records], oof_probs[valid_records], threshold=threshold)
-    class_summary_path = TABLE_DIR / "oof_full_class_summary.csv"
+    class_summary_path = TABLE_DIR / f"{artifact_stem}_class_summary.csv"
     class_rows = per_class_summary_rows(
         y[valid_records],
         oof_probs[valid_records],
@@ -1086,8 +1093,8 @@ def generate_oof(args: argparse.Namespace) -> None:
     save_csv(class_summary_path, class_rows)
     print(f"Wrote: {class_summary_path}")
 
-    manifest_path = MANIFEST_DIR / "oof_full_prediction_run_manifest.json"
-    summary_path = METRIC_DIR / "oof_full_prediction_summary.json"
+    manifest_path = MANIFEST_DIR / f"{artifact_stem}_prediction_run_manifest.json"
+    summary_path = METRIC_DIR / f"{artifact_stem}_prediction_summary.json"
 
     output_paths = {
         "prediction_file": out_path,
