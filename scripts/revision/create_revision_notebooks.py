@@ -16,6 +16,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 NOTEBOOK_DIR = PROJECT_ROOT / "notebooks"
+HAND_MAINTAINED_NOTEBOOKS = {
+    "02_predictions_and_external_eval.ipynb",
+    "04_baselines_and_component_checks.ipynb",
+    "05_hrv_domain_and_robustness.ipynb",
+    "06_pooling_and_representation.ipynb",
+}
 
 
 SETUP_CODE = """from pathlib import Path
@@ -310,7 +316,12 @@ run('git status --short --branch')
 """
         ),
         markdown("## Install Lightweight Dependencies"),
-        code("!python --version\n!pip install -q numpy==1.26.4 pandas scipy scikit-learn tqdm wfdb joblib matplotlib seaborn packaging neurokit2 iterative-stratification thop\n"),
+        code(
+            '!python --version\n'
+            '!pip install -q "numpy>=2.0,<2.6" "scipy>=1.14.1,<2.0" '
+            'pandas scikit-learn tqdm wfdb joblib matplotlib seaborn packaging '
+            'neurokit2 iterative-stratification thop\n'
+        ),
         markdown("## Run A0 Audit"),
         code("os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)\nos.chdir(REPO_DIR)\n!python scripts/revision/00_audit_protocol.py\n"),
     ]
@@ -1518,6 +1529,9 @@ def main() -> None:
     }
 
     for filename, (title, cells) in notebooks.items():
+        if filename in HAND_MAINTAINED_NOTEBOOKS and (NOTEBOOK_DIR / filename).exists():
+            print(f"Preserved hand-maintained {filename}")
+            continue
         write_notebook(NOTEBOOK_DIR / filename, title, cells)
 
 

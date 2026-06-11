@@ -12,17 +12,19 @@ reports/revision/
   hrv36_schema.csv
   predictions/
     oof_full_predictions.npz
-    ptbxl_full_predictions.npz
-    georgia_full_predictions.npz
-    cpsc2021_full_predictions.npz
+    oof_full_slice_predictions.npz
+    hrv_only_oof_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
     oof_full_prediction_summary.json
-    calibration_ci_<dataset>.json
+    calibration_ci_oof_full_predictions.json
     baseline_summary.csv
+    hrv_only_baseline_summary.json
+    hrv_domain_classifier_summary.json
     hrv_domain_summary.csv
     robustness_summary.csv
     pooling_sensitivity.csv
+    pooling_sensitivity.json
   figures/
     reliability_<dataset>.png
     robustness_<dataset>.png
@@ -32,6 +34,8 @@ reports/revision/
     table_baselines.csv
     table_calibration.csv
     table_bootstrap_ci.csv
+    table_hrv_domain_status.csv
+    table_hrv_only_class_metrics.csv
     reliability_bins_<dataset>.csv
     table_robustness.csv
   logs/
@@ -44,8 +48,11 @@ reports/revision/
     artifacts_manifest.csv
   experimental/
     external/
+      external_summary_experimental.csv
       <dataset>/
         <dataset>_full_predictions.npz
+        <dataset>_full_slice_predictions.npz
+        <dataset>_full_prediction_summary.json
 ```
 
 ## Prediction NPZ Contract
@@ -95,6 +102,11 @@ slice, summary, class table, run manifest, and OOF logs.
 External outputs are stored under `reports/revision/experimental/` with
 `manuscript_ready=false` until dataset-specific protocol review, fold-specific
 PCA provenance, fair baselines, and uncertainty analysis are complete.
+
+HRV-domain artifacts are manuscript-usable only for the analyses marked
+`complete` in `metrics/hrv_domain_summary.csv`. Duration/noise HRV sensitivity
+and robustness stress tests remain blocked until dedicated perturbation runners
+produce metric artifacts rather than status ledgers.
 
 ## Minimum Metric Contract
 

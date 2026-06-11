@@ -15,7 +15,8 @@ revision notebooks as the main Colab workflow.
     fold1_best.pt
     ...
     fold5_best.pt
-    global_pca_zeroshot.pkl
+    ptbxl_hrv36.npz              # optional, enables HRV domain classifier
+    cpsc2021_hrv36.npz           # optional, enables HRV domain classifier
   ECG-RAMBA/
     configs/
     src/
@@ -60,14 +61,10 @@ Option B - Manual Drive upload:
 2. Upload it to `MyDrive/ECG-Ramba`.
 3. Extract it in Colab to `/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA`.
 
-Option C - Apply the revision patch zip:
-
-Use this only when Git push/pull is not available.
-
-1. Upload `ECG_RAMBA_colab_revision_patch_v2.zip` to
-   `MyDrive/ECG-Ramba/notebook`.
-2. In Colab, extract it into the repo root, not into `notebooks/`.
-3. Open `notebooks/00_revision_runner.ipynb` and run top to bottom.
+Do not use the older patch-zip workflow for new runs. It is easy to extract
+files into the wrong folder and bypass the Git/manifest checks. If GitHub is
+temporarily unavailable, upload the whole `ECG-RAMBA` repo folder and start
+from `notebooks/00_colab_bootstrap.ipynb`.
 
 ## First Colab Run
 
@@ -121,11 +118,19 @@ Revision scripts should write artifacts to:
   hrv36_schema.csv
   predictions/oof_full_predictions.npz
   predictions/oof_full_slice_predictions.npz
+  predictions/hrv_only_oof_predictions.npz
   manifests/oof_freeze_manifest.json
+  metrics/oof_full_prediction_summary.json
+  metrics/calibration_ci_oof_full_predictions.json
+  metrics/baseline_summary.csv
+  metrics/hrv_domain_summary.csv
+  metrics/robustness_summary.csv
+  metrics/pooling_sensitivity.csv
+  tables/table_calibration.csv
+  tables/table_bootstrap_ci.csv
+  tables/table_hrv_domain_status.csv
+  tables/table_robustness.csv
   experimental/external/<dataset>/<dataset>_full_predictions.npz
-  calibration_ci.json
-  ablation_results.csv
-  robustness_results.csv
   figures/
 ```
 
