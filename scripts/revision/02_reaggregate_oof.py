@@ -123,12 +123,9 @@ def current_checkpoint_rows(kind: str, expected_folds: int) -> list[dict]:
     rows = []
     model_dir = Path(PATHS["model_dir"])
     for fold in range(1, expected_folds + 1):
-        preferred = model_dir / f"fold{fold}_{kind}.pt"
-        fallback_kind = "final" if kind == "best" else "best"
-        fallback = model_dir / f"fold{fold}_{fallback_kind}.pt"
-        path = preferred if preferred.exists() else fallback
+        path = model_dir / f"fold{fold}_{kind}.pt"
         if not path.exists():
-            raise FileNotFoundError(f"Missing checkpoint for fold {fold}: {preferred} or {fallback}")
+            raise FileNotFoundError(f"Missing exact checkpoint for fold {fold}: {path}")
         rows.append(
             {
                 "fold": fold,

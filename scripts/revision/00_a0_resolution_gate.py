@@ -33,19 +33,19 @@ def read_rows(path: Path) -> list[dict]:
 
 
 def update_a0_task_board(path: Path, status: str, notes: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    updated = []
+    rows = read_rows(path)
     found = False
-    escaped_notes = notes.replace('"', '""')
-    for line in lines:
-        if line.startswith("A0,"):
-            prefix, _, _ = line.rsplit(",", 2)
-            line = f'{prefix},{status},"{escaped_notes}"'
+    for row in rows:
+        if row.get("id") == "A0":
+            row["status"] = status
+            row["notes"] = notes
             found = True
-        updated.append(line)
     if not found:
         raise ValueError("A0 row not found in task_board.csv")
-    path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def evidence_status(value: str) -> tuple[list[str], list[str]]:

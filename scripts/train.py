@@ -15,19 +15,20 @@ Principles:
 import os
 import sys
 import gc
+import hashlib
 import warnings
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import torch
+import joblib
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import StratifiedGroupKFold
-from collections import defaultdict
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from configs.config import CONFIG, PATHS, DEVICE
+from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE
 from src.data_loader import load_chapman_multilabel
 from src.features import (
     generate_raw_rocket_cache,
@@ -36,6 +37,10 @@ from src.features import (
     apply_pca,
 )
 from src.model import ECGRambaV7Advanced
+from src.aggregation import (
+    POWER_MEAN_IMPLEMENTATION,
+    aggregate_record_probabilities,
+)
 from src.utils import (
     compute_metrics,
     AsymmetricLossMultiLabel,
@@ -45,6 +50,8 @@ from src.utils import (
 
 # Suppress specific warning
 warnings.filterwarnings("ignore", message="The least populated class in y")
+
+FEATURE_CACHE_SCHEMA_VERSION = 2
 
 # ==================================================================================
 # 🔪 DATASET HELPERS
@@ -105,6 +112,86 @@ def build_slice_dataset(indices, hydra_dict, X, y, X_hrv_base):
             pos.append(p)
 
     return map(np.array, (xs, xh, xhr, ys, rids, pos)), skipped
+
+
+def index_fingerprint(indices: np.ndarray) -> str:
+    arr = np.ascontiguousarray(np.asarray(indices, dtype=np.int64))
+    return hashlib.sha256(arr.view(np.uint8)).hexdigest()[:16]
+
+
+def cpu_state_dict(model: torch.nn.Module) -> dict:
+    return {
+        key: value.detach().cpu().clone()
+        for key, value in model.state_dict().items()
+    }
+
+
+def float_metrics(metrics: dict | None) -> dict:
+    if not metrics:
+        return {}
+    return {key: float(value) for key, value in metrics.items()}
+
+
+def checkpoint_payload(
+    *,
+    model_state: dict,
+    fold: int,
+    epoch: int,
+    weights_kind: str,
+    selected_by_weights_kind: str,
+    metrics: dict | None,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    pca_variance: float,
+) -> dict:
+    metrics = float_metrics(metrics)
+    return {
+        "model": model_state,
+        "epoch": int(epoch),
+        "fold": int(fold),
+        "weights_kind": weights_kind,
+        "selected_by_weights_kind": selected_by_weights_kind,
+        "validation_weights_kind": selected_by_weights_kind,
+        "f1_macro": float(metrics.get("f1_macro", np.nan)),
+        "metrics": metrics,
+        "config_hash": CONFIG_HASH,
+        "class_names": list(CLASSES),
+        "aggregation": {
+            "method": "power_mean",
+            "q": float(CONFIG["power_mean_q"]),
+            "implementation": POWER_MEAN_IMPLEMENTATION,
+        },
+        "split": {
+            "train_count": int(len(train_indices)),
+            "val_count": int(len(val_indices)),
+            "train_index_hash": index_fingerprint(train_indices),
+            "val_index_hash": index_fingerprint(val_indices),
+        },
+        "pca_explained_variance": float(pca_variance),
+        "checkpoint_contract": "explicit_weights_kind_v1",
+    }
+
+
+def save_checkpoint(path: str, payload: dict) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+
+
+def save_fold_pca_model(fold: int, pca, train_indices: np.ndarray) -> str:
+    cache_dir = os.path.join(PATHS["cache_dir"], "revision_pca_models")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(
+        cache_dir,
+        (
+            f"fold{fold}_pca_v{FEATURE_CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
+            f"train{len(train_indices)}_{index_fingerprint(train_indices)}_"
+            f"D{CONFIG['hydra_dim']}.joblib"
+        ),
+    )
+    joblib.dump(pca, path)
+    return path
 
 
 # ==================================================================================
@@ -173,21 +260,31 @@ def main():
         random_state=CONFIG["seeds"][0],
     )
 
-    PM_Q = 3.0
-    PM_EPS = 1e-6
-    TEMPORAL_BINS = np.array([0.0, 0.33, 0.66, 1.01])
-
     fold_results, epoch_logs = [], []
+    os.makedirs(PATHS["model_dir"], exist_ok=True)
+    folds = [
+        {
+            "tr_idx": np.asarray(tr_idx, dtype=np.int64),
+            "va_idx": np.asarray(va_idx, dtype=np.int64),
+        }
+        for tr_idx, va_idx in sgkf.split(X, y_strat, groups=subjects)
+    ]
+    folds_path = os.path.join(PATHS["model_dir"], "folds.pkl")
+    joblib.dump(folds, folds_path)
+    print(f"✅ Saved fold split provenance: {folds_path}")
 
-    for fold, (tr_idx, va_idx) in enumerate(
-        sgkf.split(X, y_strat, groups=subjects), start=1
-    ):
+    for fold, split in enumerate(folds, start=1):
+        tr_idx = split["tr_idx"]
+        va_idx = split["va_idx"]
         print(f"\n⚡ FOLD {fold}/{CONFIG['n_folds']}")
 
         pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
         hydra_tr = apply_pca(pca, X_rocket_raw[tr_idx])
         hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
-        print(f"   🛡️ PCA variance retained: {pca.explained_variance_ratio_.sum():.3f}")
+        pca_variance = float(pca.explained_variance_ratio_.sum())
+        pca_path = save_fold_pca_model(fold, pca, tr_idx)
+        print(f"   🛡️ PCA variance retained: {pca_variance:.3f}")
+        print(f"   💾 Fold PCA object: {pca_path}")
 
         hydra_dict = {i: f for i, f in zip(tr_idx, hydra_tr)}
         hydra_dict.update({i: f for i, f in zip(va_idx, hydra_va)})
@@ -250,14 +347,16 @@ def main():
 
         ema = EMA(model, decay=CONFIG["ema_decay"])
 
-        best_f1, best_epoch = 0.0, -1
+        best_f1, best_epoch = -np.inf, -1
         best_metrics = None
         fold_skipped_nan = 0
 
-        # Ensure model directory exists
-        os.makedirs(PATHS["model_dir"], exist_ok=True)
         best_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best.pt")
+        best_ema_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best_ema.pt")
+        best_raw_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best_raw.pt")
         final_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final.pt")
+        final_ema_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final_ema.pt")
+        final_raw_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final_raw.pt")
 
         for epoch in range(CONFIG["epochs"]):
             model.train()
@@ -289,10 +388,16 @@ def main():
             lr = optimizer.param_groups[0]["lr"]
 
             model.eval()
-            if epoch >= CONFIG["asym_start_epoch"]:
+            eval_weights_kind = (
+                "ema"
+                if CONFIG.get("use_ema", True) and epoch >= CONFIG["asym_start_epoch"]
+                else "raw"
+            )
+            if eval_weights_kind == "ema":
                 ema.apply_shadow(model)
 
-            record_bins = defaultdict(lambda: defaultdict(list))
+            slice_prob_batches = []
+            slice_rid_batches = []
             with torch.no_grad():
                 for x, xh, xhr, _, rids, pos in val_loader:
                     x, xh, xhr = x.to(DEVICE), xh.to(DEVICE), xhr.to(DEVICE)
@@ -302,54 +407,90 @@ def main():
                             probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
                     else:
                         probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
-                        
-                    for p, rid, t in zip(probs, rids, pos):
-                        b = int(np.digitize(t, TEMPORAL_BINS) - 1)
-                        record_bins[int(rid)][b].append(p)
+                    if torch.is_tensor(rids):
+                        rid_np = rids.cpu().numpy().astype(np.int64)
+                    else:
+                        rid_np = np.asarray(rids, dtype=np.int64)
+                    slice_prob_batches.append(probs.astype(np.float32))
+                    slice_rid_batches.append(rid_np)
 
-            if epoch >= CONFIG["asym_start_epoch"]:
-                ema.restore(model)
+            if not slice_prob_batches:
+                if eval_weights_kind == "ema":
+                    ema.restore(model)
+                continue
 
-            y_true_list, y_pred_list = [], []
-
-            for rid, bins in record_bins.items():
-                preds = []
-                for b in bins.values():
-                    p = np.clip(np.stack(b), PM_EPS, 1 - PM_EPS)
-                    preds.append(np.exp(np.mean(PM_Q * np.log(p), axis=0) / PM_Q))
-                pred = np.mean(preds, axis=0)
-                if not np.isfinite(pred).all():
-                    fold_skipped_nan += 1
-                    continue
-                y_true_list.append(y[rid])
-                y_pred_list.append(pred)
-
-            if len(y_true_list) == 0:
+            slice_probs = np.concatenate(slice_prob_batches, axis=0)
+            slice_rids = np.concatenate(slice_rid_batches, axis=0)
+            finite_slice_mask = np.isfinite(slice_probs).all(axis=1)
+            if not np.all(finite_slice_mask):
+                fold_skipped_nan += int(np.sum(~finite_slice_mask))
+                slice_probs = slice_probs[finite_slice_mask]
+                slice_rids = slice_rids[finite_slice_mask]
+            y_prob_all, valid_record_mask, _ = aggregate_record_probabilities(
+                slice_probs,
+                slice_rids,
+                n_records=len(y),
+                q=float(CONFIG["power_mean_q"]),
+            )
+            val_record_mask = np.zeros(len(y), dtype=bool)
+            val_record_mask[va_idx] = True
+            metric_mask = val_record_mask & valid_record_mask
+            if not np.any(metric_mask):
+                if eval_weights_kind == "ema":
+                    ema.restore(model)
                 continue
 
             metrics = compute_metrics(
-                np.vstack(y_true_list),
-                np.vstack(y_pred_list),
+                y[metric_mask],
+                y_prob_all[metric_mask],
                 threshold=CONFIG["default_threshold"],
             )
 
             f1m = metrics["f1_macro"]
-            if f1m > best_f1:
+            is_new_best = f1m > best_f1
+            selected_state = cpu_state_dict(model) if is_new_best else None
+
+            if eval_weights_kind == "ema":
+                ema.restore(model)
+
+            if is_new_best:
                 best_f1 = f1m
                 best_epoch = epoch + 1
                 best_metrics = metrics.copy()
-                torch.save(
-                    {
-                        "model": model.state_dict(),
-                        "epoch": best_epoch,
-                        "f1_macro": best_f1,
-                    },
-                    best_ckpt_path,
+                selected_payload = checkpoint_payload(
+                    model_state=selected_state,
+                    fold=fold,
+                    epoch=best_epoch,
+                    weights_kind=eval_weights_kind,
+                    selected_by_weights_kind=eval_weights_kind,
+                    metrics=best_metrics,
+                    train_indices=tr_idx,
+                    val_indices=va_idx,
+                    pca_variance=pca_variance,
                 )
+                if eval_weights_kind == "ema":
+                    save_checkpoint(best_ema_ckpt_path, selected_payload)
+                    save_checkpoint(best_ckpt_path, {**selected_payload, "alias_of": f"fold{fold}_best_ema.pt"})
+                    raw_payload = checkpoint_payload(
+                        model_state=cpu_state_dict(model),
+                        fold=fold,
+                        epoch=best_epoch,
+                        weights_kind="raw",
+                        selected_by_weights_kind=eval_weights_kind,
+                        metrics=best_metrics,
+                        train_indices=tr_idx,
+                        val_indices=va_idx,
+                        pca_variance=pca_variance,
+                    )
+                    save_checkpoint(best_raw_ckpt_path, raw_payload)
+                else:
+                    save_checkpoint(best_raw_ckpt_path, selected_payload)
+                    save_checkpoint(best_ckpt_path, {**selected_payload, "alias_of": f"fold{fold}_best_raw.pt"})
 
             print(
                 f"Ep {epoch+1:03d} | {loss_name} | LR {lr:.2e} | "
                 f"Loss {loss_sum/len(train_loader):.4f} | "
+                f"Eval {eval_weights_kind.upper()} | "
                 f"F1m {metrics['f1_macro']:.4f} | "
                 f"P {metrics['precision_macro']:.4f} | "
                 f"R {metrics['recall_macro']:.4f} | "
@@ -365,19 +506,60 @@ def main():
                     lr=lr,
                     loss_value=loss_sum / len(train_loader),
                     is_best_epoch=(epoch + 1 == best_epoch),
+                    validation_weights_kind=eval_weights_kind,
+                    aggregation_method="power_mean",
+                    aggregation_q=float(CONFIG["power_mean_q"]),
+                    aggregation_implementation=POWER_MEAN_IMPLEMENTATION,
+                    n_validation_records_scored=int(np.sum(metric_mask)),
+                    n_validation_slices_scored=int(len(slice_probs)),
                     **metrics,
                 )
             )
 
-        torch.save(
-            {
-                "model": model.state_dict(),
-                "epoch": CONFIG["epochs"],
-            },
-            final_ckpt_path,
+        final_metrics = best_metrics or {}
+        final_raw_payload = checkpoint_payload(
+            model_state=cpu_state_dict(model),
+            fold=fold,
+            epoch=CONFIG["epochs"],
+            weights_kind="raw",
+            selected_by_weights_kind="raw",
+            metrics=final_metrics,
+            train_indices=tr_idx,
+            val_indices=va_idx,
+            pca_variance=pca_variance,
         )
+        save_checkpoint(final_raw_ckpt_path, final_raw_payload)
+        save_checkpoint(final_ckpt_path, {**final_raw_payload, "alias_of": f"fold{fold}_final_raw.pt"})
 
-        fold_results.append(dict(fold=fold, best_epoch=best_epoch, **best_metrics))
+        if CONFIG.get("use_ema", True):
+            ema.apply_shadow(model)
+            final_ema_payload = checkpoint_payload(
+                model_state=cpu_state_dict(model),
+                fold=fold,
+                epoch=CONFIG["epochs"],
+                weights_kind="ema",
+                selected_by_weights_kind="raw",
+                metrics=final_metrics,
+                train_indices=tr_idx,
+                val_indices=va_idx,
+                pca_variance=pca_variance,
+            )
+            ema.restore(model)
+            save_checkpoint(final_ema_ckpt_path, final_ema_payload)
+
+        fold_results.append(
+            dict(
+                fold=fold,
+                best_epoch=best_epoch,
+                best_weights_kind=(
+                    "ema"
+                    if os.path.exists(best_ema_ckpt_path)
+                    else "raw"
+                ),
+                pca_explained_variance=pca_variance,
+                **(best_metrics or {}),
+            )
+        )
 
         del model, optimizer, scheduler, ema
         torch.cuda.empty_cache()

@@ -7,9 +7,13 @@ Run from repo root on Colab:
     python scripts/revision/01_generate_predictions.py --dataset oof
 
 Outputs:
-    reports/revision/predictions/oof_full_predictions.npz
-    reports/revision/predictions/oof_full_slice_predictions.npz
-    reports/revision/metrics/oof_full_prediction_summary.json
+    reports/revision/predictions/<artifact_stem>_predictions.npz
+    reports/revision/predictions/<artifact_stem>_slice_predictions.npz
+    reports/revision/metrics/<artifact_stem>_prediction_summary.json
+
+    `--checkpoint-kind best` preserves the legacy `oof_full` stem. Explicit
+    EMA retrains should use `--checkpoint-kind best_ema`, which writes
+    `oof_best_ema_*` artifacts for manuscript gating.
 
 Prediction files follow the artifact contract in docs/revision_plan/.
 """
@@ -54,6 +58,8 @@ from scripts.revision.common import (  # noqa: E402
     save_csv,
     save_json,
 )
+
+CHECKPOINT_KINDS = ["best", "final", "best_ema", "final_ema", "best_raw", "final_raw"]
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -505,7 +511,7 @@ class ECGSliceDatasetInfer(Dataset):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["oof"], default="oof")
-    parser.add_argument("--checkpoint-kind", choices=["best", "final"], default="best")
+    parser.add_argument("--checkpoint-kind", choices=CHECKPOINT_KINDS, default="best")
     parser.add_argument("--batch-size", type=int, default=max(1, int(CONFIG["batch_size"])))
     parser.add_argument(
         "--num-workers",
@@ -519,6 +525,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-fold-cache", action="store_true", default=True)
     parser.add_argument("--no-resume-fold-cache", dest="resume_fold_cache", action="store_false")
     parser.add_argument("--force-rerun-folds", action="store_true", default=False)
+    parser.add_argument(
+        "--allow-checkpoint-fallback",
+        action="store_true",
+        help="Legacy/debug only. Manuscript exports must use the exact requested checkpoint files.",
+    )
     parser.add_argument("--min-system-ram-gb", type=float, default=24.0)
     parser.add_argument("--allow-low-ram", action="store_true", default=False)
     return parser.parse_args()
@@ -590,16 +601,37 @@ def load_folds(y: np.ndarray, subjects: np.ndarray) -> list[dict[str, np.ndarray
     ]
 
 
-def checkpoint_path(fold: int, checkpoint_kind: str) -> Path:
+def checkpoint_path(fold: int, checkpoint_kind: str, *, allow_fallback: bool = False) -> Path:
     preferred = Path(PATHS["model_dir"]) / f"fold{fold}_{checkpoint_kind}.pt"
-    fallback_kind = "final" if checkpoint_kind == "best" else "best"
-    fallback = Path(PATHS["model_dir"]) / f"fold{fold}_{fallback_kind}.pt"
     if preferred.exists():
         return preferred
-    if fallback.exists():
-        print(f"Checkpoint fallback for fold {fold}: {preferred.name} missing, using {fallback.name}")
-        return fallback
-    raise FileNotFoundError(f"Missing checkpoint for fold {fold}: {preferred} or {fallback}")
+    if allow_fallback:
+        fallback_candidates = []
+        if checkpoint_kind == "best":
+            fallback_candidates = ["best_ema", "best_raw", "final"]
+        elif checkpoint_kind == "final":
+            fallback_candidates = ["final_raw", "final_ema", "best"]
+        elif checkpoint_kind.endswith("_ema"):
+            fallback_candidates = [checkpoint_kind.replace("_ema", "")]
+        elif checkpoint_kind.endswith("_raw"):
+            fallback_candidates = [checkpoint_kind.replace("_raw", "")]
+        for fallback_kind in fallback_candidates:
+            fallback = Path(PATHS["model_dir"]) / f"fold{fold}_{fallback_kind}.pt"
+            if fallback.exists():
+                print(
+                    f"Checkpoint fallback for fold {fold}: {preferred.name} missing, "
+                    f"using {fallback.name}. This is not manuscript-safe."
+                )
+                return fallback
+    raise FileNotFoundError(f"Missing exact checkpoint for fold {fold}: {preferred}")
+
+
+def expected_weights_kind(checkpoint_kind: str) -> str | None:
+    if checkpoint_kind.endswith("_ema"):
+        return "ema"
+    if checkpoint_kind.endswith("_raw"):
+        return "raw"
+    return None
 
 
 def load_model_for_fold(
@@ -613,6 +645,13 @@ def load_model_for_fold(
     print(f"Loading checkpoint: {path}")
     checkpoint = torch.load(path, map_location=DEVICE)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    expected = expected_weights_kind(checkpoint_kind)
+    actual = checkpoint.get("weights_kind") if isinstance(checkpoint, dict) else None
+    if expected is not None and actual not in {None, expected}:
+        raise ValueError(
+            f"Checkpoint kind {checkpoint_kind} requires weights_kind={expected}, "
+            f"but {path} reports weights_kind={actual}"
+        )
 
     model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
     try:
@@ -848,7 +887,11 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Fold {fold_num}/{len(folds)} | train={len(tr_idx)} | val={len(va_idx)}")
         print("=" * 80)
 
-        ckpt_path = checkpoint_path(fold_num, args.checkpoint_kind)
+        ckpt_path = checkpoint_path(
+            fold_num,
+            args.checkpoint_kind,
+            allow_fallback=args.allow_checkpoint_fallback,
+        )
         ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
         checkpoint_sha256 = ckpt_info["sha256"]
         fold_cache_path = fold_prediction_cache_path(

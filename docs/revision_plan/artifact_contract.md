@@ -11,11 +11,15 @@ reports/revision/
   audit_protocol.json
   hrv36_schema.csv
   predictions/
+    oof_best_ema_predictions.npz
+    oof_best_ema_slice_predictions.npz
     oof_full_predictions.npz
     oof_full_slice_predictions.npz
     hrv_only_oof_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
+    oof_best_ema_prediction_summary.json
+    calibration_ci_oof_best_ema_predictions.json
     oof_full_prediction_summary.json
     calibration_ci_oof_full_predictions.json
     baseline_summary.csv
@@ -30,6 +34,7 @@ reports/revision/
     robustness_<dataset>.png
     representation_umap.png
   tables/
+    oof_best_ema_class_summary.csv
     oof_full_class_summary.csv
     table_baselines.csv
     table_calibration.csv
@@ -41,6 +46,8 @@ reports/revision/
   logs/
     <notebook_or_script>_<timestamp>.log
   manifests/
+    oof_best_ema_prediction_run_manifest.json
+    oof_best_ema_freeze_manifest.json
     oof_full_prediction_run_manifest.json
     oof_freeze_manifest.json
     mirror_manifest.json
@@ -94,10 +101,17 @@ Legacy OOF artifacts without `aggregation_implementation=power_mean_v2` and
 `cache_schema_version>=2` are invalid. Georgia and CPSC2021 are distinct
 datasets and must never share a dataset label.
 
-The canonical OOF artifact is reusable only when `oof_freeze_manifest.json`
-confirms 44,186 records, all five folds, Q=3 re-aggregation equivalence,
-matching checkpoint SHA256 fingerprints, and checksums for the prediction,
-slice, summary, class table, run manifest, and OOF logs.
+After the checkpoint/EMA blocker is resolved, the canonical manuscript OOF
+artifact is `oof_best_ema_predictions.npz` with
+`oof_best_ema_freeze_manifest.json`. It is reusable only when the freeze
+manifest confirms 44,186 records, all five folds, Q=3 re-aggregation
+equivalence, matching `fold*_best_ema.pt` SHA256 fingerprints, and checksums for
+the prediction, slice, summary, class table, run manifest, and OOF logs.
+
+Historical `oof_full_*` and `oof_final_*` artifacts produced from raw
+`fold*_best.pt` or `fold*_final.pt` checkpoints are diagnostic only unless their
+checkpoint metadata proves they are explicit EMA aliases from a post-fix
+retrain.
 
 External outputs are stored under `reports/revision/experimental/` with
 `manuscript_ready=false` until dataset-specific protocol review, fold-specific

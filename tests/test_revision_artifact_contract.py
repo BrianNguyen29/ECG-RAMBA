@@ -23,6 +23,20 @@ class RevisionArtifactContractTests(unittest.TestCase):
     def test_oof_artifact_stem_separates_best_and_final_outputs(self):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
         self.assertEqual(generate_predictions.oof_artifact_stem("final"), "oof_final")
+        self.assertEqual(generate_predictions.oof_artifact_stem("best_ema"), "oof_best_ema")
+        self.assertEqual(generate_predictions.oof_artifact_stem("final_raw"), "oof_final_raw")
+
+    def test_checkpoint_path_requires_exact_kind_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            model_dir = Path(tmp)
+            (model_dir / "fold1_best.pt").write_bytes(b"legacy")
+            with patch.dict(generate_predictions.PATHS, {"model_dir": str(model_dir)}):
+                with self.assertRaises(FileNotFoundError):
+                    generate_predictions.checkpoint_path(1, "best_ema")
+                self.assertEqual(
+                    generate_predictions.checkpoint_path(1, "best_ema", allow_fallback=True),
+                    model_dir / "fold1_best.pt",
+                )
 
     def test_fold_cache_without_complete_slice_coverage_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,7 +180,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 path.read_text(encoding="utf-8"),
                 (
                     "id,status,notes\n"
-                    'A0,audit_complete_with_deferred_blockers,"new note"\n'
+                    "A0,audit_complete_with_deferred_blockers,new note\n"
                     'A1,pending,"preserve, quoted note"\n'
                 ),
             )

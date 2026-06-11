@@ -97,12 +97,9 @@ def current_checkpoint_rows(kind: str, expected_folds: int) -> list[dict]:
     model_dir = Path(PATHS["model_dir"])
     rows = []
     for fold in range(1, expected_folds + 1):
-        preferred = model_dir / f"fold{fold}_{kind}.pt"
-        fallback_kind = "final" if kind == "best" else "best"
-        fallback = model_dir / f"fold{fold}_{fallback_kind}.pt"
-        path = preferred if preferred.exists() else fallback
+        path = model_dir / f"fold{fold}_{kind}.pt"
         if not path.exists():
-            raise FileNotFoundError(f"Missing checkpoint for fold {fold}: {preferred} or {fallback}")
+            raise FileNotFoundError(f"Missing exact checkpoint for fold {fold}: {path}")
         rows.append(
             {
                 "fold": fold,
@@ -268,11 +265,16 @@ def validate_oof(args: argparse.Namespace) -> dict:
     if mismatches:
         raise ValueError(f"Checkpoint fingerprint mismatch for folds: {mismatches}")
 
-    logs = [
-        LOG_DIR / name
-        for name in ["oof_generate_predictions.log", "oof_reaggregate.log"]
-        if (LOG_DIR / name).is_file() and (LOG_DIR / name).stat().st_size > 0
-    ]
+    log_candidates = []
+    for pattern in ["oof*_generate_predictions.log", "oof*_reaggregate.log", "oof_reaggregate.log"]:
+        log_candidates.extend(LOG_DIR.glob(pattern))
+    logs = sorted(
+        {
+            path
+            for path in log_candidates
+            if path.is_file() and path.stat().st_size > 0
+        }
+    )
     if not logs and not args.allow_missing_log:
         raise FileNotFoundError("No non-empty OOF generation/re-aggregation log found")
 

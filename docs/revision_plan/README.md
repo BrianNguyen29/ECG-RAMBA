@@ -36,17 +36,22 @@ Run in this order on Colab:
 
 1. `notebooks/00_colab_bootstrap.ipynb`
 2. `notebooks/01_a0_protocol_audit.ipynb`
-3. `notebooks/02_predictions_and_external_eval.ipynb`
-4. `notebooks/03_calibration_and_ci.ipynb`
-5. `notebooks/06_pooling_and_representation.ipynb` (pooling sensitivity)
-6. `notebooks/04_baselines_and_component_checks.ipynb`
-7. `notebooks/05_hrv_domain_and_robustness.ipynb`
-8. Revisit `notebooks/06_pooling_and_representation.ipynb` for representation work.
-9. `notebooks/07_results_freeze.ipynb`
+3. `notebooks/02a_retrain_best_ema.ipynb`
+4. `notebooks/02_predictions_and_external_eval.ipynb`
+5. `notebooks/03_calibration_and_ci.ipynb`
+6. `notebooks/06_pooling_and_representation.ipynb` (pooling sensitivity)
+7. `notebooks/04_baselines_and_component_checks.ipynb`
+8. `notebooks/05_hrv_domain_and_robustness.ipynb`
+9. Revisit `notebooks/06_pooling_and_representation.ipynb` for representation work.
+10. `notebooks/07_results_freeze.ipynb`
 
+Notebook 02 must first produce and freeze the post-fix
+`oof_best_ema_*` artifacts from explicit `fold*_best_ema.pt` checkpoints.
 Notebook 03 and pooling sensitivity consume only the checksum-verified
-`oof_freeze_manifest.json`. External outputs remain experimental until their
-separate readiness restrictions are resolved.
+`oof_best_ema_freeze_manifest.json`. Historical raw `oof_full_*` and
+`oof_final_*` outputs are diagnostic until a post-fix retrain proves otherwise.
+External outputs remain experimental until their separate readiness restrictions
+are resolved.
 
 The current priority is A-level work: consistency audit, calibration,
 baseline expansion, bootstrap CI, method clarity, and minimum robustness.

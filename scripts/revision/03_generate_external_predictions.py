@@ -57,13 +57,14 @@ from src.features import (  # noqa: E402
 
 
 STANDARD_LEADS = ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+CHECKPOINT_KINDS = ["best", "final", "best_ema", "final_ema", "best_raw", "final_raw"]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["ptbxl", "georgia", "cpsc2021"], required=True)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--checkpoint-kind", choices=["best", "final"], default="best")
+    parser.add_argument("--checkpoint-kind", choices=CHECKPOINT_KINDS, default="best")
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--force-features", action="store_true")
     parser.add_argument(
@@ -562,11 +563,9 @@ def build_slices(
 def checkpoint_paths(kind: str) -> list[Path]:
     paths = []
     for fold in range(1, int(CONFIG["n_folds"]) + 1):
-        preferred = Path(PATHS["model_dir"]) / f"fold{fold}_{kind}.pt"
-        fallback = Path(PATHS["model_dir"]) / f"fold{fold}_{'final' if kind == 'best' else 'best'}.pt"
-        path = preferred if preferred.exists() else fallback
+        path = Path(PATHS["model_dir"]) / f"fold{fold}_{kind}.pt"
         if not path.exists():
-            raise FileNotFoundError(f"Missing checkpoint for fold {fold}: {preferred} or {fallback}")
+            raise FileNotFoundError(f"Missing exact checkpoint for fold {fold}: {path}")
         paths.append(path)
     return paths
 
