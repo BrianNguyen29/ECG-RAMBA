@@ -158,12 +158,15 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
             base_dir = candidate
             break
         
+    explicit_model_dir = os.environ.get('ECG_RAMBA_MODEL_DIR')
     model_candidates = [
         './models',
         './model',
         f'{base_dir}/model',
         f'{base_dir}/models',
     ]
+    if explicit_model_dir:
+        model_candidates.insert(0, explicit_model_dir)
     model_dir = './models'
     for candidate in model_candidates:
         if (

@@ -117,6 +117,23 @@ class DatasetPathTests(unittest.TestCase):
                 paths = setup_paths(27, 3072, "test")
             self.assertEqual(Path(paths["zip_path"]), explicit)
 
+    def test_explicit_model_directory_precedes_repo_candidates(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model_dir = root / "drive-model"
+            model_dir.mkdir()
+            (model_dir / "fold1_best.pt").touch()
+            with patch.dict(
+                "os.environ",
+                {
+                    "ECG_RAMBA_DRIVE_ROOT": str(root),
+                    "ECG_RAMBA_MODEL_DIR": str(model_dir),
+                },
+                clear=False,
+            ):
+                paths = setup_paths(27, 3072, "test")
+            self.assertEqual(Path(paths["model_dir"]), model_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

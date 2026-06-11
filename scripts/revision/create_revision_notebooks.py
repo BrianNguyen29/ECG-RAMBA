@@ -28,6 +28,7 @@ SETUP_CODE = """from pathlib import Path
 import json
 import os
 import subprocess
+import zipfile
 
 try:
     from google.colab import drive
@@ -57,10 +58,16 @@ if chapman_zip is None:
         + f'. ZIP files currently visible under {DRIVE_ROOT}: {visible_zips}'
     )
 os.environ['ECG_RAMBA_CHAPMAN_ZIP'] = str(chapman_zip)
-os.environ.setdefault('ECG_RAMBA_LOCAL_ROOT', str(LOCAL_RUNTIME_ROOT))
-os.environ.setdefault('ECG_RAMBA_EXTRACT_DIR', str(LOCAL_RUNTIME_ROOT / 'chapman'))
-os.environ.setdefault('ECG_RAMBA_USE_CLEAN_CACHE', '0')
-os.environ.setdefault('ECG_RAMBA_SAVE_CLEAN_CACHE', '0')
+if chapman_zip.stat().st_size == 0 or not zipfile.is_zipfile(chapman_zip):
+    raise ValueError(f'Chapman dataset is not a valid non-empty ZIP: {chapman_zip}')
+model_dir = DRIVE_ROOT / 'model'
+if not model_dir.is_dir():
+    raise FileNotFoundError(f'Model directory not found: {model_dir}')
+os.environ['ECG_RAMBA_MODEL_DIR'] = str(model_dir)
+os.environ['ECG_RAMBA_LOCAL_ROOT'] = str(LOCAL_RUNTIME_ROOT)
+os.environ['ECG_RAMBA_EXTRACT_DIR'] = str(LOCAL_RUNTIME_ROOT / 'chapman')
+os.environ['ECG_RAMBA_USE_CLEAN_CACHE'] = '0'
+os.environ['ECG_RAMBA_SAVE_CLEAN_CACHE'] = '0'
 
 def _run_setup(cmd, cwd=None, check=True):
     print(f'$ {cmd}', flush=True)
@@ -145,6 +152,7 @@ print('cwd       :', Path.cwd())
 print('drive_root:', DRIVE_ROOT)
 print('repo_dir  :', REPO_DIR)
 print('chapman_zip:', chapman_zip, '| size=', chapman_zip.stat().st_size)
+print('model_dir  :', model_dir)
 print('branch    :', BRANCH)
 
 cache_status = {
@@ -974,14 +982,16 @@ for path in sorted(pred_dir.glob('*.npz')):
             "all valid records are present. Otherwise it leaves artifacts untouched."
         ),
         code(
-            """REAGGREGATE_SAVED_SLICES = True
+            """RUN_STANDALONE_LEGACY_REAGGREGATION = False
 
-if REAGGREGATE_SAVED_SLICES:
+if RUN_STANDALONE_LEGACY_REAGGREGATION:
     run(
-        'python -u scripts/revision/02_reaggregate_oof.py --if-possible',
+        'python -u scripts/revision/02_reaggregate_oof.py --expected-folds 5 --q 3 --if-possible',
         check=False,
         log_path='reports/revision/logs/oof_reaggregate.log',
     )
+else:
+    print('Standalone repair skipped; Generate OOF Predictions performs this repair automatically.')
 """
         ),
         markdown("## Generate OOF Predictions"),
@@ -998,6 +1008,20 @@ DEBUG_LIMIT_RECORDS = 0
 
 import os
 import shutil
+import zipfile
+
+if not chapman_zip.is_file() or not zipfile.is_zipfile(chapman_zip):
+    raise FileNotFoundError(f'Valid Chapman ZIP is required before OOF generation: {chapman_zip}')
+required_model_files = [model_dir / 'folds.pkl']
+for fold in range(1, 6):
+    best = model_dir / f'fold{fold}_best.pt'
+    final = model_dir / f'fold{fold}_final.pt'
+    if not best.is_file() and not final.is_file():
+        required_model_files.append(best)
+missing_model_files = [str(path) for path in required_model_files if not path.is_file()]
+if missing_model_files:
+    raise FileNotFoundError('OOF model inputs are incomplete: ' + '; '.join(missing_model_files))
+print('OOF input preflight: Chapman ZIP, folds.pkl, and five fold checkpoints are available.')
 
 page_size = os.sysconf('SC_PAGE_SIZE')
 physical_pages = os.sysconf('SC_PHYS_PAGES')
@@ -1060,7 +1084,13 @@ else:
         ),
         markdown("## Verify OOF Prediction Outputs"),
         code(
-            """expected = [
+            """run(
+    'python -u scripts/revision/06_freeze_oof.py '
+    '--expected-records 44186 --expected-folds 5 --q 3 --check-only',
+    log_path='reports/revision/logs/oof_verify_contract.log',
+)
+
+expected = [
     Path('reports/revision/predictions/oof_full_predictions.npz'),
     Path('reports/revision/predictions/oof_full_slice_predictions.npz'),
     Path('reports/revision/metrics/oof_full_prediction_summary.json'),
@@ -1177,7 +1207,13 @@ print('Experimental outputs are written under reports/revision/experimental.')
         code("!python scripts/revision/05_artifact_inventory.py\n"),
         markdown("## Mirror Artifacts To Stable Drive Cache"),
         code(
-            """source_root = Path('reports/revision')
+            """run(
+    'python -u scripts/revision/06_freeze_oof.py '
+    '--expected-records 44186 --expected-folds 5 --q 3 --check-only',
+    log_path='reports/revision/logs/oof_pre_publish_contract.log',
+)
+
+source_root = Path('reports/revision')
 mirror_root = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
 run(
     f'python -u scripts/revision/artifact_mirror.py publish --mirror-root "{mirror_root}"',

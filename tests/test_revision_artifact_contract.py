@@ -16,9 +16,46 @@ from scripts.revision.common import aggregate_record_probabilities, sha256_file
 freeze_oof = importlib.import_module("scripts.revision.06_freeze_oof")
 pooling = importlib.import_module("scripts.revision.07_pooling_sensitivity")
 a0_gate = importlib.import_module("scripts.revision.00_a0_resolution_gate")
+generate_predictions = importlib.import_module("scripts.revision.01_generate_predictions")
 
 
 class RevisionArtifactContractTests(unittest.TestCase):
+    def test_fold_cache_without_complete_slice_coverage_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fold.npz"
+            n_classes = len(CLASSES)
+            np.savez_compressed(
+                path,
+                record_id=np.asarray([0, 1], dtype=np.int64),
+                y_prob=np.zeros((2, n_classes), dtype=np.float32),
+                valid_record_mask=np.asarray([True, True]),
+                slice_count=np.asarray([1, 1], dtype=np.int16),
+                fold_summary_json=np.asarray(json.dumps({"fold": 1})),
+                cache_schema_version=np.asarray(2, dtype=np.int16),
+                checkpoint_sha256=np.asarray("checkpoint"),
+                aggregation_implementation=np.asarray("power_mean_v2"),
+                slice_prob=np.zeros((1, n_classes), dtype=np.float32),
+                slice_record_id=np.asarray([0], dtype=np.int64),
+                slice_index=np.asarray([0], dtype=np.int16),
+                slice_fold_id=np.asarray([1], dtype=np.int16),
+            )
+            result = generate_predictions.load_fold_prediction_cache(
+                path=path,
+                fold_num=1,
+                va_idx=np.asarray([0, 1], dtype=np.int64),
+                n_classes=n_classes,
+                oof_probs=np.zeros((2, n_classes), dtype=np.float32),
+                fold_id=np.full(2, -1, dtype=np.int16),
+                record_slice_count=np.zeros(2, dtype=np.int16),
+                save_slice_probs=True,
+                slice_probs_all=[],
+                slice_record_index_all=[],
+                slice_index_all=[],
+                slice_fold_id_all=[],
+                checkpoint_sha256="checkpoint",
+            )
+            self.assertIsNone(result)
+
     def test_legacy_mirror_manifest_is_normalized(self):
         payload = {
             "mirror_root": "/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision",

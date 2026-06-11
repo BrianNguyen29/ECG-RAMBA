@@ -332,22 +332,23 @@ def load_fold_prediction_cache(
     if not path.exists():
         return None
     try:
-        data = np.load(path, allow_pickle=False)
+        with np.load(path, allow_pickle=False) as loaded:
+            data = {key: loaded[key] for key in loaded.files}
         record_id = data["record_id"].astype(np.int64)
         cached_y_prob = data["y_prob"]
         y_prob = cached_y_prob.astype(np.float32)
         valid_mask = data["valid_record_mask"].astype(bool)
         slice_count = data["slice_count"].astype(np.int16)
         summary = json.loads(str(data["fold_summary_json"].item()))
-        schema_version = int(data["cache_schema_version"]) if "cache_schema_version" in data.files else 0
+        schema_version = int(data["cache_schema_version"]) if "cache_schema_version" in data else 0
         cached_checkpoint_sha = (
             str(data["checkpoint_sha256"].item())
-            if "checkpoint_sha256" in data.files
+            if "checkpoint_sha256" in data
             else ""
         )
         aggregation_implementation = (
             str(data["aggregation_implementation"].item())
-            if "aggregation_implementation" in data.files
+            if "aggregation_implementation" in data
             else ""
         )
         if (
@@ -361,7 +362,7 @@ def load_fold_prediction_cache(
             or aggregation_implementation != POWER_MEAN_IMPLEMENTATION
         ):
             print(
-                f"⚠️  Fold cache contract/fingerprint mismatch; recomputing fold {fold_num}: {path}",
+                    f"WARNING: Fold cache contract/fingerprint mismatch; recomputing fold {fold_num}: {path}",
                 flush=True,
             )
             return None
@@ -370,11 +371,29 @@ def load_fold_prediction_cache(
         fold_id[record_id[valid_mask]] = fold_num
         record_slice_count[record_id] = slice_count
 
-        if save_slice_probs and "slice_prob" in data.files and len(data["slice_prob"]):
+        if save_slice_probs:
+            required_slice_keys = {
+                "slice_prob",
+                "slice_record_id",
+                "slice_index",
+                "slice_fold_id",
+            }
+            if not required_slice_keys.issubset(data) or len(data["slice_prob"]) == 0:
+                print(
+                    f"WARNING: Fold cache lacks required slice probabilities; recomputing fold {fold_num}: {path}",
+                    flush=True,
+                )
+                return None
             cached_slice_prob = data["slice_prob"]
             cached_slice_record_id = data["slice_record_id"]
             cached_slice_index = data["slice_index"]
             cached_slice_fold_id = data["slice_fold_id"]
+            expected_slice_records = set(int(x) for x in record_id[valid_mask])
+            actual_slice_records = set(int(x) for x in np.unique(cached_slice_record_id))
+            cached_slice_counts = np.bincount(
+                cached_slice_record_id,
+                minlength=int(np.max(record_id)) + 1,
+            )[record_id]
             if (
                 cached_slice_prob.dtype != np.float32
                 or cached_slice_prob.ndim != 2
@@ -384,19 +403,26 @@ def load_fold_prediction_cache(
                 or len(cached_slice_prob) != len(cached_slice_fold_id)
                 or not np.isfinite(cached_slice_prob).all()
                 or not np.all(cached_slice_fold_id == fold_num)
-                or not set(np.unique(cached_slice_record_id)).issubset(set(va_idx))
+                or actual_slice_records != expected_slice_records
+                or not np.array_equal(cached_slice_counts.astype(np.int16), slice_count)
             ):
-                print(f"⚠️  Fold slice cache is not float32; recomputing fold {fold_num}: {path}", flush=True)
+                print(
+                    f"WARNING: Fold slice cache contract mismatch; recomputing fold {fold_num}: {path}",
+                    flush=True,
+                )
                 return None
             slice_probs_all.append(cached_slice_prob)
             slice_record_index_all.append(cached_slice_record_id.astype(np.int64))
             slice_index_all.append(cached_slice_index.astype(np.int16))
             slice_fold_id_all.append(cached_slice_fold_id.astype(np.int16))
 
-        print(f"✅ Loaded cached predictions for fold {fold_num}: {path}", flush=True)
+        print(f"Loaded cached predictions for fold {fold_num}: {path}", flush=True)
         return summary
     except Exception as exc:
-        print(f"⚠️  Could not load fold prediction cache for fold {fold_num}: {exc}. Recomputing.", flush=True)
+        print(
+            f"WARNING: Could not load fold prediction cache for fold {fold_num}: {exc}. Recomputing.",
+            flush=True,
+        )
         return None
 
 
