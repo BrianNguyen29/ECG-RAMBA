@@ -29,8 +29,10 @@ from scripts.revision.common import (  # noqa: E402
     TABLE_DIR,
     bootstrap_ci,
     calibration_summary,
+    ece_binary,
     macro_pr_auc,
     macro_roc_auc,
+    mce_binary,
     multilabel_metrics,
     save_json,
     sha256_file,
@@ -56,6 +58,68 @@ def current_git_commit() -> str | None:
         ).strip()
     except Exception:
         return None
+
+
+def load_prediction_payload(pred_path: Path) -> dict[str, np.ndarray]:
+    with np.load(pred_path, allow_pickle=False) as data:
+        missing_keys = {"y_true", "y_prob"} - set(data.files)
+        if missing_keys:
+            raise KeyError(
+                f"{pred_path} is not a metric prediction file; missing keys: {sorted(missing_keys)}"
+            )
+        return {key: data[key].copy() for key in data.files}
+
+
+def validate_prediction_payload(
+    payload: dict[str, np.ndarray],
+    pred_path: Path,
+) -> tuple[np.ndarray, np.ndarray, list[str] | None]:
+    y_true = np.asarray(payload["y_true"], dtype=np.float32)
+    y_prob = np.asarray(payload["y_prob"], dtype=np.float32)
+    if y_true.shape != y_prob.shape:
+        raise ValueError(f"Shape mismatch: y_true {y_true.shape}, y_prob {y_prob.shape}")
+    if y_true.ndim != 2:
+        raise ValueError(f"Expected 2D multi-label arrays, found shape {y_true.shape}")
+    if not np.isfinite(y_true).all() or not np.isfinite(y_prob).all():
+        raise ValueError(f"Prediction artifact contains NaN/Inf values: {pred_path}")
+    if not np.isin(y_true, [0.0, 1.0]).all():
+        raise ValueError(f"y_true must be binary 0/1 labels: {pred_path}")
+    if float(np.min(y_prob)) < 0.0 or float(np.max(y_prob)) > 1.0:
+        raise ValueError(f"y_prob must be probabilities in [0, 1]: {pred_path}")
+
+    class_names = None
+    if "class_names" in payload:
+        class_names = np.asarray(payload["class_names"]).astype(str).tolist()
+        if len(class_names) != y_true.shape[1]:
+            raise ValueError(
+                f"class_names length {len(class_names)} does not match prediction width {y_true.shape[1]}"
+            )
+    return y_true, y_prob, class_names
+
+
+def validate_freeze_manifest(
+    *,
+    freeze_path: Path,
+    pred_path: Path,
+    y_true: np.ndarray,
+    class_names: list[str] | None,
+) -> str:
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
+        raise ValueError(f"Invalid OOF freeze manifest: {freeze_path}")
+    relative = pred_path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    frozen = {row["path"]: row for row in freeze.get("artifacts", [])}
+    if relative not in frozen:
+        raise ValueError(f"Freeze manifest does not contain prediction file: {relative}")
+    if sha256_file(pred_path) != frozen[relative]["sha256"]:
+        raise RuntimeError(f"Prediction checksum changed after freeze: {relative}")
+    if int(freeze.get("validated_records", y_true.shape[0])) != y_true.shape[0]:
+        raise ValueError("Prediction record count differs from freeze manifest")
+    if int(freeze.get("n_classes", y_true.shape[1])) != y_true.shape[1]:
+        raise ValueError("Prediction class count differs from freeze manifest")
+    if class_names is not None and freeze.get("class_names") and freeze["class_names"] != class_names:
+        raise ValueError("Prediction class order differs from freeze manifest")
+    return sha256_file(freeze_path)
 
 
 def reliability_bins(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int) -> list[dict]:
@@ -89,6 +153,49 @@ def reliability_bins(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int) -> lis
                 "confidence": confidence,
                 "empirical_rate": empirical_rate,
                 "abs_gap": abs(empirical_rate - confidence),
+            }
+        )
+    return rows
+
+
+def calibration_micro_summary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int) -> dict:
+    from sklearn.metrics import brier_score_loss
+
+    yt = np.asarray(y_true, dtype=np.float32).ravel()
+    yp = np.asarray(y_prob, dtype=np.float32).ravel()
+    return {
+        "ece_micro": ece_binary(yt, yp, n_bins=n_bins),
+        "mce_micro": mce_binary(yt, yp, n_bins=n_bins),
+        "brier_micro": float(brier_score_loss(yt, yp)),
+        "n_label_record_pairs": int(len(yt)),
+    }
+
+
+def per_class_calibration_rows(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    class_names: list[str] | None,
+    n_bins: int,
+) -> list[dict]:
+    from sklearn.metrics import brier_score_loss
+
+    names = class_names or [f"class_{idx}" for idx in range(y_true.shape[1])]
+    rows = []
+    for idx, name in enumerate(names):
+        yt = y_true[:, idx]
+        yp = y_prob[:, idx]
+        has_both = len(np.unique(yt)) >= 2
+        rows.append(
+            {
+                "class_index": idx,
+                "class_name": str(name),
+                "n_records": int(len(yt)),
+                "n_positive": int(np.sum(yt)),
+                "prevalence": float(np.mean(yt)),
+                "ece": ece_binary(yt, yp, n_bins=n_bins) if has_both else float("nan"),
+                "mce": mce_binary(yt, yp, n_bins=n_bins) if has_both else float("nan"),
+                "brier": float(brier_score_loss(yt, yp)) if has_both else float("nan"),
+                "evaluated": bool(has_both),
             }
         )
     return rows
@@ -162,33 +269,24 @@ def main() -> None:
     if not pred_path.exists():
         raise FileNotFoundError(pred_path)
 
-    data = np.load(pred_path, allow_pickle=True)
-    missing_keys = {"y_true", "y_prob"} - set(data.files)
-    if missing_keys:
-        raise KeyError(f"{pred_path} is not a metric prediction file; missing keys: {sorted(missing_keys)}")
-    if args.require_manuscript_ready and "manuscript_ready" in data.files:
+    data = load_prediction_payload(pred_path)
+    if args.require_manuscript_ready and "manuscript_ready" in data:
         if not bool(data["manuscript_ready"].item()):
             raise ValueError(f"Prediction artifact is not manuscript-ready: {pred_path}")
+
+    y_true, y_prob, class_names = validate_prediction_payload(data, pred_path)
     freeze_manifest_sha256 = None
     if args.freeze_manifest:
-        freeze = json.loads(args.freeze_manifest.read_text(encoding="utf-8"))
-        if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
-            raise ValueError(f"Invalid OOF freeze manifest: {args.freeze_manifest}")
-        relative = pred_path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
-        frozen = {row["path"]: row for row in freeze.get("artifacts", [])}
-        if relative not in frozen:
-            raise ValueError(f"Freeze manifest does not contain prediction file: {relative}")
-        if sha256_file(pred_path) != frozen[relative]["sha256"]:
-            raise RuntimeError(f"Prediction checksum changed after freeze: {relative}")
-        freeze_manifest_sha256 = sha256_file(args.freeze_manifest)
-
-    y_true = data["y_true"].astype(np.float32)
-    y_prob = data["y_prob"].astype(np.float32)
-    if y_true.shape != y_prob.shape:
-        raise ValueError(f"Shape mismatch: y_true {y_true.shape}, y_prob {y_prob.shape}")
+        freeze_manifest_sha256 = validate_freeze_manifest(
+            freeze_path=args.freeze_manifest,
+            pred_path=pred_path,
+            y_true=y_true,
+            class_names=class_names,
+        )
 
     metrics = multilabel_metrics(y_true, y_prob, threshold=args.threshold)
     calibration = calibration_summary(y_true, y_prob, n_bins=args.n_bins)
+    calibration_micro = calibration_micro_summary(y_true, y_prob, n_bins=args.n_bins)
     ci = {
         "macro_pr_auc": bootstrap_ci(
             y_true, y_prob, macro_pr_auc, n_boot=args.n_boot, seed=args.seed
@@ -203,14 +301,32 @@ def main() -> None:
             n_boot=args.n_boot,
             seed=args.seed,
         ),
+        "ece_macro": bootstrap_ci(
+            y_true,
+            y_prob,
+            lambda yt, yp: calibration_summary(yt, yp, n_bins=args.n_bins)["ece_macro"],
+            n_boot=args.n_boot,
+            seed=args.seed,
+        ),
+        "brier_macro": bootstrap_ci(
+            y_true,
+            y_prob,
+            lambda yt, yp: calibration_summary(yt, yp, n_bins=args.n_bins)["brier_macro"],
+            n_boot=args.n_boot,
+            seed=args.seed,
+        ),
     }
     dataset = scalar_from_npz(data, "dataset", pred_path.stem)
     protocol = scalar_from_npz(data, "protocol", None)
-    class_names = data["class_names"].astype(str).tolist() if "class_names" in data.files else None
     reliability = reliability_bins(y_true, y_prob, n_bins=args.n_bins)
     reliability_csv = TABLE_DIR / f"reliability_bins_{pred_path.stem}.csv"
+    class_calibration_csv = TABLE_DIR / f"calibration_by_class_{pred_path.stem}.csv"
     reliability_fig = FIGURE_DIR / f"reliability_{pred_path.stem}.png"
     save_csv_rows(reliability_csv, reliability)
+    save_csv_rows(
+        class_calibration_csv,
+        per_class_calibration_rows(y_true, y_prob, class_names, n_bins=args.n_bins),
+    )
     write_reliability_figure(reliability, reliability_fig, title=f"Reliability: {dataset}")
 
     payload = {
@@ -226,11 +342,19 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "seed": args.seed,
         "metrics": metrics,
         "calibration": calibration,
+        "calibration_micro": calibration_micro,
+        "reliability": {
+            "scope": "micro_flattened_label_record_pairs",
+            "description": "All record-class probability pairs are binned together for the reliability curve.",
+            "n_bins": args.n_bins,
+        },
         "bootstrap_ci": ci,
         "artifacts": {
             "reliability_bins_csv": str(reliability_csv),
+            "class_calibration_csv": str(class_calibration_csv),
             "reliability_figure": str(reliability_fig),
         },
     }

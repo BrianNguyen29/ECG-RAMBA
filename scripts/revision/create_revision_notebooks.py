@@ -1265,6 +1265,25 @@ else:
     print('Skipping metric dependency install.')
 """
         ),
+        markdown("## Restore And Validate Frozen OOF Inputs"),
+        code(
+            """stable_mirror = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'
+if stable_mirror.exists():
+    run(
+        f'python -u scripts/revision/artifact_mirror.py restore '
+        f'--mirror-root "{stable_mirror}" --replace-mismatched',
+        log_path='reports/revision/logs/calibration_mirror_restore.log',
+    )
+else:
+    print('Stable mirror does not exist yet:', stable_mirror)
+
+run(
+    'python -u scripts/revision/06_freeze_oof.py '
+    '--expected-records 44186 --expected-folds 5 --q 3 --check-only',
+    log_path='reports/revision/logs/calibration_oof_input_check.log',
+)
+"""
+        ),
         markdown("## Run Calibration And Bootstrap CI"),
         code(
             """N_BOOT = 1000
@@ -1304,6 +1323,8 @@ for path in metric_jsons:
     print('shape:', payload.get('shape'))
     print('metrics:', payload.get('metrics'))
     print('calibration:', payload.get('calibration'))
+    print('calibration_micro:', payload.get('calibration_micro'))
+    print('reliability:', payload.get('reliability'))
     print('bootstrap_ci:', payload.get('bootstrap_ci'))
     print('artifacts:', payload.get('artifacts'))
 """
@@ -1323,20 +1344,25 @@ for path in sorted(Path('reports/revision/metrics').glob('calibration_ci_*.json'
     payload = json.loads(path.read_text(encoding='utf-8'))
     metrics = payload.get('metrics', {})
     calibration = payload.get('calibration', {})
+    calibration_micro = payload.get('calibration_micro', {})
+    reliability = payload.get('reliability', {})
     shape = payload.get('shape', {})
     row = {
         'dataset': payload.get('dataset') or Path(payload.get('predictions', path.stem)).stem,
         'predictions': payload.get('predictions'),
         'protocol': payload.get('protocol'),
         'git_commit': payload.get('git_commit'),
+        'seed': payload.get('seed'),
         'n_records': shape.get('y_true', [None, None])[0],
         'n_classes': shape.get('y_true', [None, None])[1],
         'threshold': payload.get('threshold'),
         'n_bins': payload.get('n_bins'),
         'n_boot': payload.get('n_boot'),
+        'reliability_scope': reliability.get('scope'),
     }
     row.update(metrics)
     row.update(calibration)
+    row.update(calibration_micro)
     calibration_rows.append(row)
 
     for metric_name, ci in payload.get('bootstrap_ci', {}).items():
