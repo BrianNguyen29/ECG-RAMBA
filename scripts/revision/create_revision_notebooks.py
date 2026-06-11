@@ -318,8 +318,8 @@ run('git status --short --branch')
         markdown("## Install Lightweight Dependencies"),
         code(
             '!python --version\n'
-            '!pip install -q "numpy>=2.0,<2.6" "scipy>=1.14.1,<2.0" '
-            '"pandas==2.2.2" scikit-learn tqdm wfdb joblib matplotlib seaborn packaging '
+            '!pip install -q "numpy>=2.0,<2.1" "scipy>=1.14.1,<2.0" '
+            '"pandas==2.2.2" scikit-learn tqdm "wfdb<4.3" joblib matplotlib seaborn packaging '
             'neurokit2 iterative-stratification thop\n'
         ),
         markdown("## Run A0 Audit"),
@@ -407,7 +407,7 @@ if INSTALL_BASE_DEPS:
     import time
 
     numeric_packages = [
-        "numpy>=2.0,<2.6",
+        "numpy>=2.0,<2.1",
         "scipy>=1.14.1,<2.0",
         "scikit-learn",
     ]
@@ -415,7 +415,7 @@ if INSTALL_BASE_DEPS:
         "pandas==2.2.2",
         "threadpoolctl",
         "tqdm",
-        "wfdb",
+        "wfdb<4.3",
         "joblib",
         "matplotlib",
         "seaborn",
