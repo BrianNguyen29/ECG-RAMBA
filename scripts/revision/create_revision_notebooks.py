@@ -319,7 +319,7 @@ run('git status --short --branch')
         code(
             '!python --version\n'
             '!pip install -q "numpy>=2.0,<2.1" "scipy>=1.14.1,<2.0" '
-            '"pandas==2.2.2" scikit-learn tqdm "wfdb<4.3" joblib matplotlib seaborn packaging '
+            '"pandas==2.2.2" scikit-learn tqdm "wfdb==4.1.2" joblib matplotlib seaborn packaging '
             'neurokit2 iterative-stratification thop\n'
         ),
         markdown("## Run A0 Audit"),
@@ -415,7 +415,7 @@ if INSTALL_BASE_DEPS:
         "pandas==2.2.2",
         "threadpoolctl",
         "tqdm",
-        "wfdb<4.3",
+        "wfdb==4.1.2",
         "joblib",
         "matplotlib",
         "seaborn",
