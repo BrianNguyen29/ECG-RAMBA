@@ -87,12 +87,60 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 return_value=None,
             ):
                 artifact_mirror.publish(mirror)
+                manifest_path = mirror / "manifests" / "mirror_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertNotIn(
+                    "manifests/mirror_manifest.json",
+                    {row["relative_path"] for row in manifest["artifacts"]},
+                )
                 source.unlink()
                 artifact_mirror.restore(mirror, replace_mismatched=True)
                 self.assertEqual(source.read_bytes(), b"verified-oof")
                 (mirror / "predictions" / source.name).write_bytes(b"corrupt")
                 with self.assertRaises(RuntimeError):
                     artifact_mirror.restore(mirror, replace_mismatched=True)
+
+    def test_restore_ignores_legacy_self_referential_mirror_manifest_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            artifact = mirror / "metrics" / "summary.json"
+            artifact.parent.mkdir(parents=True)
+            artifact.write_text('{"ok": true}', encoding="utf-8")
+            manifest_path = mirror / "manifests" / "mirror_manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "mirror_root": str(mirror),
+                        "artifacts": [
+                            {
+                                "relative_path": "manifests/mirror_manifest.json",
+                                "size_bytes": 1,
+                                "sha256": "legacy-stale-self-hash",
+                            },
+                            {
+                                "relative_path": "metrics/summary.json",
+                                "size_bytes": artifact.stat().st_size,
+                                "sha256": sha256_file(artifact),
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(artifact_mirror, "REVISION_DIR", revision), patch.object(
+                artifact_mirror,
+                "ensure_revision_dirs",
+                return_value=None,
+            ):
+                artifact_mirror.restore(mirror, replace_mismatched=True)
+            self.assertEqual(
+                (revision / "metrics" / "summary.json").read_text(encoding="utf-8"),
+                '{"ok": true}',
+            )
 
     def test_a0_update_preserves_other_task_board_rows(self):
         original = (

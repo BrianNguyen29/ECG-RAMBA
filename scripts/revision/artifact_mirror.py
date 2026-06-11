@@ -36,7 +36,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def skip_artifact(relative: Path) -> bool:
-    return relative.parts[:1] == ("logs",) and "mirror" in relative.name
+    normalized = relative.as_posix()
+    return (
+        normalized == "manifests/mirror_manifest.json"
+        or relative.parts[:1] == ("logs",) and "mirror" in relative.name
+    )
 
 
 def publish(mirror_root: Path) -> Path:
