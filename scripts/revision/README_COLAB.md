@@ -37,7 +37,7 @@ Option A - GitHub, preferred:
 
 ```bash
 cd /content/drive/MyDrive/ECG-Ramba
-git clone -b revision/colab-pipeline https://github.com/BrianNguyen29/ECG-RAMBA.git
+git clone -b main https://github.com/BrianNguyen29/ECG-RAMBA.git
 cd ECG-RAMBA
 git pull --ff-only
 ```

@@ -254,7 +254,7 @@ except Exception as exc:
 DRIVE_ROOT = Path('/content/drive/MyDrive/ECG-Ramba')
 REPO_DIR = DRIVE_ROOT / 'ECG-RAMBA'
 REPO_URL = 'https://github.com/BrianNguyen29/ECG-RAMBA.git'
-BRANCH = 'revision/colab-pipeline'
+BRANCH = 'main'
 os.environ['ECG_RAMBA_DRIVE_ROOT'] = str(DRIVE_ROOT)
 
 print('drive_root:', DRIVE_ROOT)
