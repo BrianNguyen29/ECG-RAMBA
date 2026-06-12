@@ -16,6 +16,7 @@ import os
 import sys
 import gc
 import hashlib
+import time
 import warnings
 import numpy as np
 import pandas as pd
@@ -276,9 +277,24 @@ def main():
     for fold, split in enumerate(folds, start=1):
         tr_idx = split["tr_idx"]
         va_idx = split["va_idx"]
-        print(f"\n⚡ FOLD {fold}/{CONFIG['n_folds']}")
+        fold_started = time.perf_counter()
+        rocket_train_gib = (
+            len(tr_idx) * X_rocket_raw.shape[1] * X_rocket_raw.dtype.itemsize
+        ) / (1024 ** 3)
+        print(f"\n⚡ FOLD {fold}/{CONFIG['n_folds']}", flush=True)
+        print(
+            f"   ⏳ PCA fit starting on CPU | train={len(tr_idx)} | "
+            f"features={X_rocket_raw.shape[1]} | input_copy≈{rocket_train_gib:.2f} GiB",
+            flush=True,
+        )
 
+        pca_started = time.perf_counter()
         pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
+        print(
+            f"   ✅ PCA fit complete in {(time.perf_counter() - pca_started) / 60:.1f} min",
+            flush=True,
+        )
+        print("   ⏳ Transforming train/validation MiniRocket features...", flush=True)
         hydra_tr = apply_pca(pca, X_rocket_raw[tr_idx])
         hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
         pca_variance = float(pca.explained_variance_ratio_.sum())
@@ -289,6 +305,7 @@ def main():
         hydra_dict = {i: f for i, f in zip(tr_idx, hydra_tr)}
         hydra_dict.update({i: f for i, f in zip(va_idx, hydra_va)})
 
+        print("   ⏳ Building train/validation slice datasets...", flush=True)
         (Xs_tr, Xh_tr, Xhr_tr, y_tr, rid_tr, pos_tr), skipped_tr = build_slice_dataset(
             tr_idx, hydra_dict, X, y, X_hrv_base
         )
@@ -350,6 +367,11 @@ def main():
         best_f1, best_epoch = -np.inf, -1
         best_metrics = None
         fold_skipped_nan = 0
+        selected_state = None
+        selected_payload = None
+        raw_payload = None
+        final_raw_payload = None
+        final_ema_payload = None
 
         best_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best.pt")
         best_ema_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best_ema.pt")
@@ -561,9 +583,21 @@ def main():
             )
         )
 
+        print(
+            f"   🧹 Releasing Fold {fold} datasets/loaders after "
+            f"{(time.perf_counter() - fold_started) / 60:.1f} min",
+            flush=True,
+        )
+        del train_loader, val_loader
+        del Xs_tr, Xh_tr, Xhr_tr, y_tr, rid_tr, pos_tr
+        del Xs_va, Xh_va, Xhr_va, y_va, rid_va, pos_va
+        del hydra_dict, hydra_tr, hydra_va, pca
+        del selected_state, selected_payload, raw_payload
+        del final_raw_payload, final_ema_payload
         del model, optimizer, scheduler, ema
         torch.cuda.empty_cache()
         gc.collect()
+        print(f"   ✅ Fold {fold} memory cleanup complete", flush=True)
 
     # ==================================================================================
     # 🏁 FINAL REPORT
