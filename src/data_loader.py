@@ -259,7 +259,13 @@ def load_chapman_multilabel(paths: dict = None):
         print(f"📦 Extracting dataset from ZIP: {zip_path}")
         os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, 'r') as z:
-            z.extractall(extract_dir)
+            members = z.infolist()
+            print(
+                f"📦 Extracting {len(members)} archive members to: {extract_dir}",
+                flush=True,
+            )
+            for member in tqdm(members, desc="Extract ZIP", unit="file"):
+                z.extract(member, extract_dir)
 
     # --------------------------------------------------------
     # 3️⃣ SCAN RAW RECORDS (TRUTH SOURCE)
