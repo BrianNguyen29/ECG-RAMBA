@@ -634,6 +634,16 @@ def expected_weights_kind(checkpoint_kind: str) -> str | None:
     return None
 
 
+def validate_checkpoint_weights_kind(checkpoint_kind: str, actual: str | None, path: Path) -> None:
+    expected = expected_weights_kind(checkpoint_kind)
+    if expected is not None and actual != expected:
+        raise ValueError(
+            f"Checkpoint kind {checkpoint_kind} requires explicit weights_kind={expected}, "
+            f"but {path} reports weights_kind={actual}. "
+            "Retrain with the explicit checkpoint contract before manuscript OOF export."
+        )
+
+
 def load_model_for_fold(
     fold: int,
     checkpoint_kind: str,
@@ -645,13 +655,8 @@ def load_model_for_fold(
     print(f"Loading checkpoint: {path}")
     checkpoint = torch.load(path, map_location=DEVICE)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-    expected = expected_weights_kind(checkpoint_kind)
     actual = checkpoint.get("weights_kind") if isinstance(checkpoint, dict) else None
-    if expected is not None and actual not in {None, expected}:
-        raise ValueError(
-            f"Checkpoint kind {checkpoint_kind} requires weights_kind={expected}, "
-            f"but {path} reports weights_kind={actual}"
-        )
+    validate_checkpoint_weights_kind(checkpoint_kind, actual, path)
 
     model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
     try:

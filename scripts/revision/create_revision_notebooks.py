@@ -1,11 +1,13 @@
-"""Generate the Colab notebook suite for the revision workflow.
+"""Legacy notebook generator for the revision workflow.
 
 Run from repo root:
     python scripts/revision/create_revision_notebooks.py
 
-The notebooks are intentionally lightweight runbooks. Heavy experiment logic
-should live in scripts so the same commands can be run from Colab, local
-shells, or CI-style checks.
+This generator is intentionally disabled. The revision notebooks are now
+hand-maintained because the canonical workflow uses explicit best_ema
+checkpoints and model-run pointers. Re-running this stale generator would
+recreate older oof_full notebook cells and can overwrite reviewer-facing
+runbooks with an invalid protocol.
 """
 
 from __future__ import annotations
@@ -17,11 +19,19 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 NOTEBOOK_DIR = PROJECT_ROOT / "notebooks"
 HAND_MAINTAINED_NOTEBOOKS = {
+    "02a_retrain_best_ema.ipynb",
     "02_predictions_and_external_eval.ipynb",
+    "03_calibration_and_ci.ipynb",
     "04_baselines_and_component_checks.ipynb",
     "05_hrv_domain_and_robustness.ipynb",
     "06_pooling_and_representation.ipynb",
 }
+STALE_GENERATOR_MESSAGE = (
+    "scripts/revision/create_revision_notebooks.py is stale and disabled. "
+    "Do not regenerate revision notebooks from this script; edit the "
+    "hand-maintained notebooks directly or update this generator to the "
+    "best_ema/model_runs protocol first."
+)
 
 
 SETUP_CODE = """from pathlib import Path
@@ -1586,6 +1596,8 @@ print('- artifacts_manifest.json was generated after the final run.')
 
 
 def main() -> None:
+    raise SystemExit(STALE_GENERATOR_MESSAGE)
+
     notebooks = {
         "00_colab_bootstrap.ipynb": ("00 Colab Bootstrap", bootstrap_notebook()),
         "01_a0_protocol_audit.ipynb": ("01 A0 Protocol Audit", a0_notebook()),

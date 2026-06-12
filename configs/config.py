@@ -159,22 +159,23 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
             break
         
     explicit_model_dir = os.environ.get('ECG_RAMBA_MODEL_DIR')
-    model_candidates = [
-        './models',
-        './model',
-        f'{base_dir}/model',
-        f'{base_dir}/models',
-    ]
     if explicit_model_dir:
-        model_candidates.insert(0, explicit_model_dir)
-    model_dir = './models'
-    for candidate in model_candidates:
-        if (
-            os.path.exists(candidate)
-            and any(name.startswith('fold') and name.endswith('_best.pt') for name in os.listdir(candidate))
-        ):
-            model_dir = candidate
-            break
+        model_dir = explicit_model_dir
+    else:
+        model_candidates = [
+            './models',
+            './model',
+            f'{base_dir}/model',
+            f'{base_dir}/models',
+        ]
+        model_dir = './models'
+        for candidate in model_candidates:
+            if (
+                os.path.exists(candidate)
+                and any(name.startswith('fold') and name.endswith('_best.pt') for name in os.listdir(candidate))
+            ):
+                model_dir = candidate
+                break
 
     explicit_chapman_zip = os.environ.get('ECG_RAMBA_CHAPMAN_ZIP')
     chapman_candidates = [

@@ -47,6 +47,10 @@ Run in this order on Colab:
 
 Notebook 02 must first produce and freeze the post-fix
 `oof_best_ema_*` artifacts from explicit `fold*_best_ema.pt` checkpoints.
+Notebook 02a writes those retrained checkpoints to a versioned Drive model-run
+directory under `Drive/ECG-Ramba/model_runs/` and writes
+`model_runs/current_best_ema_model_dir.txt`. Notebook 02 reads that pointer
+before falling back to the historical `Drive/ECG-Ramba/model` directory.
 Notebook 03 and pooling sensitivity consume only the checksum-verified
 `oof_best_ema_freeze_manifest.json`. Historical raw `oof_full_*` and
 `oof_final_*` outputs are diagnostic until a post-fix retrain proves otherwise.

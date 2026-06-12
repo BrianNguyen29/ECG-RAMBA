@@ -38,6 +38,16 @@ class RevisionArtifactContractTests(unittest.TestCase):
                     model_dir / "fold1_best.pt",
                 )
 
+    def test_explicit_checkpoint_kind_requires_explicit_weights_metadata(self):
+        generate_predictions.validate_checkpoint_weights_kind("best_ema", "ema", Path("fold1_best_ema.pt"))
+        generate_predictions.validate_checkpoint_weights_kind("final_raw", "raw", Path("fold1_final_raw.pt"))
+        generate_predictions.validate_checkpoint_weights_kind("best", None, Path("fold1_best.pt"))
+
+        with self.assertRaises(ValueError):
+            generate_predictions.validate_checkpoint_weights_kind("best_ema", None, Path("fold1_best_ema.pt"))
+        with self.assertRaises(ValueError):
+            generate_predictions.validate_checkpoint_weights_kind("best_ema", "raw", Path("fold1_best_ema.pt"))
+
     def test_fold_cache_without_complete_slice_coverage_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fold.npz"
