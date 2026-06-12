@@ -89,6 +89,7 @@ Do not launch full training/evaluation until the audit warnings are resolved.
 ```text
 notebooks/00_colab_bootstrap.ipynb
 notebooks/01_a0_protocol_audit.ipynb
+notebooks/02a_retrain_best_ema.ipynb
 notebooks/02_predictions_and_external_eval.ipynb
 notebooks/03_calibration_and_ci.ipynb
 notebooks/06_pooling_and_representation.ipynb  # pooling sensitivity
@@ -97,6 +98,12 @@ notebooks/05_hrv_domain_and_robustness.ipynb
 notebooks/06_pooling_and_representation.ipynb  # representation follow-up
 notebooks/07_results_freeze.ipynb
 ```
+
+Colab package installations are scoped to the current runtime session. Do not
+manually disconnect between notebooks unless you need a fresh session. Restart
+only when a dependency cell explicitly requests it, then rerun the current
+notebook from the first cell. Notebook 02a replays the canonical base and Mamba
+installers when it detects a fresh runtime.
 
 Planning metadata lives in:
 

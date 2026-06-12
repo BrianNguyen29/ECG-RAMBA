@@ -45,6 +45,11 @@ Run in this order on Colab:
 9. Revisit `notebooks/06_pooling_and_representation.ipynb` for representation work.
 10. `notebooks/07_results_freeze.ipynb`
 
+Colab package installations are runtime-scoped. Keep the same runtime between
+notebooks when practical. If Colab restarts or you disconnect, rerun the current
+notebook from its first cell; Notebook 02a will replay the canonical base and
+Mamba bootstrap before retraining.
+
 Notebook 02 must first produce and freeze the post-fix
 `oof_best_ema_*` artifacts from explicit `fold*_best_ema.pt` checkpoints.
 Notebook 02a writes those retrained checkpoints to a versioned Drive model-run
