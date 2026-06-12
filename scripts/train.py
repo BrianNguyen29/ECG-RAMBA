@@ -640,7 +640,7 @@ def main():
                     
                     if DEVICE == 'cuda':
                         with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
-                            probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
+                            probs = torch.sigmoid(model(x, xh, xhr)).float().cpu().numpy()
                     else:
                         probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
                     if torch.is_tensor(rids):

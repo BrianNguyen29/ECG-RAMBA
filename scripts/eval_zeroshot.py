@@ -253,7 +253,7 @@ def main():
                 for m in models:
                     if DEVICE == 'cuda':
                         with autocast("cuda"):
-                            fold_preds.append(torch.sigmoid(m(xb, zh, zhrv)).cpu().numpy())
+                            fold_preds.append(torch.sigmoid(m(xb, zh, zhrv)).float().cpu().numpy())
                     else:
                         fold_preds.append(torch.sigmoid(m(xb, zh, zhrv)).cpu().numpy())
                 probs_ptb.append(np.mean(fold_preds, axis=0))
