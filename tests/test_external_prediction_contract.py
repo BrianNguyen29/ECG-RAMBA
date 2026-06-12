@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import torch
 
 from configs.config import CLASS_TO_IDX, CLASSES
 
@@ -15,6 +16,27 @@ external = importlib.import_module("scripts.revision.03_generate_external_predic
 
 
 class ExternalPredictionContractTests(unittest.TestCase):
+    def test_checkpoint_provenance_requires_matching_explicit_ema_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for fold in (1, 2):
+                path = Path(tmp) / f"fold{fold}_final_ema.pt"
+                torch.save(
+                    {
+                        "model": {},
+                        "weights_kind": "ema",
+                        "epoch": 20,
+                        "selection_rule": "fixed_final_epoch",
+                        "config_hash": "source123",
+                        "dataset_record_order_fingerprint": "records123",
+                    },
+                    path,
+                )
+                paths.append(path)
+            rows, source_hash = external.checkpoint_provenance(paths, "final_ema")
+            self.assertEqual(source_hash, "source123")
+            self.assertEqual([row["weights_kind"] for row in rows], ["ema", "ema"])
+
     def test_ptb_mapping_uses_declared_chapman_classes(self):
         probs = np.zeros((2, len(CLASSES)), dtype=np.float32)
         probs[:, CLASS_TO_IDX["SNR"]] = [0.8, 0.1]

@@ -16,7 +16,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import CLASSES, CONFIG_HASH, PATHS  # noqa: E402
+from configs.config import (  # noqa: E402
+    CLASSES,
+    EVALUATION_CONFIG_HASH,
+    PATHS,
+)
 from scripts.revision.common import (  # noqa: E402
     CACHE_SCHEMA_VERSION,
     LOG_DIR,
@@ -53,6 +57,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-records", type=int, default=44186)
     parser.add_argument("--expected-folds", type=int, default=5)
     parser.add_argument("--q", type=float, default=3.0)
+    parser.add_argument(
+        "--expected-checkpoint-kind",
+        default="final_ema",
+        help=(
+            "Checkpoint kind allowed for manuscript-ready OOF. The default "
+            "uses the pre-specified final EMA epoch and rejects validation-selected best checkpoints."
+        ),
+    )
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--allow-missing-log", action="store_true")
     return parser.parse_args()
@@ -159,6 +171,7 @@ def validate_oof(args: argparse.Namespace) -> dict:
             "aggregation_q",
             "aggregation_implementation",
             "cache_schema_version",
+            "dataset_record_order_fingerprint",
         }
         required_slice = {"slice_prob", "record_id", "fold_id", "class_names"}
         if not required_record.issubset(record_data.files):
@@ -247,13 +260,42 @@ def validate_oof(args: argparse.Namespace) -> dict:
             )
         )
         checkpoint_kind = str(npz_scalar(record_data, "checkpoint_kind", "best"))
-        if evaluation_config_hash != CONFIG_HASH:
+        dataset_record_order_fingerprint = str(
+            npz_scalar(record_data, "dataset_record_order_fingerprint", "")
+        )
+        if not dataset_record_order_fingerprint:
+            raise ValueError("OOF artifact lacks the Chapman record-order fingerprint")
+        if evaluation_config_hash != EVALUATION_CONFIG_HASH:
             raise ValueError(
                 "OOF evaluation_config_hash differs from the current evaluation config. "
                 "Re-run 02_reaggregate_oof.py before freezing."
             )
+        if checkpoint_kind != args.expected_checkpoint_kind:
+            raise ValueError(
+                f"Checkpoint kind {checkpoint_kind} is not manuscript-ready under this "
+                f"protocol; expected {args.expected_checkpoint_kind}. Validation-selected "
+                "best checkpoints are diagnostic unless evaluated in a nested CV design."
+            )
 
-    source_checkpoints = normalize_checkpoint_rows(checkpoint_rows_from_manifest(run_manifest))
+    raw_source_checkpoint_rows = checkpoint_rows_from_manifest(run_manifest)
+    manifest_dataset_fingerprint = run_manifest.get(
+        "dataset_record_order_fingerprint"
+    )
+    if manifest_dataset_fingerprint != dataset_record_order_fingerprint:
+        raise ValueError(
+            "Run manifest dataset record-order fingerprint differs from the OOF artifact"
+        )
+    checkpoint_dataset_fingerprints = {
+        str(row.get("dataset_record_order_fingerprint"))
+        for row in raw_source_checkpoint_rows
+        if row.get("dataset_record_order_fingerprint")
+    }
+    if checkpoint_dataset_fingerprints != {dataset_record_order_fingerprint}:
+        raise ValueError(
+            "Source checkpoint dataset record-order fingerprints are incomplete "
+            "or differ from the OOF artifact"
+        )
+    source_checkpoints = normalize_checkpoint_rows(raw_source_checkpoint_rows)
     current_checkpoints_list = current_checkpoint_rows(checkpoint_kind, args.expected_folds)
     current_checkpoints = normalize_checkpoint_rows(current_checkpoints_list)
     if set(source_checkpoints) != set(range(1, args.expected_folds + 1)):
@@ -307,8 +349,9 @@ def validate_oof(args: argparse.Namespace) -> dict:
             "max_abs_reaggregation_delta": max_abs_delta,
         },
         "source_config_hash": source_config_hash,
+        "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
         "evaluation_config_hash": evaluation_config_hash,
-        "current_evaluation_config_hash": CONFIG_HASH,
+        "current_evaluation_config_hash": EVALUATION_CONFIG_HASH,
         "checkpoint_kind": checkpoint_kind,
         "checkpoint_fingerprints_match": True,
         "source_checkpoints": [source_checkpoints[i] for i in sorted(source_checkpoints)],

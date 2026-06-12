@@ -384,8 +384,8 @@ def load_cached_chapman_hrv(
     pred_mod = importlib.import_module("scripts.revision.01_generate_predictions")
     from src.features import generate_hrv_cache
 
-    X, _y, X_raw_amp, _subjects = pred_mod.prepare_clean_chapman(limit_records=limit_records)
-    X_hrv = generate_hrv_cache(X, X_raw_amp)
+    X, _y, X_raw_amp, subjects = pred_mod.prepare_clean_chapman(limit_records=limit_records)
+    X_hrv = generate_hrv_cache(X, X_raw_amp, subjects)
     return sanitize_features(X_hrv), {
         "chapman_hrv_cache": None,
         "chapman_hrv_cache_sha256": None,

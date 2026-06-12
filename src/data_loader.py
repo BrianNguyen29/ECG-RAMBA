@@ -27,6 +27,7 @@ from configs.config import (
     SNOMED_MAPPING
 )
 from src.features import extract_amplitude_features
+from src.provenance import record_order_fingerprint
 
 
 def env_flag(name: str, default: bool = True) -> bool:
@@ -50,6 +51,42 @@ def quarantine_file(path: str, reason: str) -> None:
         print(f"⚠️  Could not quarantine corrupt cache: {path}")
         print(f"    Reason: {reason}")
         print(f"    Rename error: {exc}")
+
+
+def validate_clean_cache_arrays(
+    X: np.ndarray,
+    y: np.ndarray,
+    X_raw_amp: np.ndarray,
+    subjects: np.ndarray,
+) -> str:
+    """Validate the clean-cache contract without allocating a full-size mask."""
+    n_records = len(X)
+    expected = {
+        "X": (n_records, 12, SEQ_LEN),
+        "y": (n_records, NUM_CLASSES),
+        "X_raw_amp": (n_records, 5),
+        "subjects": (n_records,),
+    }
+    actual = {
+        "X": X.shape,
+        "y": y.shape,
+        "X_raw_amp": X_raw_amp.shape,
+        "subjects": subjects.shape,
+    }
+    if actual != expected:
+        raise ValueError(f"Clean cache shape mismatch: actual={actual}, expected={expected}")
+    if n_records == 0:
+        raise ValueError("Clean cache contains no records")
+    if len(np.unique(subjects.astype(str))) != n_records:
+        raise ValueError("Clean cache record/subject identifiers are not unique")
+    if not np.isfinite(y).all() or not np.isfinite(X_raw_amp).all():
+        raise ValueError("Clean cache labels or amplitude features are non-finite")
+    if not np.logical_or(y == 0, y == 1).all():
+        raise ValueError("Clean cache labels must be binary")
+    for start in range(0, n_records, 512):
+        if not np.isfinite(X[start:start + 512]).all():
+            raise ValueError(f"Clean cache ECG contains non-finite values near row {start}")
+    return record_order_fingerprint(subjects)
 
 
 def reset_or_relocate_extract_dir(extract_dir: str) -> str:
@@ -160,12 +197,31 @@ def load_chapman_multilabel(paths: dict = None):
         if env_flag("ECG_RAMBA_USE_CLEAN_CACHE", default=True):
             print(f"⚠️  Loading cached data: {cache_path}")
             try:
-                d = np.load(cache_path, allow_pickle=True)
-                X_cached = d['X']
-                y_cached = d['y']
-                X_raw_amp_cached = d['X_raw_amp']
-                subjects_cached = d['subjects']
+                with np.load(cache_path, allow_pickle=True) as d:
+                    X_cached = d['X']
+                    y_cached = d['y']
+                    X_raw_amp_cached = d['X_raw_amp']
+                    subjects_cached = d['subjects']
+                    stored_record_fingerprint = (
+                        str(d["record_order_fingerprint"].item())
+                        if "record_order_fingerprint" in d.files
+                        else None
+                    )
+                record_fingerprint = validate_clean_cache_arrays(
+                    X_cached,
+                    y_cached,
+                    X_raw_amp_cached,
+                    subjects_cached,
+                )
+                if (
+                    stored_record_fingerprint is not None
+                    and stored_record_fingerprint != record_fingerprint
+                ):
+                    raise ValueError(
+                        "Clean cache record-order fingerprint does not match its subjects array"
+                    )
                 print(f"✅ Loaded cleaned data cache: {X_cached.shape}")
+                print(f"🔐 Record-order fingerprint: {record_fingerprint}")
                 return X_cached, y_cached, X_raw_amp_cached, subjects_cached
             except Exception as exc:
                 quarantine_file(cache_path, repr(exc))
@@ -213,6 +269,7 @@ def load_chapman_multilabel(paths: dict = None):
         hea_files.extend(
             os.path.join(root, f) for f in files if f.endswith('.hea')
         )
+    hea_files.sort(key=lambda path: extract_record_id(path))
 
     print(f"🔎 Found {len(hea_files)} RAW records")
 
@@ -273,6 +330,7 @@ def load_chapman_multilabel(paths: dict = None):
     y = np.stack(y_list).astype(np.float32)
     X_raw_amp = np.stack(amp_list).astype(np.float32)
     subjects = np.array(subject_list)
+    record_fingerprint = validate_clean_cache_arrays(X, y, X_raw_amp, subjects)
 
     print(f"\n📊 Loaded {len(X)} usable samples")
     print(f"🚫 Skipped records: {skipped}")
@@ -292,7 +350,8 @@ def load_chapman_multilabel(paths: dict = None):
             X=X,
             y=y,
             X_raw_amp=X_raw_amp,
-            subjects=subjects
+            subjects=subjects,
+            record_order_fingerprint=np.asarray(record_fingerprint),
         )
         print(f"💾 Cached cleaned dataset to: {cache_path}")
     else:

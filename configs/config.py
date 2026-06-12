@@ -40,17 +40,12 @@ BASE_CONFIG = {
 
     # ================= TRAINING ======================
     'batch_size': 192,
-    'accum_iter': 1,
     'epochs': 20,
     'lr_max': 9e-4,
     'lr_min': 1e-6,
     'weight_decay': 0.05,
     'grad_clip': 1.0,
     'num_workers': 8,
-
-    # ================= WARMUP ========================
-    'warmup_epochs': 8,
-    'warmup_lr_scale': 1.0,
 
     # ================= LOSS STRATEGY =================
     'loss_type': 'bce_then_asymmetric',
@@ -94,8 +89,16 @@ BASE_CONFIG = {
     'seq_len_after_tokenizer': 625,
 }
 
-CONFIG = BASE_CONFIG
+CONFIG = dict(BASE_CONFIG)
 CONFIG['_profile'] = ''
+
+if os.environ.get('ECG_RAMBA_EPOCHS'):
+    CONFIG['epochs'] = int(os.environ['ECG_RAMBA_EPOCHS'])
+if CONFIG['epochs'] <= CONFIG['asym_start_epoch']:
+    raise ValueError(
+        "ECG-RAMBA requires epochs > asym_start_epoch so EMA validation "
+        "and explicit EMA checkpoints can be produced."
+    )
 
 # ============================================================
 # ABLATION CONFIG (MODEL COMPATIBILITY)
@@ -137,6 +140,43 @@ CONFIG_HASH = hashlib.md5(
     json.dumps(CONFIG, sort_keys=True).encode()
 ).hexdigest()[:8]
 
+EVALUATION_CONFIG_KEYS = [
+    'd_model',
+    'n_layers',
+    'hydra_dim',
+    'n_latents',
+    'hrv_dim',
+    'drop_path_rate',
+    'use_cross_attention_fusion',
+    'fusion_heads',
+    'use_spatial_attention',
+    'use_hrv',
+    'use_final_perceiver',
+    'use_event_slicing',
+    'slice_length',
+    'slice_stride',
+    'max_slices_per_record',
+    'aggregation_method',
+    'power_mean_q',
+    'default_threshold',
+    'seq_len_after_tokenizer',
+]
+EVALUATION_CONFIG = {
+    key: CONFIG[key]
+    for key in EVALUATION_CONFIG_KEYS
+}
+EVALUATION_CONFIG_HASH = hashlib.md5(
+    json.dumps(
+        {
+            'config': EVALUATION_CONFIG,
+            'classes': CLASSES,
+            'seq_len': SEQ_LEN,
+            'fs': FS,
+        },
+        sort_keys=True,
+    ).encode()
+).hexdigest()[:8]
+
 def first_existing_path(candidates: list[str]) -> str:
     for path in candidates:
         if os.path.exists(path):
@@ -172,7 +212,17 @@ def setup_paths(num_classes: int, hydra_dim: int, cfg_hash: str, drive_mounted: 
         for candidate in model_candidates:
             if (
                 os.path.exists(candidate)
-                and any(name.startswith('fold') and name.endswith('_best.pt') for name in os.listdir(candidate))
+                and any(
+                    name.startswith('fold')
+                    and name.endswith((
+                        '_best.pt',
+                        '_best_ema.pt',
+                        '_final_ema.pt',
+                        '_best_raw.pt',
+                        '_final_raw.pt',
+                    ))
+                    for name in os.listdir(candidate)
+                )
             ):
                 model_dir = candidate
                 break

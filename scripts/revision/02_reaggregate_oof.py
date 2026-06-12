@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import CONFIG_HASH, PATHS  # noqa: E402
+from configs.config import EVALUATION_CONFIG_HASH, PATHS  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
     CACHE_SCHEMA_VERSION,
     MANIFEST_DIR,
@@ -268,6 +268,11 @@ def main() -> None:
                 if "evaluation_config_hash" in record_data.files
                 else ""
             )
+            dataset_record_order_fingerprint = (
+                str(record_data["dataset_record_order_fingerprint"].item())
+                if "dataset_record_order_fingerprint" in record_data.files
+                else ""
+            )
             metadata = {
                 key: record_data[key].copy()
                 for key in [
@@ -318,6 +323,11 @@ def main() -> None:
         threshold = float(metadata.get("threshold", np.asarray(0.5)))
         metadata.pop("threshold", None)
         checkpoint_kind = str(metadata.get("checkpoint_kind", np.asarray("best")).item())
+        if checkpoint_kind == "final_ema" and not dataset_record_order_fingerprint:
+            raise ValueError(
+                "Cannot re-aggregate manuscript OOF without a Chapman "
+                "record-order fingerprint"
+            )
         source_checkpoints = checkpoint_rows_from_manifest(source_run_manifest)
         current_checkpoints = current_checkpoint_rows(checkpoint_kind, args.expected_folds)
         source_checkpoint_map = checkpoint_map(source_checkpoints)
@@ -343,7 +353,7 @@ def main() -> None:
             and existing_schema >= CACHE_SCHEMA_VERSION
             and np.isclose(existing_q, args.q)
             and has_explicit_config_provenance
-            and existing_evaluation_config_hash == CONFIG_HASH
+            and existing_evaluation_config_hash == EVALUATION_CONFIG_HASH
             and np.allclose(existing_y_prob, y_prob, rtol=0.0, atol=2e-6)
         ):
             print("OOF record probabilities already match the standardized Q=3 artifact contract.")
@@ -367,9 +377,12 @@ def main() -> None:
             cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
             probability_dtype=np.asarray("float32"),
             standardized_utc=np.asarray(created_utc),
-            config_hash=np.asarray(CONFIG_HASH),
+            config_hash=np.asarray(EVALUATION_CONFIG_HASH),
             source_config_hash=np.asarray(source_slice_config_hash),
-            evaluation_config_hash=np.asarray(CONFIG_HASH),
+            evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+            dataset_record_order_fingerprint=np.asarray(
+                dataset_record_order_fingerprint
+            ),
             source_git_commit=np.asarray(source_git_commit),
             evaluation_git_commit=np.asarray(evaluation_git_commit),
             checkpoint_fingerprints_json=np.asarray(
@@ -387,9 +400,12 @@ def main() -> None:
             slice_count=slice_count,
             valid_record_mask=valid_mask,
             protocol=np.asarray(protocol),
-            config_hash=np.asarray(CONFIG_HASH),
+            config_hash=np.asarray(EVALUATION_CONFIG_HASH),
             source_config_hash=np.asarray(source_config_hash),
-            evaluation_config_hash=np.asarray(CONFIG_HASH),
+            evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+            dataset_record_order_fingerprint=np.asarray(
+                dataset_record_order_fingerprint
+            ),
             source_git_commit=np.asarray(source_git_commit),
             evaluation_git_commit=np.asarray(evaluation_git_commit),
             created_utc=np.asarray(created_utc),
@@ -415,9 +431,10 @@ def main() -> None:
             {
                 "dataset": "chapman_oof",
                 "created_utc": created_utc,
-                "config_hash": CONFIG_HASH,
+                "config_hash": EVALUATION_CONFIG_HASH,
                 "source_config_hash": source_config_hash,
-                "evaluation_config_hash": CONFIG_HASH,
+                "evaluation_config_hash": EVALUATION_CONFIG_HASH,
+                "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
                 "prediction_file": str(args.record_file),
                 "slice_prediction_file": str(args.slice_file),
                 "class_summary_csv": str(class_path),
@@ -432,6 +449,7 @@ def main() -> None:
                 "cache_schema_version": CACHE_SCHEMA_VERSION,
                 "source_slice_dtype": source_slice_dtype,
                 "source_config_hash": source_config_hash,
+                "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
                 "metrics": metrics,
             },
         )

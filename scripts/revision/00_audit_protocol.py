@@ -55,6 +55,7 @@ def main() -> None:
 
     model_dir = Path(PATHS["model_dir"])
     fold_ckpts = sorted(glob.glob(str(model_dir / "fold*_best.pt")))
+    explicit_ema_ckpts = sorted(glob.glob(str(model_dir / "fold*_final_ema.pt")))
     global_pca_candidates = [
         model_dir / "global_pca_zeroshot.pkl",
         PROJECT_ROOT / "global_pca_zeroshot.pkl",
@@ -69,8 +70,11 @@ def main() -> None:
             "Current HRV36 schema has reserved zero-filled slots 5:24. "
             "Do not describe it as full HRV with RMSSD/SDNN/LF-HF unless implemented and retrained."
         )
-    if not fold_ckpts:
-        warnings.append("No fold*_best.pt checkpoints found under configured model_dir.")
+    if not fold_ckpts and not explicit_ema_ckpts:
+        warnings.append(
+            "No legacy fold*_best.pt or explicit fold*_final_ema.pt checkpoints "
+            "found under configured model_dir."
+        )
     if not fold_pca_manifest.exists():
         warnings.append(
             "No fold_pca_manifest.json found. External evaluation remains blocked until "

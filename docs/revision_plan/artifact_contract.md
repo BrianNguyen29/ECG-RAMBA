@@ -11,15 +11,17 @@ reports/revision/
   audit_protocol.json
   hrv36_schema.csv
   predictions/
-    oof_best_ema_predictions.npz
-    oof_best_ema_slice_predictions.npz
+    oof_final_ema_predictions.npz
+    oof_final_ema_slice_predictions.npz
+    oof_best_ema_predictions.npz          # diagnostic only
+    oof_best_ema_slice_predictions.npz    # diagnostic only
     oof_full_predictions.npz
     oof_full_slice_predictions.npz
     hrv_only_oof_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
-    oof_best_ema_prediction_summary.json
-    calibration_ci_oof_best_ema_predictions.json
+    oof_final_ema_prediction_summary.json
+    calibration_ci_oof_final_ema_predictions.json
     oof_full_prediction_summary.json
     calibration_ci_oof_full_predictions.json
     baseline_summary.csv
@@ -34,7 +36,7 @@ reports/revision/
     robustness_<dataset>.png
     representation_umap.png
   tables/
-    oof_best_ema_class_summary.csv
+    oof_final_ema_class_summary.csv
     oof_full_class_summary.csv
     table_baselines.csv
     table_calibration.csv
@@ -46,8 +48,8 @@ reports/revision/
   logs/
     <notebook_or_script>_<timestamp>.log
   manifests/
-    oof_best_ema_prediction_run_manifest.json
-    oof_best_ema_freeze_manifest.json
+    oof_final_ema_prediction_run_manifest.json
+    oof_final_ema_freeze_manifest.json
     oof_full_prediction_run_manifest.json
     oof_freeze_manifest.json
     mirror_manifest.json
@@ -102,13 +104,19 @@ Legacy OOF artifacts without `aggregation_implementation=power_mean_v2` and
 datasets and must never share a dataset label.
 
 After the checkpoint/EMA blocker is resolved, the canonical manuscript OOF
-artifact is `oof_best_ema_predictions.npz` with
-`oof_best_ema_freeze_manifest.json`. It is reusable only when the freeze
+artifact is `oof_final_ema_predictions.npz` with
+`oof_final_ema_freeze_manifest.json`. It uses EMA weights at the
+pre-specified final epoch. It is reusable only when the freeze
 manifest confirms 44,186 records, all five folds, Q=3 re-aggregation
-equivalence, matching `fold*_best_ema.pt` SHA256 fingerprints, and checksums for
+equivalence, matching `fold*_final_ema.pt` SHA256 fingerprints, and checksums for
 the prediction, slice, summary, class table, run manifest, and OOF logs.
+Checkpoint, feature-cache, and prediction metadata must also carry the same
+ordered Chapman record-ID fingerprint; shape-only cache matching is
+insufficient.
 
-Historical `oof_full_*` and `oof_final_*` artifacts produced from raw
+Validation-selected `oof_best_ema_*` artifacts are diagnostic because the
+selection fold is also represented in OOF. Historical `oof_full_*` and raw
+`oof_final_*` artifacts produced from raw
 `fold*_best.pt` or `fold*_final.pt` checkpoints are diagnostic only unless their
 checkpoint metadata proves they are explicit EMA aliases from a post-fix
 retrain.

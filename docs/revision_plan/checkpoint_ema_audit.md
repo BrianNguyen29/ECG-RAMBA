@@ -30,13 +30,21 @@ Retrain the five Chapman folds after updating `scripts/train.py` so that it
 writes explicit checkpoint variants:
 
 - `fold*_best_ema.pt`: selected and saved with EMA weights when EMA validation
-  wins.
+  wins. This is a diagnostic checkpoint because selection uses the same held-out
+  fold later represented in OOF.
 - `fold*_best_raw.pt`: raw companion saved for diagnostics.
-- `fold*_final_ema.pt` and `fold*_final_raw.pt`: final-epoch diagnostic
-  variants.
-- `fold*_best.pt`: compatibility alias only, with metadata indicating the
-  underlying weights kind.
+- `fold*_final_ema.pt` and `fold*_final_raw.pt`: fixed final-epoch variants.
+- Generic `fold*_best.pt` and `fold*_final.pt` aliases are not written for new
+  runs because they duplicate multi-GB checkpoint data and obscure weights
+  provenance. Revision scripts must request an explicit checkpoint kind.
 
-Manuscript OOF must be generated from `--checkpoint-kind best_ema` and frozen
-only after checksum, fold coverage, Q=3 re-aggregation, and checkpoint
-fingerprint validation pass.
+Manuscript OOF must be generated from `--checkpoint-kind final_ema` at the
+pre-specified epoch and frozen only after checksum, fold coverage, Q=3
+re-aggregation, and checkpoint fingerprint validation pass. Using
+`best_ema` for manuscript OOF would select an epoch on the same fold being
+reported and is not allowed without nested CV.
+
+New checkpoints also record the fixed loss scaling contract: BCE averages over
+the batch and classes, while asymmetric loss sums classes and averages the
+batch. This legacy scale change is not an LR warmup and must not be described
+as one.

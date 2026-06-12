@@ -29,6 +29,8 @@ metrics, figures, tables, and manifests must be written under
   contracts, and completion gates.
 - `artifact_contract.md`: folder layout and naming rules for reproducible
   outputs.
+- `training_epoch_policy.md`: fixed-epoch manuscript policy, EMA checkpoint
+  roles, and the e20/e30 decision rule.
 
 ## Notebook Sequence
 
@@ -51,14 +53,15 @@ notebook from its first cell; Notebook 02a will replay the canonical base and
 Mamba bootstrap before retraining.
 
 Notebook 02 must first produce and freeze the post-fix
-`oof_best_ema_*` artifacts from explicit `fold*_best_ema.pt` checkpoints.
+`oof_final_ema_*` artifacts from explicit fixed-epoch
+`fold*_final_ema.pt` checkpoints.
 Notebook 02a writes those retrained checkpoints to a versioned Drive model-run
 directory under `Drive/ECG-Ramba/model_runs/` and writes
-`model_runs/current_best_ema_model_dir.txt`. Notebook 02 reads that pointer
+`model_runs/current_final_ema_model_dir.txt`. Notebook 02 reads that pointer
 before falling back to the historical `Drive/ECG-Ramba/model` directory.
 Notebook 03 and pooling sensitivity consume only the checksum-verified
-`oof_best_ema_freeze_manifest.json`. Historical raw `oof_full_*` and
-`oof_final_*` outputs are diagnostic until a post-fix retrain proves otherwise.
+`oof_final_ema_freeze_manifest.json`. Validation-selected `oof_best_ema_*`
+and historical raw `oof_full_*` and `oof_final_*` outputs are diagnostic.
 External outputs remain experimental until their separate readiness restrictions
 are resolved.
 

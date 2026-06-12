@@ -4,7 +4,7 @@ Run from repo root:
     python scripts/revision/create_revision_notebooks.py
 
 This generator is intentionally disabled. The revision notebooks are now
-hand-maintained because the canonical workflow uses explicit best_ema
+hand-maintained because the canonical workflow uses fixed-epoch final_ema
 checkpoints and model-run pointers. Re-running this stale generator would
 recreate older oof_full notebook cells and can overwrite reviewer-facing
 runbooks with an invalid protocol.
@@ -30,7 +30,7 @@ STALE_GENERATOR_MESSAGE = (
     "scripts/revision/create_revision_notebooks.py is stale and disabled. "
     "Do not regenerate revision notebooks from this script; edit the "
     "hand-maintained notebooks directly or update this generator to the "
-    "best_ema/model_runs protocol first."
+    "fixed-epoch final_ema/model_runs protocol first."
 )
 
 

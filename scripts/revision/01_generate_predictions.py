@@ -11,9 +11,9 @@ Outputs:
     reports/revision/predictions/<artifact_stem>_slice_predictions.npz
     reports/revision/metrics/<artifact_stem>_prediction_summary.json
 
-    `--checkpoint-kind best` preserves the legacy `oof_full` stem. Explicit
-    EMA retrains should use `--checkpoint-kind best_ema`, which writes
-    `oof_best_ema_*` artifacts for manuscript gating.
+    `--checkpoint-kind best` preserves the legacy `oof_full` stem. Canonical
+    manuscript OOF uses fixed-epoch `--checkpoint-kind final_ema`, which writes
+    `oof_final_ema_*`. Validation-selected `best_ema` remains diagnostic.
 
 Prediction files follow the artifact contract in docs/revision_plan/.
 """
@@ -43,7 +43,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE  # noqa: E402
+from configs.config import (  # noqa: E402
+    CLASSES,
+    CONFIG,
+    CONFIG_HASH,
+    DEVICE,
+    EVALUATION_CONFIG_HASH,
+    PATHS,
+)
 from scripts.revision.common import (  # noqa: E402
     CACHE_SCHEMA_VERSION,
     LOG_DIR,
@@ -58,8 +65,19 @@ from scripts.revision.common import (  # noqa: E402
     save_csv,
     save_json,
 )
+from src.provenance import record_order_fingerprint  # noqa: E402
 
 CHECKPOINT_KINDS = ["best", "final", "best_ema", "final_ema", "best_raw", "final_raw"]
+AMP_DTYPE = (
+    torch.bfloat16
+    if DEVICE == "cuda" and torch.cuda.is_bf16_supported()
+    else torch.float16
+)
+AMP_DTYPE_NAME = (
+    str(AMP_DTYPE).replace("torch.", "")
+    if DEVICE == "cuda"
+    else "float32"
+)
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -145,7 +163,8 @@ def config_snapshot() -> dict:
         "use_cross_attention_fusion",
     ]
     return {
-        "config_hash": CONFIG_HASH,
+        "source_runtime_config_hash": CONFIG_HASH,
+        "evaluation_config_hash": EVALUATION_CONFIG_HASH,
         "core": {key: CONFIG.get(key) for key in keys},
         "classes": CLASSES,
         "paths": {key: path_info(value) for key, value in PATHS.items()},
@@ -219,23 +238,32 @@ def index_fingerprint(indices: np.ndarray) -> str:
     return hashlib.sha256(arr.view(np.uint8)).hexdigest()[:16]
 
 
-def hydra_fold_cache_path(fold_num: int, tr_idx: np.ndarray, va_idx: np.ndarray) -> Path:
+def hydra_fold_cache_path(
+    fold_num: int,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray,
+    source_config_hash: str,
+) -> Path:
     cache_dir = Path(PATHS["cache_dir"]) / "revision_feature_cache"
     train_hash = index_fingerprint(tr_idx)
     val_hash = index_fingerprint(va_idx)
     name = (
-        f"hydra_oof_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_fold{fold_num}_"
+        f"hydra_oof_v{CACHE_SCHEMA_VERSION}_{source_config_hash}_fold{fold_num}_"
         f"train{len(tr_idx)}_{train_hash}_val{len(va_idx)}_{val_hash}_"
         f"D{CONFIG['hydra_dim']}.npz"
     )
     return cache_dir / name
 
 
-def fold_pca_model_path(fold_num: int, tr_idx: np.ndarray) -> Path:
+def fold_pca_model_path(
+    fold_num: int,
+    tr_idx: np.ndarray,
+    source_config_hash: str,
+) -> Path:
     cache_dir = Path(PATHS["cache_dir"]) / "revision_pca_models"
     train_hash = index_fingerprint(tr_idx)
     return cache_dir / (
-        f"fold{fold_num}_pca_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
+        f"fold{fold_num}_pca_v{CACHE_SCHEMA_VERSION}_{source_config_hash}_"
         f"train{len(tr_idx)}_{train_hash}_D{CONFIG['hydra_dim']}.joblib"
     )
 
@@ -246,10 +274,16 @@ def load_or_compute_fold_hydra(
     X_rocket_raw: np.ndarray,
     tr_idx: np.ndarray,
     va_idx: np.ndarray,
+    source_config_hash: str,
 ) -> tuple[np.ndarray, float, Path, bool]:
     from src.features import apply_pca, fit_pca_on_train
 
-    cache_path = hydra_fold_cache_path(fold_num, tr_idx, va_idx)
+    cache_path = hydra_fold_cache_path(
+        fold_num,
+        tr_idx,
+        va_idx,
+        source_config_hash,
+    )
     expected_shape = (len(va_idx), int(CONFIG["hydra_dim"]))
     if cache_path.exists():
         try:
@@ -274,17 +308,25 @@ def load_or_compute_fold_hydra(
             print(f"⚠️  Could not load Hydra cache for fold {fold_num}: {exc}. Recomputing.", flush=True)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    print(
-        f"Fitting fold-aware PCA for fold {fold_num}: "
-        f"train={len(tr_idx)} x {X_rocket_raw.shape[1]} -> D={CONFIG['hydra_dim']}",
-        flush=True,
-    )
     start = time.time()
-    pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
-    pca_model_path = fold_pca_model_path(fold_num, tr_idx)
-    pca_model_path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(pca, pca_model_path)
-    print(f"Saved fold-aware PCA object: {pca_model_path}", flush=True)
+    pca_model_path = fold_pca_model_path(
+        fold_num,
+        tr_idx,
+        source_config_hash,
+    )
+    if pca_model_path.exists():
+        print(f"Loading training-fold PCA object: {pca_model_path}", flush=True)
+        pca = joblib.load(pca_model_path)
+    else:
+        print(
+            f"Fitting fold-aware PCA for fold {fold_num}: "
+            f"train={len(tr_idx)} x {X_rocket_raw.shape[1]} -> D={CONFIG['hydra_dim']}",
+            flush=True,
+        )
+        pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
+        pca_model_path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(pca, pca_model_path)
+        print(f"Saved fold-aware PCA object: {pca_model_path}", flush=True)
     print(f"Transforming validation Hydra features for fold {fold_num}: val={len(va_idx)}", flush=True)
     hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
     pca_var = float(pca.explained_variance_ratio_.sum())
@@ -297,7 +339,8 @@ def load_or_compute_fold_hydra(
         pca_explained_variance=np.asarray(pca_var, dtype=np.float32),
         cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         fold=np.asarray(fold_num, dtype=np.int16),
-        config_hash=np.asarray(CONFIG_HASH),
+        source_config_hash=np.asarray(source_config_hash),
+        evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
         train_index_hash=np.asarray(index_fingerprint(tr_idx)),
         val_index_hash=np.asarray(index_fingerprint(va_idx)),
     )
@@ -313,7 +356,7 @@ def fold_prediction_cache_path(
         PREDICTION_DIR
         / "folds"
         / (
-            f"oof_fold{fold_num}_{checkpoint_kind}_{CONFIG_HASH}_"
+            f"oof_fold{fold_num}_{checkpoint_kind}_{EVALUATION_CONFIG_HASH}_"
             f"{checkpoint_sha256[:12]}_v{CACHE_SCHEMA_VERSION}.npz"
         )
     )
@@ -459,7 +502,7 @@ def save_fold_prediction_cache(
         "valid_record_mask": valid_mask.astype(np.bool_),
         "slice_count": record_slice_count[va_idx].astype(np.int16),
         "fold": np.asarray(fold_num, dtype=np.int16),
-        "config_hash": np.asarray(CONFIG_HASH),
+        "config_hash": np.asarray(EVALUATION_CONFIG_HASH),
         "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         "checkpoint_sha256": np.asarray(checkpoint_sha256),
         "aggregation_implementation": np.asarray(POWER_MEAN_IMPLEMENTATION),
@@ -644,16 +687,45 @@ def validate_checkpoint_weights_kind(checkpoint_kind: str, actual: str | None, p
         )
 
 
+def load_checkpoint_payload(path: Path, checkpoint_kind: str) -> tuple[dict, dict]:
+    checkpoint = torch.load(path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+        raise ValueError(
+            f"Checkpoint lacks the explicit metadata contract: {path}"
+        )
+    actual = checkpoint.get("weights_kind")
+    validate_checkpoint_weights_kind(checkpoint_kind, actual, path)
+    source_config_hash = checkpoint.get("config_hash")
+    if not source_config_hash:
+        raise ValueError(f"Checkpoint lacks config_hash provenance: {path}")
+    metadata = {
+        "source_config_hash": str(source_config_hash),
+        "weights_kind": actual,
+        "epoch": int(checkpoint.get("epoch", -1)),
+        "selection_rule": checkpoint.get("selection_rule"),
+        "metrics_weights_kind": checkpoint.get("metrics_weights_kind"),
+        "checkpoint_contract": checkpoint.get("checkpoint_contract"),
+        "training_protocol": checkpoint.get("training_protocol"),
+        "dataset_record_order_fingerprint": checkpoint.get(
+            "dataset_record_order_fingerprint"
+        ),
+    }
+    return checkpoint, metadata
+
+
 def load_model_for_fold(
     fold: int,
     checkpoint_kind: str,
     checkpoint_file: Path | None = None,
+    checkpoint_payload: dict | None = None,
 ) -> torch.nn.Module:
     from src.model import ECGRambaV7Advanced
 
     path = checkpoint_file or checkpoint_path(fold, checkpoint_kind)
     print(f"Loading checkpoint: {path}")
-    checkpoint = torch.load(path, map_location=DEVICE)
+    checkpoint = checkpoint_payload
+    if checkpoint is None:
+        checkpoint, _ = load_checkpoint_payload(path, checkpoint_kind)
     state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
     actual = checkpoint.get("weights_kind") if isinstance(checkpoint, dict) else None
     validate_checkpoint_weights_kind(checkpoint_kind, actual, path)
@@ -662,6 +734,12 @@ def load_model_for_fold(
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
+        if expected_weights_kind(checkpoint_kind) is not None:
+            raise RuntimeError(
+                f"Strict checkpoint load failed for explicit checkpoint kind "
+                f"{checkpoint_kind}: {path}. Architecture/config drift must be "
+                "resolved before manuscript evaluation."
+            ) from exc
         print(f"Strict checkpoint load failed; retrying strict=False. Reason: {exc}")
         model.load_state_dict(state_dict, strict=False)
     model.eval()
@@ -745,7 +823,7 @@ def infer_slices(model: torch.nn.Module, loader: DataLoader) -> tuple[np.ndarray
             xhr = xhr.to(DEVICE, non_blocking=True)
 
             if DEVICE == "cuda":
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
                     logits = model(x, xh, xhr)
             else:
                 logits = model(x, xh, xhr)
@@ -853,9 +931,10 @@ def generate_oof(args: argparse.Namespace) -> None:
 
     X, y, X_raw_amp, subjects = prepare_clean_chapman(limit_records=args.limit_records)
     n_records, n_classes = y.shape
+    dataset_record_fingerprint = record_order_fingerprint(subjects)
 
-    X_rocket_raw = generate_raw_rocket_cache(X)
-    X_hrv = generate_hrv_cache(X, X_raw_amp) if CONFIG["use_hrv"] else np.zeros(
+    X_rocket_raw = generate_raw_rocket_cache(X, subjects)
+    X_hrv = generate_hrv_cache(X, X_raw_amp, subjects) if CONFIG["use_hrv"] else np.zeros(
         (n_records, CONFIG["hrv_dim"]), dtype=np.float32
     )
     folds = load_folds(y, subjects)
@@ -876,6 +955,7 @@ def generate_oof(args: argparse.Namespace) -> None:
     pca_variance = []
     fold_summaries = []
     checkpoint_infos = []
+    source_config_hashes: set[str] = set()
     slice_probs_all = []
     slice_record_index_all = []
     slice_index_all = []
@@ -898,7 +978,24 @@ def generate_oof(args: argparse.Namespace) -> None:
             allow_fallback=args.allow_checkpoint_fallback,
         )
         ckpt_info = {"fold": fold_num, **path_info(ckpt_path, with_sha256=True)}
+        checkpoint_payload, checkpoint_meta = load_checkpoint_payload(
+            ckpt_path,
+            args.checkpoint_kind,
+        )
+        if (
+            args.limit_records == 0
+            and checkpoint_meta["dataset_record_order_fingerprint"]
+            != dataset_record_fingerprint
+        ):
+            raise RuntimeError(
+                f"Fold {fold_num} checkpoint record-order fingerprint does not "
+                "match the loaded Chapman dataset"
+            )
+        ckpt_info.update(checkpoint_meta)
+        source_config_hash = checkpoint_meta["source_config_hash"]
+        source_config_hashes.add(source_config_hash)
         checkpoint_sha256 = ckpt_info["sha256"]
+        checkpoint_infos.append(ckpt_info)
         fold_cache_path = fold_prediction_cache_path(
             fold_num,
             args.checkpoint_kind,
@@ -921,6 +1018,7 @@ def generate_oof(args: argparse.Namespace) -> None:
                 checkpoint_sha256=checkpoint_sha256,
             )
             if cached_summary is not None:
+                del checkpoint_payload
                 fold_summaries.append(cached_summary)
                 if "pca_explained_variance" in cached_summary:
                     pca_variance.append(
@@ -932,18 +1030,20 @@ def generate_oof(args: argparse.Namespace) -> None:
                             "prediction_cache_hit": True,
                         }
                     )
-                if cached_summary.get("checkpoint"):
-                    checkpoint_infos.append(cached_summary["checkpoint"])
                 continue
 
-        checkpoint_infos.append(ckpt_info)
         hydra_va, pca_var, pca_cache_path, pca_cache_hit = load_or_compute_fold_hydra(
             fold_num=fold_num,
             X_rocket_raw=X_rocket_raw,
             tr_idx=tr_idx,
             va_idx=va_idx,
+            source_config_hash=source_config_hash,
         )
-        pca_object_path = fold_pca_model_path(fold_num, tr_idx)
+        pca_object_path = fold_pca_model_path(
+            fold_num,
+            tr_idx,
+            source_config_hash,
+        )
         pca_variance.append(
             {
                 "fold": fold_num,
@@ -986,6 +1086,7 @@ def generate_oof(args: argparse.Namespace) -> None:
 
         if len(rids) == 0:
             print(f"Fold {fold_num}: no slices generated; skipping")
+            del checkpoint_payload
             fold_summary["n_predicted_records"] = 0
             fold_summaries.append(fold_summary)
             save_fold_prediction_cache(
@@ -1002,7 +1103,13 @@ def generate_oof(args: argparse.Namespace) -> None:
             )
             continue
 
-        model = load_model_for_fold(fold_num, args.checkpoint_kind, checkpoint_file=ckpt_path)
+        model = load_model_for_fold(
+            fold_num,
+            args.checkpoint_kind,
+            checkpoint_file=ckpt_path,
+            checkpoint_payload=checkpoint_payload,
+        )
+        del checkpoint_payload
         infer_dataset = ECGSliceDatasetInfer(xs, xh, xhr, rids)
         slice_probs, slice_rids, actual_batch_size, actual_num_workers, inference_attempts = infer_with_retries(
             model,
@@ -1073,6 +1180,12 @@ def generate_oof(args: argparse.Namespace) -> None:
     )
     threshold = 0.5
     aggregation_q = float(CONFIG["power_mean_q"])
+    if len(source_config_hashes) != 1:
+        raise RuntimeError(
+            "All fold checkpoints must share one source_config_hash; found "
+            f"{sorted(source_config_hashes)}"
+        )
+    source_config_hash = next(iter(source_config_hashes))
     checkpoint_fingerprints_json = json.dumps(
         sorted(checkpoint_infos, key=lambda row: int(row["fold"])),
         sort_keys=True,
@@ -1091,9 +1204,10 @@ def generate_oof(args: argparse.Namespace) -> None:
         fold_id=fold_id,
         slice_count=record_slice_count,
         valid_record_mask=valid_records.astype(np.bool_),
-        config_hash=np.asarray(CONFIG_HASH),
-        source_config_hash=np.asarray(CONFIG_HASH),
-        evaluation_config_hash=np.asarray(CONFIG_HASH),
+        config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+        source_config_hash=np.asarray(source_config_hash),
+        evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+        dataset_record_order_fingerprint=np.asarray(dataset_record_fingerprint),
         git_commit=np.asarray(git_commit),
         created_utc=np.asarray(created_utc),
         checkpoint_kind=np.asarray(args.checkpoint_kind),
@@ -1119,9 +1233,10 @@ def generate_oof(args: argparse.Namespace) -> None:
             class_names=np.asarray(CLASSES),
             dataset=np.asarray("chapman_oof"),
             protocol=np.asarray(f"slice_level_fold_{args.checkpoint_kind}"),
-            config_hash=np.asarray(CONFIG_HASH),
-            source_config_hash=np.asarray(CONFIG_HASH),
-            evaluation_config_hash=np.asarray(CONFIG_HASH),
+            config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+            source_config_hash=np.asarray(source_config_hash),
+            evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+            dataset_record_order_fingerprint=np.asarray(dataset_record_fingerprint),
             git_commit=np.asarray(git_commit),
             created_utc=np.asarray(created_utc),
             probability_dtype=np.asarray("float32"),
@@ -1155,7 +1270,9 @@ def generate_oof(args: argparse.Namespace) -> None:
         "dataset": "chapman_oof",
         "created_utc": created_utc,
         "git_commit": git_commit,
-        "config_hash": CONFIG_HASH,
+        "source_config_hash": source_config_hash,
+        "evaluation_config_hash": EVALUATION_CONFIG_HASH,
+        "dataset_record_order_fingerprint": dataset_record_fingerprint,
         "prediction_file": str(out_path),
         "slice_prediction_file": str(slice_out_path) if slice_out_path else None,
         "class_summary_csv": str(class_summary_path),
@@ -1168,6 +1285,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         "class_names": CLASSES,
         "checkpoint_kind_requested": args.checkpoint_kind,
         "batch_size": int(args.batch_size),
+        "inference_amp_dtype": AMP_DTYPE_NAME,
         "num_workers": int(args.num_workers),
         "limit_records": int(args.limit_records),
         "save_slice_probs": bool(args.save_slice_probs),
@@ -1192,6 +1310,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         "dataset": "chapman_oof",
         "created_utc": created_utc,
         "protocol": protocol,
+        "dataset_record_order_fingerprint": dataset_record_fingerprint,
         "runtime": run_meta,
         "config": config_meta,
         "inputs": {

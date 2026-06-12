@@ -5,9 +5,9 @@ ECG RAMBA - Training Pipeline
 Principles:
 - Subject-aware CV (no leakage)
 - Fold-wise PCA only
-- BCE warmup → ONE-TIME switch to FIXED Asymmetric Loss
+- BCE phase → ONE-TIME switch to FIXED Asymmetric Loss
 - NO early stopping (full-epoch training)
-- EMA for evaluation only (AFTER warmup)
+- EMA for evaluation only (AFTER the BCE phase)
 - Fixed threshold evaluation
 - Quiet logging (NaN aggregated per fold only)
 """
@@ -16,14 +16,16 @@ import os
 import sys
 import gc
 import hashlib
+import json
 import time
 import warnings
+from threading import Event, Thread
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
 import torch
 import joblib
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedGroupKFold
 
 # Add project root to path
@@ -38,6 +40,11 @@ from src.features import (
     apply_pca,
 )
 from src.model import ECGRambaV7Advanced
+from src.training_data import (
+    LazyECGSliceDataset,
+    audit_fold_splits,
+    build_slice_index,
+)
 from src.aggregation import (
     POWER_MEAN_IMPLEMENTATION,
     aggregate_record_probabilities,
@@ -53,67 +60,16 @@ from src.utils import (
 warnings.filterwarnings("ignore", message="The least populated class in y")
 
 FEATURE_CACHE_SCHEMA_VERSION = 2
-
-# ==================================================================================
-# 🔪 DATASET HELPERS
-# ==================================================================================
-
-def slice_record(x):
-    if x.shape[-1] < CONFIG["slice_length"]:
-        return [], []
-    slices, positions = [], []
-    T = x.shape[-1]
-    for s in range(
-        0,
-        T - CONFIG["slice_length"] + 1,
-        CONFIG["slice_stride"],
-    ):
-        slices.append(x[..., s : s + CONFIG["slice_length"]])
-        positions.append((s + CONFIG["slice_length"] / 2) / T)
-        if len(slices) >= CONFIG["max_slices_per_record"]:
-            break
-    return slices, positions
-
-
-class ECGSliceDataset(Dataset):
-    def __init__(self, Xs, Xh, Xhr, y, rids, pos):
-        self.Xs, self.Xh, self.Xhr, self.y, self.rids, self.pos = Xs, Xh, Xhr, y, rids, pos
-
-    def __len__(self):
-        return len(self.y)
-
-    def __getitem__(self, i):
-        return (
-            torch.tensor(self.Xs[i], dtype=torch.float32),
-            torch.tensor(self.Xh[i], dtype=torch.float32),
-            torch.tensor(self.Xhr[i], dtype=torch.float32),
-            torch.tensor(self.y[i], dtype=torch.float32),
-            self.rids[i],
-            self.pos[i],
-        )
-
-
-def build_slice_dataset(indices, hydra_dict, X, y, X_hrv_base):
-    xs, xh, xhr, ys, rids, pos = [], [], [], [], [], []
-    skipped = 0
-    for rid in indices:
-        slices, positions = slice_record(X[rid])
-        if len(slices) == 0:
-            skipped += 1
-            continue
-
-        hrv_ext = X_hrv_base[rid] if X_hrv_base is not None else np.zeros(1)
-
-        for s, p in zip(slices, positions):
-            xs.append(s)
-            xh.append(hydra_dict[rid])
-            xhr.append(hrv_ext)
-            ys.append(y[rid])
-            rids.append(rid)
-            pos.append(p)
-
-    return map(np.array, (xs, xh, xhr, ys, rids, pos)), skipped
-
+AMP_DTYPE = (
+    torch.bfloat16
+    if DEVICE == "cuda" and torch.cuda.is_bf16_supported()
+    else torch.float16
+)
+AMP_DTYPE_NAME = (
+    str(AMP_DTYPE).replace("torch.", "")
+    if DEVICE == "cuda"
+    else "float32"
+)
 
 def index_fingerprint(indices: np.ndarray) -> str:
     arr = np.ascontiguousarray(np.asarray(indices, dtype=np.int64))
@@ -133,6 +89,13 @@ def float_metrics(metrics: dict | None) -> dict:
     return {key: float(value) for key, value in metrics.items()}
 
 
+def atomic_write_csv(frame: pd.DataFrame, path: str, *, index: bool = False) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    frame.to_csv(tmp_path, index=index)
+    os.replace(tmp_path, path)
+
+
 def checkpoint_payload(
     *,
     model_state: dict,
@@ -144,23 +107,48 @@ def checkpoint_payload(
     train_indices: np.ndarray,
     val_indices: np.ndarray,
     pca_variance: float,
+    dataset_record_order_fingerprint: str,
+    selection_rule: str,
+    metrics_weights_kind: str | None = None,
+    selection_metrics: dict | None = None,
 ) -> dict:
     metrics = float_metrics(metrics)
+    selection_metrics = float_metrics(selection_metrics)
     return {
         "model": model_state,
         "epoch": int(epoch),
         "fold": int(fold),
         "weights_kind": weights_kind,
         "selected_by_weights_kind": selected_by_weights_kind,
-        "validation_weights_kind": selected_by_weights_kind,
+        "validation_weights_kind": metrics_weights_kind,
+        "metrics_weights_kind": metrics_weights_kind,
         "f1_macro": float(metrics.get("f1_macro", np.nan)),
         "metrics": metrics,
+        "selection_rule": selection_rule,
+        "selection_metrics": selection_metrics,
         "config_hash": CONFIG_HASH,
+        "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
         "class_names": list(CLASSES),
         "aggregation": {
             "method": "power_mean",
             "q": float(CONFIG["power_mean_q"]),
             "implementation": POWER_MEAN_IMPLEMENTATION,
+        },
+        "training_protocol": {
+            "epochs": int(CONFIG["epochs"]),
+            "loss_switch_epoch": int(CONFIG["asym_start_epoch"]) + 1,
+            "bce_reduction": "mean_over_batch_and_classes",
+            "asymmetric_reduction": "sum_over_classes_mean_over_batch",
+            "scheduler": "cosine_annealing",
+            "lr_max": float(CONFIG["lr_max"]),
+            "lr_min": float(CONFIG["lr_min"]),
+            "ema_decay": float(CONFIG["ema_decay"]),
+            "ema_scope": "trainable_parameters_only",
+            "amp_dtype": AMP_DTYPE_NAME,
+            "model_selection": (
+                "fixed_final_epoch_for_manuscript_oof; "
+                "best_ema_is_diagnostic_on_cv_validation"
+            ),
         },
         "split": {
             "train_count": int(len(train_indices)),
@@ -169,7 +157,7 @@ def checkpoint_payload(
             "val_index_hash": index_fingerprint(val_indices),
         },
         "pca_explained_variance": float(pca_variance),
-        "checkpoint_contract": "explicit_weights_kind_v1",
+        "checkpoint_contract": "explicit_weights_kind_v2",
     }
 
 
@@ -181,9 +169,15 @@ def save_checkpoint(path: str, payload: dict) -> None:
 
 
 def save_fold_pca_model(fold: int, pca, train_indices: np.ndarray) -> str:
+    path = fold_pca_model_path(fold, train_indices)
+    joblib.dump(pca, path)
+    return path
+
+
+def fold_pca_model_path(fold: int, train_indices: np.ndarray) -> str:
     cache_dir = os.path.join(PATHS["cache_dir"], "revision_pca_models")
     os.makedirs(cache_dir, exist_ok=True)
-    path = os.path.join(
+    return os.path.join(
         cache_dir,
         (
             f"fold{fold}_pca_v{FEATURE_CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
@@ -191,8 +185,54 @@ def save_fold_pca_model(fold: int, pca, train_indices: np.ndarray) -> str:
             f"D{CONFIG['hydra_dim']}.joblib"
         ),
     )
-    joblib.dump(pca, path)
-    return path
+
+
+def env_flag(name: str, default: bool = True) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def read_existing_rows(paths: list[str]) -> list[dict]:
+    for path in paths:
+        if os.path.exists(path):
+            frame = pd.read_csv(path)
+            return frame.to_dict(orient="records")
+    return []
+
+
+def make_loader(dataset, *, shuffle: bool) -> DataLoader:
+    workers = int(CONFIG["num_workers"])
+    kwargs = {
+        "batch_size": int(CONFIG["batch_size"]),
+        "shuffle": shuffle,
+        "num_workers": workers,
+        "pin_memory": DEVICE == "cuda",
+    }
+    if workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 2
+    return DataLoader(dataset, **kwargs)
+
+
+def run_with_heartbeat(label: str, function, *, interval_seconds: int = 300):
+    """Run a blocking CPU task while emitting elapsed-time heartbeats."""
+    stop = Event()
+    started = time.perf_counter()
+
+    def heartbeat():
+        while not stop.wait(interval_seconds):
+            elapsed = (time.perf_counter() - started) / 60
+            print(f"   ⏳ {label} still running | elapsed={elapsed:.1f} min", flush=True)
+
+    thread = Thread(target=heartbeat, daemon=True)
+    thread.start()
+    try:
+        return function()
+    finally:
+        stop.set()
+        thread.join(timeout=1)
 
 
 # ==================================================================================
@@ -207,7 +247,11 @@ def main():
     # ==================================================================================
     print("🔧 ECG RAMBA ")
     print(f"   D={CONFIG['d_model']} | Gamma={CONFIG['asym_gamma_neg']} | LR={CONFIG['lr_max']}")
-    print(f"   Warmup={CONFIG['asym_start_epoch']} | Epochs={CONFIG['epochs']} | Folds={CONFIG['n_folds']}")
+    print(
+        f"   BCE epochs={CONFIG['asym_start_epoch']} | "
+        f"ASYM starts={CONFIG['asym_start_epoch'] + 1} | "
+        f"Epochs={CONFIG['epochs']} | Folds={CONFIG['n_folds']}"
+    )
 
     # ==================================================================================
     # 🛡️ PHASE 1 | LOAD DATA & AUTO-CLEAN
@@ -218,19 +262,29 @@ def main():
 
     X, y, X_raw_amp, subjects = load_chapman_multilabel()
     print(f"Original: {len(y)} records | {y.shape[1]} classes")
+    if len(y) != 44186:
+        raise RuntimeError(
+            f"Canonical Chapman protocol requires 44186 records, found {len(y)}"
+        )
 
     MIN_SAMPLES = 5
     class_counts = y.sum(axis=0)
     keep_mask = class_counts >= MIN_SAMPLES
 
     if not keep_mask.all():
-        print(f"🧹 Dropping {np.sum(~keep_mask)} classes (<{MIN_SAMPLES} samples)")
-        y = y[:, keep_mask]
-        valid = y.sum(axis=1) > 0
-        X, y, X_raw_amp, subjects = X[valid], y[valid], X_raw_amp[valid], subjects[valid]
+        rare_classes = [
+            CLASSES[index]
+            for index in np.flatnonzero(~keep_mask)
+        ]
+        raise RuntimeError(
+            "Fixed 27-class protocol cannot silently drop rare classes. "
+            f"Classes below {MIN_SAMPLES} samples: {rare_classes}"
+        )
 
-    # NUM_CLASSES is effectively updated by valid y shape, but global config likely remains fixed
-    # We should ensure model output matches this if it changed, but usually we stick to fixed classes
+    if y.shape[1] != len(CLASSES):
+        raise RuntimeError(
+            f"Label dimension {y.shape[1]} does not match fixed taxonomy {len(CLASSES)}"
+        )
     print(f"✅ Cleaned → {len(y)} records | {y.shape[1]} classes")
 
     # ==================================================================================
@@ -240,8 +294,12 @@ def main():
     print("PHASE 2 | RAW FEATURE GENERATION (ANTI-LEAKAGE)")
     print("=" * 80)
 
-    X_rocket_raw = generate_raw_rocket_cache(X)
-    X_hrv_base = generate_hrv_cache(X, X_raw_amp) if CONFIG["use_hrv"] else None
+    X_rocket_raw = generate_raw_rocket_cache(X, subjects)
+    X_hrv_base = (
+        generate_hrv_cache(X, X_raw_amp, subjects)
+        if CONFIG["use_hrv"]
+        else None
+    )
 
     print(f"✅ RAW MiniRocket shape: {X_rocket_raw.shape}")
     if X_hrv_base is not None:
@@ -261,20 +319,126 @@ def main():
         random_state=CONFIG["seeds"][0],
     )
 
-    fold_results, epoch_logs = [], []
     os.makedirs(PATHS["model_dir"], exist_ok=True)
-    folds = [
-        {
-            "tr_idx": np.asarray(tr_idx, dtype=np.int64),
-            "va_idx": np.asarray(va_idx, dtype=np.int64),
-        }
-        for tr_idx, va_idx in sgkf.split(X, y_strat, groups=subjects)
-    ]
+    epoch_log_partial_path = os.path.join(PATHS["model_dir"], "training_log_epochs.partial.csv")
+    fold_log_partial_path = os.path.join(PATHS["model_dir"], "cv_results_clean_core.partial.csv")
+    epoch_log_path = os.path.join(PATHS["model_dir"], "training_log_epochs.csv")
+    fold_log_path = os.path.join(PATHS["model_dir"], "cv_results_clean_core.csv")
+    resume_training = env_flag("ECG_RAMBA_RESUME_TRAINING", default=True)
+    epoch_logs = (
+        read_existing_rows([epoch_log_partial_path, epoch_log_path])
+        if resume_training
+        else []
+    )
+    fold_results = (
+        read_existing_rows([fold_log_partial_path, fold_log_path])
+        if resume_training
+        else []
+    )
+
     folds_path = os.path.join(PATHS["model_dir"], "folds.pkl")
-    joblib.dump(folds, folds_path)
-    print(f"✅ Saved fold split provenance: {folds_path}")
+    if resume_training and os.path.exists(folds_path):
+        folds = joblib.load(folds_path)
+        print(f"✅ Reusing fold split provenance: {folds_path}")
+    else:
+        folds = [
+            {
+                "tr_idx": np.asarray(tr_idx, dtype=np.int64),
+                "va_idx": np.asarray(va_idx, dtype=np.int64),
+            }
+            for tr_idx, va_idx in sgkf.split(X, y_strat, groups=subjects)
+        ]
+        joblib.dump(folds, folds_path)
+        print(f"✅ Saved fold split provenance: {folds_path}")
+    split_audit = audit_fold_splits(folds, subjects, n_records=len(y))
+    split_audit_path = os.path.join(PATHS["model_dir"], "fold_split_audit.json")
+    tmp_split_audit_path = f"{split_audit_path}.tmp"
+    with open(tmp_split_audit_path, "w", encoding="utf-8") as handle:
+        json.dump(split_audit, handle, indent=2, sort_keys=True)
+    os.replace(tmp_split_audit_path, split_audit_path)
+    print(f"✅ Saved fold split audit: {split_audit_path}")
+
+    prevalence_rows = []
+    for fold_num, split in enumerate(folds, start=1):
+        for split_name, indices in (("train", split["tr_idx"]), ("validation", split["va_idx"])):
+            prevalence = y[indices].mean(axis=0)
+            positives = y[indices].sum(axis=0)
+            prevalence_rows.extend(
+                {
+                    "fold": fold_num,
+                    "split": split_name,
+                    "class_name": class_name,
+                    "n_records": int(len(indices)),
+                    "positive_records": int(positives[class_index]),
+                    "prevalence": float(prevalence[class_index]),
+                }
+                for class_index, class_name in enumerate(CLASSES)
+            )
+    prevalence_path = os.path.join(PATHS["model_dir"], "fold_label_prevalence.csv")
+    atomic_write_csv(pd.DataFrame(prevalence_rows), prevalence_path)
+    print(f"✅ Saved fold label prevalence audit: {prevalence_path}")
+
+    completed_folds = set()
+    for fold in range(1, int(CONFIG["n_folds"]) + 1):
+        epoch_count = sum(
+            int(row.get("fold", -1)) == fold
+            for row in epoch_logs
+        )
+        has_result = any(
+            int(row.get("fold", -1)) == fold
+            for row in fold_results
+        )
+        checkpoint_paths = [
+            os.path.join(PATHS["model_dir"], f"fold{fold}_{kind}.pt")
+            for kind in ("best_ema", "best_raw", "final_ema", "final_raw")
+        ]
+        checkpoint_metadata_valid = False
+        final_ema_path = os.path.join(
+            PATHS["model_dir"],
+            f"fold{fold}_final_ema.pt",
+        )
+        if os.path.exists(final_ema_path):
+            try:
+                payload = torch.load(final_ema_path, map_location="cpu")
+                checkpoint_metadata_valid = (
+                    payload.get("config_hash") == CONFIG_HASH
+                    and payload.get("dataset_record_order_fingerprint")
+                    == split_audit["record_order_fingerprint"]
+                    and payload.get("weights_kind") == "ema"
+                    and payload.get("selection_rule") == "fixed_final_epoch"
+                    and int(payload.get("epoch", -1)) == int(CONFIG["epochs"])
+                )
+                del payload
+            except Exception as exc:
+                print(
+                    f"⚠️ Fold {fold} resume checkpoint validation failed: {exc}",
+                    flush=True,
+                )
+        if (
+            epoch_count == int(CONFIG["epochs"])
+            and has_result
+            and all(os.path.exists(path) for path in checkpoint_paths)
+            and checkpoint_metadata_valid
+        ):
+            completed_folds.add(fold)
+    if completed_folds:
+        print(
+            f"♻️ Resume enabled; completed folds will be reused: "
+            f"{sorted(completed_folds)}"
+        )
 
     for fold, split in enumerate(folds, start=1):
+        if fold in completed_folds:
+            print(f"\n♻️ FOLD {fold}/{CONFIG['n_folds']} already complete; skipping")
+            continue
+        epoch_logs = [
+            row for row in epoch_logs
+            if int(row.get("fold", -1)) != fold
+        ]
+        fold_results = [
+            row for row in fold_results
+            if int(row.get("fold", -1)) != fold
+        ]
         tr_idx = split["tr_idx"]
         va_idx = split["va_idx"]
         fold_started = time.perf_counter()
@@ -288,34 +452,56 @@ def main():
             flush=True,
         )
 
+        pca_path = fold_pca_model_path(fold, tr_idx)
         pca_started = time.perf_counter()
-        pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
-        print(
-            f"   ✅ PCA fit complete in {(time.perf_counter() - pca_started) / 60:.1f} min",
-            flush=True,
-        )
+        if resume_training and os.path.exists(pca_path):
+            pca = joblib.load(pca_path)
+            print(f"   ♻️ Reusing fold PCA object: {pca_path}", flush=True)
+        else:
+            pca = run_with_heartbeat(
+                f"Fold {fold} PCA fit",
+                lambda: fit_pca_on_train(
+                    X_rocket_raw[tr_idx],
+                    CONFIG["hydra_dim"],
+                ),
+            )
+            pca_path = save_fold_pca_model(fold, pca, tr_idx)
+            print(
+                f"   ✅ PCA fit complete in "
+                f"{(time.perf_counter() - pca_started) / 60:.1f} min",
+                flush=True,
+            )
         print("   ⏳ Transforming train/validation MiniRocket features...", flush=True)
         hydra_tr = apply_pca(pca, X_rocket_raw[tr_idx])
         hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
         pca_variance = float(pca.explained_variance_ratio_.sum())
-        pca_path = save_fold_pca_model(fold, pca, tr_idx)
         print(f"   🛡️ PCA variance retained: {pca_variance:.3f}")
         print(f"   💾 Fold PCA object: {pca_path}")
 
-        hydra_dict = {i: f for i, f in zip(tr_idx, hydra_tr)}
-        hydra_dict.update({i: f for i, f in zip(va_idx, hydra_va)})
+        hydra_by_record = np.zeros((len(X), CONFIG["hydra_dim"]), dtype=np.float32)
+        hydra_by_record[tr_idx] = hydra_tr
+        hydra_by_record[va_idx] = hydra_va
+        del hydra_tr, hydra_va
 
-        print("   ⏳ Building train/validation slice datasets...", flush=True)
-        (Xs_tr, Xh_tr, Xhr_tr, y_tr, rid_tr, pos_tr), skipped_tr = build_slice_dataset(
-            tr_idx, hydra_dict, X, y, X_hrv_base
+        print("   ⏳ Building lazy train/validation slice indices...", flush=True)
+        rid_tr, start_tr, pos_tr, skipped_tr = build_slice_index(
+            tr_idx,
+            X,
+            slice_length=CONFIG["slice_length"],
+            slice_stride=CONFIG["slice_stride"],
+            max_slices_per_record=CONFIG["max_slices_per_record"],
         )
-        (Xs_va, Xh_va, Xhr_va, y_va, rid_va, pos_va), skipped_va = build_slice_dataset(
-            va_idx, hydra_dict, X, y, X_hrv_base
+        rid_va, start_va, pos_va, skipped_va = build_slice_index(
+            va_idx,
+            X,
+            slice_length=CONFIG["slice_length"],
+            slice_stride=CONFIG["slice_stride"],
+            max_slices_per_record=CONFIG["max_slices_per_record"],
         )
 
         n_val_records_expected = len(np.unique(va_idx))
         n_val_records_with_slice = len(np.unique(rid_va))
-        total_val_slices = len(Xs_va)
+        total_val_slices = len(rid_va)
         avg_slices_per_record = total_val_slices / max(n_val_records_with_slice, 1)
 
         print(
@@ -325,21 +511,44 @@ def main():
           f"avg_slices/record={avg_slices_per_record:.2f} | "
           f"skipped_no_slice={skipped_va}"
         )
+        if skipped_va or n_val_records_with_slice != n_val_records_expected:
+            raise RuntimeError(
+                f"Fold {fold} validation slicing is incomplete: "
+                f"records_with_slice={n_val_records_with_slice}/"
+                f"{n_val_records_expected}, skipped={skipped_va}"
+            )
 
-        train_loader = DataLoader(
-            ECGSliceDataset(Xs_tr, Xh_tr, Xhr_tr, y_tr, rid_tr, pos_tr),
-            batch_size=CONFIG["batch_size"],
+        hrv_by_record = (
+            X_hrv_base
+            if X_hrv_base is not None
+            else np.zeros((len(X), 1), dtype=np.float32)
+        )
+        train_loader = make_loader(
+            LazyECGSliceDataset(
+                X,
+                hydra_by_record,
+                hrv_by_record,
+                y,
+                rid_tr,
+                start_tr,
+                pos_tr,
+                slice_length=CONFIG["slice_length"],
+            ),
             shuffle=True,
-            num_workers=CONFIG["num_workers"],
-            pin_memory=True,
         )
 
-        val_loader = DataLoader(
-            ECGSliceDataset(Xs_va, Xh_va, Xhr_va, y_va, rid_va, pos_va),
-            batch_size=CONFIG["batch_size"],
+        val_loader = make_loader(
+            LazyECGSliceDataset(
+                X,
+                hydra_by_record,
+                hrv_by_record,
+                y,
+                rid_va,
+                start_va,
+                pos_va,
+                slice_length=CONFIG["slice_length"],
+            ),
             shuffle=False,
-            num_workers=CONFIG["num_workers"],
-            pin_memory=True,
         )
 
         model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
@@ -364,25 +573,27 @@ def main():
 
         ema = EMA(model, decay=CONFIG["ema_decay"])
 
-        best_f1, best_epoch = -np.inf, -1
-        best_metrics = None
+        best_ema_f1, best_ema_epoch = -np.inf, -1
+        best_ema_metrics = None
+        best_raw_warmup_f1 = -np.inf
         fold_skipped_nan = 0
+        last_eval_metrics = None
+        last_eval_weights_kind = None
         selected_state = None
         selected_payload = None
         raw_payload = None
         final_raw_payload = None
         final_ema_payload = None
 
-        best_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best.pt")
         best_ema_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best_ema.pt")
         best_raw_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_best_raw.pt")
-        final_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final.pt")
         final_ema_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final_ema.pt")
         final_raw_ckpt_path = os.path.join(PATHS["model_dir"], f"fold{fold}_final_raw.pt")
 
         for epoch in range(CONFIG["epochs"]):
             model.train()
             loss_sum = 0.0
+            lr = float(optimizer.param_groups[0]["lr"])
 
             use_bce = epoch < CONFIG["asym_start_epoch"]
             loss_name = "BCE" if use_bce else "ASYM"
@@ -393,13 +604,17 @@ def main():
                 
                 # Mixed Precision usually requires CUDA
                 if DEVICE == 'cuda':
-                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
                         logits = model(x, xh, xhr)
                         loss = bce_criterion(logits, tgt) if use_bce else asym_criterion(logits, tgt)
                 else:
                     logits = model(x, xh, xhr)
                     loss = bce_criterion(logits, tgt) if use_bce else asym_criterion(logits, tgt)
-                
+
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(
+                        f"Non-finite training loss at fold={fold}, epoch={epoch + 1}"
+                    )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CONFIG["grad_clip"])
                 optimizer.step()
@@ -407,7 +622,6 @@ def main():
                 loss_sum += loss.item()
 
             scheduler.step()
-            lr = optimizer.param_groups[0]["lr"]
 
             model.eval()
             eval_weights_kind = (
@@ -425,7 +639,7 @@ def main():
                     x, xh, xhr = x.to(DEVICE), xh.to(DEVICE), xhr.to(DEVICE)
                     
                     if DEVICE == 'cuda':
-                        with torch.amp.autocast("cuda"):
+                        with torch.amp.autocast("cuda", dtype=AMP_DTYPE):
                             probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
                     else:
                         probs = torch.sigmoid(model(x, xh, xhr)).cpu().numpy()
@@ -439,15 +653,21 @@ def main():
             if not slice_prob_batches:
                 if eval_weights_kind == "ema":
                     ema.restore(model)
-                continue
+                raise RuntimeError(
+                    f"Fold {fold} epoch {epoch + 1} produced no validation batches"
+                )
 
             slice_probs = np.concatenate(slice_prob_batches, axis=0)
             slice_rids = np.concatenate(slice_rid_batches, axis=0)
             finite_slice_mask = np.isfinite(slice_probs).all(axis=1)
             if not np.all(finite_slice_mask):
                 fold_skipped_nan += int(np.sum(~finite_slice_mask))
-                slice_probs = slice_probs[finite_slice_mask]
-                slice_rids = slice_rids[finite_slice_mask]
+                if eval_weights_kind == "ema":
+                    ema.restore(model)
+                raise FloatingPointError(
+                    f"Fold {fold} epoch {epoch + 1} produced "
+                    f"{fold_skipped_nan} non-finite validation slices"
+                )
             y_prob_all, valid_record_mask, _ = aggregate_record_probabilities(
                 slice_probs,
                 slice_rids,
@@ -457,10 +677,14 @@ def main():
             val_record_mask = np.zeros(len(y), dtype=bool)
             val_record_mask[va_idx] = True
             metric_mask = val_record_mask & valid_record_mask
-            if not np.any(metric_mask):
+            n_metric_records = int(np.sum(metric_mask))
+            if n_metric_records != n_val_records_expected:
                 if eval_weights_kind == "ema":
                     ema.restore(model)
-                continue
+                raise RuntimeError(
+                    f"Fold {fold} epoch {epoch + 1} scored "
+                    f"{n_metric_records}/{n_val_records_expected} validation records"
+                )
 
             metrics = compute_metrics(
                 y[metric_mask],
@@ -469,45 +693,60 @@ def main():
             )
 
             f1m = metrics["f1_macro"]
-            is_new_best = f1m > best_f1
-            selected_state = cpu_state_dict(model) if is_new_best else None
+            is_new_best_ema = eval_weights_kind == "ema" and f1m > best_ema_f1
+            selected_state = cpu_state_dict(model) if is_new_best_ema else None
 
             if eval_weights_kind == "ema":
                 ema.restore(model)
 
-            if is_new_best:
-                best_f1 = f1m
-                best_epoch = epoch + 1
-                best_metrics = metrics.copy()
+            if eval_weights_kind == "raw":
+                best_raw_warmup_f1 = max(best_raw_warmup_f1, f1m)
+
+            if is_new_best_ema:
+                best_ema_f1 = f1m
+                best_ema_epoch = epoch + 1
+                best_ema_metrics = metrics.copy()
+                for previous_row in epoch_logs:
+                    if previous_row["fold"] == fold:
+                        previous_row["is_best_epoch"] = False
                 selected_payload = checkpoint_payload(
                     model_state=selected_state,
                     fold=fold,
-                    epoch=best_epoch,
-                    weights_kind=eval_weights_kind,
-                    selected_by_weights_kind=eval_weights_kind,
-                    metrics=best_metrics,
+                    epoch=best_ema_epoch,
+                    weights_kind="ema",
+                    selected_by_weights_kind="ema",
+                    metrics=best_ema_metrics,
                     train_indices=tr_idx,
                     val_indices=va_idx,
                     pca_variance=pca_variance,
+                    dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
+                    metrics_weights_kind="ema",
+                    selection_rule="max_validation_f1_macro",
                 )
-                if eval_weights_kind == "ema":
-                    save_checkpoint(best_ema_ckpt_path, selected_payload)
-                    save_checkpoint(best_ckpt_path, {**selected_payload, "alias_of": f"fold{fold}_best_ema.pt"})
-                    raw_payload = checkpoint_payload(
-                        model_state=cpu_state_dict(model),
-                        fold=fold,
-                        epoch=best_epoch,
-                        weights_kind="raw",
-                        selected_by_weights_kind=eval_weights_kind,
-                        metrics=best_metrics,
-                        train_indices=tr_idx,
-                        val_indices=va_idx,
-                        pca_variance=pca_variance,
-                    )
-                    save_checkpoint(best_raw_ckpt_path, raw_payload)
-                else:
-                    save_checkpoint(best_raw_ckpt_path, selected_payload)
-                    save_checkpoint(best_ckpt_path, {**selected_payload, "alias_of": f"fold{fold}_best_raw.pt"})
+                save_checkpoint(best_ema_ckpt_path, selected_payload)
+                raw_payload = checkpoint_payload(
+                    model_state=cpu_state_dict(model),
+                    fold=fold,
+                    epoch=best_ema_epoch,
+                    weights_kind="raw",
+                    selected_by_weights_kind="ema",
+                    metrics=None,
+                    train_indices=tr_idx,
+                    val_indices=va_idx,
+                    pca_variance=pca_variance,
+                    dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
+                    metrics_weights_kind=None,
+                    selection_rule="paired_with_best_ema_epoch",
+                    selection_metrics=best_ema_metrics,
+                )
+
+            last_eval_metrics = metrics.copy()
+            last_eval_weights_kind = eval_weights_kind
+            displayed_best = (
+                best_ema_f1
+                if eval_weights_kind == "ema"
+                else best_raw_warmup_f1
+            )
 
             print(
                 f"Ep {epoch+1:03d} | {loss_name} | LR {lr:.2e} | "
@@ -517,7 +756,7 @@ def main():
                 f"P {metrics['precision_macro']:.4f} | "
                 f"R {metrics['recall_macro']:.4f} | "
                 f"AP {metrics['auprc_macro']:.4f} | "
-                f"Best {best_f1:.4f}"
+                f"Best {displayed_best:.4f}"
             )
 
             epoch_logs.append(
@@ -527,7 +766,7 @@ def main():
                     loss=loss_name,
                     lr=lr,
                     loss_value=loss_sum / len(train_loader),
-                    is_best_epoch=(epoch + 1 == best_epoch),
+                    is_best_epoch=bool(is_new_best_ema),
                     validation_weights_kind=eval_weights_kind,
                     aggregation_method="power_mean",
                     aggregation_q=float(CONFIG["power_mean_q"]),
@@ -537,21 +776,39 @@ def main():
                     **metrics,
                 )
             )
+            atomic_write_csv(pd.DataFrame(epoch_logs), epoch_log_partial_path)
 
-        final_metrics = best_metrics or {}
+        if best_ema_epoch < 0 or best_ema_metrics is None:
+            raise RuntimeError(
+                f"Fold {fold} did not produce an EMA validation checkpoint. "
+                "Increase epochs or reduce asym_start_epoch before using this run."
+            )
+        if last_eval_weights_kind != "ema" or last_eval_metrics is None:
+            raise RuntimeError(
+                f"Fold {fold} final epoch did not produce EMA validation metrics"
+            )
+        if raw_payload is None:
+            raise RuntimeError(f"Fold {fold} did not retain the raw best-EMA companion")
+        save_checkpoint(best_raw_ckpt_path, raw_payload)
+        selected_state = None
+        selected_payload = None
+        raw_payload = None
+
         final_raw_payload = checkpoint_payload(
             model_state=cpu_state_dict(model),
             fold=fold,
             epoch=CONFIG["epochs"],
             weights_kind="raw",
             selected_by_weights_kind="raw",
-            metrics=final_metrics,
+            metrics=None,
             train_indices=tr_idx,
             val_indices=va_idx,
             pca_variance=pca_variance,
+            dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
+            metrics_weights_kind=None,
+            selection_rule="fixed_final_epoch",
         )
         save_checkpoint(final_raw_ckpt_path, final_raw_payload)
-        save_checkpoint(final_ckpt_path, {**final_raw_payload, "alias_of": f"fold{fold}_final_raw.pt"})
 
         if CONFIG.get("use_ema", True):
             ema.apply_shadow(model)
@@ -560,11 +817,14 @@ def main():
                 fold=fold,
                 epoch=CONFIG["epochs"],
                 weights_kind="ema",
-                selected_by_weights_kind="raw",
-                metrics=final_metrics,
+                selected_by_weights_kind="ema",
+                metrics=last_eval_metrics if last_eval_weights_kind == "ema" else None,
                 train_indices=tr_idx,
                 val_indices=va_idx,
                 pca_variance=pca_variance,
+                dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
+                metrics_weights_kind="ema",
+                selection_rule="fixed_final_epoch",
             )
             ema.restore(model)
             save_checkpoint(final_ema_ckpt_path, final_ema_payload)
@@ -572,15 +832,22 @@ def main():
         fold_results.append(
             dict(
                 fold=fold,
-                best_epoch=best_epoch,
-                best_weights_kind=(
-                    "ema"
-                    if os.path.exists(best_ema_ckpt_path)
-                    else "raw"
-                ),
+                protocol_checkpoint_kind="final_ema",
+                protocol_epoch=int(CONFIG["epochs"]),
+                best_ema_epoch=best_ema_epoch,
                 pca_explained_variance=pca_variance,
-                **(best_metrics or {}),
+                skipped_nonfinite_validation_slices=int(fold_skipped_nan),
+                **last_eval_metrics,
+                **{
+                    f"best_ema_{key}": value
+                    for key, value in best_ema_metrics.items()
+                },
             )
+        )
+        atomic_write_csv(
+            pd.DataFrame(fold_results).set_index("fold"),
+            fold_log_partial_path,
+            index=True,
         )
 
         print(
@@ -589,9 +856,9 @@ def main():
             flush=True,
         )
         del train_loader, val_loader
-        del Xs_tr, Xh_tr, Xhr_tr, y_tr, rid_tr, pos_tr
-        del Xs_va, Xh_va, Xhr_va, y_va, rid_va, pos_va
-        del hydra_dict, hydra_tr, hydra_va, pca
+        del rid_tr, start_tr, pos_tr
+        del rid_va, start_va, pos_va
+        del hydra_by_record, hrv_by_record, pca
         del selected_state, selected_payload, raw_payload
         del final_raw_payload, final_ema_payload
         del model, optimizer, scheduler, ema
@@ -606,8 +873,8 @@ def main():
     print("FINAL CROSS-VALIDATION RESULTS (OOF)")
     print("=" * 80)
 
-    df_folds = pd.DataFrame(fold_results).set_index("fold")
-    df_epochs = pd.DataFrame(epoch_logs)
+    df_folds = pd.DataFrame(fold_results).sort_values("fold").set_index("fold")
+    df_epochs = pd.DataFrame(epoch_logs).sort_values(["fold", "epoch"])
 
     print(df_folds.round(4))
 
@@ -617,8 +884,11 @@ def main():
         ci = stats.t.interval(0.95, len(v) - 1, loc=mean, scale=std / np.sqrt(len(v)))
         print(f"{m:18s} {mean:.4f} ± {std:.4f} [{ci[0]:.4f}, {ci[1]:.4f}]")
 
-    df_epochs.to_csv(f"{PATHS['model_dir']}/training_log_epochs.csv", index=False)
-    df_folds.to_csv(f"{PATHS['model_dir']}/cv_results_clean_core.csv")
+    atomic_write_csv(df_epochs, epoch_log_path)
+    atomic_write_csv(df_folds, fold_log_path, index=True)
+    for partial_path in (epoch_log_partial_path, fold_log_partial_path):
+        if os.path.exists(partial_path):
+            os.remove(partial_path)
 
     print("\n✅ PIPELINE FINISHED.")
 

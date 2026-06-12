@@ -24,6 +24,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
         self.assertEqual(generate_predictions.oof_artifact_stem("final"), "oof_final")
         self.assertEqual(generate_predictions.oof_artifact_stem("best_ema"), "oof_best_ema")
+        self.assertEqual(generate_predictions.oof_artifact_stem("final_ema"), "oof_final_ema")
         self.assertEqual(generate_predictions.oof_artifact_stem("final_raw"), "oof_final_raw")
 
     def test_checkpoint_path_requires_exact_kind_by_default(self):
@@ -227,9 +228,22 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 q=3.0,
             )
             y_true = (rng.uniform(size=(n_records, n_classes)) > 0.8).astype(np.float32)
+            dataset_fingerprint = "records123"
             checkpoint_rows = [
-                {"fold": 1, "path": "fold1_best.pt", "sha256": "sha1", "size_bytes": 1},
-                {"fold": 2, "path": "fold2_best.pt", "sha256": "sha2", "size_bytes": 1},
+                {
+                    "fold": 1,
+                    "path": "fold1_final_ema.pt",
+                    "sha256": "sha1",
+                    "size_bytes": 1,
+                    "dataset_record_order_fingerprint": dataset_fingerprint,
+                },
+                {
+                    "fold": 2,
+                    "path": "fold2_final_ema.pt",
+                    "sha256": "sha2",
+                    "size_bytes": 1,
+                    "dataset_record_order_fingerprint": dataset_fingerprint,
+                },
             ]
 
             record_file = pred_dir / "oof_full_predictions.npz"
@@ -246,9 +260,10 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 aggregation_q=np.asarray(3.0, dtype=np.float32),
                 aggregation_implementation=np.asarray("power_mean_v2"),
                 cache_schema_version=np.asarray(2, dtype=np.int16),
-                checkpoint_kind=np.asarray("best"),
+                checkpoint_kind=np.asarray("final_ema"),
                 source_config_hash=np.asarray("source"),
-                evaluation_config_hash=np.asarray(freeze_oof.CONFIG_HASH),
+                evaluation_config_hash=np.asarray(freeze_oof.EVALUATION_CONFIG_HASH),
+                dataset_record_order_fingerprint=np.asarray(dataset_fingerprint),
             )
             np.savez_compressed(
                 slice_file,
@@ -275,7 +290,12 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
             run_manifest.write_text(
-                json.dumps({"inputs": {"checkpoints": checkpoint_rows}}),
+                json.dumps(
+                    {
+                        "dataset_record_order_fingerprint": dataset_fingerprint,
+                        "inputs": {"checkpoints": checkpoint_rows},
+                    }
+                ),
                 encoding="utf-8",
             )
             (log_dir / "oof_reaggregate.log").write_text("reaggregated", encoding="utf-8")
@@ -290,6 +310,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 expected_records=n_records,
                 expected_folds=2,
                 q=3.0,
+                expected_checkpoint_kind="final_ema",
                 check_only=True,
                 allow_missing_log=False,
             )

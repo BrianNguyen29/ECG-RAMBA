@@ -30,8 +30,8 @@ from configs.config import (  # noqa: E402
     CLASSES,
     CLASS_TO_IDX,
     CONFIG,
-    CONFIG_HASH,
     DEVICE,
+    EVALUATION_CONFIG_HASH,
     FS,
     PATHS,
     SNOMED_MAPPING,
@@ -58,6 +58,16 @@ from src.features import (  # noqa: E402
 
 STANDARD_LEADS = ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 CHECKPOINT_KINDS = ["best", "final", "best_ema", "final_ema", "best_raw", "final_raw"]
+AMP_DTYPE = (
+    torch.bfloat16
+    if DEVICE == "cuda" and torch.cuda.is_bf16_supported()
+    else torch.float16
+)
+AMP_DTYPE_NAME = (
+    str(AMP_DTYPE).replace("torch.", "")
+    if DEVICE == "cuda"
+    else "float32"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -473,7 +483,7 @@ def feature_cache_path(
         ":".join(file_fingerprint(path) for path in pca_paths).encode()
     ).hexdigest()[:16]
     return cache_dir / (
-        f"{dataset}_features_v{CACHE_SCHEMA_VERSION}_{CONFIG_HASH}_"
+        f"{dataset}_features_v{CACHE_SCHEMA_VERSION}_{EVALUATION_CONFIG_HASH}_"
         f"{file_fingerprint(archive)}_{pca_fingerprint}_"
         f"N{len(record_ids)}_{record_id_fingerprint(record_ids)}.npz"
     )
@@ -522,7 +532,7 @@ def generate_features(
     payload = {
         "X_hrv": hrv,
         "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
-        "config_hash": np.asarray(CONFIG_HASH),
+        "config_hash": np.asarray(EVALUATION_CONFIG_HASH),
         "pca_paths": np.asarray([str(path) for path in pca_paths]),
         "pca_sha256": np.asarray([sha256_file(path) for path in pca_paths]),
         "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
@@ -570,7 +580,66 @@ def checkpoint_paths(kind: str) -> list[Path]:
     return paths
 
 
-def fold_pca_paths(expected_folds: int) -> list[Path]:
+def checkpoint_provenance(paths: list[Path], kind: str) -> tuple[list[dict], str]:
+    expected_weights_kind = (
+        "ema" if kind.endswith("_ema")
+        else "raw" if kind.endswith("_raw")
+        else None
+    )
+    rows = []
+    source_hashes = set()
+    dataset_fingerprints = set()
+    for fold, path in enumerate(paths, start=1):
+        payload = torch.load(path, map_location="cpu")
+        if not isinstance(payload, dict) or "model" not in payload:
+            raise ValueError(f"Checkpoint lacks explicit metadata: {path}")
+        weights_kind = payload.get("weights_kind")
+        if expected_weights_kind and weights_kind != expected_weights_kind:
+            raise ValueError(
+                f"{path} reports weights_kind={weights_kind}; expected {expected_weights_kind}"
+            )
+        source_hash = payload.get("config_hash")
+        if not source_hash:
+            raise ValueError(f"Checkpoint lacks config_hash provenance: {path}")
+        source_hashes.add(str(source_hash))
+        dataset_fingerprint = payload.get("dataset_record_order_fingerprint")
+        if not dataset_fingerprint:
+            raise ValueError(
+                f"Checkpoint lacks dataset record-order provenance: {path}"
+            )
+        dataset_fingerprints.add(str(dataset_fingerprint))
+        rows.append(
+            {
+                "fold": fold,
+                "path": str(path),
+                "sha256": sha256_file(path),
+                "size_bytes": path.stat().st_size,
+                "weights_kind": weights_kind,
+                "epoch": payload.get("epoch"),
+                "selection_rule": payload.get("selection_rule"),
+                "source_config_hash": str(source_hash),
+                "dataset_record_order_fingerprint": str(dataset_fingerprint),
+            }
+        )
+        del payload
+    if len(source_hashes) != 1:
+        raise ValueError(
+            f"External ensemble checkpoints use different config hashes: {sorted(source_hashes)}"
+        )
+    if len(dataset_fingerprints) != 1:
+        raise ValueError(
+            "External ensemble checkpoints use different dataset record-order "
+            f"fingerprints: {sorted(dataset_fingerprints)}"
+        )
+    return rows, next(iter(source_hashes))
+
+
+def fold_pca_paths(
+    expected_folds: int,
+    expected_source_config_hash: str,
+    expected_checkpoint_kind: str,
+    expected_dataset_record_order_fingerprint: str,
+) -> list[Path]:
     manifest_path = MANIFEST_DIR / "fold_pca_manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(
@@ -583,6 +652,22 @@ def fold_pca_paths(expected_folds: int) -> list[Path]:
         raise FileNotFoundError(folds_path)
     if payload.get("folds_path_sha256") != sha256_file(folds_path):
         raise RuntimeError("Fold PCA manifest was built from a different folds.pkl")
+    if payload.get("source_config_hash") != expected_source_config_hash:
+        raise RuntimeError(
+            "Fold PCA manifest source_config_hash does not match the selected checkpoints"
+        )
+    if payload.get("checkpoint_kind") != expected_checkpoint_kind:
+        raise RuntimeError(
+            "Fold PCA manifest checkpoint_kind does not match the selected checkpoints"
+        )
+    if (
+        payload.get("dataset_record_order_fingerprint")
+        != expected_dataset_record_order_fingerprint
+    ):
+        raise RuntimeError(
+            "Fold PCA manifest dataset record-order fingerprint does not match "
+            "the selected checkpoints"
+        )
     rows = {int(row["fold"]): row for row in payload.get("fold_pca", [])}
     if set(rows) != set(range(1, expected_folds + 1)):
         raise ValueError("Fold PCA manifest is incomplete")
@@ -624,7 +709,11 @@ def infer_ensemble(
                 record_batch = slice_record_index[start:stop]
                 hb = torch.from_numpy(hydra_by_fold[fold - 1][record_batch]).to(DEVICE)
                 rb = torch.from_numpy(xhr[start:stop]).to(DEVICE)
-                with torch.amp.autocast("cuda", enabled=DEVICE == "cuda"):
+                with torch.amp.autocast(
+                    "cuda",
+                    enabled=DEVICE == "cuda",
+                    dtype=AMP_DTYPE,
+                ):
                     probability_sum[start:stop] += torch.sigmoid(model(xb, hb, rb)).float().cpu().numpy()
         del model, state, state_dict
         if DEVICE == "cuda":
@@ -698,8 +787,17 @@ def main() -> None:
             "Re-run with --allow-experimental only after acknowledging that outputs "
             "will be stored under reports/revision/experimental with manuscript_ready=false."
         )
-    pca_paths = fold_pca_paths(int(CONFIG["n_folds"]))
     checkpoints = checkpoint_paths(args.checkpoint_kind)
+    checkpoint_info, source_config_hash = checkpoint_provenance(
+        checkpoints,
+        args.checkpoint_kind,
+    )
+    pca_paths = fold_pca_paths(
+        int(CONFIG["n_folds"]),
+        source_config_hash,
+        args.checkpoint_kind,
+        checkpoint_info[0]["dataset_record_order_fingerprint"],
+    )
     created_utc = datetime.now(timezone.utc).isoformat()
     archive = archive_path(args.dataset)
     root = extract_archive(args.dataset, archive, args.extract_root)
@@ -747,15 +845,6 @@ def main() -> None:
     summary_path = output_root / f"{args.dataset}_full_prediction_summary.json"
     class_path = output_root / f"{args.dataset}_full_class_summary.csv"
     manifest_path = output_root / f"{args.dataset}_full_prediction_run_manifest.json"
-    checkpoint_info = [
-        {
-            "fold": fold,
-            "path": str(path),
-            "sha256": sha256_file(path),
-            "size_bytes": path.stat().st_size,
-        }
-        for fold, path in enumerate(checkpoints, start=1)
-    ]
     pca_info = [
         {
             "fold": fold,
@@ -793,9 +882,9 @@ def main() -> None:
         dataset=np.asarray(args.dataset),
         protocol=np.asarray(protocol),
         slice_count=slice_count,
-        config_hash=np.asarray(CONFIG_HASH),
-        source_config_hash=np.asarray(CONFIG_HASH),
-        evaluation_config_hash=np.asarray(CONFIG_HASH),
+        config_hash=np.asarray(EVALUATION_CONFIG_HASH),
+        source_config_hash=np.asarray(source_config_hash),
+        evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
         git_commit=np.asarray(git_commit()),
         created_utc=np.asarray(created_utc),
         aggregation_method=np.asarray("power_mean"),
@@ -836,6 +925,8 @@ def main() -> None:
         "manuscript_ready": False,
         "restrictions": restrictions,
         "protocol": protocol,
+        "checkpoint_kind": args.checkpoint_kind,
+        "inference_amp_dtype": AMP_DTYPE_NAME,
         "n_records": len(y_true),
         "n_classes": y_true.shape[1],
         "class_names": [str(x) for x in class_names],

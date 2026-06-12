@@ -33,6 +33,7 @@ except ImportError:
     HAS_NEUROKIT = False
 
 from configs.config import CONFIG, PATHS, SEQ_LEN, FS
+from src.provenance import record_order_fingerprint
 
 
 # ============================================================
@@ -116,7 +117,10 @@ class MiniRocketNative(nn.Module):
 # RAW MINI-ROCKET CACHE (STABLE, CONFIG-INDEPENDENT)
 # ============================================================
 
-def generate_raw_rocket_cache(X: np.ndarray) -> np.ndarray:
+def generate_raw_rocket_cache(
+    X: np.ndarray,
+    record_ids: np.ndarray | None = None,
+) -> np.ndarray:
     """
     RAW MiniRocket features.
 
@@ -128,24 +132,50 @@ def generate_raw_rocket_cache(X: np.ndarray) -> np.ndarray:
 
     assert X.ndim == 3, "X must be (N, C, T)"
 
+    record_fingerprint = (
+        record_order_fingerprint(record_ids)
+        if record_ids is not None
+        else None
+    )
     rocket_cache_name = (
         f"rocket_raw_"
         f"N{len(X)}_"
         f"C{X.shape[1]}_"
         f"L{X.shape[-1]}_"
         f"K10000_"
-        f"S42.npz"
+        f"S42"
+        f"{f'_R{record_fingerprint}' if record_fingerprint else ''}.npz"
     )
 
     cache_path = os.path.join(PATHS["cache_dir"], rocket_cache_name)
 
     if os.path.exists(cache_path):
-        cached = np.load(cache_path)["X"]
-        if cached.shape[0] == len(X):
+        with np.load(cache_path, allow_pickle=False) as payload:
+            cached = payload["X"]
+            cached_record_fingerprint = (
+                str(payload["record_order_fingerprint"].item())
+                if "record_order_fingerprint" in payload.files
+                else None
+            )
+        expected_shape = (len(X), 20000)
+        fingerprint_matches = (
+            record_fingerprint is None
+            or cached_record_fingerprint == record_fingerprint
+        )
+        if (
+            cached.shape == expected_shape
+            and np.isfinite(cached).all()
+            and fingerprint_matches
+        ):
             print(f"✅ Loaded RAW MiniRocket cache: {cached.shape}")
             return cached.astype(np.float32)
         else:
-            print("⚠️ Rocket cache exists but size mismatch → regenerating")
+            print(
+                "⚠️ Rocket cache contract mismatch "
+                f"(found={cached.shape}, expected={expected_shape}, "
+                f"finite={bool(np.isfinite(cached).all())}, "
+                f"record_fingerprint_match={fingerprint_matches}) → regenerating"
+            )
 
     print("🚀 Generating RAW MiniRocket features (CPU, deterministic)...")
 
@@ -165,13 +195,27 @@ def generate_raw_rocket_cache(X: np.ndarray) -> np.ndarray:
             feats.append(model(xb).numpy())
 
     X_rocket = np.vstack(feats).astype(np.float32)
+    if X_rocket.shape != (len(X), 20000) or not np.isfinite(X_rocket).all():
+        raise RuntimeError(
+            f"Invalid RAW MiniRocket output: shape={X_rocket.shape}, "
+            f"finite={bool(np.isfinite(X_rocket).all())}"
+        )
 
     print(f"💾 Saving RAW MiniRocket cache to: {cache_path}", flush=True)
-    np.savez_compressed(cache_path, X=X_rocket.astype(np.float16))
+    cached_float16 = X_rocket.astype(np.float16)
+    np.savez_compressed(
+        cache_path,
+        X=cached_float16,
+        storage_dtype=np.asarray("float16"),
+        consumer_dtype=np.asarray("float32"),
+        quantization_contract=np.asarray("float16_storage_roundtrip_v1"),
+        record_order_fingerprint=np.asarray(record_fingerprint or ""),
+    )
     print(f"✅ Saved RAW MiniRocket cache: {X_rocket.shape}")
     print(f"📦 Cache path: {cache_path}")
 
-    return X_rocket
+    # Cold-cache and warm-cache runs must consume identical values.
+    return cached_float16.astype(np.float32)
 
 
 # ============================================================
@@ -281,23 +325,56 @@ def extract_global_record_stats(signal: np.ndarray) -> np.ndarray:
 # HRV + AMP + GLOBAL CACHE (FIXED DIM = 36)
 # ============================================================
 
-def generate_hrv_cache(X: np.ndarray, X_raw_amp: np.ndarray) -> np.ndarray:
+def generate_hrv_cache(
+    X: np.ndarray,
+    X_raw_amp: np.ndarray,
+    record_ids: np.ndarray | None = None,
+) -> np.ndarray:
     """
     HRV + amplitude + global record stats.
 
     Fixed dimensionality = 36
     """
 
+    record_fingerprint = (
+        record_order_fingerprint(record_ids)
+        if record_ids is not None
+        else None
+    )
     cache_path = os.path.join(
         PATHS["cache_dir"],
-        f"hrv36_N{len(X)}_C{X.shape[1]}_L{X.shape[-1]}.npz",
+        (
+            f"hrv36_N{len(X)}_C{X.shape[1]}_L{X.shape[-1]}"
+            f"{f'_R{record_fingerprint}' if record_fingerprint else ''}.npz"
+        ),
     )
 
     if os.path.exists(cache_path):
-        cached = np.load(cache_path)["X"]
-        if cached.shape[0] == len(X):
+        with np.load(cache_path, allow_pickle=False) as payload:
+            cached = payload["X"]
+            cached_record_fingerprint = (
+                str(payload["record_order_fingerprint"].item())
+                if "record_order_fingerprint" in payload.files
+                else None
+            )
+        expected_shape = (len(X), int(CONFIG["hrv_dim"]))
+        fingerprint_matches = (
+            record_fingerprint is None
+            or cached_record_fingerprint == record_fingerprint
+        )
+        if (
+            cached.shape == expected_shape
+            and np.isfinite(cached).all()
+            and fingerprint_matches
+        ):
             print(f"✅ Loaded HRV36 cache: {cached.shape}")
             return cached.astype(np.float32)
+        print(
+            "⚠️ HRV36 cache contract mismatch "
+            f"(found={cached.shape}, expected={expected_shape}, "
+            f"finite={bool(np.isfinite(cached).all())}, "
+            f"record_fingerprint_match={fingerprint_matches}) → regenerating"
+        )
 
     print("💓 Extracting HRV + amplitude + global stats (CPU)...")
 
@@ -311,10 +388,20 @@ def generate_hrv_cache(X: np.ndarray, X_raw_amp: np.ndarray) -> np.ndarray:
 
     assert feats.shape[1] == CONFIG["hrv_dim"], \
         f"HRV dim mismatch: got {feats.shape[1]}, expected {CONFIG['hrv_dim']}"
+    if not np.isfinite(feats).all():
+        raise RuntimeError("HRV36 extraction produced non-finite values")
 
     print(f"💾 Saving HRV36 cache to: {cache_path}", flush=True)
-    np.savez_compressed(cache_path, X=feats.astype(np.float16))
+    cached_float16 = feats.astype(np.float16)
+    np.savez_compressed(
+        cache_path,
+        X=cached_float16,
+        storage_dtype=np.asarray("float16"),
+        consumer_dtype=np.asarray("float32"),
+        quantization_contract=np.asarray("float16_storage_roundtrip_v1"),
+        record_order_fingerprint=np.asarray(record_fingerprint or ""),
+    )
     print(f"✅ Saved HRV36 cache: {feats.shape}")
     print(f"📦 Cache path: {cache_path}")
 
-    return feats
+    return cached_float16.astype(np.float32)

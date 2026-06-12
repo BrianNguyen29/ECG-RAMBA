@@ -129,7 +129,7 @@ def compute_metrics(
     """
     assert y_true.shape == y_prob.shape
 
-    y_pred = (y_prob > threshold).astype(np.float32)
+    y_pred = (y_prob >= threshold).astype(np.float32)
 
     metrics = {
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
