@@ -11,6 +11,7 @@ revision notebooks as the main Colab workflow.
   WFDB-ChapmanShaoxing.zip
   PTB-XL.zip
   Georgia.zip
+  cpsc2021.zip
   model/
     fold1_best.pt
     ...
@@ -28,7 +29,8 @@ revision notebooks as the main Colab workflow.
 The current `configs/config.py` detects `/content/drive/MyDrive/ECG-Ramba`
 or the `ECG_RAMBA_DRIVE_ROOT` environment variable as the cache root when
 running in Colab. It also detects the uploaded dataset names
-`WFDB-ChapmanShaoxing.zip`, `PTB-XL.zip`, and `Georgia.zip`. The repo may also
+`WFDB-ChapmanShaoxing.zip`, `PTB-XL.zip`, `Georgia.zip`, and `cpsc2021.zip`.
+The repo may also
 live directly in `MyDrive/ECG-Ramba` if that folder contains `configs/`,
 `src/`, `scripts/`, and `notebooks/`.
 
