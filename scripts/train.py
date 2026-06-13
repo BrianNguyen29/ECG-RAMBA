@@ -170,7 +170,9 @@ def save_checkpoint(path: str, payload: dict) -> None:
 
 def save_fold_pca_model(fold: int, pca, train_indices: np.ndarray) -> str:
     path = fold_pca_model_path(fold, train_indices)
-    joblib.dump(pca, path)
+    tmp_path = f"{path}.tmp"
+    joblib.dump(pca, tmp_path)
+    os.replace(tmp_path, path)
     return path
 
 
@@ -187,11 +189,40 @@ def fold_pca_model_path(fold: int, train_indices: np.ndarray) -> str:
     )
 
 
+def validate_fold_pca_model(pca, *, path: str, n_features: int) -> None:
+    components = getattr(pca, "components_", None)
+    expected_shape = (int(CONFIG["hydra_dim"]), int(n_features))
+    if components is None or tuple(components.shape) != expected_shape:
+        actual_shape = None if components is None else tuple(components.shape)
+        raise ValueError(
+            f"PCA cache has invalid components shape: {actual_shape}; "
+            f"expected {expected_shape} at {path}"
+        )
+    explained = getattr(pca, "explained_variance_ratio_", None)
+    if explained is None or len(explained) != int(CONFIG["hydra_dim"]):
+        actual_len = None if explained is None else len(explained)
+        raise ValueError(
+            f"PCA cache has invalid explained_variance_ratio_ length: "
+            f"{actual_len}; expected {CONFIG['hydra_dim']} at {path}"
+        )
+
+
 def env_flag(name: str, default: bool = True) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def env_int(name: str, default: int, *, minimum: int = 1) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return max(minimum, parsed)
 
 
 def read_existing_rows(paths: list[str]) -> list[dict]:
@@ -216,8 +247,10 @@ def make_loader(dataset, *, shuffle: bool) -> DataLoader:
     return DataLoader(dataset, **kwargs)
 
 
-def run_with_heartbeat(label: str, function, *, interval_seconds: int = 300):
+def run_with_heartbeat(label: str, function, *, interval_seconds: int | None = None):
     """Run a blocking CPU task while emitting elapsed-time heartbeats."""
+    if interval_seconds is None:
+        interval_seconds = env_int("ECG_RAMBA_PCA_HEARTBEAT_SECONDS", 60)
     stop = Event()
     started = time.perf_counter()
 
@@ -447,7 +480,7 @@ def main():
         ) / (1024 ** 3)
         print(f"\n⚡ FOLD {fold}/{CONFIG['n_folds']}", flush=True)
         print(
-            f"   ⏳ PCA fit starting on CPU | train={len(tr_idx)} | "
+            f"   ⏳ PCA stage starting on CPU | train={len(tr_idx)} | "
             f"features={X_rocket_raw.shape[1]} | input_copy≈{rocket_train_gib:.2f} GiB",
             flush=True,
         )
@@ -455,17 +488,87 @@ def main():
         pca_path = fold_pca_model_path(fold, tr_idx)
         pca_started = time.perf_counter()
         if resume_training and os.path.exists(pca_path):
-            pca = joblib.load(pca_path)
-            print(f"   ♻️ Reusing fold PCA object: {pca_path}", flush=True)
+            pca_size_mib = os.path.getsize(pca_path) / (1024 ** 2)
+            print(
+                f"   ♻️ Fold PCA cache candidate: {pca_path} "
+                f"({pca_size_mib:.1f} MiB)",
+                flush=True,
+            )
+            try:
+                pca = run_with_heartbeat(
+                    f"Fold {fold} PCA cache load",
+                    lambda: joblib.load(pca_path),
+                )
+                validate_fold_pca_model(
+                    pca,
+                    path=pca_path,
+                    n_features=X_rocket_raw.shape[1],
+                )
+                print(
+                    f"   ✅ Loaded fold PCA object in "
+                    f"{(time.perf_counter() - pca_started) / 60:.1f} min",
+                    flush=True,
+                )
+            except Exception as exc:
+                corrupt_path = f"{pca_path}.corrupt_{int(time.time())}"
+                try:
+                    os.replace(pca_path, corrupt_path)
+                    print(
+                        f"   ⚠️ PCA cache load failed and was quarantined: "
+                        f"{corrupt_path}",
+                        flush=True,
+                    )
+                except OSError:
+                    print(
+                        f"   ⚠️ PCA cache load failed but could not be "
+                        f"quarantined: {pca_path}",
+                        flush=True,
+                    )
+                print(f"   ⚠️ PCA cache error: {exc}. Re-fitting fold PCA.", flush=True)
+                pca_started = time.perf_counter()
+                print("   ⏳ Materializing fold train MiniRocket matrix...", flush=True)
+                X_train_pca = np.ascontiguousarray(X_rocket_raw[tr_idx], dtype=np.float32)
+                print(
+                    f"   ⏳ Fitting randomized PCA: "
+                    f"{X_train_pca.shape[0]} x {X_train_pca.shape[1]} "
+                    f"-> D={CONFIG['hydra_dim']}",
+                    flush=True,
+                )
+                pca = run_with_heartbeat(
+                    f"Fold {fold} PCA fit",
+                    lambda: fit_pca_on_train(X_train_pca, CONFIG["hydra_dim"]),
+                )
+                del X_train_pca
+                print(f"   💾 Saving fold PCA object: {pca_path}", flush=True)
+                run_with_heartbeat(
+                    f"Fold {fold} PCA cache save",
+                    lambda: save_fold_pca_model(fold, pca, tr_idx),
+                )
+                print(
+                    f"   ✅ PCA fit complete in "
+                    f"{(time.perf_counter() - pca_started) / 60:.1f} min",
+                    flush=True,
+                )
         else:
+            print(f"   🧭 Fold PCA cache path: {pca_path}", flush=True)
+            print("   ⏳ Materializing fold train MiniRocket matrix...", flush=True)
+            X_train_pca = np.ascontiguousarray(X_rocket_raw[tr_idx], dtype=np.float32)
+            print(
+                f"   ⏳ Fitting randomized PCA: "
+                f"{X_train_pca.shape[0]} x {X_train_pca.shape[1]} "
+                f"-> D={CONFIG['hydra_dim']}",
+                flush=True,
+            )
             pca = run_with_heartbeat(
                 f"Fold {fold} PCA fit",
-                lambda: fit_pca_on_train(
-                    X_rocket_raw[tr_idx],
-                    CONFIG["hydra_dim"],
-                ),
+                lambda: fit_pca_on_train(X_train_pca, CONFIG["hydra_dim"]),
             )
-            pca_path = save_fold_pca_model(fold, pca, tr_idx)
+            del X_train_pca
+            print(f"   💾 Saving fold PCA object: {pca_path}", flush=True)
+            pca_path = run_with_heartbeat(
+                f"Fold {fold} PCA cache save",
+                lambda: save_fold_pca_model(fold, pca, tr_idx),
+            )
             print(
                 f"   ✅ PCA fit complete in "
                 f"{(time.perf_counter() - pca_started) / 60:.1f} min",
