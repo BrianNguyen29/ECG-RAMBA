@@ -19,6 +19,7 @@ import hashlib
 import json
 import time
 import warnings
+from datetime import datetime, timezone
 from threading import Event, Thread
 import numpy as np
 import pandas as pd
@@ -93,6 +94,14 @@ def atomic_write_csv(frame: pd.DataFrame, path: str, *, index: bool = False) -> 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp"
     frame.to_csv(tmp_path, index=index)
+    os.replace(tmp_path, path)
+
+
+def atomic_write_json(payload: dict, path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
     os.replace(tmp_path, path)
 
 
@@ -412,6 +421,7 @@ def main():
     print(f"✅ Saved fold label prevalence audit: {prevalence_path}")
 
     completed_folds = set()
+    resume_audit_rows = []
     for fold in range(1, int(CONFIG["n_folds"]) + 1):
         epoch_count = sum(
             int(row.get("fold", -1)) == fold
@@ -425,7 +435,13 @@ def main():
             os.path.join(PATHS["model_dir"], f"fold{fold}_{kind}.pt")
             for kind in ("best_ema", "best_raw", "final_ema", "final_raw")
         ]
+        checkpoint_exists = {
+            kind: os.path.exists(os.path.join(PATHS["model_dir"], f"fold{fold}_{kind}.pt"))
+            for kind in ("best_ema", "best_raw", "final_ema", "final_raw")
+        }
         checkpoint_metadata_valid = False
+        checkpoint_metadata_error = ""
+        final_ema_metadata = {}
         final_ema_path = os.path.join(
             PATHS["model_dir"],
             f"fold{fold}_final_ema.pt",
@@ -433,6 +449,17 @@ def main():
         if os.path.exists(final_ema_path):
             try:
                 payload = torch.load(final_ema_path, map_location="cpu")
+                final_ema_metadata = {
+                    "config_hash": payload.get("config_hash"),
+                    "dataset_record_order_fingerprint": payload.get(
+                        "dataset_record_order_fingerprint"
+                    ),
+                    "weights_kind": payload.get("weights_kind"),
+                    "selection_rule": payload.get("selection_rule"),
+                    "epoch": int(payload.get("epoch", -1)),
+                    "checkpoint_contract": payload.get("checkpoint_contract"),
+                    "training_protocol": payload.get("training_protocol"),
+                }
                 checkpoint_metadata_valid = (
                     payload.get("config_hash") == CONFIG_HASH
                     and payload.get("dataset_record_order_fingerprint")
@@ -443,17 +470,73 @@ def main():
                 )
                 del payload
             except Exception as exc:
+                checkpoint_metadata_error = repr(exc)
                 print(
                     f"⚠️ Fold {fold} resume checkpoint validation failed: {exc}",
                     flush=True,
                 )
-        if (
+        complete_for_resume = (
             epoch_count == int(CONFIG["epochs"])
             and has_result
             and all(os.path.exists(path) for path in checkpoint_paths)
             and checkpoint_metadata_valid
-        ):
+        )
+        resume_audit_rows.append(
+            {
+                "fold": int(fold),
+                "resume_training_enabled": bool(resume_training),
+                "epoch_log_rows": int(epoch_count),
+                "expected_epoch_rows": int(CONFIG["epochs"]),
+                "has_cv_result_row": bool(has_result),
+                "checkpoint_best_ema_exists": bool(checkpoint_exists["best_ema"]),
+                "checkpoint_best_raw_exists": bool(checkpoint_exists["best_raw"]),
+                "checkpoint_final_ema_exists": bool(checkpoint_exists["final_ema"]),
+                "checkpoint_final_raw_exists": bool(checkpoint_exists["final_raw"]),
+                "all_required_checkpoints_exist": bool(all(checkpoint_exists.values())),
+                "final_ema_metadata_valid": bool(checkpoint_metadata_valid),
+                "final_ema_config_hash": final_ema_metadata.get("config_hash"),
+                "expected_config_hash": CONFIG_HASH,
+                "final_ema_dataset_record_order_fingerprint": final_ema_metadata.get(
+                    "dataset_record_order_fingerprint"
+                ),
+                "expected_dataset_record_order_fingerprint": split_audit[
+                    "record_order_fingerprint"
+                ],
+                "final_ema_weights_kind": final_ema_metadata.get("weights_kind"),
+                "final_ema_selection_rule": final_ema_metadata.get("selection_rule"),
+                "final_ema_epoch": final_ema_metadata.get("epoch"),
+                "expected_final_epoch": int(CONFIG["epochs"]),
+                "checkpoint_contract": final_ema_metadata.get("checkpoint_contract"),
+                "training_protocol": final_ema_metadata.get("training_protocol"),
+                "metadata_error": checkpoint_metadata_error,
+                "complete_for_resume_skip": bool(complete_for_resume),
+            }
+        )
+        if complete_for_resume:
             completed_folds.add(fold)
+    resume_audit_payload = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "model_dir": PATHS["model_dir"],
+        "resume_training_enabled": bool(resume_training),
+        "config_hash": CONFIG_HASH,
+        "expected_epochs": int(CONFIG["epochs"]),
+        "expected_folds": int(CONFIG["n_folds"]),
+        "dataset_record_order_fingerprint": split_audit["record_order_fingerprint"],
+        "completed_folds_reused": sorted(int(fold) for fold in completed_folds),
+        "skip_policy": (
+            "A fold may be skipped only when epoch logs cover all configured epochs, "
+            "the CV result row exists, all four explicit checkpoints exist, and "
+            "fold*_final_ema.pt metadata matches config hash, dataset fingerprint, "
+            "weights_kind=ema, selection_rule=fixed_final_epoch, and final epoch."
+        ),
+        "folds": resume_audit_rows,
+    }
+    resume_audit_json_path = os.path.join(PATHS["model_dir"], "resume_integrity_audit.json")
+    resume_audit_csv_path = os.path.join(PATHS["model_dir"], "resume_integrity_audit.csv")
+    atomic_write_json(resume_audit_payload, resume_audit_json_path)
+    atomic_write_csv(pd.DataFrame(resume_audit_rows), resume_audit_csv_path)
+    print(f"🧾 Wrote resume integrity audit: {resume_audit_json_path}")
+    print(f"🧾 Wrote resume integrity audit table: {resume_audit_csv_path}")
     if completed_folds:
         print(
             f"♻️ Resume enabled; completed folds will be reused: "
