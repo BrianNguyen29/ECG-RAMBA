@@ -50,6 +50,8 @@ from scripts.revision.common import (  # noqa: E402
 
 PROTOCOL = "hrv36_logistic_regression_same_folds_threshold_0.5"
 DOMAIN_PROTOCOL = "hrv36_domain_logistic_regression_stratified_cv"
+DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
+DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,9 +64,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--oof-predictions",
         type=Path,
-        default=PREDICTION_DIR / "oof_full_predictions.npz",
+        default=DEFAULT_OOF_PREDICTIONS,
         help="Frozen OOF NPZ used for y_true, class order, and fold_id.",
     )
+    parser.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        default=DEFAULT_FREEZE_MANIFEST,
+        help="Manuscript-ready OOF freeze manifest used to verify the OOF NPZ.",
+    )
+    parser.add_argument("--expected-checkpoint-kind", default="final_ema")
     parser.add_argument(
         "--chapman-hrv-cache",
         type=Path,
@@ -123,6 +132,59 @@ def _path_info(path: os.PathLike[str] | str, *, with_sha256: bool = False) -> di
     if with_sha256 and p.exists() and p.is_file():
         info["sha256"] = sha256_file(p)
     return info
+
+
+def _resolve_project_path(path: Path) -> Path:
+    resolved = path if path.is_absolute() else PROJECT_ROOT / path
+    return resolved.resolve()
+
+
+def _project_relative(path: Path) -> str:
+    return _resolve_project_path(path).relative_to(PROJECT_ROOT.resolve()).as_posix()
+
+
+def validate_oof_freeze_contract(
+    *,
+    freeze_manifest: Path,
+    oof_predictions: Path,
+    expected_checkpoint_kind: str,
+) -> dict:
+    freeze_path = _resolve_project_path(freeze_manifest)
+    pred_path = _resolve_project_path(oof_predictions)
+    if not freeze_path.exists():
+        raise FileNotFoundError(f"Missing OOF freeze manifest: {freeze_path}")
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
+        raise ValueError("OOF freeze manifest must be status=frozen and manuscript_ready=true.")
+    if freeze.get("checkpoint_kind") != expected_checkpoint_kind:
+        raise ValueError(
+            "Unexpected OOF checkpoint kind: "
+            f"{freeze.get('checkpoint_kind')} != {expected_checkpoint_kind}"
+        )
+    relative = _project_relative(pred_path)
+    artifacts = {row["path"]: row for row in freeze.get("artifacts", [])}
+    if relative not in artifacts:
+        raise ValueError(f"Freeze manifest does not include OOF predictions: {relative}")
+    pred_sha = sha256_file(pred_path)
+    expected_sha = artifacts[relative].get("sha256")
+    if pred_sha != expected_sha:
+        raise RuntimeError(
+            f"OOF prediction SHA256 changed after freeze: {relative} "
+            f"{pred_sha} != {expected_sha}"
+        )
+    if int(freeze.get("validated_records", -1)) != 44186:
+        raise ValueError(f"Unexpected freeze validated_records: {freeze.get('validated_records')}")
+    if int(freeze.get("n_classes", -1)) != len(CLASSES):
+        raise ValueError(f"Unexpected freeze n_classes: {freeze.get('n_classes')}")
+    return {
+        "freeze_manifest": str(freeze_path),
+        "freeze_manifest_sha256": sha256_file(freeze_path),
+        "oof_predictions_relative": relative,
+        "oof_predictions_sha256": pred_sha,
+        "checkpoint_kind": freeze.get("checkpoint_kind"),
+        "validated_records": freeze.get("validated_records"),
+        "n_classes": freeze.get("n_classes"),
+    }
 
 
 def _json_safe(value):
@@ -845,7 +907,15 @@ def write_outputs(
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
+    args.oof_predictions = _resolve_project_path(args.oof_predictions)
+    args.freeze_manifest = _resolve_project_path(args.freeze_manifest)
+    freeze_contract = validate_oof_freeze_contract(
+        freeze_manifest=args.freeze_manifest,
+        oof_predictions=args.oof_predictions,
+        expected_checkpoint_kind=args.expected_checkpoint_kind,
+    )
     X_hrv, y, folds, load_info = load_chapman_hrv_and_folds(args)
+    load_info["freeze_contract"] = freeze_contract
     baseline = compute_hrv_baseline(
         X_hrv,
         y,

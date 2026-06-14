@@ -15,6 +15,7 @@ from scripts.revision.common import aggregate_record_probabilities, sha256_file
 
 freeze_oof = importlib.import_module("scripts.revision.06_freeze_oof")
 pooling = importlib.import_module("scripts.revision.07_pooling_sensitivity")
+hrv_domain = importlib.import_module("scripts.revision.09_hrv_domain_analysis")
 a0_gate = importlib.import_module("scripts.revision.00_a0_resolution_gate")
 generate_predictions = importlib.import_module("scripts.revision.01_generate_predictions")
 
@@ -47,6 +48,40 @@ class RevisionArtifactContractTests(unittest.TestCase):
             }
 
             pooling.verify_frozen_artifact(manifest, relative)
+
+    def test_hrv_domain_validates_final_ema_freeze_contract(self):
+        with tempfile.TemporaryDirectory(dir=hrv_domain.PROJECT_ROOT) as tmp:
+            root = Path(tmp)
+            pred = root / "oof_final_ema_predictions.npz"
+            pred.write_bytes(b"canonical-oof")
+            freeze = root / "oof_final_ema_freeze_manifest.json"
+            freeze.write_text(
+                json.dumps(
+                    {
+                        "status": "frozen",
+                        "manuscript_ready": True,
+                        "checkpoint_kind": "final_ema",
+                        "validated_records": 44186,
+                        "n_classes": len(CLASSES),
+                        "artifacts": [
+                            {
+                                "path": pred.relative_to(hrv_domain.PROJECT_ROOT).as_posix(),
+                                "sha256": sha256_file(pred),
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = hrv_domain.validate_oof_freeze_contract(
+                freeze_manifest=freeze.relative_to(hrv_domain.PROJECT_ROOT),
+                oof_predictions=pred.relative_to(hrv_domain.PROJECT_ROOT),
+                expected_checkpoint_kind="final_ema",
+            )
+
+            self.assertEqual(payload["checkpoint_kind"], "final_ema")
+            self.assertEqual(payload["oof_predictions_sha256"], sha256_file(pred))
 
     def test_oof_artifact_stem_separates_best_and_final_outputs(self):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
