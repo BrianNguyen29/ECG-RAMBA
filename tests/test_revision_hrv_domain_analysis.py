@@ -106,6 +106,27 @@ class HRVDomainAnalysisTests(unittest.TestCase):
             np.testing.assert_array_equal(X_loaded, X_hrv)
             self.assertFalse(hrv_info["raw_chapman_loaded"])
 
+    def test_cached_hrv_loader_prefers_record_fingerprinted_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy_path = root / "hrv36_N6_C12_L5000.npz"
+            fingerprinted_path = root / "hrv36_N6_C12_L5000_Rabc123.npz"
+            legacy = np.zeros((6, 36), dtype=np.float32)
+            fingerprinted = np.ones((6, 36), dtype=np.float32)
+            np.savez_compressed(legacy_path, X=legacy)
+            np.savez_compressed(fingerprinted_path, X=fingerprinted)
+
+            with patch.dict(hrv_analysis.PATHS, {"cache_dir": str(root)}, clear=False):
+                X_loaded, hrv_info = hrv_analysis.load_cached_chapman_hrv(
+                    n_records=6,
+                    explicit_cache=None,
+                    limit_records=0,
+                    allow_raw_fallback=False,
+                )
+
+            np.testing.assert_array_equal(X_loaded, fingerprinted)
+            self.assertEqual(hrv_info["chapman_hrv_cache_kind"], "record_fingerprinted")
+
     def test_write_outputs_records_blocked_domain_classifier(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

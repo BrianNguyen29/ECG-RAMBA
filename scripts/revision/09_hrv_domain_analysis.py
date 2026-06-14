@@ -78,7 +78,11 @@ def parse_args() -> argparse.Namespace:
         "--chapman-hrv-cache",
         type=Path,
         default=None,
-        help="Optional explicit HRV36 NPZ path. Defaults to cache_dir/hrv36_N{N}_C12_L5000.npz.",
+        help=(
+            "Optional explicit HRV36 NPZ path. Without this, the script prefers "
+            "record-fingerprinted caches hrv36_N{N}_C12_L5000_R*.npz before "
+            "legacy shape-only caches."
+        ),
     )
     parser.add_argument(
         "--allow-raw-chapman-fallback",
@@ -359,6 +363,48 @@ def default_chapman_hrv_cache_path(n_records: int) -> Path:
     return Path(PATHS["cache_dir"]) / f"hrv36_N{n_records}_C12_L5000.npz"
 
 
+def candidate_chapman_hrv_cache_paths(n_records: int, explicit_cache: Path | None) -> list[Path]:
+    """Return HRV cache candidates in manuscript-safe preference order."""
+    candidates: list[Path] = []
+    if explicit_cache is not None:
+        candidates.append(Path(explicit_cache))
+
+    roots: list[Path] = [Path(PATHS["cache_dir"]), PROJECT_ROOT]
+    drive_root = os.environ.get("ECG_RAMBA_DRIVE_ROOT")
+    if drive_root:
+        roots.append(Path(drive_root))
+
+    seen_roots: set[str] = set()
+    for root in roots:
+        root = Path(root)
+        key = str(root.resolve()) if root.exists() else str(root)
+        if key in seen_roots:
+            continue
+        seen_roots.add(key)
+        if not root.exists():
+            continue
+        fingerprinted = sorted(
+            root.glob(f"hrv36_N{n_records}_C12_L5000_R*.npz"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        candidates.extend(fingerprinted)
+
+    candidates.append(default_chapman_hrv_cache_path(n_records))
+    candidates.append(PROJECT_ROOT / f"hrv36_N{n_records}_C12_L5000.npz")
+
+    deduped: list[Path] = []
+    seen_paths: set[str] = set()
+    for path in candidates:
+        path = Path(path)
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append(path)
+    return deduped
+
+
 def load_oof_labels_and_folds(oof_predictions: Path, limit_records: int) -> tuple[np.ndarray, list[dict[str, np.ndarray]], dict]:
     if not oof_predictions.exists():
         raise FileNotFoundError(
@@ -407,11 +453,7 @@ def load_cached_chapman_hrv(
     limit_records: int,
     allow_raw_fallback: bool,
 ) -> tuple[np.ndarray, dict]:
-    candidates = []
-    if explicit_cache is not None:
-        candidates.append(explicit_cache)
-    candidates.append(default_chapman_hrv_cache_path(n_records))
-    candidates.append(PROJECT_ROOT / f"hrv36_N{n_records}_C12_L5000.npz")
+    candidates = candidate_chapman_hrv_cache_paths(n_records, explicit_cache)
 
     checked = []
     for path in candidates:
@@ -429,6 +471,7 @@ def load_cached_chapman_hrv(
         return X_hrv, {
             "chapman_hrv_cache": str(path),
             "chapman_hrv_cache_sha256": sha256_file(path),
+            "chapman_hrv_cache_kind": "record_fingerprinted" if "_R" in path.name else "legacy_shape_only",
             "hrv_shape": list(X_hrv.shape),
             "raw_chapman_loaded": False,
             "checked_cache_paths": checked,
@@ -451,6 +494,7 @@ def load_cached_chapman_hrv(
     return sanitize_features(X_hrv), {
         "chapman_hrv_cache": None,
         "chapman_hrv_cache_sha256": None,
+        "chapman_hrv_cache_kind": "raw_generated",
         "hrv_shape": list(X_hrv.shape),
         "raw_chapman_loaded": True,
         "checked_cache_paths": checked,
