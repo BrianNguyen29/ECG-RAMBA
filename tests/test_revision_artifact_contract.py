@@ -32,6 +32,22 @@ class RevisionArtifactContractTests(unittest.TestCase):
             self.assertEqual(info["size_bytes"], path.stat().st_size)
             self.assertEqual(info["sha256"], sha256_file(path))
 
+    def test_pooling_verify_frozen_artifact_accepts_relative_paths(self):
+        with tempfile.TemporaryDirectory(dir=pooling.PROJECT_ROOT) as tmp:
+            path = Path(tmp) / "pooling_artifact.txt"
+            path.write_text("ok", encoding="utf-8")
+            relative = path.relative_to(pooling.PROJECT_ROOT)
+            manifest = {
+                "artifacts": [
+                    {
+                        "path": relative.as_posix(),
+                        "sha256": sha256_file(path),
+                    }
+                ]
+            }
+
+            pooling.verify_frozen_artifact(manifest, relative)
+
     def test_oof_artifact_stem_separates_best_and_final_outputs(self):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
         self.assertEqual(generate_predictions.oof_artifact_stem("final"), "oof_final")

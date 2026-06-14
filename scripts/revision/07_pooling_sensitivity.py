@@ -31,28 +31,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--freeze-manifest",
         type=Path,
-        default=MANIFEST_DIR / "oof_freeze_manifest.json",
+        default=MANIFEST_DIR / "oof_final_ema_freeze_manifest.json",
     )
     parser.add_argument(
         "--record-file",
         type=Path,
-        default=PREDICTION_DIR / "oof_full_predictions.npz",
+        default=PREDICTION_DIR / "oof_final_ema_predictions.npz",
     )
     parser.add_argument(
         "--slice-file",
         type=Path,
-        default=PREDICTION_DIR / "oof_full_slice_predictions.npz",
+        default=PREDICTION_DIR / "oof_final_ema_slice_predictions.npz",
     )
+    parser.add_argument("--expected-checkpoint-kind", default="final_ema")
     parser.add_argument("--threshold", type=float, default=0.5)
     return parser.parse_args()
 
 
+def project_relative_path(path: Path) -> tuple[Path, str]:
+    resolved = path if path.is_absolute() else PROJECT_ROOT / path
+    resolved = resolved.resolve()
+    return resolved, resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
+
+
 def verify_frozen_artifact(manifest: dict, path: Path) -> None:
-    relative = path.relative_to(PROJECT_ROOT).as_posix()
+    resolved, relative = project_relative_path(path)
     rows = {row["path"]: row for row in manifest.get("artifacts", [])}
     if relative not in rows:
         raise ValueError(f"Freeze manifest does not include {relative}")
-    if sha256_file(path) != rows[relative]["sha256"]:
+    if sha256_file(resolved) != rows[relative]["sha256"]:
         raise RuntimeError(f"Frozen artifact checksum changed: {relative}")
 
 
@@ -81,6 +88,11 @@ def main() -> None:
     freeze = json.loads(args.freeze_manifest.read_text(encoding="utf-8"))
     if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
         raise ValueError("OOF freeze manifest is not manuscript-ready")
+    if freeze.get("checkpoint_kind") != args.expected_checkpoint_kind:
+        raise ValueError(
+            "Unexpected OOF checkpoint kind: "
+            f"{freeze.get('checkpoint_kind')} != {args.expected_checkpoint_kind}"
+        )
     verify_frozen_artifact(freeze, args.record_file)
     verify_frozen_artifact(freeze, args.slice_file)
 
