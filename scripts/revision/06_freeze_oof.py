@@ -124,10 +124,12 @@ def current_checkpoint_rows(kind: str, expected_folds: int) -> list[dict]:
 
 
 def artifact_info(path: Path) -> dict:
+    resolved = path if path.is_absolute() else PROJECT_ROOT / path
+    resolved = resolved.resolve()
     return {
-        "path": path.relative_to(PROJECT_ROOT).as_posix(),
-        "size_bytes": path.stat().st_size,
-        "sha256": sha256_file(path),
+        "path": resolved.relative_to(PROJECT_ROOT.resolve()).as_posix(),
+        "size_bytes": resolved.stat().st_size,
+        "sha256": sha256_file(resolved),
     }
 
 

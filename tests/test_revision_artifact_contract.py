@@ -20,6 +20,18 @@ generate_predictions = importlib.import_module("scripts.revision.01_generate_pre
 
 
 class RevisionArtifactContractTests(unittest.TestCase):
+    def test_freeze_artifact_info_accepts_relative_paths(self):
+        with tempfile.TemporaryDirectory(dir=freeze_oof.PROJECT_ROOT) as tmp:
+            path = Path(tmp) / "relative_artifact.txt"
+            path.write_text("ok", encoding="utf-8")
+            relative = path.relative_to(freeze_oof.PROJECT_ROOT)
+
+            info = freeze_oof.artifact_info(relative)
+
+            self.assertEqual(info["path"], relative.as_posix())
+            self.assertEqual(info["size_bytes"], path.stat().st_size)
+            self.assertEqual(info["sha256"], sha256_file(path))
+
     def test_oof_artifact_stem_separates_best_and_final_outputs(self):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")
         self.assertEqual(generate_predictions.oof_artifact_stem("final"), "oof_final")
