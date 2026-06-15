@@ -41,7 +41,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL = "minirocket_raw_torch_linear_same_folds_threshold_0.5"
+PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 
@@ -57,11 +57,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--alpha", type=float, default=1e-4)
     parser.add_argument("--n-jobs", type=int, default=-1)
     parser.add_argument("--backend", choices=["torch_linear", "sgd"], default="torch_linear")
-    parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--torch-epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--stats-batch-size", type=int, default=1024)
+    parser.add_argument("--torch-epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu for torch_linear backend.")
+    parser.add_argument("--standardize", choices=["train_fold", "none"], default="train_fold")
+    parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument(
         "--oof-predictions",
@@ -468,6 +471,57 @@ def fit_predict_minirocket_sgd_oof(
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
+def iter_index_batches(indices: np.ndarray, batch_size: int, *, shuffle: bool, rng: np.random.Generator):
+    indices = np.asarray(indices, dtype=np.int64)
+    if shuffle:
+        indices = indices.copy()
+        rng.shuffle(indices)
+    for start in range(0, len(indices), batch_size):
+        yield indices[start : start + batch_size]
+
+
+def compute_train_standardization(
+    X: np.ndarray,
+    train_idx: np.ndarray,
+    *,
+    batch_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute feature mean/std on the training fold without materializing it."""
+    if batch_size <= 0:
+        raise ValueError("--stats-batch-size must be positive.")
+    n_features = int(X.shape[1])
+    total = np.zeros(n_features, dtype=np.float64)
+    total_sq = np.zeros(n_features, dtype=np.float64)
+    count = 0
+    rng = np.random.default_rng(0)
+    for batch_idx in iter_index_batches(train_idx, batch_size, shuffle=False, rng=rng):
+        xb = np.asarray(X[batch_idx], dtype=np.float32)
+        total += np.sum(xb, axis=0, dtype=np.float64)
+        total_sq += np.sum(xb * xb, axis=0, dtype=np.float64)
+        count += int(len(batch_idx))
+    if count == 0:
+        raise ValueError("Cannot standardize with an empty training fold.")
+    mean = total / float(count)
+    var = np.maximum(total_sq / float(count) - mean * mean, 1e-8)
+    std = np.sqrt(var)
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def prepare_feature_batch(
+    X: np.ndarray,
+    batch_idx: np.ndarray,
+    *,
+    mean: np.ndarray | None,
+    std: np.ndarray | None,
+) -> np.ndarray:
+    xb = np.asarray(X[batch_idx], dtype=np.float32)
+    if mean is not None and std is not None:
+        xb = xb.copy()
+        xb -= mean
+        xb /= std
+    return np.ascontiguousarray(xb, dtype=np.float32)
+
+
 def fit_predict_minirocket_torch_oof(
     X: np.ndarray,
     y: np.ndarray,
@@ -475,10 +529,13 @@ def fit_predict_minirocket_torch_oof(
     *,
     seed: int,
     batch_size: int,
+    stats_batch_size: int,
     epochs: int,
     lr: float,
     weight_decay: float,
     device_name: str,
+    standardize: str,
+    allow_tf32: bool,
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     """Fit a fold-safe linear logistic head on MiniRocket features in batches."""
     import torch
@@ -492,8 +549,16 @@ def fit_predict_minirocket_torch_oof(
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
     if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.allow_tf32 = bool(allow_tf32)
+        torch.backends.cudnn.benchmark = False
+    if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"Torch linear backend device={device} batch_size={batch_size} epochs={epochs}", flush=True)
+    print(
+        f"Torch linear backend device={device} batch_size={batch_size} "
+        f"epochs={epochs} standardize={standardize} allow_tf32={allow_tf32}",
+        flush=True,
+    )
 
     X = np.asarray(X)
     y = np.asarray(y, dtype=np.float32)
@@ -505,14 +570,6 @@ def fit_predict_minirocket_torch_oof(
     y_prob = np.full((n_records, n_classes), np.nan, dtype=np.float32)
     fold_id_out = np.full(n_records, -1, dtype=np.int16)
     fold_rows: list[dict] = []
-
-    def iter_batches(indices: np.ndarray, *, shuffle: bool, rng: np.random.Generator):
-        indices = np.asarray(indices, dtype=np.int64)
-        if shuffle:
-            indices = indices.copy()
-            rng.shuffle(indices)
-        for start in range(0, len(indices), batch_size):
-            yield indices[start : start + batch_size]
 
     for fold in folds:
         fold_num = int(fold["fold"])
@@ -528,6 +585,15 @@ def fit_predict_minirocket_torch_oof(
             f"features={n_features}",
             flush=True,
         )
+        if standardize == "train_fold":
+            print(f"  fold {fold_num}: computing train-fold feature standardization", flush=True)
+            mean, std = compute_train_standardization(
+                X,
+                tr_idx,
+                batch_size=stats_batch_size,
+            )
+        else:
+            mean, std = None, None
         pos = np.sum(y[tr_idx], axis=0).astype(np.float32)
         neg = float(len(tr_idx)) - pos
         pos_weight = np.where(pos > 0, neg / np.maximum(pos, 1.0), 1.0).astype(np.float32)
@@ -542,8 +608,8 @@ def fit_predict_minirocket_torch_oof(
         for epoch in range(1, epochs + 1):
             total_loss = 0.0
             total_seen = 0
-            for batch_idx in iter_batches(tr_idx, shuffle=True, rng=rng):
-                xb = np.ascontiguousarray(X[batch_idx])
+            for batch_idx in iter_index_batches(tr_idx, batch_size, shuffle=True, rng=rng):
+                xb = prepare_feature_batch(X, batch_idx, mean=mean, std=std)
                 xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
                 yb_t = torch.as_tensor(y[batch_idx], dtype=torch.float32, device=device)
                 optimizer.zero_grad(set_to_none=True)
@@ -561,8 +627,8 @@ def fit_predict_minirocket_torch_oof(
 
         model.eval()
         with torch.no_grad():
-            for batch_idx in iter_batches(va_idx, shuffle=False, rng=rng):
-                xb = np.ascontiguousarray(X[batch_idx])
+            for batch_idx in iter_index_batches(va_idx, batch_size, shuffle=False, rng=rng):
+                xb = prepare_feature_batch(X, batch_idx, mean=mean, std=std)
                 xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
                 probs = torch.sigmoid(model(xb_t)).detach().cpu().numpy()
                 y_prob[batch_idx] = probs.astype(np.float32)
@@ -577,8 +643,11 @@ def fit_predict_minirocket_torch_oof(
                 "classifier": "torch.nn.Linear+BCEWithLogitsLoss",
                 "epochs": int(epochs),
                 "batch_size": int(batch_size),
+                "stats_batch_size": int(stats_batch_size),
                 "lr": float(lr),
                 "weight_decay": float(weight_decay),
+                "standardize": standardize,
+                "allow_tf32": bool(allow_tf32),
                 "device": str(device),
             }
         )
@@ -674,10 +743,13 @@ def main() -> None:
             folds,
             seed=args.seed,
             batch_size=args.batch_size,
+            stats_batch_size=args.stats_batch_size,
             epochs=args.torch_epochs,
             lr=args.lr,
             weight_decay=args.weight_decay,
             device_name=args.device,
+            standardize=args.standardize,
+            allow_tf32=args.allow_tf32,
         )
         model_name = "fold_safe_torch_linear_logistic_head"
         classifier_params = {
@@ -685,11 +757,14 @@ def main() -> None:
             "loss": "BCEWithLogitsLoss",
             "optimizer": "AdamW",
             "batch_size": int(args.batch_size),
+            "stats_batch_size": int(args.stats_batch_size),
             "epochs": int(args.torch_epochs),
             "lr": float(args.lr),
             "weight_decay": float(args.weight_decay),
             "pos_weight": "fold_train_negative_positive_ratio",
             "device": args.device,
+            "standardize": args.standardize,
+            "allow_tf32": bool(args.allow_tf32),
         }
     else:
         y_prob, fold_id, fold_rows = fit_predict_minirocket_sgd_oof(
@@ -751,6 +826,9 @@ def main() -> None:
         dataset=np.asarray("chapman_oof"),
         protocol=np.asarray(PROTOCOL),
         feature_contract=np.asarray("minirocket_raw"),
+        feature_preprocessing=np.asarray(
+            "fold_train_standardization" if args.standardize == "train_fold" else "none"
+        ),
         threshold=np.asarray(float(args.threshold)),
         config_hash=np.asarray(CONFIG_HASH),
         git_commit=np.asarray(_git_output(["rev-parse", "HEAD"]) or ""),
@@ -774,6 +852,7 @@ def main() -> None:
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": "minirocket_raw",
+        "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "model": model_name,
         "classifier_params": classifier_params,
         "n_records": int(len(y)),
@@ -800,6 +879,7 @@ def main() -> None:
         "git_commit": _git_output(["rev-parse", "HEAD"]),
         "protocol": PROTOCOL,
         "feature_contract": "minirocket_raw",
+        "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "artifacts": {

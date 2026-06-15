@@ -135,6 +135,15 @@ HRV-domain artifacts are manuscript-usable only for the analyses marked
 and robustness stress tests remain blocked until dedicated perturbation runners
 produce metric artifacts rather than status ledgers.
 
+MiniRocket-only baseline artifacts are manuscript-usable only when
+`metrics/minirocket_only_baseline_summary.json` reports
+`protocol=minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5`,
+`feature_preprocessing=fold_train_standardization`, `manuscript_ready=true`,
+44,186 records, 27 classes, the canonical `oof_final_ema` prediction SHA256,
+and a record-fingerprinted RAW MiniRocket cache. The classifier is a fixed-epoch
+linear logistic head trained only on each fold's training records; it is a
+feature baseline, not ECG-RAMBA checkpoint inference.
+
 ## Minimum Metric Contract
 
 Each dataset/model result should report:
