@@ -2,8 +2,8 @@
 
 This runner is intentionally separate from the full ECG-RAMBA model. It uses
 the cached deterministic RAW MiniRocket feature matrix, the exact frozen OOF
-fold split/labels, and a lightweight one-vs-rest logistic SGD classifier. The
-goal is reviewer-facing baseline evidence, not checkpoint inference.
+fold split/labels, and a lightweight linear logistic head. The goal is
+reviewer-facing baseline evidence, not checkpoint inference.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL = "minirocket_raw_sgd_logistic_same_folds_threshold_0.5"
+PROTOCOL = "minirocket_raw_torch_linear_same_folds_threshold_0.5"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 
@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tol", type=float, default=1e-3)
     parser.add_argument("--alpha", type=float, default=1e-4)
     parser.add_argument("--n-jobs", type=int, default=-1)
+    parser.add_argument("--backend", choices=["torch_linear", "sgd"], default="torch_linear")
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--torch-epochs", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--device", default="auto", help="auto, cuda, or cpu for torch_linear backend.")
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument(
         "--oof-predictions",
@@ -329,7 +335,7 @@ def load_minirocket_cache(
         with np.load(path, allow_pickle=False) as payload:
             if "X" not in payload.files:
                 raise KeyError(f"{path} must contain key 'X'; found {payload.files}")
-            X = np.asarray(payload["X"], dtype=np.float32)
+            X = np.asarray(payload["X"])
             cached_fingerprint = str(npz_scalar(payload, "record_order_fingerprint", "") or "")
             storage_dtype = str(npz_scalar(payload, "storage_dtype", str(payload["X"].dtype)))
             consumer_dtype = str(npz_scalar(payload, "consumer_dtype", "float32"))
@@ -354,7 +360,7 @@ def load_minirocket_cache(
 
         if limit_records > 0:
             X = X[:limit_records]
-        return X.astype(np.float32, copy=False), {
+        return X, {
             "minirocket_cache": str(path),
             "minirocket_cache_sha256": sha256_file(path),
             "minirocket_cache_kind": cache_kind,
@@ -363,6 +369,7 @@ def load_minirocket_cache(
             "minirocket_consumer_dtype": consumer_dtype,
             "minirocket_quantization_contract": quantization_contract,
             "minirocket_shape": list(X.shape),
+            "minirocket_loaded_dtype": str(X.dtype),
             "checked_cache_paths": checked,
         }
 
@@ -373,7 +380,7 @@ def load_minirocket_cache(
     )
 
 
-def fit_predict_minirocket_oof(
+def fit_predict_minirocket_sgd_oof(
     X: np.ndarray,
     y: np.ndarray,
     folds: list[dict[str, np.ndarray]],
@@ -461,6 +468,132 @@ def fit_predict_minirocket_oof(
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
+def fit_predict_minirocket_torch_oof(
+    X: np.ndarray,
+    y: np.ndarray,
+    folds: list[dict[str, np.ndarray]],
+    *,
+    seed: int,
+    batch_size: int,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    device_name: str,
+) -> tuple[np.ndarray, np.ndarray, list[dict]]:
+    """Fit a fold-safe linear logistic head on MiniRocket features in batches."""
+    import torch
+    import torch.nn as nn
+
+    if batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if epochs <= 0:
+        raise ValueError("--torch-epochs must be positive.")
+    if device_name == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    print(f"Torch linear backend device={device} batch_size={batch_size} epochs={epochs}", flush=True)
+
+    X = np.asarray(X)
+    y = np.asarray(y, dtype=np.float32)
+    if len(X) != len(y):
+        raise ValueError(f"Feature/label length mismatch: {len(X)} vs {len(y)}")
+
+    n_records, n_classes = y.shape
+    n_features = int(X.shape[1])
+    y_prob = np.full((n_records, n_classes), np.nan, dtype=np.float32)
+    fold_id_out = np.full(n_records, -1, dtype=np.int16)
+    fold_rows: list[dict] = []
+
+    def iter_batches(indices: np.ndarray, *, shuffle: bool, rng: np.random.Generator):
+        indices = np.asarray(indices, dtype=np.int64)
+        if shuffle:
+            indices = indices.copy()
+            rng.shuffle(indices)
+        for start in range(0, len(indices), batch_size):
+            yield indices[start : start + batch_size]
+
+    for fold in folds:
+        fold_num = int(fold["fold"])
+        tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
+        va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
+        rng = np.random.default_rng(seed + fold_num)
+        torch.manual_seed(seed + fold_num)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed + fold_num)
+
+        print(
+            f"Fold {fold_num}/5 | train={len(tr_idx)} | val={len(va_idx)} | "
+            f"features={n_features}",
+            flush=True,
+        )
+        pos = np.sum(y[tr_idx], axis=0).astype(np.float32)
+        neg = float(len(tr_idx)) - pos
+        pos_weight = np.where(pos > 0, neg / np.maximum(pos, 1.0), 1.0).astype(np.float32)
+
+        model = nn.Linear(n_features, n_classes).to(device)
+        criterion = nn.BCEWithLogitsLoss(
+            pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device)
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        model.train()
+
+        for epoch in range(1, epochs + 1):
+            total_loss = 0.0
+            total_seen = 0
+            for batch_idx in iter_batches(tr_idx, shuffle=True, rng=rng):
+                xb = np.ascontiguousarray(X[batch_idx])
+                xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
+                yb_t = torch.as_tensor(y[batch_idx], dtype=torch.float32, device=device)
+                optimizer.zero_grad(set_to_none=True)
+                loss = criterion(model(xb_t), yb_t)
+                loss.backward()
+                optimizer.step()
+                batch_n = int(len(batch_idx))
+                total_loss += float(loss.detach().cpu()) * batch_n
+                total_seen += batch_n
+            print(
+                f"  fold {fold_num}: epoch {epoch:02d}/{epochs} "
+                f"loss={total_loss / max(total_seen, 1):.5f}",
+                flush=True,
+            )
+
+        model.eval()
+        with torch.no_grad():
+            for batch_idx in iter_batches(va_idx, shuffle=False, rng=rng):
+                xb = np.ascontiguousarray(X[batch_idx])
+                xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
+                probs = torch.sigmoid(model(xb_t)).detach().cpu().numpy()
+                y_prob[batch_idx] = probs.astype(np.float32)
+
+        fold_id_out[va_idx] = fold_num
+        fold_rows.append(
+            {
+                "fold": fold_num,
+                "train_records": int(len(tr_idx)),
+                "validation_records": int(len(va_idx)),
+                "validation_positive_labels": int(np.sum(y[va_idx])),
+                "classifier": "torch.nn.Linear+BCEWithLogitsLoss",
+                "epochs": int(epochs),
+                "batch_size": int(batch_size),
+                "lr": float(lr),
+                "weight_decay": float(weight_decay),
+                "device": str(device),
+            }
+        )
+        del model, optimizer, criterion
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    missing = np.where(fold_id_out < 0)[0]
+    if len(missing):
+        raise RuntimeError(f"OOF prediction coverage is incomplete; missing records: {len(missing)}")
+    if not np.all(np.isfinite(y_prob)):
+        raise RuntimeError("OOF probabilities contain non-finite values.")
+    return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
+
+
 def per_class_rows(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -534,16 +667,51 @@ def main() -> None:
     if len(X) != len(y):
         raise ValueError(f"MiniRocket/y length mismatch after loading: {len(X)} vs {len(y)}")
 
-    y_prob, fold_id, fold_rows = fit_predict_minirocket_oof(
-        X,
-        y,
-        folds,
-        seed=args.seed,
-        max_iter=args.max_iter,
-        tol=args.tol,
-        alpha=args.alpha,
-        n_jobs=args.n_jobs,
-    )
+    if args.backend == "torch_linear":
+        y_prob, fold_id, fold_rows = fit_predict_minirocket_torch_oof(
+            X,
+            y,
+            folds,
+            seed=args.seed,
+            batch_size=args.batch_size,
+            epochs=args.torch_epochs,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            device_name=args.device,
+        )
+        model_name = "fold_safe_torch_linear_logistic_head"
+        classifier_params = {
+            "backend": args.backend,
+            "loss": "BCEWithLogitsLoss",
+            "optimizer": "AdamW",
+            "batch_size": int(args.batch_size),
+            "epochs": int(args.torch_epochs),
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "pos_weight": "fold_train_negative_positive_ratio",
+            "device": args.device,
+        }
+    else:
+        y_prob, fold_id, fold_rows = fit_predict_minirocket_sgd_oof(
+            X,
+            y,
+            folds,
+            seed=args.seed,
+            max_iter=args.max_iter,
+            tol=args.tol,
+            alpha=args.alpha,
+            n_jobs=args.n_jobs,
+        )
+        model_name = "fold_safe_one_vs_rest_sgd_logistic_regression"
+        classifier_params = {
+            "backend": args.backend,
+            "loss": "log_loss",
+            "penalty": "l2",
+            "alpha": float(args.alpha),
+            "max_iter": int(args.max_iter),
+            "tol": float(args.tol),
+            "class_weight": "balanced",
+        }
     metrics = multilabel_metrics(y, y_prob, threshold=args.threshold)
     calibration = calibration_summary(y, y_prob, n_bins=args.n_bins)
     ci = {
@@ -606,15 +774,8 @@ def main() -> None:
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": "minirocket_raw",
-        "model": "fold_safe_one_vs_rest_sgd_logistic_regression",
-        "classifier_params": {
-            "loss": "log_loss",
-            "penalty": "l2",
-            "alpha": float(args.alpha),
-            "max_iter": int(args.max_iter),
-            "tol": float(args.tol),
-            "class_weight": "balanced",
-        },
+        "model": model_name,
+        "classifier_params": classifier_params,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
         "threshold": float(args.threshold),
