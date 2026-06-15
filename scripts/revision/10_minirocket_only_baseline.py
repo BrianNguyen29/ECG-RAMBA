@@ -507,6 +507,13 @@ def main() -> None:
         args.oof_predictions,
         limit_records=args.limit_records,
     )
+    if oof_info["oof_records_total"] != int(freeze_contract["validated_records"]):
+        raise ValueError(
+            "OOF prediction record count does not match freeze manifest: "
+            f"{oof_info['oof_records_total']} != {freeze_contract['validated_records']}"
+        )
+    if int(args.limit_records) == 0 and oof_info["fold_count"] != 5:
+        raise ValueError(f"Canonical MiniRocket-only baseline requires five folds, got {oof_info['fold_count']}")
     record_fingerprint = (
         oof_info.get("dataset_record_order_fingerprint")
         or freeze_contract.get("dataset_record_order_fingerprint")
