@@ -18,6 +18,7 @@ reports/revision/
     oof_full_predictions.npz
     oof_full_slice_predictions.npz
     hrv_only_oof_predictions.npz
+    minirocket_only_oof_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
     oof_final_ema_prediction_summary.json
@@ -26,6 +27,7 @@ reports/revision/
     calibration_ci_oof_full_predictions.json
     baseline_summary.csv
     hrv_only_baseline_summary.json
+    minirocket_only_baseline_summary.json
     hrv_domain_classifier_summary.json
     hrv_domain_summary.csv
     robustness_summary.csv
@@ -41,6 +43,8 @@ reports/revision/
     table_baselines.csv
     table_calibration.csv
     table_bootstrap_ci.csv
+    table_minirocket_only_class_metrics.csv
+    table_minirocket_only_fold_summary.csv
     table_hrv_domain_status.csv
     table_hrv_only_class_metrics.csv
     reliability_bins_<dataset>.csv
@@ -50,6 +54,7 @@ reports/revision/
   manifests/
     oof_final_ema_prediction_run_manifest.json
     oof_final_ema_freeze_manifest.json
+    minirocket_only_baseline_manifest.json
     oof_full_prediction_run_manifest.json
     oof_freeze_manifest.json
     mirror_manifest.json

@@ -61,6 +61,7 @@ Thumbs.db
 
 # Test artifacts
 test_import.py
+local_uploads/
 
 # Revision experiment outputs
 reports/revision/**
