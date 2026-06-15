@@ -65,6 +65,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu for torch_linear backend.")
     parser.add_argument("--standardize", choices=["train_fold", "none"], default="train_fold")
     parser.add_argument("--allow-tf32", action="store_true")
+    parser.add_argument(
+        "--reuse-predictions",
+        action="store_true",
+        help="Reuse an existing validated MiniRocket prediction NPZ and recompute tables/metrics.",
+    )
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument(
         "--oof-predictions",
@@ -150,6 +155,134 @@ def _save_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _prediction_metadata(
+    *,
+    args: argparse.Namespace,
+    load_info: dict,
+    model_name: str,
+    classifier_params: dict,
+) -> dict:
+    return {
+        "dataset": np.asarray("chapman_oof"),
+        "protocol": np.asarray(PROTOCOL),
+        "feature_contract": np.asarray("minirocket_raw"),
+        "feature_preprocessing": np.asarray(
+            "fold_train_standardization" if args.standardize == "train_fold" else "none"
+        ),
+        "threshold": np.asarray(float(args.threshold)),
+        "config_hash": np.asarray(CONFIG_HASH),
+        "git_commit": np.asarray(_git_output(["rev-parse", "HEAD"]) or ""),
+        "manuscript_ready": np.asarray(args.limit_records == 0),
+        "model": np.asarray(model_name),
+        "classifier_params_json": np.asarray(json.dumps(_json_safe(classifier_params), sort_keys=True)),
+        "oof_predictions_sha256": np.asarray(load_info.get("oof_predictions_sha256", "")),
+        "freeze_manifest_sha256": np.asarray(
+            (load_info.get("freeze_contract") or {}).get("freeze_manifest_sha256", "")
+        ),
+        "minirocket_cache_sha256": np.asarray(load_info.get("minirocket_cache_sha256", "")),
+        "dataset_record_order_fingerprint": np.asarray(
+            load_info.get("dataset_record_order_fingerprint", "")
+        ),
+    }
+
+
+def write_prediction_npz(
+    path: Path,
+    *,
+    y: np.ndarray,
+    y_prob: np.ndarray,
+    record_id: np.ndarray,
+    fold_id: np.ndarray,
+    class_names: list[str],
+    args: argparse.Namespace,
+    load_info: dict,
+    model_name: str,
+    classifier_params: dict,
+) -> None:
+    print(f"Writing MiniRocket-only predictions: {path}", flush=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        y_true=y.astype(np.float32),
+        y_prob=y_prob.astype(np.float32),
+        record_id=record_id.astype(np.int64),
+        fold_id=fold_id.astype(np.int16),
+        class_names=np.asarray(class_names),
+        **_prediction_metadata(
+            args=args,
+            load_info=load_info,
+            model_name=model_name,
+            classifier_params=classifier_params,
+        ),
+    )
+    print(f"Wrote prediction NPZ before metric/bootstrap stage: {path}", flush=True)
+
+
+def load_existing_prediction_npz(
+    path: Path,
+    *,
+    y: np.ndarray,
+    record_id: np.ndarray,
+    class_names: list[str],
+    args: argparse.Namespace,
+    load_info: dict,
+    model_name: str,
+    classifier_params: dict,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    if not path.exists():
+        return None
+    print(f"Checking reusable MiniRocket-only prediction NPZ: {path}", flush=True)
+    with np.load(path, allow_pickle=False) as data:
+        required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
+        missing = required - set(data.files)
+        if missing:
+            raise KeyError(f"Reusable prediction NPZ is missing keys: {sorted(missing)}")
+        existing_y = np.asarray(data["y_true"], dtype=np.float32)
+        y_prob = np.asarray(data["y_prob"], dtype=np.float32)
+        existing_record_id = np.asarray(data["record_id"], dtype=np.int64)
+        fold_id = np.asarray(data["fold_id"], dtype=np.int16)
+        existing_classes = np.asarray(data["class_names"]).astype(str).tolist()
+        expected_meta = _prediction_metadata(
+            args=args,
+            load_info=load_info,
+            model_name=model_name,
+            classifier_params=classifier_params,
+        )
+        advisory_metadata = {"git_commit"}
+        for key, expected in expected_meta.items():
+            if key not in data.files:
+                raise KeyError(f"Reusable prediction NPZ lacks metadata key: {key}")
+            actual = data[key]
+            actual_value = actual.item() if np.ndim(actual) == 0 else actual
+            expected_value = expected.item() if np.ndim(expected) == 0 else expected
+            if str(actual_value) != str(expected_value):
+                if key in advisory_metadata:
+                    print(
+                        f"Reusable prediction NPZ advisory metadata differs for {key}: "
+                        f"{actual_value} != {expected_value}",
+                        flush=True,
+                    )
+                    continue
+                raise ValueError(
+                    f"Reusable prediction NPZ metadata mismatch for {key}: "
+                    f"{actual_value} != {expected_value}"
+                )
+    if existing_y.shape != y.shape or y_prob.shape != y.shape:
+        raise ValueError(f"Reusable prediction shape mismatch: y={existing_y.shape}, prob={y_prob.shape}, expected={y.shape}")
+    if not np.array_equal(existing_y, y):
+        raise ValueError("Reusable prediction y_true differs from frozen OOF labels.")
+    if not np.array_equal(existing_record_id, record_id):
+        raise ValueError("Reusable prediction record_id differs from frozen OOF record_id.")
+    if existing_classes != class_names:
+        raise ValueError("Reusable prediction class_names differ from frozen OOF classes.")
+    if len(np.unique(fold_id[fold_id > 0])) != 5 and int(args.limit_records) == 0:
+        raise ValueError("Reusable canonical prediction does not cover all five folds.")
+    if not np.all(np.isfinite(y_prob)):
+        raise ValueError("Reusable prediction contains non-finite probabilities.")
+    print("Reusable MiniRocket-only prediction NPZ passed contract checks.", flush=True)
+    return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id
 
 
 def validate_oof_freeze_contract(
@@ -626,12 +759,14 @@ def fit_predict_minirocket_torch_oof(
             )
 
         model.eval()
+        print(f"  fold {fold_num}: running validation inference", flush=True)
         with torch.no_grad():
             for batch_idx in iter_index_batches(va_idx, batch_size, shuffle=False, rng=rng):
                 xb = prepare_feature_batch(X, batch_idx, mean=mean, std=std)
                 xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
                 probs = torch.sigmoid(model(xb_t)).detach().cpu().numpy()
                 y_prob[batch_idx] = probs.astype(np.float32)
+        print(f"  fold {fold_num}: validation inference complete", flush=True)
 
         fold_id_out[va_idx] = fold_num
         fold_rows.append(
@@ -660,6 +795,7 @@ def fit_predict_minirocket_torch_oof(
         raise RuntimeError(f"OOF prediction coverage is incomplete; missing records: {len(missing)}")
     if not np.all(np.isfinite(y_prob)):
         raise RuntimeError("OOF probabilities contain non-finite values.")
+    print("All MiniRocket-only folds produced finite OOF probabilities.", flush=True)
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
@@ -736,47 +872,29 @@ def main() -> None:
     if len(X) != len(y):
         raise ValueError(f"MiniRocket/y length mismatch after loading: {len(X)} vs {len(y)}")
 
-    if args.backend == "torch_linear":
-        y_prob, fold_id, fold_rows = fit_predict_minirocket_torch_oof(
-            X,
-            y,
-            folds,
-            seed=args.seed,
-            batch_size=args.batch_size,
-            stats_batch_size=args.stats_batch_size,
-            epochs=args.torch_epochs,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            device_name=args.device,
-            standardize=args.standardize,
-            allow_tf32=args.allow_tf32,
-        )
-        model_name = "fold_safe_torch_linear_logistic_head"
-        classifier_params = {
-            "backend": args.backend,
-            "loss": "BCEWithLogitsLoss",
-            "optimizer": "AdamW",
-            "batch_size": int(args.batch_size),
-            "stats_batch_size": int(args.stats_batch_size),
-            "epochs": int(args.torch_epochs),
-            "lr": float(args.lr),
-            "weight_decay": float(args.weight_decay),
-            "pos_weight": "fold_train_negative_positive_ratio",
-            "device": args.device,
-            "standardize": args.standardize,
-            "allow_tf32": bool(args.allow_tf32),
-        }
-    else:
-        y_prob, fold_id, fold_rows = fit_predict_minirocket_sgd_oof(
-            X,
-            y,
-            folds,
-            seed=args.seed,
-            max_iter=args.max_iter,
-            tol=args.tol,
-            alpha=args.alpha,
-            n_jobs=args.n_jobs,
-        )
+    load_info = {
+        **oof_info,
+        **cache_info,
+        "freeze_contract": freeze_contract,
+        "limit_records": int(args.limit_records),
+    }
+    prediction_path = PREDICTION_DIR / "minirocket_only_oof_predictions.npz"
+    model_name = "fold_safe_torch_linear_logistic_head"
+    classifier_params = {
+        "backend": args.backend,
+        "loss": "BCEWithLogitsLoss",
+        "optimizer": "AdamW",
+        "batch_size": int(args.batch_size),
+        "stats_batch_size": int(args.stats_batch_size),
+        "epochs": int(args.torch_epochs),
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "pos_weight": "fold_train_negative_positive_ratio",
+        "device": args.device,
+        "standardize": args.standardize,
+        "allow_tf32": bool(args.allow_tf32),
+    }
+    if args.backend == "sgd":
         model_name = "fold_safe_one_vs_rest_sgd_logistic_regression"
         classifier_params = {
             "backend": args.backend,
@@ -787,65 +905,108 @@ def main() -> None:
             "tol": float(args.tol),
             "class_weight": "balanced",
         }
+
+    if args.reuse_predictions:
+        reusable = load_existing_prediction_npz(
+            prediction_path,
+            y=y,
+            record_id=record_id,
+            class_names=class_names,
+            args=args,
+            load_info=load_info,
+            model_name=model_name,
+            classifier_params=classifier_params,
+        )
+    else:
+        reusable = None
+
+    fold_rows = []
+    if reusable is not None:
+        y_prob, fold_id = reusable
+        fold_rows = [
+            {
+                "fold": int(fold),
+                "train_records": int(sum(np.asarray(fold_id) != fold)),
+                "validation_records": int(np.sum(np.asarray(fold_id) == fold)),
+                "validation_positive_labels": int(np.sum(y[np.asarray(fold_id) == fold])),
+                "classifier": model_name,
+                "reused_predictions": True,
+            }
+            for fold in sorted(int(x) for x in np.unique(fold_id) if int(x) > 0)
+        ]
+    if args.backend == "torch_linear":
+        if reusable is None:
+            y_prob, fold_id, fold_rows = fit_predict_minirocket_torch_oof(
+                X,
+                y,
+                folds,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                stats_batch_size=args.stats_batch_size,
+                epochs=args.torch_epochs,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                device_name=args.device,
+                standardize=args.standardize,
+                allow_tf32=args.allow_tf32,
+            )
+    elif reusable is None:
+        y_prob, fold_id, fold_rows = fit_predict_minirocket_sgd_oof(
+            X,
+            y,
+            folds,
+            seed=args.seed,
+            max_iter=args.max_iter,
+            tol=args.tol,
+            alpha=args.alpha,
+            n_jobs=args.n_jobs,
+        )
+    if reusable is None:
+        write_prediction_npz(
+            prediction_path,
+            y=y,
+            y_prob=y_prob,
+            record_id=record_id,
+            fold_id=fold_id,
+            class_names=class_names,
+            args=args,
+            load_info=load_info,
+            model_name=model_name,
+            classifier_params=classifier_params,
+        )
+    print("Computing point metrics...", flush=True)
     metrics = multilabel_metrics(y, y_prob, threshold=args.threshold)
+    print("Computing calibration metrics...", flush=True)
     calibration = calibration_summary(y, y_prob, n_bins=args.n_bins)
+    print(f"Computing bootstrap CI with n_boot={args.n_boot}; this stage is CPU-bound.", flush=True)
+    def _bootstrap_metric(name: str, fn):
+        print(f"  bootstrap {name} start", flush=True)
+        result = bootstrap_ci(y, y_prob, fn, n_boot=args.n_boot, seed=args.seed)
+        print(f"  bootstrap {name} done: {result}", flush=True)
+        return result
+
     ci = {
-        "macro_pr_auc": bootstrap_ci(y, y_prob, macro_pr_auc, n_boot=args.n_boot, seed=args.seed),
-        "macro_roc_auc": bootstrap_ci(y, y_prob, macro_roc_auc, n_boot=args.n_boot, seed=args.seed),
-        "f1_macro": bootstrap_ci(
-            y,
-            y_prob,
+        "macro_pr_auc": _bootstrap_metric("macro_pr_auc", macro_pr_auc),
+        "macro_roc_auc": _bootstrap_metric("macro_roc_auc", macro_roc_auc),
+        "f1_macro": _bootstrap_metric(
+            "f1_macro",
             lambda yt, yp: multilabel_metrics(yt, yp, threshold=args.threshold)["f1_macro"],
-            n_boot=args.n_boot,
-            seed=args.seed,
         ),
-        "brier_macro": bootstrap_ci(
-            y,
-            y_prob,
+        "brier_macro": _bootstrap_metric(
+            "brier_macro",
             lambda yt, yp: calibration_summary(yt, yp, n_bins=args.n_bins)["brier_macro"],
-            n_boot=args.n_boot,
-            seed=args.seed,
         ),
-        "ece_macro": bootstrap_ci(
-            y,
-            y_prob,
+        "ece_macro": _bootstrap_metric(
+            "ece_macro",
             lambda yt, yp: calibration_summary(yt, yp, n_bins=args.n_bins)["ece_macro"],
-            n_boot=args.n_boot,
-            seed=args.seed,
         ),
     }
-
-    prediction_path = PREDICTION_DIR / "minirocket_only_oof_predictions.npz"
-    np.savez_compressed(
-        prediction_path,
-        y_true=y.astype(np.float32),
-        y_prob=y_prob.astype(np.float32),
-        record_id=record_id.astype(np.int64),
-        fold_id=fold_id.astype(np.int16),
-        class_names=np.asarray(class_names),
-        dataset=np.asarray("chapman_oof"),
-        protocol=np.asarray(PROTOCOL),
-        feature_contract=np.asarray("minirocket_raw"),
-        feature_preprocessing=np.asarray(
-            "fold_train_standardization" if args.standardize == "train_fold" else "none"
-        ),
-        threshold=np.asarray(float(args.threshold)),
-        config_hash=np.asarray(CONFIG_HASH),
-        git_commit=np.asarray(_git_output(["rev-parse", "HEAD"]) or ""),
-        manuscript_ready=np.asarray(args.limit_records == 0),
-    )
 
     per_class_path = TABLE_DIR / "table_minirocket_only_class_metrics.csv"
     fold_path = TABLE_DIR / "table_minirocket_only_fold_summary.csv"
     _save_csv(per_class_path, per_class_rows(y, y_prob, class_names, args.threshold))
     _save_csv(fold_path, fold_rows)
 
-    load_info = {
-        **oof_info,
-        **cache_info,
-        "freeze_contract": freeze_contract,
-        "limit_records": int(args.limit_records),
-    }
     summary = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
