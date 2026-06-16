@@ -70,6 +70,7 @@ from src.provenance import record_order_fingerprint  # noqa: E402
 
 PROTOCOL = "robustness_full_vs_minirocket_perturbation_v1"
 MINIROCKET_HEAD_PROTOCOL = "minirocket_clean_heads_for_robustness_v1"
+EXPECTED_MINIROCKET_PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 DEFAULT_STRESS_TESTS = [
     "snr20db",
     "snr10db",
@@ -307,6 +308,25 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
     mini_summary = resolve_path(args.minirocket_summary)
     if not mini_manifest.exists() or not mini_summary.exists():
         raise FileNotFoundError("MiniRocket baseline manifest/summary are required before robustness tests.")
+    mini_manifest_payload = json.loads(mini_manifest.read_text(encoding="utf-8"))
+    mini_summary_payload = json.loads(mini_summary.read_text(encoding="utf-8"))
+    for source_name, payload in [("summary", mini_summary_payload), ("manifest", mini_manifest_payload)]:
+        if payload.get("protocol") != EXPECTED_MINIROCKET_PROTOCOL:
+            raise ValueError(
+                f"MiniRocket {source_name} protocol mismatch: "
+                f"{payload.get('protocol')} != {EXPECTED_MINIROCKET_PROTOCOL}"
+            )
+        if payload.get("feature_contract") != "minirocket_raw":
+            raise ValueError(f"MiniRocket {source_name} feature_contract must be minirocket_raw.")
+    if mini_summary_payload.get("manuscript_ready") is not True:
+        raise ValueError("MiniRocket summary must report manuscript_ready=true.")
+    if int(mini_summary_payload.get("n_records", -1)) != int(full["y_true"].shape[0]):
+        raise ValueError("MiniRocket summary n_records does not match Full clean predictions.")
+    manifest_prediction_sha = (mini_manifest_payload.get("artifact_sha256") or {}).get("predictions")
+    if manifest_prediction_sha and manifest_prediction_sha != mini["sha256"]:
+        raise RuntimeError(
+            f"MiniRocket prediction SHA mismatch: manifest {manifest_prediction_sha} != file {mini['sha256']}"
+        )
     return {
         "freeze_manifest": {
             "path": str(freeze_path),
@@ -315,8 +335,19 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
             "validated_records": freeze.get("validated_records"),
             "dataset_record_order_fingerprint": freeze.get("dataset_record_order_fingerprint"),
         },
-        "minirocket_manifest": {"path": str(mini_manifest), "sha256": sha256_file(mini_manifest)},
-        "minirocket_summary": {"path": str(mini_summary), "sha256": sha256_file(mini_summary)},
+        "minirocket_manifest": {
+            "path": str(mini_manifest),
+            "sha256": sha256_file(mini_manifest),
+            "protocol": mini_manifest_payload.get("protocol"),
+            "prediction_sha256": manifest_prediction_sha,
+        },
+        "minirocket_summary": {
+            "path": str(mini_summary),
+            "sha256": sha256_file(mini_summary),
+            "protocol": mini_summary_payload.get("protocol"),
+            "manuscript_ready": mini_summary_payload.get("manuscript_ready"),
+            "n_records": mini_summary_payload.get("n_records"),
+        },
     }
 
 
@@ -389,9 +420,19 @@ def perturb_signals(X: np.ndarray, spec: dict) -> tuple[np.ndarray, dict]:
             leads = np.sort(rng.choice(X.shape[1], size=n_drop, replace=False)).astype(np.int16)
             out[i, leads, :] = 0.0
             dropped[i] = leads
+        map_dir = EXPERIMENTAL_DIR / "robustness_perturbations"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        map_path = map_dir / f"{spec['name']}_{stable_hash(spec)}_dropped_leads.npz"
+        np.savez_compressed(
+            map_path,
+            dropped_leads=dropped,
+            stress_json=np.asarray(json.dumps(spec, sort_keys=True)),
+            record_count=np.asarray(len(X), dtype=np.int64),
+        )
         meta["dropped_leads_shape"] = list(dropped.shape)
         meta["dropped_leads_sha256"] = hashlib.sha256(np.ascontiguousarray(dropped).view(np.uint8)).hexdigest()
-        meta["lead_indices_file"] = None
+        meta["lead_indices_file"] = str(map_path)
+        meta["lead_indices_file_sha256"] = sha256_file(map_path)
         return out, meta
     if kind == "fixed_lead_dropout":
         leads = np.asarray(spec["lead_indices"], dtype=np.int64)
@@ -1012,9 +1053,14 @@ def main() -> None:
             flush=True,
         )
 
+    # Debug subsets still consume the manuscript full-record cache and slice it
+    # inside the MiniRocket loader. This avoids looking for an artificial
+    # N=<limit> cache keyed by the subset fingerprint.
+    clean_cache_n_records = int(contract["freeze_manifest"].get("validated_records") or len(full_clean["record_id"]))
+    clean_cache_fingerprint = expected_fp if args.limit_records > 0 and expected_fp else record_fp
     clean_X_rocket, clean_rocket_info = mini.load_minirocket_cache(
-        n_records=len(X),
-        record_fingerprint=record_fp,
+        n_records=clean_cache_n_records if args.limit_records > 0 else len(X),
+        record_fingerprint=clean_cache_fingerprint,
         explicit_cache=None,
         allow_legacy_shape_cache=args.allow_legacy_shape_cache,
         limit_records=args.limit_records,
