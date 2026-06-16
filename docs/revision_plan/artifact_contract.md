@@ -132,8 +132,12 @@ PCA provenance, fair baselines, and uncertainty analysis are complete.
 
 HRV-domain artifacts are manuscript-usable only for the analyses marked
 `complete` in `metrics/hrv_domain_summary.csv`. Duration/noise HRV sensitivity
-and robustness stress tests remain blocked until dedicated perturbation runners
-produce metric artifacts rather than status ledgers.
+remains separate. Robustness stress-test claims are manuscript-usable only after
+`scripts/revision/12_robustness_stress.py` produces
+`metrics/robustness_summary.csv`,
+`metrics/robustness_full_vs_minirocket_comparison.json`, and
+`manifests/robustness_stress_manifest.json`; a status ledger alone is not
+robustness evidence.
 
 MiniRocket-only baseline artifacts are manuscript-usable only when
 `metrics/minirocket_only_baseline_summary.json` reports
