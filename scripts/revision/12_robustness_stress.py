@@ -130,6 +130,15 @@ def parse_args() -> argparse.Namespace:
         default=PREDICTION_DIR / "minirocket_only_oof_predictions.npz",
     )
     parser.add_argument("--freeze-manifest", type=Path, default=MANIFEST_DIR / "oof_final_ema_freeze_manifest.json")
+    parser.add_argument(
+        "--oof-run-manifest",
+        type=Path,
+        default=MANIFEST_DIR / "oof_final_ema_prediction_run_manifest.json",
+        help=(
+            "OOF prediction run manifest that records the exact fold checkpoints "
+            "used for the frozen Full ECG-RAMBA predictions."
+        ),
+    )
     parser.add_argument("--minirocket-manifest", type=Path, default=MANIFEST_DIR / "minirocket_only_baseline_manifest.json")
     parser.add_argument("--minirocket-summary", type=Path, default=METRIC_DIR / "minirocket_only_baseline_summary.json")
     return parser.parse_args()
@@ -367,6 +376,69 @@ def stable_hash(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
+
+
+def expected_weights_kind(checkpoint_kind: str) -> str | None:
+    if checkpoint_kind.endswith("_ema"):
+        return "ema"
+    if checkpoint_kind.endswith("_raw"):
+        return "raw"
+    return None
+
+
+def load_oof_checkpoint_contract(args: argparse.Namespace) -> dict:
+    """Load exact checkpoint paths/SHA from the frozen OOF run manifest."""
+    manifest_path = resolve_path(args.oof_run_manifest)
+    if not manifest_path.exists():
+        print(
+            f"WARNING: OOF run manifest not found: {manifest_path}. "
+            "Falling back to config model_dir checkpoint lookup.",
+            flush=True,
+        )
+        return {
+            "path": str(manifest_path),
+            "sha256": None,
+            "status": "missing_fallback_to_model_dir",
+            "checkpoints": {},
+        }
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    requested_kind = payload.get("checkpoint_kind_requested")
+    if requested_kind and requested_kind != args.expected_checkpoint_kind:
+        raise ValueError(
+            f"OOF run manifest checkpoint kind mismatch: {requested_kind} != {args.expected_checkpoint_kind}"
+        )
+    records = payload.get("checkpoints") or (payload.get("inputs") or {}).get("checkpoints") or []
+    if not records:
+        raise ValueError(f"OOF run manifest contains no checkpoint records: {manifest_path}")
+
+    checkpoints: dict[int, dict] = {}
+    expected_kind = expected_weights_kind(args.expected_checkpoint_kind)
+    for row in records:
+        fold = int(row["fold"])
+        weights_kind = row.get("weights_kind")
+        if expected_kind and weights_kind and weights_kind != expected_kind:
+            raise ValueError(
+                f"OOF run manifest fold {fold} weights_kind mismatch: {weights_kind} != {expected_kind}"
+            )
+        ckpt_path = resolve_path(Path(row["path"]))
+        checkpoints[fold] = {
+            "path": str(ckpt_path),
+            "sha256": row.get("sha256"),
+            "weights_kind": weights_kind,
+            "source_config_hash": row.get("source_config_hash"),
+            "dataset_record_order_fingerprint": row.get("dataset_record_order_fingerprint"),
+        }
+
+    print(f"Loaded OOF checkpoint contract: {manifest_path} | folds={sorted(checkpoints)}", flush=True)
+    return {
+        "path": str(manifest_path),
+        "sha256": sha256_file(manifest_path),
+        "status": "loaded",
+        "protocol": payload.get("protocol"),
+        "dataset_record_order_fingerprint": payload.get("dataset_record_order_fingerprint"),
+        "checkpoints": checkpoints,
+    }
 
 
 def stress_specs(names: list[str], seed: int) -> list[dict]:
@@ -782,6 +854,7 @@ def predict_full_model(
     args: argparse.Namespace,
     stress_name: str,
     dataset_record_fingerprint: str,
+    checkpoint_contract: dict[int, dict],
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     gen = load_revision_module("01_generate_predictions.py", "_ecg_ramba_generate_predictions_for_robustness")
     n_records, n_classes = y.shape
@@ -794,7 +867,24 @@ def predict_full_model(
         tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
         va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
         print(f"Full ECG-RAMBA stress={stress_name} fold {fold_num}/5 | val={len(va_idx)}", flush=True)
-        ckpt_path = gen.checkpoint_path(fold_num, args.checkpoint_kind, allow_fallback=False)
+        ckpt_record = checkpoint_contract.get(fold_num)
+        if ckpt_record:
+            ckpt_path = resolve_path(Path(ckpt_record["path"]))
+            if not ckpt_path.exists():
+                raise FileNotFoundError(
+                    f"Missing checkpoint recorded by frozen OOF manifest for fold {fold_num}: {ckpt_path}. "
+                    "Restore/copy the model_runs checkpoints that produced oof_final_ema_predictions.npz; "
+                    "do not substitute legacy model/fold*_final.pt checkpoints."
+                )
+            expected_sha = ckpt_record.get("sha256")
+            if expected_sha:
+                actual_sha = sha256_file(ckpt_path)
+                if actual_sha != expected_sha:
+                    raise RuntimeError(
+                        f"Fold {fold_num} checkpoint SHA mismatch: {actual_sha} != {expected_sha} ({ckpt_path})"
+                    )
+        else:
+            ckpt_path = gen.checkpoint_path(fold_num, args.checkpoint_kind, allow_fallback=False)
         checkpoint_payload, checkpoint_meta = gen.load_checkpoint_payload(ckpt_path, args.checkpoint_kind)
         checkpoint_fp = checkpoint_meta.get("dataset_record_order_fingerprint")
         if args.limit_records == 0 and checkpoint_fp and checkpoint_fp != dataset_record_fingerprint:
@@ -1025,6 +1115,8 @@ def main() -> None:
     full_clean = load_prediction_npz(args.full_clean_predictions, "Full clean")
     mini_clean_canonical = load_prediction_npz(args.minirocket_clean_predictions, "MiniRocket canonical clean")
     contract = validate_clean_prediction_contract(full_clean, mini_clean_canonical, args)
+    checkpoint_contract_payload = load_oof_checkpoint_contract(args)
+    checkpoint_contract = checkpoint_contract_payload.get("checkpoints", {})
     y = full_clean["y_true"]
     fold_id = np.asarray(full_clean["fold_id"], dtype=np.int16)
     folds = fold_list_from_fold_id(fold_id)
@@ -1147,6 +1239,7 @@ def main() -> None:
                     args=args,
                     stress_name=stress_name,
                     dataset_record_fingerprint=record_fp,
+                    checkpoint_contract=checkpoint_contract,
                 )
                 write_prediction(
                     full_pred_path,
@@ -1320,6 +1413,7 @@ def main() -> None:
                 "sha256": mini_clean_canonical["sha256"],
             },
             "contract": contract,
+            "oof_checkpoint_contract": checkpoint_contract_payload,
             "clean_minirocket_cache": clean_rocket_info,
             "minirocket_heads": heads.manifest,
         },
