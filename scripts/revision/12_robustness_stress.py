@@ -120,6 +120,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minirocket-feature-device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--require-existing-stress-predictions",
+        action="store_true",
+        help=(
+            "Fail early unless every requested Full/MiniRocket stress prediction and "
+            "the MiniRocket clean robustness reference already exist. This enables "
+            "a low-memory final aggregation pass without loading raw Chapman signals."
+        ),
+    )
     parser.add_argument("--reuse-minirocket-heads", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--save-perturbed-caches", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow-legacy-shape-cache", action="store_true")
@@ -1008,6 +1017,61 @@ def load_existing_prediction(path: Path, *, y: np.ndarray, fold_id: np.ndarray) 
     return None
 
 
+def load_existing_minirocket_clean_reference(*, y: np.ndarray, fold_id: np.ndarray) -> MiniRocketHeads | None:
+    """Load the MiniRocket clean reference without materializing MiniRocket features.
+
+    This is used for final robustness aggregation after all per-stress prediction
+    artifacts have already been generated and mirrored. It avoids reloading the
+    raw Chapman array and the 20k-feature MiniRocket cache just to recompute
+    clean-reference metrics.
+    """
+
+    clean_pred_path = PREDICTION_DIR / "robustness_minirocket_clean_ref_predictions.npz"
+    manifest_path = MANIFEST_DIR / "robustness_minirocket_heads_manifest.json"
+    head_dir = EXPERIMENTAL_DIR / "robustness_minirocket_heads"
+    if not clean_pred_path.exists() or not manifest_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("protocol") != MINIROCKET_HEAD_PROTOCOL:
+        raise ValueError(
+            f"MiniRocket robustness clean reference protocol mismatch: "
+            f"{manifest.get('protocol')} != {MINIROCKET_HEAD_PROTOCOL}"
+        )
+    expected_sha = manifest.get("clean_prediction_sha256")
+    if expected_sha and sha256_file(clean_pred_path) != expected_sha:
+        raise RuntimeError("MiniRocket robustness clean reference SHA does not match its manifest.")
+    with np.load(clean_pred_path, allow_pickle=False) as data:
+        required = {"y_true", "y_prob", "fold_id", "class_names"}
+        missing = required - set(data.files)
+        if missing:
+            raise KeyError(f"{clean_pred_path} missing required keys: {sorted(missing)}")
+        cached_y = np.asarray(data["y_true"], dtype=np.float32)
+        cached_prob = np.asarray(data["y_prob"], dtype=np.float32)
+        cached_fold = np.asarray(data["fold_id"], dtype=np.int16)
+        class_names = np.asarray(data["class_names"]).astype(str).tolist()
+    if class_names != CLASSES:
+        raise ValueError("MiniRocket robustness clean reference class_names do not match config CLASSES.")
+    if cached_y.shape != y.shape or cached_prob.shape != y.shape:
+        raise ValueError(
+            f"MiniRocket robustness clean reference shape mismatch: "
+            f"y_true={cached_y.shape}, y_prob={cached_prob.shape}, expected={y.shape}"
+        )
+    if not np.array_equal(cached_y, y):
+        raise ValueError("MiniRocket robustness clean reference y_true does not match frozen OOF labels.")
+    if not np.array_equal(cached_fold, fold_id):
+        raise ValueError("MiniRocket robustness clean reference fold_id does not match frozen OOF folds.")
+    if not np.isfinite(cached_prob).all():
+        raise ValueError("MiniRocket robustness clean reference contains non-finite probabilities.")
+    print(f"Reusing MiniRocket robustness clean reference: {clean_pred_path}", flush=True)
+    return MiniRocketHeads(
+        head_dir=head_dir,
+        manifest=manifest,
+        clean_prob=np.clip(cached_prob, 0.0, 1.0).astype(np.float32),
+        fold_id=cached_fold,
+        fold_rows=manifest.get("fold_rows", []),
+    )
+
+
 def paired_bootstrap_robustness(
     *,
     y: np.ndarray,
@@ -1129,44 +1193,92 @@ def main() -> None:
         folds = fold_list_from_fold_id(fold_id)
         print(f"Debug limit active: {len(y)} records", flush=True)
 
-    gen = load_revision_module("01_generate_predictions.py", "_ecg_ramba_generate_predictions_data_for_robustness")
-    mini = load_revision_module("10_minirocket_only_baseline.py", "_ecg_ramba_minirocket_data_for_robustness")
-    X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(limit_records=args.limit_records)
-    if y_loaded.shape != y.shape or not np.array_equal(y_loaded, y):
-        raise ValueError("Loaded Chapman labels do not match frozen OOF y_true.")
-    record_fp = record_order_fingerprint(subjects)
-    expected_fp = contract["freeze_manifest"].get("dataset_record_order_fingerprint")
-    if args.limit_records == 0 and expected_fp and record_fp != expected_fp:
-        raise RuntimeError(f"Loaded Chapman record fingerprint {record_fp} != frozen {expected_fp}")
-    if args.limit_records > 0:
-        print(
-            "Debug limit active: skipping full-record fingerprint equality check "
-            f"(subset fingerprint={record_fp}, frozen full fingerprint={expected_fp}).",
-            flush=True,
+    specs = stress_specs(args.stress_tests.split(","), args.seed)
+    existing_stress_probs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    missing_existing: list[str] = []
+    if args.reuse_existing:
+        for stress in specs:
+            stress_name = stress["name"]
+            full_pred_path = PREDICTION_DIR / f"robustness_full_{stress_name}_predictions.npz"
+            mini_pred_path = PREDICTION_DIR / f"robustness_minirocket_{stress_name}_predictions.npz"
+            full_prob = load_existing_prediction(full_pred_path, y=y, fold_id=fold_id)
+            mini_prob = load_existing_prediction(mini_pred_path, y=y, fold_id=fold_id)
+            if full_prob is None:
+                missing_existing.append(project_relative(full_pred_path))
+            if mini_prob is None:
+                missing_existing.append(project_relative(mini_pred_path))
+            if full_prob is not None and mini_prob is not None:
+                existing_stress_probs[stress_name] = (full_prob, mini_prob)
+
+    aggregation_only = bool(args.reuse_existing and not missing_existing)
+    heads = load_existing_minirocket_clean_reference(y=y, fold_id=fold_id) if aggregation_only else None
+    if args.require_existing_stress_predictions and (missing_existing or heads is None):
+        missing = list(missing_existing)
+        if heads is None:
+            missing.extend(
+                [
+                    project_relative(PREDICTION_DIR / "robustness_minirocket_clean_ref_predictions.npz"),
+                    project_relative(MANIFEST_DIR / "robustness_minirocket_heads_manifest.json"),
+                ]
+            )
+        raise FileNotFoundError(
+            "Low-memory aggregation was requested, but required existing artifacts are missing or invalid: "
+            + "; ".join(missing)
         )
 
-    # Debug subsets still consume the manuscript full-record cache and slice it
-    # inside the MiniRocket loader. This avoids looking for an artificial
-    # N=<limit> cache keyed by the subset fingerprint.
-    clean_cache_n_records = int(contract["freeze_manifest"].get("validated_records") or len(full_clean["record_id"]))
-    clean_cache_fingerprint = expected_fp if args.limit_records > 0 and expected_fp else record_fp
-    clean_X_rocket, clean_rocket_info = mini.load_minirocket_cache(
-        n_records=clean_cache_n_records if args.limit_records > 0 else len(X),
-        record_fingerprint=clean_cache_fingerprint,
-        explicit_cache=None,
-        allow_legacy_shape_cache=args.allow_legacy_shape_cache,
-        limit_records=args.limit_records,
-    )
-    heads = fit_or_load_minirocket_heads(
-        X_clean=clean_X_rocket,
-        y=y,
-        folds=folds,
-        clean_cache_info=clean_rocket_info,
-        args=args,
-    )
-    mini_clean_ref = heads.clean_prob
+    expected_fp = contract["freeze_manifest"].get("dataset_record_order_fingerprint")
+    if aggregation_only and heads is not None:
+        print(
+            "All requested stress predictions and MiniRocket clean reference are reusable; "
+            "running low-memory aggregation without loading raw Chapman signals.",
+            flush=True,
+        )
+        record_fp = str(expected_fp or "")
+        clean_rocket_info = {
+            "aggregation_only_reused_clean_reference": True,
+            "clean_prediction_file": str(PREDICTION_DIR / "robustness_minirocket_clean_ref_predictions.npz"),
+            "clean_prediction_sha256": sha256_file(PREDICTION_DIR / "robustness_minirocket_clean_ref_predictions.npz"),
+        }
+        mini_clean_ref = heads.clean_prob
+        X = None
+        X_raw_amp = None
+    else:
+        gen = load_revision_module("01_generate_predictions.py", "_ecg_ramba_generate_predictions_data_for_robustness")
+        mini = load_revision_module("10_minirocket_only_baseline.py", "_ecg_ramba_minirocket_data_for_robustness")
+        X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(limit_records=args.limit_records)
+        if y_loaded.shape != y.shape or not np.array_equal(y_loaded, y):
+            raise ValueError("Loaded Chapman labels do not match frozen OOF y_true.")
+        record_fp = record_order_fingerprint(subjects)
+        if args.limit_records == 0 and expected_fp and record_fp != expected_fp:
+            raise RuntimeError(f"Loaded Chapman record fingerprint {record_fp} != frozen {expected_fp}")
+        if args.limit_records > 0:
+            print(
+                "Debug limit active: skipping full-record fingerprint equality check "
+                f"(subset fingerprint={record_fp}, frozen full fingerprint={expected_fp}).",
+                flush=True,
+            )
 
-    specs = stress_specs(args.stress_tests.split(","), args.seed)
+        # Debug subsets still consume the manuscript full-record cache and slice it
+        # inside the MiniRocket loader. This avoids looking for an artificial
+        # N=<limit> cache keyed by the subset fingerprint.
+        clean_cache_n_records = int(contract["freeze_manifest"].get("validated_records") or len(full_clean["record_id"]))
+        clean_cache_fingerprint = expected_fp if args.limit_records > 0 and expected_fp else record_fp
+        clean_X_rocket, clean_rocket_info = mini.load_minirocket_cache(
+            n_records=clean_cache_n_records if args.limit_records > 0 else len(X),
+            record_fingerprint=clean_cache_fingerprint,
+            explicit_cache=None,
+            allow_legacy_shape_cache=args.allow_legacy_shape_cache,
+            limit_records=args.limit_records,
+        )
+        heads = fit_or_load_minirocket_heads(
+            X_clean=clean_X_rocket,
+            y=y,
+            folds=folds,
+            clean_cache_info=clean_rocket_info,
+            args=args,
+        )
+        mini_clean_ref = heads.clean_prob
+
     rows: list[dict] = []
     sample_rows: list[dict] = []
     artifact_rows: list[dict] = []
@@ -1204,11 +1316,19 @@ def main() -> None:
         print("=" * 80, flush=True)
         full_pred_path = PREDICTION_DIR / f"robustness_full_{stress_name}_predictions.npz"
         mini_pred_path = PREDICTION_DIR / f"robustness_minirocket_{stress_name}_predictions.npz"
-        full_prob = load_existing_prediction(full_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
-        mini_prob = load_existing_prediction(mini_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
+        if stress_name in existing_stress_probs:
+            full_prob, mini_prob = existing_stress_probs[stress_name]
+        else:
+            full_prob = load_existing_prediction(full_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
+            mini_prob = load_existing_prediction(mini_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
         feature_infos = {}
         perturb_meta = {}
         if full_prob is None or mini_prob is None:
+            if X is None or X_raw_amp is None:
+                raise RuntimeError(
+                    f"Missing reusable predictions for {stress_name} during low-memory aggregation. "
+                    "Run this stress individually first or disable --require-existing-stress-predictions."
+                )
             X_stress, perturb_meta = perturb_signals(X, stress)
             X_rocket, rocket_info = generate_minirocket_features(
                 X_stress,
