@@ -121,6 +121,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
+        "--reuse-metric-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse per-stress/per-metric robustness bootstrap caches when their "
+            "input fingerprints match. This makes long Colab aggregation runs resumable."
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap-progress-every",
+        type=int,
+        default=100,
+        help="Print paired-bootstrap progress every N resamples; use 0 to disable.",
+    )
+    parser.add_argument(
+        "--metric-cache-dir",
+        type=Path,
+        default=METRIC_DIR / "robustness_metric_cache",
+        help=(
+            "Directory for resumable per-stress/per-metric bootstrap caches. "
+            "Use a Drive-backed path on Colab if runtime disconnections are expected."
+        ),
+    )
+    parser.add_argument(
         "--require-existing-stress-predictions",
         action="store_true",
         help=(
@@ -165,6 +189,13 @@ def project_relative(path: Path) -> str:
     return resolve_path(path).resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
 
 
+def log_path(path: Path) -> str:
+    try:
+        return project_relative(path)
+    except ValueError:
+        return str(resolve_path(path))
+
+
 def json_safe(value):
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
@@ -190,6 +221,40 @@ def save_csv(path: Path, rows: list[dict]) -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
+
+
+def metric_cache_path(cache_dir: Path, stress_name: str, metric_name: str) -> Path:
+    cache_dir = cache_dir if cache_dir.is_absolute() else resolve_path(cache_dir)
+    return cache_dir / f"{stress_name}_{metric_name}.json"
+
+
+def load_metric_cache(path: Path, expected_metadata: dict) -> tuple[dict, list[dict]] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if payload.get("metadata") != expected_metadata:
+        return None
+    row = payload.get("row")
+    samples = payload.get("samples")
+    if not isinstance(row, dict) or not isinstance(samples, list):
+        return None
+    return row, samples
+
+
+def write_metric_cache(path: Path, metadata: dict, row: dict, samples: list[dict]) -> None:
+    save_json(
+        path,
+        json_safe(
+            {
+                "metadata": metadata,
+                "row": row,
+                "samples": samples,
+            }
+        ),
+    )
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -1083,11 +1148,17 @@ def paired_bootstrap_robustness(
     n_boot: int,
     seed: int,
     stress_name: str,
+    progress_every: int = 0,
 ) -> tuple[dict, list[dict]]:
     rng = np.random.default_rng(seed)
     n = len(y)
     samples = []
     for boot_idx in range(n_boot):
+        if progress_every > 0 and boot_idx > 0 and boot_idx % progress_every == 0:
+            print(
+                f"  paired bootstrap {stress_name} {spec.name}: {boot_idx}/{n_boot}",
+                flush=True,
+            )
         idx = rng.integers(0, n, size=n)
         try:
             cf = metric_value(spec, y[idx], clean_full[idx])
@@ -1403,19 +1474,24 @@ def main() -> None:
             del X_stress
             gc.collect()
 
+        full_pred_sha = sha256_file(full_pred_path)
+        mini_pred_sha = sha256_file(mini_pred_path)
+        mini_clean_ref_path = PREDICTION_DIR / "robustness_minirocket_clean_ref_predictions.npz"
+        mini_clean_ref_sha = sha256_file(mini_clean_ref_path) if mini_clean_ref_path.exists() else None
+
         artifact_rows.extend(
             [
                 {
                     "stress_test": stress_name,
                     "artifact": "full_predictions",
                     "path": project_relative(full_pred_path),
-                    "sha256": sha256_file(full_pred_path),
+                    "sha256": full_pred_sha,
                 },
                 {
                     "stress_test": stress_name,
                     "artifact": "minirocket_predictions",
                     "path": project_relative(mini_pred_path),
-                    "sha256": sha256_file(mini_pred_path),
+                    "sha256": mini_pred_sha,
                 },
             ]
         )
@@ -1428,6 +1504,42 @@ def main() -> None:
             }
         )
         for metric_index, spec in enumerate(metric_specs(args.threshold, args.n_bins)):
+            metric_seed = args.seed + 10007 * (metric_index + 1) + int(stress_hash[:6], 16)
+            cache_metadata = {
+                "protocol": PROTOCOL,
+                "cache_version": 1,
+                "stress_test": stress_name,
+                "stress_hash": stress_hash,
+                "stress_json": json.dumps(stress, sort_keys=True),
+                "metric": spec.name,
+                "metric_family": spec.family,
+                "higher_is_better": bool(spec.higher_is_better),
+                "threshold": float(args.threshold),
+                "n_bins": int(args.n_bins),
+                "n_boot": int(args.n_boot),
+                "seed": int(metric_seed),
+                "n_records": int(len(y)),
+                "n_classes": int(y.shape[1]),
+                "full_clean_predictions_sha256": full_clean["sha256"],
+                "minirocket_clean_predictions_sha256": mini_clean_canonical["sha256"],
+                "minirocket_clean_reference_sha256": mini_clean_ref_sha,
+                "full_stress_predictions_sha256": full_pred_sha,
+                "minirocket_stress_predictions_sha256": mini_pred_sha,
+                "expected_checkpoint_kind": str(args.expected_checkpoint_kind),
+            }
+            cache_path = metric_cache_path(args.metric_cache_dir, stress_name, spec.name)
+            cached_metric = load_metric_cache(cache_path, cache_metadata) if args.reuse_metric_cache else None
+            if cached_metric is not None:
+                cached_row, cached_samples = cached_metric
+                rows.append(cached_row)
+                sample_rows.extend(cached_samples)
+                print(
+                    f"Reusing robustness metric cache: {stress_name} {spec.name} "
+                    f"({len(cached_samples)} bootstrap rows)",
+                    flush=True,
+                )
+                continue
+
             clean_full_value = metric_value(spec, y, full_clean["y_prob"])
             stress_full_value = metric_value(spec, y, full_prob)
             clean_mini_value = metric_value(spec, y, mini_clean_ref)
@@ -1442,6 +1554,7 @@ def main() -> None:
                 f"mini_stress={stress_mini_value:.6f} degradation_adv_full={deg_adv:.6f}",
                 flush=True,
             )
+            print(f"  paired bootstrap {stress_name} {spec.name} start", flush=True)
             ci, samples = paired_bootstrap_robustness(
                 y=y,
                 clean_full=full_clean["y_prob"],
@@ -1450,8 +1563,14 @@ def main() -> None:
                 stress_mini=mini_prob,
                 spec=spec,
                 n_boot=args.n_boot,
-                seed=args.seed + 10007 * (metric_index + 1) + int(stress_hash[:6], 16),
+                seed=metric_seed,
                 stress_name=stress_name,
+                progress_every=max(0, int(args.bootstrap_progress_every)),
+            )
+            print(
+                f"  paired bootstrap {stress_name} {spec.name} done: "
+                f"n_boot_valid={ci['n_boot_valid']}",
+                flush=True,
             )
             row = {
                 "stress_test": stress_name,
@@ -1488,6 +1607,8 @@ def main() -> None:
             }
             rows.append(row)
             sample_rows.extend(samples)
+            write_metric_cache(cache_path, cache_metadata, row, samples)
+            print(f"  cached metric result: {log_path(cache_path)}", flush=True)
         del full_prob, mini_prob
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1550,6 +1671,7 @@ def main() -> None:
             "artifacts_csv": str(artifacts_csv),
             "comparison_json": str(comparison_json),
             "manifest": str(manifest_path),
+            "metric_cache_dir": str(resolve_path(args.metric_cache_dir)),
         },
     }
     save_json(comparison_json, json_safe(payload))
