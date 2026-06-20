@@ -468,13 +468,21 @@ def main() -> None:
     ]
     robustness_claims = robustness_claim_rows(robustness_rows)
 
-    final_ready = not contract_issues and not unresolved_blockers and bool(matrix_rows)
+    final_ready = (
+        not missing
+        and not contract_issues
+        and not unresolved_blockers
+        and len(matrix_rows) == 6
+        and len(robustness_claims)
+        == len(REQUIRED_ROBUSTNESS_STRESSES) * len(REQUIRED_ROBUSTNESS_METRICS)
+    )
     payload = {
         "status": True,
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "final_ready_for_rebuttal": final_ready,
         "all_claims_supported": False,
+        "missing_inputs": missing,
         "contract_issues": contract_issues,
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
