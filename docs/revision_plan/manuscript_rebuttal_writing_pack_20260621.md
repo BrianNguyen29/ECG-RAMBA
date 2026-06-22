@@ -23,19 +23,32 @@ Purpose: convert the final evidence package into manuscript and rebuttal text th
 6. Do not claim external PTB/Georgia/CPSC or few-shot results are manuscript-ready.
 7. Do not cite local `model/fold*_final.pt` as canonical manuscript checkpoints; the manuscript evidence is the frozen final_ema OOF artifact package.
 
+## 2026-06-22 ResNet1D/CNN Update
+
+The fair-baseline story changed after the validated paired Full-vs-ResNet1D/CNN comparison. ResNet1D/CNN is now a completed in-domain architecture baseline under the same frozen Chapman OOF contract, and it significantly outperforms Full ECG-RAMBA on all five paired metrics:
+
+- ResNet1D/CNN PR-AUC `0.4899` vs Full `0.3432`; Full improvement `-0.1467`, 95% CI `[-0.1607, -0.1392]`.
+- ResNet1D/CNN ROC-AUC `0.9391` vs Full `0.8373`; Full improvement `-0.1019`, 95% CI `[-0.1127, -0.0909]`.
+- ResNet1D/CNN F1 macro `0.4906` vs Full `0.3998`; Full improvement `-0.0908`, 95% CI `[-0.1016, -0.0796]`.
+- ResNet1D/CNN Brier `0.0342` vs Full `0.0355`; Full improvement `-0.0014`, 95% CI `[-0.0017, -0.0010]`.
+- ResNet1D/CNN ECE `0.0414` vs Full `0.0552`; Full improvement `-0.0139`, 95% CI `[-0.0143, -0.0134]`.
+
+This means the manuscript must not claim an in-domain fixed-threshold/calibration advantage for ECG-RAMBA over fair architecture baselines. The MiniRocket-only comparison remains a metric-dependent feature-baseline tradeoff, but the broader in-domain CNN/ResNet baseline comparison favors ResNet1D/CNN. Any ECG-RAMBA value claim now needs to be narrowed to architecture characterization, metric-specific robustness against MiniRocket-only, interpretability/feature analyses, or separately validated external/few-shot transfer evidence.
+
 ## Supported Core Story
 
-The revised paper should be framed as a protocol-faithful evaluation of a structured ECG model with complementary morphology-rhythm streams. The strongest supported result is not global ranking superiority. The supported result is a calibrated fixed-threshold operating-point advantage for Full ECG-RAMBA over MiniRocket-only, while MiniRocket-only remains stronger for rank-based PR-AUC/ROC-AUC.
+The revised paper should be framed as a protocol-faithful evaluation of a structured ECG model with complementary morphology-rhythm streams. The strongest supported result is not global ranking superiority and not in-domain superiority over ResNet1D/CNN. The supported story is narrower: Full ECG-RAMBA shows a MiniRocket-specific operating-point tradeoff and metric-specific robustness behavior, while ResNet1D/CNN is the stronger in-domain architecture baseline on frozen Chapman OOF.
 
 Use this one-sentence thesis:
 
-> Under a frozen Chapman OOF protocol, ECG-RAMBA provides better calibrated fixed-threshold operating behavior than a MiniRocket-only feature baseline, while MiniRocket-only remains the stronger rank-based discriminator; therefore, the contribution is best presented as a physiologically structured operating-point tradeoff rather than global model superiority.
+> Under a frozen Chapman OOF protocol, ECG-RAMBA should be presented as a physiologically structured model with metric-specific behavior, not as the best in-domain classifier: it shows a MiniRocket-specific operating-point tradeoff, but a fair ResNet1D/CNN baseline significantly outperforms it on PR-AUC, ROC-AUC, F1, Brier, and ECE.
 
 ## Key Numbers To Carry Into The Manuscript
 
 - Frozen Chapman OOF records: 44,186; classes: 27.
 - Full ECG-RAMBA: ROC-AUC=0.8373, PR-AUC=0.3432, F1=0.3998, Brier=0.0355, ECE=0.0552.
 - MiniRocket-only: ROC-AUC=0.9169, PR-AUC=0.4508, F1=0.2477, Brier=0.1906, ECE=0.3759.
+- ResNet1D/CNN: ROC-AUC=0.9391, PR-AUC=0.4899, F1=0.4906, Brier=0.0342, ECE=0.0414.
 - HRV-only: ROC-AUC=0.8113, PR-AUC=0.1771, F1=0.2077.
 - HRV domain classifier: domain AUC approximately 1.0000, so HRV is domain-sensitive.
 - Robustness: Full less degraded in 4/30 stress-metric rows; MiniRocket-only less degraded in 26/30 rows. Full is better under stress in 18/30 rows, specifically the fixed-threshold/calibration family.
@@ -60,7 +73,7 @@ This concern is supported by the new evidence. HRV-only has non-trivial signal, 
 
 ### Reviewer 1 Comment 4 - Baseline strength
 
-Only MiniRocket-only and HRV-only feature baselines are complete under the frozen evidence package. A ResNet1D/CNN runner has been implemented but is not evidence until it is executed and its artifacts pass the frozen OOF contract. Raw Mamba remains deferred. The rebuttal must not claim broad fair-baseline superiority.
+MiniRocket-only, HRV-only, and ResNet1D/CNN baselines are complete under the frozen evidence package. ResNet1D/CNN significantly outperforms Full ECG-RAMBA across the paired in-domain metrics, so the rebuttal must not claim broad fair-baseline superiority or in-domain CNN/ResNet superiority. Raw Mamba remains deferred.
 
 ### Reviewer 1 Comment 5 - Confidence intervals and significance
 
@@ -92,14 +105,14 @@ Few-shot remains optional/deferred. Do not claim few-shot experiments were added
 
 ## Abstract Draft
 
-ECG-RAMBA combines morphology- and rhythm-oriented streams for ECG classification and is evaluated under a frozen, traceable Chapman OOF protocol. The revised analysis reports calibration, threshold-dependent operating metrics, paired MiniRocket-only and HRV-only feature baselines, pooling sensitivity, HRV domain-sensitivity analysis, and perturbation stress tests. The results show a calibrated fixed-threshold operating-point advantage for the full model, while also revealing that MiniRocket-only remains stronger for rank-based discrimination. These findings narrow the contribution to a metric-dependent, protocol-faithful characterization rather than a claim of global superiority or clinical safety.
+ECG-RAMBA combines morphology- and rhythm-oriented streams for ECG classification and is evaluated under a frozen, traceable Chapman OOF protocol. The revised analysis reports calibration, threshold-dependent operating metrics, paired MiniRocket-only, HRV-only, and ResNet1D/CNN baselines, pooling sensitivity, HRV domain-sensitivity analysis, and perturbation stress tests. The results do not support global in-domain superiority: ResNet1D/CNN is stronger across the paired Chapman OOF metrics, while ECG-RAMBA shows metric-specific behavior against MiniRocket-only and perturbation-specific operating-point behavior. These findings narrow the contribution to a transparent, protocol-faithful characterization rather than a claim of superiority or clinical safety.
 
 ## Contribution Draft
 
 Use these contributions instead of the stronger original claims:
 
 1. A structured ECG modeling pipeline combining morphology- and rhythm-oriented inputs under a subject-aware frozen OOF protocol.
-2. A calibration-aware evaluation showing improved fixed-threshold operating behavior for Full ECG-RAMBA relative to MiniRocket-only.
+2. A calibration-aware evaluation showing metric-specific operating behavior, including a MiniRocket-specific fixed-threshold/calibration tradeoff but no in-domain advantage over ResNet1D/CNN.
 3. A feature-baseline analysis showing that HRV contains rhythm signal but is highly domain-sensitive.
 4. A pooling sensitivity analysis supporting Q=3 as a frozen tradeoff operating point, not as a global optimum.
 5. A perturbation stress-test analysis showing metric-specific robustness behavior across noise, missing-lead, and sampling-rate shifts.
@@ -143,9 +156,9 @@ The current manuscript-ready evidence is the frozen Chapman OOF protocol. PTB/Ge
 | Area | Old/risky claim | Revised claim | Evidence status | Manuscript action |
 |---|---|---|---|---|
 | R1C1 safety / ranking-decision gap | safety-oriented behavior; clinically appropriate conservatism | calibrated fixed-threshold operating behavior under a frozen Chapman OOF protocol | `supported_with_limitations` | Replace safety language in Abstract, Results, and Discussion; report calibration metrics and threshold-0.5 metrics. |
-| R1C2 MiniRocket / morphology branch | deterministic morphology improves robustness; ECG-RAMBA outperforms MiniRocket | MiniRocket-only is stronger for rank-based discrimination; Full ECG-RAMBA is stronger for fixed-threshold and calibration-sensitive metrics | `blocked_fair_baselines_missing` | Report metric-dependent tradeoff. Do not claim deterministic morphology superiority or global baseline superiority. |
+| R1C2 MiniRocket / morphology branch | deterministic morphology improves robustness; ECG-RAMBA outperforms MiniRocket | MiniRocket-only is stronger for rank-based discrimination; Full ECG-RAMBA is stronger than MiniRocket-only for fixed-threshold and calibration-sensitive metrics, but this does not generalize to ResNet1D/CNN | `blocked_fair_baselines_missing` | Report metric-dependent tradeoff only for MiniRocket. Do not claim deterministic morphology superiority or global baseline superiority. |
 | R1C3 HRV domain bias | HRV serves as an invariant anchor | HRV provides complementary rhythm descriptors but is domain-sensitive | `partially_supported_with_domain_limitation` | Move HRV invariance to limitations. State HRV domain classifier result directly. |
-| R1C4 baseline strength | ECG-RAMBA is superior to fair ECG baselines | MiniRocket-only and HRV-only are complete; ResNet1D/CNN runner is implemented but pending execution/contract validation; Raw Mamba remains deferred | `blocked_fair_baselines_missing` | Do not present broad fair-baseline superiority. If ResNet1D/CNN is run, add it only after contract validation and metric-specific interpretation. |
+| R1C4 baseline strength | ECG-RAMBA is superior to fair ECG baselines | MiniRocket-only, HRV-only, and ResNet1D/CNN are complete; ResNet1D/CNN significantly outperforms ECG-RAMBA on frozen Chapman OOF; Raw Mamba remains deferred | `blocked_fair_baselines_missing` | Do not present broad fair-baseline superiority or in-domain CNN/ResNet superiority. |
 | R1C5 uncertainty | point estimates alone establish superiority | record-level bootstrap and paired comparisons support only metric-specific conclusions | `supported_with_limitations` | Add uncertainty table text and cite bootstrap method. For robustness, quote paired CI rows only where present. |
 | R1C6 Power Mean Q=3 | Q=3 is optimal | Q=3 is the pre-specified frozen operating point and a sensitivity-tested tradeoff | `supported_as_tradeoff_not_optimality_claim` | Keep Q=3 wording as tradeoff, not optimality. Cite pooling sensitivity table. |
 | R2C2 morphology-rhythm separation | validating morphology-rhythm disentanglement | architecture combines complementary morphology-rhythm streams; strict representation separation remains future work | `blocked_representation_probe_missing` | Remove proven-disentanglement wording. Do not say UMAP/probing/CKA were added unless those artifacts are generated later. |
@@ -168,7 +181,7 @@ The current manuscript-ready evidence is the frozen Chapman OOF protocol. PTB/Ge
 
 Do not open new experiments until the manuscript and response letter are locked to the safe wording above.
 
-If an additional experiment is needed after writing lock, the highest-ROI option is now to execute the implemented ResNet1D/CNN fair baseline under the same frozen OOF protocol. This would address the strongest remaining non-Raw-Mamba baseline blocker, but it has risk: it may not outperform MiniRocket, it requires A100 compute, and it can delay the resubmission. Do not start Transformer, few-shot, or new external experiments before deciding whether completing the ResNet1D/CNN baseline is worth that risk.
+If an additional experiment is needed after writing lock, the highest-ROI option is no longer another in-domain Chapman baseline. ResNet1D/CNN already wins that comparison. The next defensible experiment would be a transfer/few-shot comparison under a separately frozen external protocol, testing whether ECG-RAMBA has value outside the in-domain Chapman setting. Do not claim this without running it.
 
 ## Immediate Execution Checklist
 

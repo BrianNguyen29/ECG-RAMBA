@@ -526,6 +526,15 @@ def main() -> None:
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
             "global_superiority": "Do not claim global superiority over all fair baselines.",
+            "resnet_in_domain": (
+                "The completed paired ResNet1D/CNN comparison favors ResNet on frozen Chapman OOF "
+                "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim ECG-RAMBA in-domain superiority "
+                "over fair CNN/ResNet baselines."
+            ),
+            "operating_point": (
+                "ECG-RAMBA operating-point advantages are comparator-specific. The MiniRocket-only "
+                "F1/Brier/ECE result does not generalize to ResNet1D/CNN."
+            ),
             "robustness": (
                 "Use only metric-specific robustness claims supported by paired degradation CIs."
             ),

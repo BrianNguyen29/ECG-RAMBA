@@ -19,6 +19,8 @@ reports/revision/
     oof_full_slice_predictions.npz
     hrv_only_oof_predictions.npz
     minirocket_only_oof_predictions.npz
+    resnet1d_cnn_oof_predictions.npz
+    resnet1d_cnn_slice_predictions.npz
     baseline_<name>_<dataset>_predictions.npz
   metrics/
     oof_final_ema_prediction_summary.json
@@ -28,6 +30,9 @@ reports/revision/
     baseline_summary.csv
     hrv_only_baseline_summary.json
     minirocket_only_baseline_summary.json
+    resnet1d_cnn_baseline_summary.json
+    paired_full_vs_minirocket_comparison.json
+    paired_full_vs_resnet_comparison.json
     hrv_domain_classifier_summary.json
     hrv_domain_summary.csv
     robustness_summary.csv
@@ -45,6 +50,10 @@ reports/revision/
     table_bootstrap_ci.csv
     table_minirocket_only_class_metrics.csv
     table_minirocket_only_fold_summary.csv
+    table_resnet1d_cnn_class_metrics.csv
+    table_resnet1d_cnn_fold_summary.csv
+    table_paired_full_vs_minirocket.csv
+    table_paired_full_vs_resnet.csv
     table_hrv_domain_status.csv
     table_hrv_only_class_metrics.csv
     reliability_bins_<dataset>.csv
@@ -55,6 +64,9 @@ reports/revision/
     oof_final_ema_prediction_run_manifest.json
     oof_final_ema_freeze_manifest.json
     minirocket_only_baseline_manifest.json
+    resnet1d_cnn_baseline_manifest.json
+    paired_full_vs_minirocket_manifest.json
+    paired_full_vs_resnet_manifest.json
     oof_full_prediction_run_manifest.json
     oof_freeze_manifest.json
     mirror_manifest.json
@@ -147,6 +159,19 @@ MiniRocket-only baseline artifacts are manuscript-usable only when
 and a record-fingerprinted RAW MiniRocket cache. The classifier is a fixed-epoch
 linear logistic head trained only on each fold's training records; it is a
 feature baseline, not ECG-RAMBA checkpoint inference.
+
+ResNet1D/CNN baseline artifacts are manuscript-usable only when
+`metrics/resnet1d_cnn_baseline_summary.json` reports
+`protocol=resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5`,
+`feature_contract=raw_ecg_12lead`, `manuscript_ready=true`, 44,186 records,
+27 classes, the canonical `oof_final_ema` prediction SHA256, and the frozen
+OOF fold contract. Its paired comparison against Full ECG-RAMBA is
+manuscript-usable only after `metrics/paired_full_vs_resnet_comparison.json`
+and `tables/table_paired_full_vs_resnet.csv` validate identical `y_true`,
+`record_id`, `fold_id`, and `class_names`. Current final evidence shows
+ResNet1D/CNN is significantly stronger than Full ECG-RAMBA on the frozen
+Chapman OOF PR-AUC, ROC-AUC, F1, Brier, and ECE metrics; do not use
+ECG-RAMBA in-domain fair-baseline superiority wording.
 
 ## Minimum Metric Contract
 

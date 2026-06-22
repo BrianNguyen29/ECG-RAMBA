@@ -54,7 +54,7 @@ This file was rechecked against the final evidence CSV/JSON artifacts on 2026-06
 The most important technical distinction is between:
 
 1. **Rank-based discrimination**: PR-AUC and ROC-AUC. MiniRocket-only is stronger here.
-2. **Fixed-threshold/calibration operating behavior**: F1 at threshold 0.5, Brier, and ECE. Full ECG-RAMBA is stronger here.
+2. **Fixed-threshold/calibration operating behavior**: F1 at threshold 0.5, Brier, and ECE. Full ECG-RAMBA is stronger than MiniRocket-only here, but the completed ResNet1D/CNN paired comparison is stronger than Full on F1, Brier, and ECE.
 3. **Relative degradation under perturbation**: which model loses less from clean to stressed conditions. MiniRocket-only is less degraded in most rows, so the manuscript cannot claim general robustness superiority for ECG-RAMBA.
 
 ## High-Level Decision
@@ -63,7 +63,7 @@ The revised discussion should not claim global superiority, strict disentangleme
 
 The strongest supported position is:
 
-> ECG-RAMBA provides a protocol-faithful frozen Chapman OOF evaluation with a calibrated fixed-threshold operating-point advantage over the MiniRocket-only feature baseline, while MiniRocket-only remains stronger for rank-based discrimination. Robustness claims must be metric-specific: ECG-RAMBA is usually better at the stressed fixed-threshold operating point for F1, Brier, and ECE, but MiniRocket-only often degrades less and remains stronger for PR-AUC/ROC-AUC.
+> ECG-RAMBA provides a protocol-faithful frozen Chapman OOF evaluation with metric-specific behavior. It has a calibrated fixed-threshold operating-point advantage over the MiniRocket-only feature baseline, while MiniRocket-only remains stronger for rank-based discrimination. However, a completed ResNet1D/CNN baseline significantly outperforms ECG-RAMBA on PR-AUC, ROC-AUC, F1, Brier, and ECE, so the paper must not claim in-domain fair-baseline superiority. Robustness claims must remain metric-specific: ECG-RAMBA is usually better than MiniRocket-only at the stressed fixed-threshold operating point for F1, Brier, and ECE, but MiniRocket-only often degrades less and remains stronger for PR-AUC/ROC-AUC.
 
 This is scientifically cleaner than the older broad claim that ECG-RAMBA is simply more robust or more generalizable.
 
@@ -104,6 +104,36 @@ Manuscript implication:
 
 - Do not write that ECG-RAMBA outperforms MiniRocket overall.
 - Write that ECG-RAMBA improves fixed-threshold and calibration-sensitive operating metrics, whereas MiniRocket-only gives stronger rank-based discrimination.
+
+### Full ECG-RAMBA vs ResNet1D/CNN
+
+ResNet1D/CNN baseline:
+
+- ROC-AUC macro: 0.9391
+- PR-AUC macro: 0.4899
+- F1 macro: 0.4906
+- Brier macro: 0.0342
+- ECE macro: 0.0414
+
+Full ECG-RAMBA:
+
+- ROC-AUC macro: 0.8373
+- PR-AUC macro: 0.3432
+- F1 macro: 0.3998
+- Brier macro: 0.0355
+- ECE macro: 0.0552
+
+Paired Full-vs-ResNet result:
+
+- ResNet1D/CNN is significantly better for PR-AUC, ROC-AUC, F1, Brier, and ECE.
+- Full-minus-ResNet improvement CIs are negative for all five metrics: PR-AUC `[-0.1607, -0.1392]`, ROC-AUC `[-0.1127, -0.0909]`, F1 `[-0.1016, -0.0796]`, Brier-improvement `[-0.0017, -0.0010]`, and ECE-improvement `[-0.0143, -0.0134]`.
+- This invalidates any broad in-domain claim that ECG-RAMBA is stronger than fair architecture baselines.
+
+Manuscript consequence:
+
+- Do not claim ECG-RAMBA has global or in-domain fair-baseline superiority.
+- Do not generalize the MiniRocket-only fixed-threshold/calibration advantage to ResNet1D/CNN.
+- If preserving ECG-RAMBA as a contribution, frame it as a structured model characterization and as a hypothesis for external/few-shot transfer, which still requires separate evidence.
 
 ### HRV-only and HRV Domain Sensitivity
 
@@ -173,7 +203,7 @@ Manuscript implication:
 | Discussion item | Original plan in revised discussion | Final evidence status | Required update |
 |---|---|---|---|
 | Safety / ranking-decision gap | Add ECE, MCE, Brier, reliability diagram, operating-point metrics. | Supported with limitations. Full has ECE 0.0552 and Brier 0.0355; paired comparison supports Full for F1/Brier/ECE but not PR-AUC/ROC-AUC. | Replace safety wording with calibrated fixed-threshold operating-point wording. |
-| MiniRocket / morphology baseline | Add MiniRocket-only, learned morphology, CNN/ResNet1D, CNN+HRV+Mamba. | MiniRocket-only and HRV-only are complete. ResNet1D/CNN runner is implemented but still pending execution/contract validation. Raw Mamba remains TBD. MiniRocket beats Full on ranking metrics. | Do not claim fair-baseline superiority. Report the mixed result and keep Raw Mamba/ResNet/CNN as pending unless completed and paired deltas are reviewed. |
+| MiniRocket / morphology baseline | Add MiniRocket-only, learned morphology, CNN/ResNet1D, CNN+HRV+Mamba. | MiniRocket-only, HRV-only, and ResNet1D/CNN are complete. MiniRocket beats Full on ranking metrics; ResNet1D/CNN beats Full on PR-AUC, ROC-AUC, F1, Brier, and ECE. Raw Mamba remains TBD. | Do not claim fair-baseline superiority. Report the MiniRocket mixed result and the ResNet in-domain loss explicitly. |
 | HRV domain bias | Add HRV-only and HRV domain classifier. | Complete, but domain classifier is near-perfect. | Use this as a limitation and domain-sensitivity finding. Remove HRV-invariance language. |
 | Statistical CI | Add bootstrap CI and paired bootstrap. | Complete for calibration and MiniRocket paired comparison; robustness also has paired degradation CIs. | Use record-level bootstrap wording and cite tables. |
 | Power Mean Q=3 | Add pooling sensitivity. | Supported as tradeoff, not optimality. | Write Q=3 as frozen/sensitivity-tested operating point only. |
@@ -187,7 +217,7 @@ Manuscript implication:
 
 Use:
 
-> We agree that a ranking-decision gap alone is insufficient to justify safety-oriented claims. We therefore replaced the original safety wording with a calibration-aware operating-point analysis. In the frozen Chapman OOF protocol, ECG-RAMBA achieved macro ROC-AUC 0.8373, macro PR-AUC 0.3432, macro F1 0.3998, macro Brier score 0.0355, and macro ECE 0.0552 at threshold 0.5. These results support a calibrated fixed-threshold operating-point advantage, but not a broad clinical safety claim.
+> We agree that a ranking-decision gap alone is insufficient to justify safety-oriented claims. We therefore replaced the original safety wording with a calibration-aware operating-point analysis. In the frozen Chapman OOF protocol, ECG-RAMBA achieved macro ROC-AUC 0.8373, macro PR-AUC 0.3432, macro F1 0.3998, macro Brier score 0.0355, and macro ECE 0.0552 at threshold 0.5. These results support reporting ECG-RAMBA's operating behavior, but not a broad clinical safety claim and not superiority over ResNet1D/CNN, which is better on the paired in-domain metrics.
 
 Avoid:
 
@@ -250,7 +280,7 @@ The final evidence package records these restrictions:
 - `A0-HRV-01`: no full-HRV or invariant-anchor claim is allowed.
 - `A0-HRV-02`: current checkpoints cannot support a causal amplitude-feature claim.
 - `A0-PTB-01`: PTB outputs remain experimental because predictions are Chapman-class proxies and HYP is unsupported.
-- `A0-BASE-01`: fair-baseline superiority remains blocked until Raw Mamba is implemented and ResNet1D/CNN is completed/validated under the same frozen protocol.
+- `A0-BASE-01`: fair-baseline superiority remains blocked. ResNet1D/CNN is now completed/validated and significantly outperforms Full ECG-RAMBA in-domain; Raw Mamba remains deferred.
 - `A0-PCA-01`: external outputs stay experimental until fold PCA artifacts and external protocol gates are reviewed.
 - `A0-EXT-01`: all external outputs remain isolated as experimental with `manuscript_ready=false`.
 
@@ -287,14 +317,14 @@ Add a limitation paragraph:
 
 Use the final evidence matrix as the source of truth. If a reviewer asks whether all planned baselines are complete, answer directly:
 
-> We completed MiniRocket-only and HRV-only feature baselines under the frozen OOF protocol and added paired comparisons against MiniRocket-only. A ResNet1D/CNN runner has been implemented but should not be cited until it is executed and its artifacts pass the frozen OOF contract. We do not claim broad fair-baseline superiority because Raw Mamba remains deferred and ResNet1D/CNN evidence is not yet complete.
+> We completed MiniRocket-only, HRV-only, and ResNet1D/CNN baselines under the frozen OOF protocol and added paired comparisons against MiniRocket-only and ResNet1D/CNN. ResNet1D/CNN significantly outperforms Full ECG-RAMBA on the in-domain Chapman OOF metrics. We therefore do not claim broad fair-baseline superiority; Raw Mamba also remains deferred.
 
 ## Writing Rule
 
 Every strong sentence in the revised manuscript should fall into one of these categories:
 
 1. Supported: calibration/fixed-threshold OOF, Q=3 as frozen tradeoff, HRV-only feature baseline, metric-specific robustness.
-2. Supported with limitation: HRV as useful but domain-sensitive, Full vs MiniRocket as metric-dependent.
+2. Supported with limitation: HRV as useful but domain-sensitive, Full vs MiniRocket as metric-dependent, and Full vs ResNet as an in-domain negative result for ECG-RAMBA superiority.
 3. Not supported yet: strict disentanglement, global superiority, external zero-shot manuscript-ready claims, full HRV/RMSSD/SDNN/LF-HF implementation, causal amplitude contribution.
 
 If a claim is in category 3, either remove it, move it to limitations/future work, or explicitly mark it as deferred.
@@ -305,8 +335,8 @@ This table is copied from `table_final_evidence_matrix.csv` and should drive the
 
 | Claim | Evidence status | Key numbers | Allowed use | Blocker |
 |---|---|---|---|---|
-| `C01` Fair baseline superiority / external transfer | `blocked_fair_baselines_missing` | Full PR-AUC=0.3432, F1=0.3998; MiniRocket PR-AUC=0.4508, F1=0.2477 | Do not claim superiority over all fair baselines. Report that MiniRocket-only is stronger on rank-based discrimination while Full ECG-RAMBA is stronger for fixed-threshold/calibrated operating metrics where paired CIs support it. | Raw Mamba remains TBD; ResNet1D/CNN runner is implemented but pending execution/contract validation. |
-| `C02` Fixed-threshold ranking-decision gap | `supported_with_limitations` | OOF F1=0.3998, PR-AUC=0.3432, ECE=0.0552, Brier=0.0355; paired F1/Brier/ECE favor Full; paired PR-AUC favors comparator. | Frozen OOF supports a calibrated/fixed-threshold operating-point advantage, not a rank-based discrimination advantage. | None. |
+| `C01` Fair baseline superiority / external transfer | `blocked_fair_baselines_missing` | Full PR-AUC=0.3432, F1=0.3998; MiniRocket PR-AUC=0.4508, F1=0.2477; ResNet1D/CNN PR-AUC=0.4899, F1=0.4906 | Do not claim superiority over all fair baselines. Report comparator-specific, metric-specific paired deltas; ResNet1D/CNN is stronger than Full on the completed in-domain architecture comparison. | Raw Mamba remains TBD; ResNet1D/CNN is complete and unfavorable to ECG-RAMBA in-domain superiority. |
+| `C02` Fixed-threshold ranking-decision gap | `supported_with_limitations` | OOF F1=0.3998, PR-AUC=0.3432, ECE=0.0552, Brier=0.0355; paired MiniRocket F1/Brier/ECE favor Full; paired ResNet F1/Brier/ECE favor ResNet. | Frozen OOF supports only metric-specific operating-point statements. Do not say ECG-RAMBA has a general fixed-threshold/calibration advantage once ResNet is included. | None. |
 | `C03` HRV feature evidence and domain sensitivity | `partially_supported_with_domain_limitation` | HRV-only ROC-AUC=0.8113, PR-AUC=0.1771, F1=0.2077; domain status=complete, domain AUC=1.0000. | Report HRV-only as a feature baseline. Present HRV as domain-sensitive and avoid domain-invariance wording. | Current HRV36 schema still contains reserved zero slots and no full RMSSD/SDNN/LF-HF claim. |
 | `C04` Morphology-rhythm separation | `blocked_representation_probe_missing` | Robustness rows=30; Full less-degraded metrics=4; MiniRocket less-degraded metrics=26. | Do not claim proven morphology-rhythm disentanglement. State that the architecture is designed to combine complementary streams and that representation separation remains future work. | No completed UMAP/probing/CKA representation artifact. |
 | `C05` Q=3 pooling operating point | `supported_as_tradeoff_not_optimality_claim` | Q=3 PR-AUC=0.3432, ROC-AUC=0.8373, F1=0.3998. | Present Q=3 as the pre-specified/frozen operating point and a sensitivity-tested tradeoff, not as globally optimal. | None. |
@@ -319,9 +349,9 @@ The Full-vs-MiniRocket result is mixed, not uniformly positive for either side.
 | Metric family | Winner / interpretation | Manuscript consequence |
 |---|---|---|
 | PR-AUC, ROC-AUC | MiniRocket-only is stronger for rank-based discrimination. | Do not claim ECG-RAMBA is the better ranker. |
-| F1 at threshold 0.5 | Full ECG-RAMBA is stronger at the frozen threshold. | It is acceptable to discuss fixed-threshold operating-point benefit. |
+| F1 at threshold 0.5 | Full ECG-RAMBA is stronger than MiniRocket-only but weaker than ResNet1D/CNN. | It is acceptable to discuss MiniRocket-specific fixed-threshold tradeoff, not general fair-baseline benefit. |
 | Brier, ECE | Full ECG-RAMBA is substantially better calibrated. | It is acceptable to discuss calibration-sensitive operating behavior. |
-| Broad fair-baseline superiority | Blocked. Raw Mamba remains TBD, and ResNet1D/CNN still needs a completed validated artifact. | Do not claim superiority over all fair baselines. |
+| Broad fair-baseline superiority | Blocked. Raw Mamba remains TBD, and ResNet1D/CNN is completed but beats Full ECG-RAMBA on all five paired in-domain metrics. | Do not claim superiority over all fair baselines. |
 
 Reviewer-facing wording should explicitly mention this tradeoff. Hiding MiniRocket's better PR-AUC/ROC-AUC would be scientifically weak and likely to be flagged.
 
