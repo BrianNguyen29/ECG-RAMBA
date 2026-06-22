@@ -93,7 +93,11 @@ def now_utc() -> str:
 
 def rel(path: Path) -> str:
     path = path if path.is_absolute() else PROJECT_ROOT / path
-    return path.resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
+    resolved = path.resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        return resolved.as_posix()
 
 
 def read_json(path: Path, *, required: bool = True) -> dict[str, Any]:
@@ -261,6 +265,9 @@ def main() -> None:
         "claim_map": PROJECT_ROOT / "docs" / "revision_plan" / "claim_evidence_map.csv",
         "task_board": PROJECT_ROOT / "docs" / "revision_plan" / "task_board.csv",
     }
+    optional_paths = {
+        "paired_raw_mamba": METRIC_DIR / "paired_full_vs_raw_mamba_comparison.json",
+    }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
         raise FileNotFoundError(
@@ -275,6 +282,7 @@ def main() -> None:
     robustness_rows = read_csv_rows(paths["robustness"], required=args.strict)
     paired_minirocket = read_json(paths["paired_minirocket"], required=False)
     paired_resnet = read_json(paths["paired_resnet"], required=False)
+    paired_raw_mamba = read_json(optional_paths["paired_raw_mamba"], required=False)
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
@@ -295,6 +303,7 @@ def main() -> None:
     mini = baseline_by_name.get("MiniRocket-only", {})
     hrv_only = baseline_by_name.get("HRV-only", {})
     resnet = baseline_by_name.get("ResNet1D/CNN", {})
+    raw_mamba = baseline_by_name.get("Raw Mamba", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
 
@@ -303,6 +312,7 @@ def main() -> None:
         "complete_feature_baseline_from_notebook05",
         "complete_feature_baseline_from_script10",
         "complete_architecture_baseline_from_script14",
+        "complete_architecture_baseline_from_script16",
     }
     required_fair_comparators = ["Raw Mamba", "ResNet1D/CNN"]
     missing_fair_comparators = [
@@ -322,6 +332,7 @@ def main() -> None:
 
     paired_minirocket_metrics = paired_minirocket.get("metrics", {}) if isinstance(paired_minirocket, dict) else {}
     paired_resnet_metrics = paired_resnet.get("metrics", {}) if isinstance(paired_resnet, dict) else {}
+    paired_raw_mamba_metrics = paired_raw_mamba.get("metrics", {}) if isinstance(paired_raw_mamba, dict) else {}
     paired_f1 = paired_minirocket_metrics.get("f1_macro", {})
     paired_pr = paired_minirocket_metrics.get("pr_auc_macro", {})
     paired_brier = paired_minirocket_metrics.get("brier_macro", {})
@@ -330,6 +341,10 @@ def main() -> None:
     paired_resnet_pr = paired_resnet_metrics.get("pr_auc_macro", {})
     paired_resnet_brier = paired_resnet_metrics.get("brier_macro", {})
     paired_resnet_ece = paired_resnet_metrics.get("ece_macro", {})
+    paired_raw_f1 = paired_raw_mamba_metrics.get("f1_macro", {})
+    paired_raw_pr = paired_raw_mamba_metrics.get("pr_auc_macro", {})
+    paired_raw_brier = paired_raw_mamba_metrics.get("brier_macro", {})
+    paired_raw_ece = paired_raw_mamba_metrics.get("ece_macro", {})
 
     calibration_metrics = calibration.get("metrics", {}) if isinstance(calibration, dict) else {}
     calibration_summary = calibration.get("calibration", {}) if isinstance(calibration, dict) else {}
@@ -363,12 +378,14 @@ def main() -> None:
             "key_numbers": (
                 f"Full PR-AUC={fmt(full.get('pr_auc_macro'))}, F1={fmt(full.get('f1_macro'))}; "
                 f"MiniRocket PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}; "
-                f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}"
+                f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}; "
+                f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
                 "reports/revision/metrics/paired_full_vs_minirocket_comparison.json;"
-                "reports/revision/metrics/paired_full_vs_resnet_comparison.json"
+                "reports/revision/metrics/paired_full_vs_resnet_comparison.json;"
+                "reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json"
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
@@ -395,12 +412,17 @@ def main() -> None:
                 f"ResNet paired F1={paired_resnet_f1.get('interpretation', '')}, "
                 f"Brier={paired_resnet_brier.get('interpretation', '')}, "
                 f"ECE={paired_resnet_ece.get('interpretation', '')}, "
-                f"PR-AUC={paired_resnet_pr.get('interpretation', '')}"
+                f"PR-AUC={paired_resnet_pr.get('interpretation', '')}; "
+                f"Raw Mamba paired F1={paired_raw_f1.get('interpretation', '')}, "
+                f"Brier={paired_raw_brier.get('interpretation', '')}, "
+                f"ECE={paired_raw_ece.get('interpretation', '')}, "
+                f"PR-AUC={paired_raw_pr.get('interpretation', '')}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
                 "reports/revision/tables/table_paired_full_vs_minirocket.csv;"
-                "reports/revision/tables/table_paired_full_vs_resnet.csv"
+                "reports/revision/tables/table_paired_full_vs_resnet.csv;"
+                "reports/revision/tables/table_paired_full_vs_raw_mamba.csv"
             ),
             "safe_wording": (
                 "Frozen OOF supports only metric-specific operating-point statements. Once ResNet "
@@ -540,8 +562,13 @@ def main() -> None:
             ),
             "external": "Keep external dataset outputs experimental unless protocol-specific checks are complete.",
             "hrv": "Do not describe reserved HRV slots as implemented RMSSD/SDNN/LF-HF features.",
+            "raw_mamba": (
+                "Use Raw Mamba only as a comparator-specific fair-baseline result. "
+                "It does not restore global superiority if ResNet1D/CNN remains stronger."
+            ),
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
+        "optional_inputs": {name: artifact(path) for name, path in optional_paths.items()},
         "robustness_summary": robustness_summary,
         "task_status": {
             key: {
