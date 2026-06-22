@@ -6,12 +6,16 @@ Purpose: convert the final evidence package into manuscript and rebuttal text th
 
 ## Authoritative Inputs
 
-- Final evidence folder: `D:\WorkSpace\ECG\ECG-Ramba\final_evidence_tables-20260620T053650Z-3-001\final_evidence_tables`
-- Final evidence manifest commit: `32f9d83c66ed1711375ddd4df2a411bc05d6402c`
+- Current Drive final evidence folder: `D:\WorkSpace\ECG\ECG-Ramba\drive\final_evidence_tables`
+- Current Drive artifact mirror: `D:\WorkSpace\ECG\ECG-Ramba\drive\revision_artifacts\reports\revision`
+- Final evidence manifest commit: `4deb9f077a7635a480ceca88d62f7d2b9bf8d2fd`
 - `final_ready_for_rebuttal`: `True`
 - `all_claims_supported`: `False`
+- Current source-of-truth writing update: `docs/revision_plan/manuscript_rebuttal_drive_source_update_20260622.md`
 - Updated discussion analysis: `docs/revision_plan/discussion_update_from_final_evidence_20260620.md`
 - Claim rewrite table: `docs/revision_plan/claim_rewrite_matrix_20260621.csv`
+
+Use `docs/revision_plan/manuscript_rebuttal_drive_source_update_20260622.md` as the latest manuscript/rebuttal wording source. It was generated from the Drive evidence package after the completed ResNet1D/CNN paired comparison and supersedes broader pre-ResNet wording.
 
 ## Non-Negotiable Writing Rules
 

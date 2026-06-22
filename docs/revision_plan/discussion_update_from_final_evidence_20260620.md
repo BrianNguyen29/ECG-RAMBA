@@ -6,10 +6,16 @@ Purpose: consolidate the downloaded final evidence tables and align them with `d
 
 ## Source Files
 
-Downloaded final evidence folder:
+Current Drive final evidence folder:
 
 ```text
-D:\WorkSpace\ECG\ECG-Ramba\final_evidence_tables-20260620T053650Z-3-001\final_evidence_tables
+D:\WorkSpace\ECG\ECG-Ramba\drive\final_evidence_tables
+```
+
+Current Drive artifact mirror:
+
+```text
+D:\WorkSpace\ECG\ECG-Ramba\drive\revision_artifacts\reports\revision
 ```
 
 Primary evidence artifacts:
@@ -37,7 +43,13 @@ Final evidence manifest:
 - `missing_inputs`: none
 - `contract_issues`: none
 - `unresolved_blockers`: none
-- source commit: `32f9d83c66ed1711375ddd4df2a411bc05d6402c`
+- source commit: `4deb9f077a7635a480ceca88d62f7d2b9bf8d2fd`
+
+Latest writing source:
+
+```text
+docs/revision_plan/manuscript_rebuttal_drive_source_update_20260622.md
+```
 
 Interpretation: the evidence package is ready to support a cautious rebuttal, but not every original or planned claim is supported. The manuscript must be revised around the safe wording, not around the stronger language in the old plan.
 

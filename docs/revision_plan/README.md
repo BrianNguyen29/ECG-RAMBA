@@ -31,6 +31,10 @@ metrics, figures, tables, and manifests must be written under
   outputs.
 - `training_epoch_policy.md`: fixed-epoch manuscript policy, EMA checkpoint
   roles, and the e20/e30 decision rule.
+- `manuscript_rebuttal_drive_source_update_20260622.md`: current
+  manuscript/rebuttal wording source generated from
+  `D:/WorkSpace/ECG/ECG-Ramba/drive/final_evidence_tables` after the completed
+  ResNet1D/CNN baseline. Use this file before reusing older discussion wording.
 
 ## Notebook Sequence
 
