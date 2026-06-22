@@ -35,6 +35,9 @@ metrics, figures, tables, and manifests must be written under
   manuscript/rebuttal wording source generated from
   `D:/WorkSpace/ECG/ECG-Ramba/drive/final_evidence_tables` after the completed
   ResNet1D/CNN baseline. Use this file before reusing older discussion wording.
+- `discussion_final_evidence_review_20260622.md`: current audit of the
+  reviewer discussion plan against the final evidence package, including the
+  updated next-item checklist.
 
 ## Notebook Sequence
 
