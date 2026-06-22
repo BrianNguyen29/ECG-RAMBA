@@ -256,6 +256,7 @@ def main() -> None:
         "hrv_domain": METRIC_DIR / "hrv_domain_summary.csv",
         "robustness": METRIC_DIR / "robustness_summary.csv",
         "paired_minirocket": METRIC_DIR / "paired_full_vs_minirocket_comparison.json",
+        "paired_resnet": METRIC_DIR / "paired_full_vs_resnet_comparison.json",
         "a0_status": REVISION_DIR / "a0_resolution_status.json",
         "claim_map": PROJECT_ROOT / "docs" / "revision_plan" / "claim_evidence_map.csv",
         "task_board": PROJECT_ROOT / "docs" / "revision_plan" / "task_board.csv",
@@ -272,7 +273,8 @@ def main() -> None:
     baseline_rows = read_csv_rows(paths["baseline"], required=args.strict)
     hrv_rows = read_csv_rows(paths["hrv_domain"], required=args.strict)
     robustness_rows = read_csv_rows(paths["robustness"], required=args.strict)
-    paired = read_json(paths["paired_minirocket"], required=False)
+    paired_minirocket = read_json(paths["paired_minirocket"], required=False)
+    paired_resnet = read_json(paths["paired_resnet"], required=False)
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
@@ -318,11 +320,16 @@ def main() -> None:
         c01_evidence_status = "complete_baseline_matrix_requires_metric_specific_interpretation"
         c01_blocker = "No missing required fair comparator rows; interpret only metric-specific paired deltas."
 
-    paired_metrics = paired.get("metrics", {}) if isinstance(paired, dict) else {}
-    paired_f1 = paired_metrics.get("f1_macro", {})
-    paired_pr = paired_metrics.get("pr_auc_macro", {})
-    paired_brier = paired_metrics.get("brier_macro", {})
-    paired_ece = paired_metrics.get("ece_macro", {})
+    paired_minirocket_metrics = paired_minirocket.get("metrics", {}) if isinstance(paired_minirocket, dict) else {}
+    paired_resnet_metrics = paired_resnet.get("metrics", {}) if isinstance(paired_resnet, dict) else {}
+    paired_f1 = paired_minirocket_metrics.get("f1_macro", {})
+    paired_pr = paired_minirocket_metrics.get("pr_auc_macro", {})
+    paired_brier = paired_minirocket_metrics.get("brier_macro", {})
+    paired_ece = paired_minirocket_metrics.get("ece_macro", {})
+    paired_resnet_f1 = paired_resnet_metrics.get("f1_macro", {})
+    paired_resnet_pr = paired_resnet_metrics.get("pr_auc_macro", {})
+    paired_resnet_brier = paired_resnet_metrics.get("brier_macro", {})
+    paired_resnet_ece = paired_resnet_metrics.get("ece_macro", {})
 
     calibration_metrics = calibration.get("metrics", {}) if isinstance(calibration, dict) else {}
     calibration_summary = calibration.get("calibration", {}) if isinstance(calibration, dict) else {}
@@ -360,12 +367,14 @@ def main() -> None:
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
-                "reports/revision/metrics/paired_full_vs_minirocket_comparison.json"
+                "reports/revision/metrics/paired_full_vs_minirocket_comparison.json;"
+                "reports/revision/metrics/paired_full_vs_resnet_comparison.json"
             ),
             "safe_wording": (
-                "Do not claim superiority over all fair baselines. Report that MiniRocket-only "
-                "is stronger on rank-based discrimination while Full ECG-RAMBA is stronger for "
-                "fixed-threshold/calibrated operating metrics where paired CIs support it."
+                "Do not claim superiority over all fair baselines. Report comparator-specific, "
+                "metric-specific paired deltas. If paired ResNet1D/CNN CIs favor ResNet, state "
+                "that ResNet is stronger for those in-domain metrics and narrow ECG-RAMBA claims "
+                "to supported operating-point, robustness, external-transfer, or efficiency evidence."
             ),
             "blocker": c01_blocker,
             "source_claim_status": claim_by_id.get("C01", {}).get("status", ""),
@@ -382,15 +391,21 @@ def main() -> None:
                 f"paired F1={paired_f1.get('interpretation', '')}, "
                 f"Brier={paired_brier.get('interpretation', '')}, "
                 f"ECE={paired_ece.get('interpretation', '')}, "
-                f"PR-AUC={paired_pr.get('interpretation', '')}"
+                f"PR-AUC={paired_pr.get('interpretation', '')}; "
+                f"ResNet paired F1={paired_resnet_f1.get('interpretation', '')}, "
+                f"Brier={paired_resnet_brier.get('interpretation', '')}, "
+                f"ECE={paired_resnet_ece.get('interpretation', '')}, "
+                f"PR-AUC={paired_resnet_pr.get('interpretation', '')}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
-                "reports/revision/tables/table_paired_full_vs_minirocket.csv"
+                "reports/revision/tables/table_paired_full_vs_minirocket.csv;"
+                "reports/revision/tables/table_paired_full_vs_resnet.csv"
             ),
             "safe_wording": (
-                "Frozen OOF supports a calibrated/fixed-threshold operating-point advantage, "
-                "not a rank-based discrimination advantage."
+                "Frozen OOF supports only metric-specific operating-point statements. Once ResNet "
+                "is included, avoid saying ECG-RAMBA has a general fixed-threshold or calibration "
+                "advantage unless the paired ResNet CI for that metric supports it."
             ),
             "blocker": "",
             "source_claim_status": claim_by_id.get("C02", {}).get("status", ""),
