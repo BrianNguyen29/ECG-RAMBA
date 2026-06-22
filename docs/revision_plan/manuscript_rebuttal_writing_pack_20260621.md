@@ -60,7 +60,7 @@ This concern is supported by the new evidence. HRV-only has non-trivial signal, 
 
 ### Reviewer 1 Comment 4 - Baseline strength
 
-Only MiniRocket-only and HRV-only feature baselines are complete under the frozen evidence package. Raw Mamba and ResNet1D/CNN fair runners remain deferred. The rebuttal must not claim broad fair-baseline superiority.
+Only MiniRocket-only and HRV-only feature baselines are complete under the frozen evidence package. A ResNet1D/CNN runner has been implemented but is not evidence until it is executed and its artifacts pass the frozen OOF contract. Raw Mamba remains deferred. The rebuttal must not claim broad fair-baseline superiority.
 
 ### Reviewer 1 Comment 5 - Confidence intervals and significance
 
@@ -145,7 +145,7 @@ The current manuscript-ready evidence is the frozen Chapman OOF protocol. PTB/Ge
 | R1C1 safety / ranking-decision gap | safety-oriented behavior; clinically appropriate conservatism | calibrated fixed-threshold operating behavior under a frozen Chapman OOF protocol | `supported_with_limitations` | Replace safety language in Abstract, Results, and Discussion; report calibration metrics and threshold-0.5 metrics. |
 | R1C2 MiniRocket / morphology branch | deterministic morphology improves robustness; ECG-RAMBA outperforms MiniRocket | MiniRocket-only is stronger for rank-based discrimination; Full ECG-RAMBA is stronger for fixed-threshold and calibration-sensitive metrics | `blocked_fair_baselines_missing` | Report metric-dependent tradeoff. Do not claim deterministic morphology superiority or global baseline superiority. |
 | R1C3 HRV domain bias | HRV serves as an invariant anchor | HRV provides complementary rhythm descriptors but is domain-sensitive | `partially_supported_with_domain_limitation` | Move HRV invariance to limitations. State HRV domain classifier result directly. |
-| R1C4 baseline strength | ECG-RAMBA is superior to fair ECG baselines | Only feature baselines MiniRocket-only and HRV-only are complete; Raw Mamba and ResNet1D/CNN fair runners remain deferred | `blocked_fair_baselines_missing` | Do not present broad fair-baseline superiority. If space allows, add ResNet1D/CNN later as a separate risk-managed experiment. |
+| R1C4 baseline strength | ECG-RAMBA is superior to fair ECG baselines | MiniRocket-only and HRV-only are complete; ResNet1D/CNN runner is implemented but pending execution/contract validation; Raw Mamba remains deferred | `blocked_fair_baselines_missing` | Do not present broad fair-baseline superiority. If ResNet1D/CNN is run, add it only after contract validation and metric-specific interpretation. |
 | R1C5 uncertainty | point estimates alone establish superiority | record-level bootstrap and paired comparisons support only metric-specific conclusions | `supported_with_limitations` | Add uncertainty table text and cite bootstrap method. For robustness, quote paired CI rows only where present. |
 | R1C6 Power Mean Q=3 | Q=3 is optimal | Q=3 is the pre-specified frozen operating point and a sensitivity-tested tradeoff | `supported_as_tradeoff_not_optimality_claim` | Keep Q=3 wording as tradeoff, not optimality. Cite pooling sensitivity table. |
 | R2C2 morphology-rhythm separation | validating morphology-rhythm disentanglement | architecture combines complementary morphology-rhythm streams; strict representation separation remains future work | `blocked_representation_probe_missing` | Remove proven-disentanglement wording. Do not say UMAP/probing/CKA were added unless those artifacts are generated later. |
@@ -168,7 +168,7 @@ The current manuscript-ready evidence is the frozen Chapman OOF protocol. PTB/Ge
 
 Do not open new experiments until the manuscript and response letter are locked to the safe wording above.
 
-If an additional experiment is needed after writing lock, the highest-ROI option is a ResNet1D/CNN fair baseline under the same frozen OOF protocol. This would address the strongest remaining baseline blocker, but it has risk: it may not outperform MiniRocket, it requires implementation and compute, and it can delay the resubmission. Do not start Transformer, few-shot, or new external experiments before deciding whether the ResNet1D/CNN baseline is worth that risk.
+If an additional experiment is needed after writing lock, the highest-ROI option is now to execute the implemented ResNet1D/CNN fair baseline under the same frozen OOF protocol. This would address the strongest remaining non-Raw-Mamba baseline blocker, but it has risk: it may not outperform MiniRocket, it requires A100 compute, and it can delay the resubmission. Do not start Transformer, few-shot, or new external experiments before deciding whether completing the ResNet1D/CNN baseline is worth that risk.
 
 ## Immediate Execution Checklist
 

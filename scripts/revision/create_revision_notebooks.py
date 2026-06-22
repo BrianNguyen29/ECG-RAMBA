@@ -1445,7 +1445,7 @@ for path in planned_outputs:
 planned = {
     'MiniRocket-only': 'python -u scripts/revision/10_minirocket_only_baseline.py --oof-predictions reports/revision/predictions/oof_final_ema_predictions.npz --freeze-manifest reports/revision/manifests/oof_final_ema_freeze_manifest.json --expected-checkpoint-kind final_ema --threshold 0.5 --n-bins 15 --n-boot 1000 --reuse-predictions --backend torch_linear --torch-epochs 20 --batch-size 4096 --stats-batch-size 1024 --lr 1e-3 --weight-decay 1e-4 --standardize train_fold --device cuda',
     'HRV-only': 'python -u scripts/revision/09_hrv_domain_analysis.py --oof-predictions reports/revision/predictions/oof_final_ema_predictions.npz --freeze-manifest reports/revision/manifests/oof_final_ema_freeze_manifest.json --expected-checkpoint-kind final_ema',
-    'ResNet1D/CNN': 'python scripts/revision/TBD_resnet1d_baseline.py',
+    'ResNet1D/CNN': 'python -u scripts/revision/14_resnet1d_cnn_baseline.py --oof-predictions reports/revision/predictions/oof_final_ema_predictions.npz --freeze-manifest reports/revision/manifests/oof_final_ema_freeze_manifest.json --expected-checkpoint-kind final_ema --epochs 20 --batch-size 512 --num-workers 2 --threshold 0.5 --n-bins 15 --n-boot 1000 --device cuda --amp --allow-tf32 --reuse-predictions',
     'Raw Mamba': 'python scripts/revision/TBD_raw_mamba_baseline.py',
 }
 

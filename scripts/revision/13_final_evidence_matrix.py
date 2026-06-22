@@ -292,8 +292,31 @@ def main() -> None:
     full = baseline_by_name.get("Full ECG-RAMBA frozen OOF", {})
     mini = baseline_by_name.get("MiniRocket-only", {})
     hrv_only = baseline_by_name.get("HRV-only", {})
+    resnet = baseline_by_name.get("ResNet1D/CNN", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
+
+    complete_fair_statuses = {
+        "complete_frozen_oof",
+        "complete_feature_baseline_from_notebook05",
+        "complete_feature_baseline_from_script10",
+        "complete_architecture_baseline_from_script14",
+    }
+    required_fair_comparators = ["Raw Mamba", "ResNet1D/CNN"]
+    missing_fair_comparators = [
+        name
+        for name in required_fair_comparators
+        if baseline_by_name.get(name, {}).get("status") not in complete_fair_statuses
+    ]
+    if missing_fair_comparators:
+        c01_evidence_status = "blocked_fair_baselines_missing"
+        c01_blocker = (
+            f"{', '.join(missing_fair_comparators)} fair comparator row(s) remain incomplete "
+            "under the frozen OOF protocol."
+        )
+    else:
+        c01_evidence_status = "complete_baseline_matrix_requires_metric_specific_interpretation"
+        c01_blocker = "No missing required fair comparator rows; interpret only metric-specific paired deltas."
 
     paired_metrics = paired.get("metrics", {}) if isinstance(paired, dict) else {}
     paired_f1 = paired_metrics.get("f1_macro", {})
@@ -329,10 +352,11 @@ def main() -> None:
         {
             "claim_id": "C01",
             "claim_topic": "Fair baseline superiority / external transfer",
-            "evidence_status": "blocked_fair_baselines_missing",
+            "evidence_status": c01_evidence_status,
             "key_numbers": (
                 f"Full PR-AUC={fmt(full.get('pr_auc_macro'))}, F1={fmt(full.get('f1_macro'))}; "
-                f"MiniRocket PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}"
+                f"MiniRocket PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}; "
+                f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
@@ -343,7 +367,7 @@ def main() -> None:
                 "is stronger on rank-based discrimination while Full ECG-RAMBA is stronger for "
                 "fixed-threshold/calibrated operating metrics where paired CIs support it."
             ),
-            "blocker": "Raw Mamba and ResNet1D/CNN fair runners remain TBD.",
+            "blocker": c01_blocker,
             "source_claim_status": claim_by_id.get("C01", {}).get("status", ""),
         },
         {
