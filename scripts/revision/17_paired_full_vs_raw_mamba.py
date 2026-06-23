@@ -34,7 +34,7 @@ from scripts.revision.common import (  # noqa: E402
 
 FULL_LABEL = "Full ECG-RAMBA frozen OOF"
 COMPARATOR_LABEL = "Raw Mamba"
-EXPECTED_RAW_MAMBA_PROTOCOL = "raw_mamba_retrained_same_folds_power_mean_v2_q3_threshold_0.5"
+EXPECTED_RAW_MAMBA_PROTOCOL = "raw_mamba_retrained_weighted_bce_same_folds_power_mean_v2_q3_threshold_0.5"
 EXPECTED_RAW_MAMBA_FEATURE_CONTRACT = "raw_ecg_12lead_mamba_only"
 
 

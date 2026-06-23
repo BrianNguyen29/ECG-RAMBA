@@ -106,7 +106,7 @@ feature_contract = raw_ecg_12lead_mamba_only
 uses_minirocket = false
 uses_hrv = false
 uses_pca = false
-checkpoint_kind = raw_mamba_retrained_same_folds_power_mean_v2_q3_threshold_0.5
+checkpoint_kind = raw_mamba_retrained_weighted_bce_same_folds_power_mean_v2_q3_threshold_0.5
 ```
 
 ### Outputs

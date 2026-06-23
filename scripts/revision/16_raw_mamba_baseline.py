@@ -46,7 +46,7 @@ from src.training_data import build_slice_index  # noqa: E402
 from src.utils import AsymmetricLossMultiLabel, EMA  # noqa: E402
 
 
-PROTOCOL = "raw_mamba_retrained_same_folds_power_mean_v2_q3_threshold_0.5"
+PROTOCOL = "raw_mamba_retrained_weighted_bce_same_folds_power_mean_v2_q3_threshold_0.5"
 FEATURE_CONTRACT = "raw_ecg_12lead_mamba_only"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
@@ -90,6 +90,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr-min", type=float, default=float(CONFIG["lr_min"]))
     parser.add_argument("--weight-decay", type=float, default=float(CONFIG["weight_decay"]))
     parser.add_argument("--grad-clip", type=float, default=float(CONFIG["grad_clip"]))
+    parser.add_argument(
+        "--bce-pos-weight",
+        choices=["fold", "none"],
+        default="fold",
+        help="Use fold-train negative/positive ratios as BCE pos_weight during warm-up.",
+    )
     parser.add_argument("--asym-start-epoch", type=int, default=int(CONFIG["asym_start_epoch"]))
     parser.add_argument("--ema-decay", type=float, default=float(CONFIG["ema_decay"]))
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu")
@@ -218,13 +224,12 @@ def predict_slice_probabilities(
     )
 
 
-def record_metrics_for_fold(
+def record_probabilities_for_fold(
     y: np.ndarray,
     slice_prob: np.ndarray,
     slice_record_id: np.ndarray,
     val_indices: np.ndarray,
-    threshold: float,
-) -> dict:
+) -> np.ndarray:
     y_prob_all, valid_mask, _slice_count = aggregate_record_probabilities(
         slice_prob,
         slice_record_id,
@@ -234,6 +239,27 @@ def record_metrics_for_fold(
     missing = sorted(set(int(x) for x in val_indices) - set(np.where(valid_mask)[0].astype(int)))
     if missing:
         raise RuntimeError(f"Validation records without slice predictions: {missing[:10]}")
+    return y_prob_all
+
+
+def prediction_diagnostics(y_prob: np.ndarray, threshold: float) -> dict:
+    return {
+        "prob_min": float(np.min(y_prob)),
+        "prob_max": float(np.max(y_prob)),
+        "prob_mean": float(np.mean(y_prob)),
+        "prob_std": float(np.std(y_prob)),
+        "pred_positive_rate": float(np.mean(y_prob >= threshold)),
+    }
+
+
+def record_metrics_for_fold(
+    y: np.ndarray,
+    slice_prob: np.ndarray,
+    slice_record_id: np.ndarray,
+    val_indices: np.ndarray,
+    threshold: float,
+) -> dict:
+    y_prob_all = record_probabilities_for_fold(y, slice_prob, slice_record_id, val_indices)
     return multilabel_metrics(y[val_indices], y_prob_all[val_indices], threshold=threshold)
 
 
@@ -420,7 +446,19 @@ def train_one_fold(
     )
 
     model = build_model().to(device)
-    bce_criterion = nn.BCEWithLogitsLoss()
+    bce_pos_weight = None
+    if args.bce_pos_weight == "fold":
+        bce_pos_weight = resnet_helpers.pos_weight_from_labels(y[tr_idx]).to(device)
+        print(
+            f"Fold {fold}: BCE pos_weight enabled "
+            f"min={float(bce_pos_weight.min().detach().cpu()):.3f} "
+            f"mean={float(bce_pos_weight.mean().detach().cpu()):.3f} "
+            f"max={float(bce_pos_weight.max().detach().cpu()):.3f}",
+            flush=True,
+        )
+    else:
+        print(f"Fold {fold}: BCE pos_weight disabled", flush=True)
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight)
     asym_criterion = AsymmetricLossMultiLabel(
         gamma_neg=float(CONFIG["asym_gamma_neg"]),
         gamma_pos=float(CONFIG["asym_gamma_pos"]),
@@ -477,23 +515,23 @@ def train_one_fold(
                     device=device,
                     args=args,
                 )
-                val_metrics = record_metrics_for_fold(
-                    y,
-                    slice_prob,
-                    slice_record_id,
-                    va_idx,
-                    threshold=args.threshold,
-                )
+                val_prob_all = record_probabilities_for_fold(y, slice_prob, slice_record_id, va_idx)
+                val_prob = val_prob_all[va_idx]
+                val_metrics = multilabel_metrics(y[va_idx], val_prob, threshold=args.threshold)
+                val_diag = prediction_diagnostics(val_prob, args.threshold)
             finally:
                 if eval_with_ema:
                     ema.restore(model)
             row.update({f"val_{k}": v for k, v in val_metrics.items()})
+            row.update({f"val_{k}": v for k, v in val_diag.items()})
             row["val_weights_kind"] = "ema" if eval_with_ema else "raw"
             print(
                 f"Fold {fold} Ep {epoch:03d}/{args.epochs} "
                 f"{row['loss_name']} loss={row['train_loss']:.5f} "
                 f"Eval={row['val_weights_kind']} F1={val_metrics['f1_macro']:.4f} "
-                f"PR={val_metrics['pr_auc_macro']:.4f} ROC={val_metrics['roc_auc_macro']:.4f}",
+                f"PR={val_metrics['pr_auc_macro']:.4f} ROC={val_metrics['roc_auc_macro']:.4f} "
+                f"Pmean={val_diag['prob_mean']:.4f} Pstd={val_diag['prob_std']:.4f} "
+                f"P>=thr={val_diag['pred_positive_rate']:.4f}",
                 flush=True,
             )
         else:
@@ -842,6 +880,12 @@ def main() -> None:
         "lr_min": float(args.lr_min),
         "weight_decay": float(args.weight_decay),
         "loss": "bce_then_asymmetric",
+        "bce_pos_weight": str(args.bce_pos_weight),
+        "bce_pos_weight_formula": (
+            "fold_train_negative_positive_ratio_clipped_1_100"
+            if args.bce_pos_weight == "fold"
+            else "none"
+        ),
         "asym_start_epoch": int(args.asym_start_epoch),
         "asym_gamma_neg": float(CONFIG["asym_gamma_neg"]),
         "asym_gamma_pos": float(CONFIG["asym_gamma_pos"]),
