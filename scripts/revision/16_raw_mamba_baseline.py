@@ -318,6 +318,10 @@ def fold_prediction_matches(
             return None
         if float(np.min(slice_prob)) < -1e-6 or float(np.max(slice_prob)) > 1.0 + 1e-6:
             return None
+        reconstructed_counts = np.bincount(slice_record_id, minlength=len(y)).astype(np.int16)
+        if not np.array_equal(reconstructed_counts, slice_count):
+            print("Fold cache rejected: slice_count does not match slice artifact", flush=True)
+            return None
         return y_prob, slice_count, slice_prob, slice_record_id, slice_start
     except Exception as exc:
         print(f"Fold cache rejected {path}: {exc!r}", flush=True)

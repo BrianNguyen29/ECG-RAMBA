@@ -656,6 +656,22 @@ def fold_prediction_matches(
             return None
         if len(slice_count) != len(y):
             return None
+        if slice_prob.ndim != 2 or slice_prob.shape[1] != y.shape[1]:
+            return None
+        if len(slice_record_id) != len(slice_prob) or len(slice_start) != len(slice_prob):
+            return None
+        if np.any(slice_record_id < 0) or np.any(slice_record_id >= len(y)):
+            return None
+        if not np.all(np.isfinite(y_prob)) or not np.all(np.isfinite(slice_prob)):
+            return None
+        if float(np.min(y_prob)) < -1e-6 or float(np.max(y_prob)) > 1.0 + 1e-6:
+            return None
+        if float(np.min(slice_prob)) < -1e-6 or float(np.max(slice_prob)) > 1.0 + 1e-6:
+            return None
+        reconstructed_counts = np.bincount(slice_record_id, minlength=len(y)).astype(np.int16)
+        if not np.array_equal(reconstructed_counts, slice_count):
+            print("Fold cache rejected: slice_count does not match slice artifact", flush=True)
+            return None
         return y_prob, slice_count, slice_prob, slice_record_id, slice_start
     except Exception as exc:
         print(f"Fold cache rejected {path}: {exc!r}", flush=True)
@@ -1050,14 +1066,63 @@ def load_existing_prediction_npz(
                 return None
             if len(slice_count_existing) != len(y) or np.any(slice_count_existing <= 0):
                 return None
-            return (
-                y_prob_existing,
-                fold_existing,
-                slice_count_existing,
-            )
+            if not np.all(np.isfinite(y_prob_existing)):
+                return None
+            if float(np.min(y_prob_existing)) < -1e-6 or float(np.max(y_prob_existing)) > 1.0 + 1e-6:
+                return None
     except Exception as exc:
         print(f"Existing ResNet1D/CNN NPZ rejected: {exc!r}", flush=True)
         return None
+
+    try:
+        with np.load(SLICE_PREDICTION_PATH, allow_pickle=False) as slice_data:
+            required_slice = {"slice_prob", "slice_record_id", "slice_fold_id", "slice_start", "class_names"}
+            missing_slice = required_slice - set(slice_data.files)
+            if missing_slice:
+                print(f"Existing ResNet1D/CNN NPZ rejected: slice artifact missing {sorted(missing_slice)}", flush=True)
+                return None
+            if str(npz_scalar(slice_data, "protocol", "")) != PROTOCOL:
+                return None
+            if str(npz_scalar(slice_data, "feature_contract", "")) != FEATURE_CONTRACT:
+                return None
+            if str(npz_scalar(slice_data, "model_params_json", "")) != json.dumps(_json_safe(model_params), sort_keys=True):
+                return None
+            if str(npz_scalar(slice_data, "oof_predictions_sha256", "")) != load_info["oof_predictions_sha256"]:
+                return None
+            if str(npz_scalar(slice_data, "raw_cache_sha256", "")) != load_info["raw_cache_sha256"]:
+                return None
+            slice_prob = np.asarray(slice_data["slice_prob"], dtype=np.float32)
+            slice_record_id = np.asarray(slice_data["slice_record_id"], dtype=np.int64)
+            slice_fold_id = np.asarray(slice_data["slice_fold_id"], dtype=np.int16)
+            slice_start = np.asarray(slice_data["slice_start"], dtype=np.int32)
+            slice_classes = np.asarray(slice_data["class_names"]).astype(str).tolist()
+        if slice_classes != class_names:
+            return None
+        if slice_prob.ndim != 2 or slice_prob.shape[1] != y.shape[1]:
+            return None
+        if len(slice_record_id) != len(slice_prob) or len(slice_fold_id) != len(slice_prob) or len(slice_start) != len(slice_prob):
+            return None
+        if np.any(slice_record_id < 0) or np.any(slice_record_id >= len(y)):
+            return None
+        if not np.array_equal(slice_fold_id, expected_fold_id[slice_record_id]):
+            return None
+        if not np.all(np.isfinite(slice_prob)):
+            return None
+        if float(np.min(slice_prob)) < -1e-6 or float(np.max(slice_prob)) > 1.0 + 1e-6:
+            return None
+        reconstructed_counts = np.bincount(slice_record_id, minlength=len(y)).astype(np.int16)
+        if not np.array_equal(reconstructed_counts, slice_count_existing):
+            print("Existing ResNet1D/CNN NPZ rejected: slice_count does not match slice artifact", flush=True)
+            return None
+    except Exception as exc:
+        print(f"Existing ResNet1D/CNN NPZ rejected: could not validate slice artifact: {exc!r}", flush=True)
+        return None
+
+    return (
+        y_prob_existing,
+        fold_existing,
+        slice_count_existing,
+    )
 
 
 def per_class_rows(y_true: np.ndarray, y_prob: np.ndarray, class_names: list[str], threshold: float) -> list[dict]:

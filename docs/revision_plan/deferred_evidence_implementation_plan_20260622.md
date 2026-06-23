@@ -16,7 +16,7 @@ reports/revision/tables/table_final_safe_wording.csv
 The current manuscript/rebuttal package is internally consistent only if these restrictions are preserved:
 
 - Do not claim global or in-domain superiority for ECG-RAMBA. ResNet1D/CNN is stronger on frozen Chapman OOF PR-AUC, ROC-AUC, F1, Brier, and ECE.
-- Do not claim superiority over all fair baselines because the Raw Mamba fair comparator is still missing.
+- Do not claim superiority over all fair baselines until the Raw Mamba fair comparator has completed successfully and Notebook 04/07 have been rerun. The runner is implemented, but manuscript-ready Raw Mamba artifacts are not yet present in the current evidence matrix.
 - Do not claim external or zero-shot superiority because PTB-XL, Georgia, and CPSC remain experimental.
 - Do not claim few-shot results because no few-shot adaptation package is complete.
 - Do not claim proven morphology-rhythm disentanglement because no representation probe, UMAP, CKA, or probing artifact is complete.
@@ -32,7 +32,7 @@ The current manuscript/rebuttal package is internally consistent only if these r
 | MiniRocket-only baseline | Complete | `scripts/revision/10_minirocket_only_baseline.py`, paired Full-vs-MiniRocket | Manuscript-ready, metric-specific |
 | HRV-only/domain | Complete with limitation | `scripts/revision/09_hrv_domain_analysis.py` | Manuscript-ready limitation |
 | Robustness vs MiniRocket | Complete with limitation | `scripts/revision/12_robustness_stress.py`, 6 stresses x 5 metrics | Manuscript-ready, metric-specific |
-| Raw Mamba fair comparator | Missing | only placeholder in Notebook 04 | Deferred |
+| Raw Mamba fair comparator | Implemented, pending successful run/artifacts | `scripts/revision/16_raw_mamba_baseline.py`, `scripts/revision/17_paired_full_vs_raw_mamba.py`, Notebook 04 runner cell | Deferred until artifacts pass |
 | External PTB-XL/Georgia/CPSC | Scaffolded but experimental | `scripts/revision/03_generate_external_predictions.py`, fold PCA builder | Deferred |
 | Few-shot adaptation | Missing | no runner/artifacts | Deferred |
 | Representation probe | Missing | Notebook 06 records blocked status | Deferred |
@@ -43,7 +43,7 @@ The current manuscript/rebuttal package is internally consistent only if these r
 
 ### P1 - Raw Mamba fair comparator
 
-This is the most defensible next experiment if the goal is to reduce fair-baseline criticism. It will not restore global superiority because ResNet1D/CNN already outperforms ECG-RAMBA in-domain, but it can close the last baseline-row gap in `baseline_summary.csv`.
+This is the most defensible next experiment if the goal is to reduce fair-baseline criticism. It will not restore global superiority because ResNet1D/CNN already outperforms ECG-RAMBA in-domain, but it can close the last baseline-row gap in `baseline_summary.csv`. The first implementation exposed an all-negative collapse under unweighted BCE; the current runner therefore uses fold-train `pos_weight` during the BCE warm-up and records this in the protocol string.
 
 ### P2 - External protocol gate
 
@@ -73,10 +73,11 @@ Train a raw-signal Mamba-only comparator under the same frozen Chapman OOF proto
 
 ### Technical Design
 
-Create:
+Implemented:
 
 ```text
 scripts/revision/16_raw_mamba_baseline.py
+scripts/revision/17_paired_full_vs_raw_mamba.py
 ```
 
 Use `scripts/revision/14_resnet1d_cnn_baseline.py` as the template because it already implements:
@@ -99,7 +100,7 @@ ECGRambaV7Advanced(
 )
 ```
 
-The runner must not pass MiniRocket PCA features or HRV information into training. It should use zero tensors only if required by the forward signature, and the manifest must declare:
+The runner must not pass MiniRocket PCA features or HRV information into training. It uses zero tensors only to satisfy the forward signature while structurally disabling Rocket, HRV, and fusion modules. The manifest must declare:
 
 ```text
 feature_contract = raw_ecg_12lead_mamba_only
@@ -451,7 +452,7 @@ Write only if supported:
 Recommended order if new evidence is required:
 
 1. Freeze the current manuscript/rebuttal package and do not change claims while running new experiments.
-2. Implement Workstream A Raw Mamba fair comparator.
+2. Run Workstream A Raw Mamba fair comparator from Notebook 04 using the weighted-BCE runner.
 3. Rerun Notebook 04 and Notebook 07 to update baseline and final evidence matrix.
 4. Decide whether the added Raw Mamba result changes the rebuttal enough to include.
 5. If transfer claims are needed, implement Workstream B external protocol gate.
@@ -464,7 +465,7 @@ Recommended order if new evidence is required:
 
 | Workstream | Scripts to add/update | Notebooks to update | Final evidence update |
 |---|---|---|---|
-| Raw Mamba | add `16_raw_mamba_baseline.py`, add `17_paired_full_vs_raw_mamba.py` | Notebook 04 | `13_final_evidence_matrix.py`, task board, registry |
+| Raw Mamba | implemented `16_raw_mamba_baseline.py`, implemented `17_paired_full_vs_raw_mamba.py`; still needs successful artifacts | Notebook 04 | `13_final_evidence_matrix.py`, task board, registry |
 | External gate | add `18_external_protocol_gate.py`, update `03_generate_external_predictions.py` if needed | Notebook 02 | `13_final_evidence_matrix.py`, claim map |
 | Few-shot | add `19_fewshot_adaptation.py` | new optional notebook or Notebook 02 extension | `13_final_evidence_matrix.py` |
 | Representation | add `20_representation_probe.py`, minor model hook support | Notebook 06 | `13_final_evidence_matrix.py` |
@@ -473,6 +474,6 @@ Recommended order if new evidence is required:
 
 ## Current Recommendation
 
-For the current resubmission, do not open all deferred workstreams. The best next engineering task is Workstream A, Raw Mamba fair comparator, because it closes the clearest remaining baseline gap without changing external/few-shot/HRV assumptions.
+For the current resubmission, do not open all deferred workstreams. The best next engineering task remains completing Workstream A, Raw Mamba fair comparator artifacts, because it closes the clearest remaining baseline gap without changing external/few-shot/HRV assumptions.
 
 If time is limited, keep all deferred items documented and submit the current conservative manuscript package. The current response is scientifically defensible because it explicitly acknowledges the stronger ResNet1D/CNN baseline and removes unsupported claims.
