@@ -57,6 +57,8 @@ MANIFEST_PATH = MANIFEST_DIR / "raw_mamba_baseline_manifest.json"
 PER_CLASS_TABLE = TABLE_DIR / "table_raw_mamba_class_metrics.csv"
 FOLD_TABLE = TABLE_DIR / "table_raw_mamba_fold_summary.csv"
 FOLD_PREDICTION_DIR = PREDICTION_DIR / "folds"
+FOLD_CACHE_STATUS_JSON = METRIC_DIR / "raw_mamba_fold_cache_status.json"
+FOLD_CACHE_STATUS_TABLE = TABLE_DIR / "table_raw_mamba_fold_cache_status.csv"
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -110,6 +112,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--reuse-predictions", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
+    parser.add_argument(
+        "--only-folds",
+        default="",
+        help=(
+            "Comma-separated fold numbers to train/cache only, e.g. '1' or '2,3'. "
+            "Subset mode writes fold caches and exits before OOF aggregation/CI."
+        ),
+    )
     parser.add_argument("--save-checkpoints", action="store_true")
     parser.add_argument(
         "--checkpoint-dir",
@@ -156,6 +166,26 @@ def npz_scalar(data: np.lib.npyio.NpzFile, key: str, default=None):
         return default
     value = data[key]
     return value.item() if np.ndim(value) == 0 else value
+
+
+def parse_only_folds(value: str) -> set[int]:
+    text = str(value or "").strip()
+    if not text:
+        return set()
+    folds: set[int] = set()
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(f"--only-folds accepts comma-separated fold numbers, got {value!r}")
+        fold = int(token)
+        if fold < 1:
+            raise ValueError(f"Invalid fold in --only-folds: {fold}")
+        folds.add(fold)
+    if not folds:
+        raise ValueError(f"--only-folds did not contain any fold numbers: {value!r}")
+    return folds
 
 
 def set_seed(seed: int) -> None:
@@ -359,9 +389,87 @@ def save_fold_predictions(
         model_params_json=np.asarray(json.dumps(_json_safe(model_params), sort_keys=True)),
         epochs=np.asarray(int(args.epochs)),
         seed=np.asarray(int(args.seed)),
+        fold_seed=np.asarray(int(args.seed) + int(fold)),
         weights_kind=np.asarray("ema" if args.ema_decay > 0 else "raw"),
     )
     print(f"Wrote fold prediction cache: {path}", flush=True)
+
+
+def fold_cache_status_rows(
+    *,
+    folds: list[dict[str, np.ndarray]],
+    y: np.ndarray,
+    load_info: dict,
+    args: argparse.Namespace,
+    model_params: dict,
+    selected_folds: set[int],
+) -> list[dict]:
+    rows = []
+    for split in folds:
+        fold = int(split["fold"])
+        va_idx = np.asarray(split["va_idx"], dtype=np.int64)
+        path = fold_prediction_path(fold)
+        reusable = fold_prediction_matches(
+            path,
+            y=y,
+            val_indices=va_idx,
+            load_info=load_info,
+            args=args,
+            model_params=model_params,
+        )
+        rows.append(
+            {
+                "fold": fold,
+                "selected_in_this_run": bool(fold in selected_folds),
+                "cache_ready": bool(reusable is not None),
+                "path": str(path),
+                "validation_records": int(len(va_idx)),
+                "size_bytes": int(path.stat().st_size) if path.exists() else None,
+            }
+        )
+    return rows
+
+
+def write_fold_cache_status(
+    *,
+    folds: list[dict[str, np.ndarray]],
+    y: np.ndarray,
+    load_info: dict,
+    args: argparse.Namespace,
+    model_params: dict,
+    selected_folds: set[int],
+    fold_rows: list[dict],
+) -> dict:
+    rows = fold_cache_status_rows(
+        folds=folds,
+        y=y,
+        load_info=load_info,
+        args=args,
+        model_params=model_params,
+        selected_folds=selected_folds,
+    )
+    save_csv(FOLD_CACHE_STATUS_TABLE, rows)
+    ready_folds = [int(row["fold"]) for row in rows if row["cache_ready"]]
+    missing_folds = [int(row["fold"]) for row in rows if not row["cache_ready"]]
+    payload = {
+        "created_utc": _now_utc(),
+        "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "protocol": PROTOCOL,
+        "feature_contract": FEATURE_CONTRACT,
+        "selected_folds": sorted(int(x) for x in selected_folds),
+        "ready_folds": ready_folds,
+        "missing_folds": missing_folds,
+        "all_folds_ready": len(missing_folds) == 0,
+        "fold_cache_table": str(FOLD_CACHE_STATUS_TABLE),
+        "fold_rows": fold_rows,
+        "note": (
+            "Subset mode intentionally writes fold caches only. Run again without "
+            "--only-folds and with --reuse-predictions after all five folds are ready "
+            "to create canonical OOF predictions, summary, manifest, and paired evidence."
+        ),
+    }
+    save_json(FOLD_CACHE_STATUS_JSON, _json_safe(payload))
+    return payload
 
 
 def train_one_fold(
@@ -376,6 +484,8 @@ def train_one_fold(
     load_info: dict,
     model_params: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    fold_seed = int(args.seed) + int(fold)
+    set_seed(fold_seed)
     fold_path = fold_prediction_path(fold)
     if not args.force_rerun:
         reusable = fold_prediction_matches(
@@ -616,6 +726,7 @@ def train_one_fold(
         "validation_slices": int(len(val_record_ids)),
         "reused_fold_predictions": False,
         "final_epoch": int(args.epochs),
+        "fold_seed": int(fold_seed),
         "final_weights_kind": final_weights_kind,
         "epoch_rows_json": json.dumps(_json_safe(epoch_rows), sort_keys=True),
         **{f"final_{k}": v for k, v in final_metrics.items()},
@@ -877,6 +988,7 @@ def main() -> None:
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
         "seed": int(args.seed),
+        "fold_seed_formula": "seed + fold",
         "amp": bool(args.amp),
         "amp_dtype": str(args.amp_dtype),
         "allow_tf32": bool(args.allow_tf32),
@@ -906,7 +1018,22 @@ def main() -> None:
         "training_from_scratch": True,
     }
 
-    if args.reuse_predictions and not args.force_rerun:
+    selected_folds = parse_only_folds(args.only_folds)
+    available_folds = {int(split["fold"]) for split in folds}
+    invalid_folds = sorted(selected_folds - available_folds)
+    if invalid_folds:
+        raise ValueError(f"--only-folds contains fold(s) not present in frozen OOF: {invalid_folds}")
+    if selected_folds:
+        print(
+            "Subset fold-cache mode enabled. "
+            f"Selected folds: {sorted(selected_folds)}. "
+            "Canonical OOF aggregation/CI will be skipped in this run.",
+            flush=True,
+        )
+        if args.n_boot:
+            print("--n-boot is ignored in subset fold-cache mode.", flush=True)
+
+    if args.reuse_predictions and not args.force_rerun and not selected_folds:
         reusable = load_existing_prediction_npz(
             PREDICTION_PATH,
             y=y,
@@ -928,6 +1055,7 @@ def main() -> None:
         for fold in sorted(int(x) for x in np.unique(fold_id_out) if int(x) > 0):
             va_idx = np.where(fold_id_out == fold)[0]
             fold_metrics = multilabel_metrics(y[va_idx], y_prob[va_idx], threshold=args.threshold)
+            fold_seed = int(args.seed) + int(fold)
             fold_rows.append(
                 {
                     "fold": int(fold),
@@ -937,6 +1065,7 @@ def main() -> None:
                     "validation_slices": int(np.sum(slice_count[va_idx])),
                     "reused_fold_predictions": True,
                     "final_epoch": int(args.epochs),
+                    "fold_seed": int(fold_seed),
                     "final_weights_kind": "ema" if args.ema_decay > 0 else "raw",
                     **{f"final_{k}": v for k, v in fold_metrics.items()},
                 }
@@ -945,7 +1074,10 @@ def main() -> None:
         y_prob = np.zeros_like(y, dtype=np.float32)
         slice_count = np.zeros(len(y), dtype=np.int16)
         fold_id_out = np.zeros(len(y), dtype=np.int16)
-        for split in folds:
+        splits_to_run = [
+            split for split in folds if not selected_folds or int(split["fold"]) in selected_folds
+        ]
+        for split in splits_to_run:
             fold = int(split["fold"])
             tr_idx = np.asarray(split["tr_idx"], dtype=np.int64)
             va_idx = np.asarray(split["va_idx"], dtype=np.int64)
@@ -968,6 +1100,38 @@ def main() -> None:
             all_slice_start.append(slice_start)
             all_slice_fold_id.append(np.full(len(slice_record_id), fold, dtype=np.int16))
             fold_rows.append(fold_summary)
+
+        if selected_folds:
+            status_payload = write_fold_cache_status(
+                folds=folds,
+                y=y,
+                load_info=load_info,
+                args=args,
+                model_params=model_params,
+                selected_folds=selected_folds,
+                fold_rows=fold_rows,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": True,
+                        "mode": "fold_cache_only",
+                        "selected_folds": status_payload["selected_folds"],
+                        "ready_folds": status_payload["ready_folds"],
+                        "missing_folds": status_payload["missing_folds"],
+                        "all_folds_ready": status_payload["all_folds_ready"],
+                        "next_step": (
+                            "Publish the revision artifacts mirror now. After all five folds are ready, "
+                            "rerun without --only-folds and with --reuse-predictions to aggregate."
+                        ),
+                    },
+                    indent=2,
+                ),
+                flush=True,
+            )
+            print(f"Wrote: {FOLD_CACHE_STATUS_JSON}", flush=True)
+            print(f"Wrote: {FOLD_CACHE_STATUS_TABLE}", flush=True)
+            return
 
         if np.any(fold_id_out <= 0):
             raise RuntimeError("OOF fold_id coverage incomplete after Raw Mamba training.")
