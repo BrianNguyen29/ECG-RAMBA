@@ -389,12 +389,13 @@ def main() -> None:
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
-                "metric-specific paired deltas. If paired ResNet1D/CNN CIs favor ResNet, state "
-                "that ResNet is stronger for those in-domain metrics and narrow ECG-RAMBA claims "
-                "to supported operating-point, robustness, external-transfer, or efficiency evidence."
+                "metric-specific paired deltas. In-domain fair comparators show ResNet1D/CNN "
+                "and Raw Mamba are stronger on discrimination/F1 metrics; narrow ECG-RAMBA "
+                "claims to supported calibration tradeoffs, architecture analysis, and "
+                "documented limitations."
             ),
             "blocker": c01_blocker,
-            "source_claim_status": claim_by_id.get("C01", {}).get("status", ""),
+            "source_claim_status": c01_evidence_status,
         },
         {
             "claim_id": "C02",
@@ -425,9 +426,10 @@ def main() -> None:
                 "reports/revision/tables/table_paired_full_vs_raw_mamba.csv"
             ),
             "safe_wording": (
-                "Frozen OOF supports only metric-specific operating-point statements. Once ResNet "
-                "is included, avoid saying ECG-RAMBA has a general fixed-threshold or calibration "
-                "advantage unless the paired ResNet CI for that metric supports it."
+                "Frozen OOF supports only metric-specific operating-point statements. ECG-RAMBA "
+                "has calibration/error advantages over MiniRocket-only and Raw Mamba, but "
+                "ResNet1D/CNN is stronger on PR-AUC, ROC-AUC, F1, Brier, and ECE; do not "
+                "claim a general fixed-threshold or calibration advantage."
             ),
             "blocker": "",
             "source_claim_status": claim_by_id.get("C02", {}).get("status", ""),
@@ -448,8 +450,9 @@ def main() -> None:
                 "reports/revision/metrics/hrv_domain_classifier_summary.json"
             ),
             "safe_wording": (
-                "Report HRV-only as a feature baseline. If domain AUC is high, present HRV "
-                "as domain-sensitive and avoid domain-invariance wording."
+                "Report HRV-only as a feature baseline. The near-perfect HRV domain classifier "
+                "indicates strong domain sensitivity, so avoid domain-invariance wording. Do "
+                "not describe reserved HRV36 slots as implemented RMSSD/SDNN/LF-HF features."
             ),
             "blocker": "Current HRV36 schema still contains reserved zero slots and no full RMSSD/SDNN/LF-HF claim.",
             "source_claim_status": claim_by_id.get("C03", {}).get("status", ""),
@@ -458,11 +461,7 @@ def main() -> None:
             "claim_id": "C04",
             "claim_topic": "Morphology-rhythm separation",
             "evidence_status": "blocked_representation_probe_missing",
-            "key_numbers": (
-                f"Robustness rows={robustness_summary['n_rows']}; "
-                f"Full less-degraded metrics={robustness_summary['full_less_degraded_count']}; "
-                f"MiniRocket less-degraded metrics={robustness_summary['minirocket_less_degraded_count']}"
-            ),
+            "key_numbers": "No completed UMAP/probing/CKA representation artifact; representation separation remains unproven.",
             "evidence_paths": (
                 "reports/revision/metrics/robustness_summary.csv;"
                 "reports/revision/metrics/representation_evidence_status.json"
