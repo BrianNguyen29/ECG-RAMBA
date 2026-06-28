@@ -15,8 +15,8 @@ reports/revision/tables/table_final_safe_wording.csv
 
 The current manuscript/rebuttal package is internally consistent only if these restrictions are preserved:
 
-- Do not claim global or in-domain superiority for ECG-RAMBA. ResNet1D/CNN is stronger on frozen Chapman OOF PR-AUC, ROC-AUC, F1, Brier, and ECE.
-- Do not claim superiority over all fair baselines until the Raw Mamba fair comparator has completed successfully and Notebook 04/07 have been rerun. The runner is implemented, but manuscript-ready Raw Mamba artifacts are not yet present in the current evidence matrix.
+- Do not claim global or in-domain superiority for ECG-RAMBA. ResNet1D/CNN is stronger on frozen Chapman OOF PR-AUC, ROC-AUC, F1, Brier, and ECE; Raw Mamba is stronger on PR-AUC, ROC-AUC, and F1.
+- Do not claim superiority over all fair baselines. The Raw Mamba fair comparator has completed successfully and Notebook 04/07 have been rerun, but the resulting evidence still supports only comparator-specific, metric-specific statements.
 - Do not claim external or zero-shot superiority because PTB-XL, Georgia, and CPSC remain experimental.
 - Do not claim few-shot results because no few-shot adaptation package is complete.
 - Do not claim proven morphology-rhythm disentanglement because no representation probe, UMAP, CKA, or probing artifact is complete.
@@ -32,8 +32,8 @@ The current manuscript/rebuttal package is internally consistent only if these r
 | MiniRocket-only baseline | Complete | `scripts/revision/10_minirocket_only_baseline.py`, paired Full-vs-MiniRocket | Manuscript-ready, metric-specific |
 | HRV-only/domain | Complete with limitation | `scripts/revision/09_hrv_domain_analysis.py` | Manuscript-ready limitation |
 | Robustness vs MiniRocket | Complete with limitation | `scripts/revision/12_robustness_stress.py`, 6 stresses x 5 metrics | Manuscript-ready, metric-specific |
-| Raw Mamba fair comparator | Implemented, pending successful run/artifacts | `scripts/revision/16_raw_mamba_baseline.py`, `scripts/revision/17_paired_full_vs_raw_mamba.py`, Notebook 04 runner cell | Deferred until artifacts pass |
-| External PTB-XL/Georgia/CPSC | Scaffolded but experimental | `scripts/revision/03_generate_external_predictions.py`, fold PCA builder | Deferred |
+| Raw Mamba fair comparator | Complete | `scripts/revision/16_raw_mamba_baseline.py`, `scripts/revision/17_paired_full_vs_raw_mamba.py`, paired Full-vs-Raw-Mamba artifacts | Manuscript-ready, metric-specific |
+| External PTB-XL/Georgia/CPSC | Scaffolded with gate runner, but not yet manuscript-ready until dataset gates pass | `scripts/revision/03_generate_external_predictions.py`, `scripts/revision/18_external_protocol_gate.py`, fold PCA builder | Deferred unless gate passes |
 | Few-shot adaptation | Missing | no runner/artifacts | Deferred |
 | Representation probe | Missing | Notebook 06 records blocked status | Deferred |
 | Full HRV feature set | Not implemented in current checkpoints | HRV36 schema audit | Deferred/retrain-only |
@@ -41,13 +41,13 @@ The current manuscript/rebuttal package is internally consistent only if these r
 
 ## Recommended Priority
 
-### P1 - Raw Mamba fair comparator
+### Completed - Raw Mamba fair comparator
 
-This is the most defensible next experiment if the goal is to reduce fair-baseline criticism. It will not restore global superiority because ResNet1D/CNN already outperforms ECG-RAMBA in-domain, but it can close the last baseline-row gap in `baseline_summary.csv`. The first implementation exposed an all-negative collapse under unweighted BCE; the current runner therefore uses fold-train `pos_weight` during the BCE warm-up and records this in the protocol string.
+Raw Mamba is now complete and closes the previous fair-baseline-row gap. It does not restore global superiority: Raw Mamba is stronger than Full ECG-RAMBA on PR-AUC, ROC-AUC, and F1, while Full ECG-RAMBA has lower Brier score and ECE. Use only comparator-specific, metric-specific wording.
 
 ### P2 - External protocol gate
 
-Run only if a transfer/generalization claim is required. External evidence needs dataset-specific label/window/PCA checks before it can be cited. Until then it must remain experimental.
+Run only if a transfer/generalization claim is required. The gate runner now exists, but external evidence still needs dataset-specific label/window/PCA checks before it can be cited. Until a dataset passes the gate, it must remain experimental.
 
 ### P2 - Representation probe
 
@@ -65,7 +65,7 @@ Do not open this for the current rebuttal unless the paper must make HRV-feature
 
 Do not pursue as a blanket claim. If needed, extend robustness to ResNet1D/CNN and Raw Mamba, then report only metric-specific conclusions.
 
-## Workstream A: Raw Mamba Fair Comparator
+## Workstream A: Raw Mamba Fair Comparator - Completed
 
 ### Goal
 
@@ -165,7 +165,7 @@ T4 is not recommended because Mamba training is GPU-bound and Colab timeout risk
 
 ### Claim Gate
 
-If complete, this can support:
+The completed result supports:
 
 > Raw Mamba was evaluated as an additional fair comparator under the same frozen OOF protocol.
 
@@ -173,7 +173,7 @@ It cannot support:
 
 > ECG-RAMBA is globally superior.
 
-If Raw Mamba is worse than ECG-RAMBA, it supports the added value of the structured MiniRocket/HRV/fusion streams over raw Mamba. If Raw Mamba is better, the manuscript must state that the structured ECG-RAMBA design does not improve in-domain performance over this comparator.
+Raw Mamba is stronger than Full ECG-RAMBA on PR-AUC, ROC-AUC, and F1, while Full ECG-RAMBA has lower Brier score and ECE. The manuscript must therefore report a comparator-specific tradeoff and must not state that the structured ECG-RAMBA design improves in-domain performance over Raw Mamba.
 
 ## Workstream B: External PTB-XL / Georgia / CPSC Protocol Gate
 
@@ -188,6 +188,7 @@ Current scaffold:
 ```text
 scripts/revision/03_generate_external_predictions.py
 scripts/revision/08_build_fold_pca.py
+scripts/revision/18_external_protocol_gate.py
 notebooks/02_predictions_and_external_eval.ipynb
 ```
 
@@ -201,11 +202,19 @@ The exporter already includes important safeguards:
 
 ### Required Gate Before Claiming
 
-Add an external protocol gate script:
+Run the external protocol gate script after external predictions are generated:
 
 ```text
 scripts/revision/18_external_protocol_gate.py
 ```
+
+Operational controls now implemented:
+
+- Notebook 02 writes the gate run log to `reports/revision/logs/external_protocol_gate.log`.
+- The gate writes a per-dataset `gate_cache_key` from source artifact SHA256 values, OOF manifest SHA256, metric parameters, and gate schema version.
+- `--reuse-existing` reuses prior gate outputs when the cache key and required output artifacts match, avoiding repeated bootstrap work.
+- The summary CSV exposes `reused_existing`, `gate_cache_key`, source prediction SHA256, source slice-prediction SHA256, and gate artifact paths for monitoring.
+- Gate outputs are ordinary `reports/revision` artifacts and should be published/restored through `scripts/revision/artifact_mirror.py` after a successful run.
 
 The gate should validate:
 
@@ -226,9 +235,10 @@ For each dataset:
 
 ```text
 reports/revision/metrics/external_<dataset>_protocol_gate.json
+reports/revision/metrics/external_protocol_gate_summary.csv
 reports/revision/tables/table_external_<dataset>_label_mapping.csv
 reports/revision/tables/table_external_<dataset>_metrics.csv
-reports/revision/manifests/external_<dataset>_manifest.json
+reports/revision/manifests/external_<dataset>_protocol_gate_manifest.json
 ```
 
 ### Claim Gate
@@ -449,24 +459,21 @@ Write only if supported:
 
 ## Execution Order
 
-Recommended order if new evidence is required:
+Recommended order if new evidence is required after the current manuscript/rebuttal package:
 
-1. Freeze the current manuscript/rebuttal package and do not change claims while running new experiments.
-2. Run Workstream A Raw Mamba fair comparator from Notebook 04 using the weighted-BCE runner.
-3. Rerun Notebook 04 and Notebook 07 to update baseline and final evidence matrix.
-4. Decide whether the added Raw Mamba result changes the rebuttal enough to include.
-5. If transfer claims are needed, implement Workstream B external protocol gate.
-6. Only after Workstream B, consider Workstream C few-shot.
-7. If architecture interpretation is challenged, implement Workstream D representation probe.
-8. Avoid Workstream E unless full HRV claims are unavoidable.
-9. Avoid Workstream F unless a reviewer explicitly asks for general robustness against CNN/ResNet.
+1. Keep the current manuscript/rebuttal wording fixed to the regenerated final evidence tables.
+2. If transfer claims are needed, implement Workstream B external protocol gate.
+3. Only after Workstream B, consider Workstream C few-shot.
+4. If architecture interpretation is challenged, implement Workstream D representation probe.
+5. Avoid Workstream E unless full HRV claims are unavoidable.
+6. Avoid Workstream F unless a reviewer explicitly asks for general robustness against CNN/ResNet.
 
 ## Notebook/Script Update Map
 
 | Workstream | Scripts to add/update | Notebooks to update | Final evidence update |
 |---|---|---|---|
-| Raw Mamba | implemented `16_raw_mamba_baseline.py`, implemented `17_paired_full_vs_raw_mamba.py`; still needs successful artifacts | Notebook 04 | `13_final_evidence_matrix.py`, task board, registry |
-| External gate | add `18_external_protocol_gate.py`, update `03_generate_external_predictions.py` if needed | Notebook 02 | `13_final_evidence_matrix.py`, claim map |
+| Raw Mamba | completed `16_raw_mamba_baseline.py` and `17_paired_full_vs_raw_mamba.py`; included in regenerated final evidence tables | Notebook 04 | `13_final_evidence_matrix.py`, task board, registry |
+| External gate | implemented `18_external_protocol_gate.py`; update `03_generate_external_predictions.py` only if a gate issue reveals an exporter defect | Notebook 02 | `13_final_evidence_matrix.py`, claim map |
 | Few-shot | add `19_fewshot_adaptation.py` | new optional notebook or Notebook 02 extension | `13_final_evidence_matrix.py` |
 | Representation | add `20_representation_probe.py`, minor model hook support | Notebook 06 | `13_final_evidence_matrix.py` |
 | Full HRV | update feature extraction/model config/training | Notebook 00/02a/03/04/05/07 | new evidence protocol, not current final EMA |
@@ -474,6 +481,6 @@ Recommended order if new evidence is required:
 
 ## Current Recommendation
 
-For the current resubmission, do not open all deferred workstreams. The best next engineering task remains completing Workstream A, Raw Mamba fair comparator artifacts, because it closes the clearest remaining baseline gap without changing external/few-shot/HRV assumptions.
+For the current resubmission, do not open all remaining deferred workstreams unless a reviewer explicitly requires additional evidence. Workstream A is complete and narrows the claims further: Raw Mamba is stronger on discrimination/F1 metrics, while ECG-RAMBA has lower Brier/ECE.
 
-If time is limited, keep all deferred items documented and submit the current conservative manuscript package. The current response is scientifically defensible because it explicitly acknowledges the stronger ResNet1D/CNN baseline and removes unsupported claims.
+The current response is scientifically defensible because it explicitly acknowledges the stronger ResNet1D/CNN baseline, reports the Raw Mamba tradeoff, and removes unsupported global-superiority, external-transfer, full-HRV, and disentanglement claims.

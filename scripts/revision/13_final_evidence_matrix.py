@@ -267,6 +267,7 @@ def main() -> None:
     }
     optional_paths = {
         "paired_raw_mamba": METRIC_DIR / "paired_full_vs_raw_mamba_comparison.json",
+        "external_protocol_gate_summary": METRIC_DIR / "external_protocol_gate_summary.csv",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
@@ -283,6 +284,10 @@ def main() -> None:
     paired_minirocket = read_json(paths["paired_minirocket"], required=False)
     paired_resnet = read_json(paths["paired_resnet"], required=False)
     paired_raw_mamba = read_json(optional_paths["paired_raw_mamba"], required=False)
+    external_gate_rows = read_csv_rows(
+        optional_paths["external_protocol_gate_summary"],
+        required=False,
+    )
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
@@ -306,6 +311,25 @@ def main() -> None:
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
+    external_gate_passed = [
+        row.get("dataset", "")
+        for row in external_gate_rows
+        if str(row.get("protocol_gate_passed", "")).lower() in {"true", "1", "yes"}
+    ]
+    external_gate_blocked = [
+        row.get("dataset", "")
+        for row in external_gate_rows
+        if str(row.get("protocol_gate_passed", "")).lower() not in {"true", "1", "yes"}
+    ]
+    external_gate_status = (
+        "not_run"
+        if not external_gate_rows
+        else (
+            "all_requested_passed"
+            if external_gate_passed and not external_gate_blocked
+            else "partial_or_blocked"
+        )
+    )
 
     complete_fair_statuses = {
         "complete_frozen_oof",
@@ -500,18 +524,26 @@ def main() -> None:
                 f"A0 audit_complete={a0.get('audit_complete')}; "
                 f"blockers={a0.get('blocker_count')}; "
                 f"calibration n={calibration.get('shape', {}).get('y_true', [''])[0] if isinstance(calibration.get('shape'), dict) else ''}; "
-                f"micro ECE={fmt(calibration_micro.get('ece_micro'))}"
+                f"micro ECE={fmt(calibration_micro.get('ece_micro'))}; "
+                f"external_gate_status={external_gate_status}; "
+                f"external_gate_passed={','.join(external_gate_passed) if external_gate_passed else 'none'}"
             ),
             "evidence_paths": (
                 "reports/revision/manifests/oof_final_ema_freeze_manifest.json;"
                 "reports/revision/a0_resolution_status.json;"
-                "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json"
+                "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
+                "reports/revision/metrics/external_protocol_gate_summary.csv"
             ),
             "safe_wording": (
-                "Claim protocol-faithful frozen Chapman OOF evaluation. Keep PTB/Georgia/CPSC outputs "
-                "experimental unless their dataset-specific protocols are separately completed."
+                "Claim protocol-faithful frozen Chapman OOF evaluation. External datasets may be "
+                "described only as protocol-gated mapped-task evaluations for datasets that pass "
+                "scripts/revision/18_external_protocol_gate.py; otherwise keep PTB/Georgia/CPSC "
+                "outputs experimental. Do not claim external zero-shot superiority."
             ),
-            "blocker": "Deferred blockers remain documented; protocol_ready is distinct from audit_complete.",
+            "blocker": (
+                "Deferred blockers remain documented; protocol_ready is distinct from audit_complete. "
+                f"External gate status: {external_gate_status}."
+            ),
             "source_claim_status": claim_by_id.get("C06", {}).get("status", ""),
         },
     ]
@@ -560,6 +592,10 @@ def main() -> None:
                 "Use only metric-specific robustness claims supported by paired degradation CIs."
             ),
             "external": "Keep external dataset outputs experimental unless protocol-specific checks are complete.",
+            "external_protocol_gate": (
+                "Use only protocol-gated mapped-task wording for external datasets that pass "
+                "the external protocol gate; this still does not support zero-shot superiority."
+            ),
             "hrv": "Do not describe reserved HRV slots as implemented RMSSD/SDNN/LF-HF features.",
             "raw_mamba": (
                 "Use Raw Mamba only as a comparator-specific fair-baseline result. "
