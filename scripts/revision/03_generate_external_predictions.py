@@ -450,7 +450,23 @@ def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.n
             if skipped <= 10:
                 print(f"Skipping {row['record_id']}: {exc}")
     if not signals:
-        raise RuntimeError(f"No usable {dataset} records were loaded")
+        detail = ""
+        if dataset == "georgia":
+            unmapped = metadata_summary.get("unmapped_snomed_codes", {})
+            top_unmapped = sorted(
+                unmapped.items(),
+                key=lambda item: (-int(item[1]), str(item[0])),
+            )[:12]
+            detail = (
+                " Georgia headers were readable, but every record was skipped because no "
+                "diagnosis code mapped to the frozen 27-class Chapman/SNOMED taxonomy. "
+                f"headers={metadata_summary.get('metadata_records', len(metadata))}; "
+                f"skipped_without_mapped_label={metadata_summary.get('skipped_records_without_mapped_label')}; "
+                f"top_unmapped_codes={top_unmapped}. "
+                "Do not coerce these records to negative labels; leave Georgia deferred or add a "
+                "reviewed label mapping before using it."
+            )
+        raise RuntimeError(f"No usable {dataset} records were loaded.{detail}")
     return (
         np.asarray(signals, dtype=np.float32),
         np.asarray(labels, dtype=np.float32),
