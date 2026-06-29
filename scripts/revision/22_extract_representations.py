@@ -121,6 +121,25 @@ def project_relative(path: Path) -> str:
         return path.as_posix()
 
 
+def validate_mamba_runtime_for_extraction() -> None:
+    missing = [
+        module
+        for module in ("mamba_ssm", "causal_conv1d")
+        if importlib.util.find_spec(module) is None
+    ]
+    if not missing:
+        return
+    raise ImportError(
+        "Representation extraction requires the ECG-RAMBA Mamba runtime before "
+        "loading data or fitting fold PCA. Missing modules: "
+        + ", ".join(missing)
+        + ". In Colab, run Notebook 00 bootstrap or the Notebook 02 model "
+        "dependency/Mamba install cell in the same GPU runtime, restart only if "
+        "that installer asks you to, then rerun Notebook 06 from Setup. Existing "
+        "fold Hydra/PCA caches are safe to reuse."
+    )
+
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -618,6 +637,7 @@ def main() -> None:
     print(f"only_folds={sorted(only_folds) if only_folds else 'all'}", flush=True)
     print(f"batch_size={args.batch_size} num_workers={args.num_workers}", flush=True)
     checkpoint_contracts = load_checkpoint_contracts(args.oof_run_manifest, args.checkpoint_kind)
+    validate_mamba_runtime_for_extraction()
 
     from src.features import generate_hrv_cache, generate_raw_rocket_cache
 
