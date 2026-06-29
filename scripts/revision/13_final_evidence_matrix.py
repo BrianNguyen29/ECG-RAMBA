@@ -49,6 +49,7 @@ REQUIRED_ROBUSTNESS_METRICS = {
     "brier_macro",
     "ece_macro",
 }
+EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 
 
 def parse_args() -> argparse.Namespace:
@@ -311,29 +312,39 @@ def main() -> None:
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
-    external_gate_passed = [
-        row.get("dataset", "")
+    external_gate_by_dataset = {
+        str(row.get("dataset", "")).strip().lower(): row
         for row in external_gate_rows
+        if str(row.get("dataset", "")).strip()
+    }
+    external_gate_passed = sorted(
+        dataset
+        for dataset, row in external_gate_by_dataset.items()
         if str(row.get("protocol_gate_passed", "")).lower() in {"true", "1", "yes"}
-    ]
-    external_gate_blocked = [
-        row.get("dataset", "")
-        for row in external_gate_rows
-        if str(row.get("protocol_gate_passed", "")).lower() not in {"true", "1", "yes"}
-    ]
-    external_gate_status = (
-        "not_run"
-        if not external_gate_rows
-        else (
-            "all_requested_passed"
-            if external_gate_passed and not external_gate_blocked
-            else "partial_or_blocked"
-        )
     )
-    if external_gate_status == "all_requested_passed":
-        c06_evidence_status = "oof_supported_external_protocol_gated_for_passed_datasets"
-    elif external_gate_status == "partial_or_blocked":
-        c06_evidence_status = "oof_supported_external_partial_or_blocked"
+    external_gate_blocked = sorted(
+        dataset
+        for dataset, row in external_gate_by_dataset.items()
+        if str(row.get("protocol_gate_passed", "")).lower() not in {"true", "1", "yes"}
+    )
+    external_gate_deferred = [
+        dataset for dataset in EXPECTED_EXTERNAL_DATASETS if dataset not in external_gate_by_dataset
+    ]
+    if not external_gate_rows:
+        external_gate_status = "not_run_all_external_deferred"
+    elif external_gate_passed and not external_gate_blocked and not external_gate_deferred:
+        external_gate_status = "all_expected_passed"
+    elif external_gate_passed:
+        external_gate_status = "partial_pass_with_deferred_or_blocked_external"
+    else:
+        external_gate_status = "blocked_or_deferred"
+
+    if external_gate_status == "all_expected_passed":
+        c06_evidence_status = "oof_supported_external_protocol_gated_all_expected"
+    elif external_gate_status == "partial_pass_with_deferred_or_blocked_external":
+        c06_evidence_status = "oof_supported_external_protocol_gated_partial_with_deferred"
+    elif external_gate_status == "blocked_or_deferred":
+        c06_evidence_status = "oof_supported_external_blocked_or_deferred"
     else:
         c06_evidence_status = "oof_supported_external_not_run_or_deferred"
 
@@ -532,7 +543,9 @@ def main() -> None:
                 f"calibration n={calibration.get('shape', {}).get('y_true', [''])[0] if isinstance(calibration.get('shape'), dict) else ''}; "
                 f"micro ECE={fmt(calibration_micro.get('ece_micro'))}; "
                 f"external_gate_status={external_gate_status}; "
-                f"external_gate_passed={','.join(external_gate_passed) if external_gate_passed else 'none'}"
+                f"external_gate_passed={','.join(external_gate_passed) if external_gate_passed else 'none'}; "
+                f"external_gate_blocked={','.join(external_gate_blocked) if external_gate_blocked else 'none'}; "
+                f"external_gate_deferred={','.join(external_gate_deferred) if external_gate_deferred else 'none'}"
             ),
             "evidence_paths": (
                 "reports/revision/manifests/oof_final_ema_freeze_manifest.json;"
@@ -541,14 +554,15 @@ def main() -> None:
                 "reports/revision/metrics/external_protocol_gate_summary.csv"
             ),
             "safe_wording": (
-                "Claim protocol-faithful frozen Chapman OOF evaluation. External datasets may be "
-                "described only as protocol-gated mapped-task evaluations for datasets that pass "
-                "scripts/revision/18_external_protocol_gate.py; otherwise keep PTB/Georgia/CPSC "
-                "outputs experimental. Do not claim external zero-shot superiority."
+                "Claim protocol-faithful frozen Chapman OOF evaluation. PTB-XL may be described "
+                "only as a protocol-gated mapped-task external evaluation when its gate passes. "
+                "Georgia and CPSC2021 remain deferred unless their dataset-specific mapping and "
+                "annotation gates pass. Do not claim external zero-shot superiority."
             ),
             "blocker": (
                 "Deferred blockers remain documented; protocol_ready is distinct from audit_complete. "
-                f"External gate status: {external_gate_status}."
+                f"External gate status: {external_gate_status}; "
+                f"deferred external datasets: {','.join(external_gate_deferred) if external_gate_deferred else 'none'}."
             ),
             "source_claim_status": claim_by_id.get("C06", {}).get("status", ""),
         },
@@ -597,7 +611,10 @@ def main() -> None:
             "robustness": (
                 "Use only metric-specific robustness claims supported by paired degradation CIs."
             ),
-            "external": "Keep external dataset outputs experimental unless protocol-specific checks are complete.",
+            "external": (
+                "Use PTB-XL only as a protocol-gated mapped-task external evaluation when its gate passes. "
+                "Keep Georgia/CPSC2021 deferred unless their dataset-specific protocol gates pass."
+            ),
             "external_protocol_gate": (
                 "Use only protocol-gated mapped-task wording for external datasets that pass "
                 "the external protocol gate; this still does not support zero-shot superiority."
@@ -610,6 +627,13 @@ def main() -> None:
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
         "optional_inputs": {name: artifact(path) for name, path in optional_paths.items()},
+        "external_gate_summary": {
+            "expected_datasets": list(EXPECTED_EXTERNAL_DATASETS),
+            "status": external_gate_status,
+            "passed": external_gate_passed,
+            "blocked": external_gate_blocked,
+            "deferred": external_gate_deferred,
+        },
         "robustness_summary": robustness_summary,
         "task_status": {
             key: {
