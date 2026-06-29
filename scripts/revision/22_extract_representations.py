@@ -74,6 +74,12 @@ def parse_args() -> argparse.Namespace:
         default=MANIFEST_DIR / "oof_final_ema_freeze_manifest.json",
     )
     parser.add_argument(
+        "--oof-run-manifest",
+        type=Path,
+        default=MANIFEST_DIR / "oof_final_ema_prediction_run_manifest.json",
+        help="Prediction run manifest containing exact checkpoint paths and SHA256 values.",
+    )
+    parser.add_argument(
         "--out-embedding",
         type=Path,
         default=PREDICTION_DIR / "representation_embeddings_final_ema.npz",
@@ -205,6 +211,108 @@ def load_oof_contract(path: Path, freeze_manifest: Path, limit_records: int) -> 
         "fold_id": fold_id,
         "class_names": class_names,
     }
+
+
+def load_checkpoint_contracts(run_manifest_path: Path, checkpoint_kind: str) -> dict[int, dict[str, Any]]:
+    path = resolve(run_manifest_path)
+    if not path.exists():
+        print(
+            f"WARNING: OOF run manifest not found: {path}. "
+            "Falling back to canonical checkpoint path lookup.",
+            flush=True,
+        )
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    checkpoint_rows = payload.get("inputs", {}).get("checkpoints", [])
+    contracts: dict[int, dict[str, Any]] = {}
+    for row in checkpoint_rows:
+        fold = int(row.get("fold", -1))
+        row_path = Path(str(row.get("path", "")))
+        if fold <= 0 or not row_path.name.endswith(f"_{checkpoint_kind}.pt"):
+            continue
+        contracts[fold] = row
+    if contracts:
+        print(
+            f"Loaded checkpoint contract from OOF run manifest: {path} | folds={sorted(contracts)}",
+            flush=True,
+        )
+    else:
+        print(
+            f"WARNING: OOF run manifest has no {checkpoint_kind} checkpoint rows: {path}",
+            flush=True,
+        )
+    return contracts
+
+
+def resolve_checkpoint_for_fold(
+    *,
+    fold_num: int,
+    checkpoint_kind: str,
+    checkpoint_contracts: dict[int, dict[str, Any]],
+) -> tuple[Path, str | None]:
+    contract = checkpoint_contracts.get(fold_num)
+    candidates: list[Path] = []
+    expected_sha = None
+    if contract:
+        expected_sha = str(contract.get("sha256") or "")
+        manifest_path = Path(str(contract.get("path", "")))
+        if str(manifest_path):
+            candidates.append(manifest_path)
+
+            # Support local clones whose Drive root differs from the original
+            # Colab absolute path recorded in the manifest.
+            marker = "/ECG-Ramba/"
+            manifest_posix = manifest_path.as_posix()
+            if marker in manifest_posix:
+                relative_to_drive = manifest_posix.split(marker, 1)[1]
+                drive_root = Path(os.environ.get("ECG_RAMBA_DRIVE_ROOT", ""))
+                if str(drive_root):
+                    candidates.append(drive_root / relative_to_drive)
+                candidates.append(PROJECT_ROOT.parent / relative_to_drive)
+
+    try:
+        candidates.append(gen.checkpoint_path(fold_num, checkpoint_kind, allow_fallback=False))
+    except FileNotFoundError:
+        pass
+
+    # Common retraining output location used by Notebook 02a.
+    drive_root = Path(os.environ.get("ECG_RAMBA_DRIVE_ROOT", ""))
+    for root in [
+        drive_root / "model_runs" / "ema_protocol_e20_v2" if str(drive_root) else None,
+        PROJECT_ROOT.parent / "model_runs" / "ema_protocol_e20_v2",
+        PROJECT_ROOT / "model_runs" / "ema_protocol_e20_v2",
+        Path(PATHS["model_dir"]),
+    ]:
+        if root is not None:
+            candidates.append(root / f"fold{fold_num}_{checkpoint_kind}.pt")
+
+    seen: set[str] = set()
+    checked: list[str] = []
+    for candidate in candidates:
+        if not candidate or not str(candidate):
+            continue
+        candidate = candidate.expanduser()
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        checked.append(key)
+        if not candidate.exists():
+            continue
+        actual_sha = sha256_file(candidate)
+        if expected_sha and actual_sha != expected_sha:
+            raise RuntimeError(
+                f"Checkpoint SHA mismatch for fold {fold_num}: {candidate} "
+                f"expected={expected_sha} actual={actual_sha}"
+            )
+        return candidate, actual_sha
+
+    raise FileNotFoundError(
+        f"Missing exact checkpoint for fold {fold_num} ({checkpoint_kind}). "
+        "Checked paths: " + "; ".join(checked) + ". "
+        "Restore/copy the model_runs/ema_protocol_e20_v2 checkpoints to Drive, "
+        "or rerun Notebook 02a retraining before representation extraction."
+    )
 
 
 def fold_embedding_cache_path(
@@ -506,8 +614,10 @@ def main() -> None:
     print("=" * 80, flush=True)
     print(f"checkpoint_kind={args.checkpoint_kind}", flush=True)
     print(f"oof_predictions={resolve(args.oof_predictions)} sha256={oof['sha256']}", flush=True)
+    print(f"oof_run_manifest={resolve(args.oof_run_manifest)}", flush=True)
     print(f"only_folds={sorted(only_folds) if only_folds else 'all'}", flush=True)
     print(f"batch_size={args.batch_size} num_workers={args.num_workers}", flush=True)
+    checkpoint_contracts = load_checkpoint_contracts(args.oof_run_manifest, args.checkpoint_kind)
 
     from src.features import generate_hrv_cache, generate_raw_rocket_cache
 
@@ -546,8 +656,13 @@ def main() -> None:
         fold_idx = int(fold["fold_num"])
         tr_idx = fold["tr_idx"]
         va_idx = fold["va_idx"]
-        checkpoint_file = gen.checkpoint_path(fold_idx, args.checkpoint_kind, allow_fallback=False)
-        checkpoint_sha = sha256_file(checkpoint_file)
+        checkpoint_file, checkpoint_sha = resolve_checkpoint_for_fold(
+            fold_num=fold_idx,
+            checkpoint_kind=args.checkpoint_kind,
+            checkpoint_contracts=checkpoint_contracts,
+        )
+        if checkpoint_sha is None:
+            checkpoint_sha = sha256_file(checkpoint_file)
         checkpoint_payload, checkpoint_meta = gen.load_checkpoint_payload(checkpoint_file, args.checkpoint_kind)
         source_config_hash = checkpoint_meta["source_config_hash"]
         if args.limit_records == 0 and checkpoint_meta["dataset_record_order_fingerprint"] != dataset_record_fingerprint:
