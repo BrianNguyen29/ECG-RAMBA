@@ -340,6 +340,9 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
     signals, labels, record_ids = [], [], []
     skipped_annotation = 0
     skipped_signal = 0
+    signal_skip_examples = []
+    annotation_skip_examples = []
+    preprocessing_skip_examples = []
     transition_windows = 0
     positive_windows = 0
     missing_leads = []
@@ -350,6 +353,8 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             raw, missing = align_leads(raw, list(record.sig_name) if record.sig_name else None)
         except Exception as exc:
             skipped_signal += 1
+            if len(signal_skip_examples) < 10:
+                signal_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping signal {row['record_id']}: {exc}")
             continue
@@ -358,6 +363,8 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             intervals = cpsc_af_intervals(row["record_path"], raw.shape[-1])
         except Exception as exc:
             skipped_annotation += 1
+            if len(annotation_skip_examples) < 10:
+                annotation_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping annotation {row['record_id']}: {exc}")
             continue
@@ -403,10 +410,23 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             positive_windows += record_positive_windows
         except Exception as exc:
             skipped_signal += 1
+            if len(preprocessing_skip_examples) < 10:
+                preprocessing_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping preprocessing {row['record_id']}: {exc}")
     if not signals:
-        raise RuntimeError("No usable CPSC2021 annotation-aligned windows were loaded")
+        raise RuntimeError(
+            "No usable CPSC2021 annotation-aligned windows were loaded. "
+            f"headers={len(metadata)}; "
+            f"skipped_signal_records={skipped_signal}; "
+            f"skipped_annotation_records={skipped_annotation}; "
+            f"signal_skip_examples={signal_skip_examples}; "
+            f"annotation_skip_examples={annotation_skip_examples}; "
+            f"preprocessing_skip_examples={preprocessing_skip_examples}. "
+            "CPSC2021 manuscript-ready evaluation requires WFDB-readable signals plus "
+            "annotation files with recognized AF/AFL/normal rhythm boundaries; otherwise "
+            "leave CPSC2021 deferred."
+        )
     return (
         np.asarray(signals, dtype=np.float32),
         np.asarray(labels, dtype=np.float32),
