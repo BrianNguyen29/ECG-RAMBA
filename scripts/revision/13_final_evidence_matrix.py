@@ -330,6 +330,12 @@ def main() -> None:
             else "partial_or_blocked"
         )
     )
+    if external_gate_status == "all_requested_passed":
+        c06_evidence_status = "oof_supported_external_protocol_gated_for_passed_datasets"
+    elif external_gate_status == "partial_or_blocked":
+        c06_evidence_status = "oof_supported_external_partial_or_blocked"
+    else:
+        c06_evidence_status = "oof_supported_external_not_run_or_deferred"
 
     complete_fair_statuses = {
         "complete_frozen_oof",
@@ -519,7 +525,7 @@ def main() -> None:
         {
             "claim_id": "C06",
             "claim_topic": "Protocol-faithful OOF evaluation",
-            "evidence_status": "oof_supported_external_experimental",
+            "evidence_status": c06_evidence_status,
             "key_numbers": (
                 f"A0 audit_complete={a0.get('audit_complete')}; "
                 f"blockers={a0.get('blocker_count')}; "
