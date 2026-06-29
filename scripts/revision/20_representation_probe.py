@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import warnings
 from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
@@ -48,7 +49,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL = "representation_probe_fold_safe_v1"
+PROTOCOL = "representation_probe_fold_safe_v2_maxiter_trace"
 VIEW_KEYS = {
     "morphology": ("morphology_embedding", "morphology", "rocket_embedding"),
     "rhythm": ("rhythm_embedding", "rhythm", "hrv_embedding"),
@@ -66,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rhythm-labels", default=DEFAULT_RHYTHM_LABELS)
     parser.add_argument("--max-cka-records", type=int, default=6000)
     parser.add_argument("--max-plot-records", type=int, default=3000)
+    parser.add_argument("--probe-max-iter", type=int, default=5000)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
@@ -188,7 +190,9 @@ def probe_one_view(
     fold_id: np.ndarray,
     threshold: float,
     seed: int,
-) -> dict[str, float]:
+    max_iter: int,
+) -> dict[str, Any]:
+    from sklearn.exceptions import ConvergenceWarning
     from sklearn.linear_model import LogisticRegression
     from sklearn.multiclass import OneVsRestClassifier
     from sklearn.pipeline import make_pipeline
@@ -199,6 +203,9 @@ def probe_one_view(
         return {"status": "blocked_no_binary_labels"}
     yv = y[:, valid_cols]
     pred = np.full(yv.shape, np.nan, dtype=np.float32)
+    convergence_warning_count = 0
+    convergence_limited_estimators = 0
+    solver_iter_max = 0
     for fold in sorted(np.unique(fold_id)):
         train = fold_id != fold
         test = fold_id == fold
@@ -213,12 +220,25 @@ def probe_one_view(
                 LogisticRegression(
                     solver="lbfgs",
                     class_weight="balanced",
-                    max_iter=1000,
+                    max_iter=max_iter,
                     random_state=seed,
                 )
             ),
         )
-        model.fit(x[train], yv[train][:, usable_cols])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ConvergenceWarning)
+            model.fit(x[train], yv[train][:, usable_cols])
+        convergence_warning_count += sum(
+            1 for warning in caught if issubclass(warning.category, ConvergenceWarning)
+        )
+        classifier = model.named_steps["onevsrestclassifier"]
+        for estimator in getattr(classifier, "estimators_", []):
+            n_iter = getattr(estimator, "n_iter_", np.asarray([], dtype=np.int32))
+            if len(n_iter):
+                estimator_iter = int(np.max(n_iter))
+                solver_iter_max = max(solver_iter_max, estimator_iter)
+                if estimator_iter >= max_iter:
+                    convergence_limited_estimators += 1
         fold_prob = np.zeros((int(np.sum(test)), yv.shape[1]), dtype=np.float32)
         fold_prob[:] = np.mean(yv[train], axis=0, keepdims=True)
         predicted = model.predict_proba(x[test])
@@ -234,6 +254,10 @@ def probe_one_view(
     metrics["macro_roc_auc"] = macro_roc_auc(yv[covered], pred[covered])
     metrics["n_labels_evaluated"] = int(len(valid_cols))
     metrics["n_records_evaluated"] = int(np.sum(covered))
+    metrics["probe_max_iter"] = int(max_iter)
+    metrics["solver_iter_max"] = int(solver_iter_max)
+    metrics["convergence_warning_count"] = int(convergence_warning_count)
+    metrics["convergence_limited_estimators"] = int(convergence_limited_estimators)
     metrics["status"] = "complete"
     return metrics
 
@@ -328,7 +352,14 @@ def main() -> None:
                     }
                 )
                 continue
-            result = probe_one_view(x, y_true[:, idx], fold_id, args.threshold, args.seed)
+            result = probe_one_view(
+                x,
+                y_true[:, idx],
+                fold_id,
+                args.threshold,
+                args.seed,
+                args.probe_max_iter,
+            )
             probe_rows.append(
                 {
                     "view": view,
@@ -366,6 +397,7 @@ def main() -> None:
         },
         "n_records": int(len(emb["record_id"])),
         "n_classes": int(y_true.shape[1]),
+        "probe_max_iter": int(args.probe_max_iter),
         "views": {name: list(arr.shape) for name, arr in emb["views"].items()},
         "label_groups": {
             "morphology_labels": class_names[morphology_idx].tolist() if morphology_idx else [],
