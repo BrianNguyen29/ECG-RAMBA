@@ -434,6 +434,7 @@ def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.n
     }[dataset](root, limit)
     signals, labels, record_ids = [], [], []
     skipped = 0
+    skipped_examples = []
     missing_leads = []
     for row in tqdm(metadata, desc=f"Loading {dataset}"):
         try:
@@ -447,6 +448,8 @@ def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.n
             missing_leads.append(missing)
         except Exception as exc:
             skipped += 1
+            if len(skipped_examples) < 10:
+                skipped_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped <= 10:
                 print(f"Skipping {row['record_id']}: {exc}")
     if not signals:
@@ -457,15 +460,25 @@ def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.n
                 unmapped.items(),
                 key=lambda item: (-int(item[1]), str(item[0])),
             )[:12]
-            detail = (
-                " Georgia headers were readable, but every record was skipped because no "
-                "diagnosis code mapped to the frozen 27-class Chapman/SNOMED taxonomy. "
-                f"headers={metadata_summary.get('metadata_records', len(metadata))}; "
-                f"skipped_without_mapped_label={metadata_summary.get('skipped_records_without_mapped_label')}; "
-                f"top_unmapped_codes={top_unmapped}. "
-                "Do not coerce these records to negative labels; leave Georgia deferred or add a "
-                "reviewed label mapping before using it."
-            )
+            if metadata:
+                detail = (
+                    " Georgia label mapping produced mapped candidate records, but every candidate "
+                    "was skipped while reading or preprocessing the ECG signal. "
+                    f"mapped_candidate_records={len(metadata)}; signal_skipped_records={skipped}; "
+                    f"skipped_without_mapped_label={metadata_summary.get('skipped_records_without_mapped_label')}; "
+                    f"skip_examples={skipped_examples}. "
+                    "Check whether the Georgia archive contains WFDB-compatible signal files next "
+                    "to the headers, or leave Georgia deferred."
+                )
+            else:
+                detail = (
+                    " Georgia headers were readable, but every record was skipped because no "
+                    "diagnosis code mapped to the frozen 27-class Chapman/SNOMED taxonomy. "
+                    f"skipped_without_mapped_label={metadata_summary.get('skipped_records_without_mapped_label')}; "
+                    f"top_unmapped_codes={top_unmapped}. "
+                    "Do not coerce these records to negative labels; leave Georgia deferred or add a "
+                    "reviewed label mapping before using it."
+                )
         raise RuntimeError(f"No usable {dataset} records were loaded.{detail}")
     return (
         np.asarray(signals, dtype=np.float32),
