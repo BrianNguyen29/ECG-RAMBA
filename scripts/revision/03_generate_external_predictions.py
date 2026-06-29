@@ -70,6 +70,38 @@ AMP_DTYPE_NAME = (
 )
 
 
+def patch_wfdb_annotation_numpy2_overflow() -> None:
+    """Patch old wfdb annotation parsing that overflows on NumPy 2 uint8 arrays."""
+
+    try:
+        import wfdb.io.annotation as wfdb_annotation
+    except Exception:
+        return
+
+    def proc_core_fields(filebytes, bpi):
+        sample_diff = 0
+        while int(filebytes[bpi, 1]) >> 2 == 59:
+            skip_diff = (
+                (int(filebytes[bpi + 1, 0]) << 16)
+                + (int(filebytes[bpi + 1, 1]) << 24)
+                + (int(filebytes[bpi + 2, 0]) << 0)
+                + (int(filebytes[bpi + 2, 1]) << 8)
+            )
+            if skip_diff > 2147483647:
+                skip_diff -= 4294967296
+            sample_diff += skip_diff
+            bpi += 3
+
+        label_store = int(filebytes[bpi, 1]) >> 2
+        sample_diff += np.int64(filebytes[bpi, 0]) + 256 * (
+            np.int64(filebytes[bpi, 1]) & 3
+        )
+        bpi += 1
+        return sample_diff, label_store, bpi
+
+    wfdb_annotation.proc_core_fields = proc_core_fields
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["ptbxl", "georgia", "cpsc2021"], required=True)
@@ -292,6 +324,7 @@ def georgia_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
 
 
 def cpsc_af_intervals(record_path: Path, signal_length: int) -> list[tuple[int, int]]:
+    patch_wfdb_annotation_numpy2_overflow()
     annotation = wfdb.rdann(str(record_path), "atr")
     events = []
     for sample, note in zip(annotation.sample, annotation.aux_note):
