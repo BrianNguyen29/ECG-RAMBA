@@ -238,6 +238,90 @@ def summarize_robustness(rows: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
+def summarize_representation(
+    status_payload: dict[str, Any],
+    probe_rows: list[dict[str, str]],
+    cka_rows: list[dict[str, str]],
+) -> dict[str, Any]:
+    status = str(status_payload.get("status", "") or "")
+    complete = status in {"complete_probe_available", "complete"} and bool(probe_rows) and bool(cka_rows)
+    complete_probe_rows = [row for row in probe_rows if row.get("status") == "complete"]
+    best_probe = max(complete_probe_rows, key=lambda row: fnum(row.get("macro_roc_auc")), default={})
+    morphology_probe = next(
+        (
+            row
+            for row in complete_probe_rows
+            if row.get("view") == "morphology" and row.get("label_group") == "morphology_labels"
+        ),
+        {},
+    )
+    rhythm_probe = next(
+        (
+            row
+            for row in complete_probe_rows
+            if row.get("view") == "rhythm" and row.get("label_group") == "rhythm_labels"
+        ),
+        {},
+    )
+    cka_by_pair = {
+        f"{row.get('left_view')}/{row.get('right_view')}": row
+        for row in cka_rows
+        if row.get("status", "complete") == "complete"
+    }
+    best_cka = max(cka_by_pair.values(), key=lambda row: fnum(row.get("linear_cka")), default={})
+    morph_rhythm_cka = cka_by_pair.get("morphology/rhythm", {})
+
+    if complete:
+        key_numbers = (
+            f"Probe/CKA complete; best probe ROC-AUC={fmt(best_probe.get('macro_roc_auc'))} "
+            f"({best_probe.get('view', '')}/{best_probe.get('label_group', '')}); "
+            f"morphology->morphology ROC-AUC={fmt(morphology_probe.get('macro_roc_auc'))}, "
+            f"PR-AUC={fmt(morphology_probe.get('macro_pr_auc'))}; "
+            f"rhythm->rhythm ROC-AUC={fmt(rhythm_probe.get('macro_roc_auc'))}, "
+            f"PR-AUC={fmt(rhythm_probe.get('macro_pr_auc'))}; "
+            f"CKA morphology/rhythm={fmt(morph_rhythm_cka.get('linear_cka'))}, "
+            f"max CKA={fmt(best_cka.get('linear_cka'))} "
+            f"({best_cka.get('left_view', '')}/{best_cka.get('right_view', '')})"
+        )
+        safe_wording = (
+            "Representation probes and CKA provide an audit of branch embeddings. "
+            "CKA shows the branch embeddings are not identical, but fold-safe linear "
+            "probes are near chance and do not support label-aligned morphology-rhythm "
+            "disentanglement. Treat branch specialization as suggestive architecture "
+            "analysis and a limitation, not a proven mechanism."
+        )
+        blocker = (
+            "Probe/CKA artifacts are complete, but mechanistic morphology-rhythm "
+            "disentanglement remains unproven because fold-safe linear probes are weak."
+        )
+        evidence_status = "complete_probe_available_with_disentanglement_limitation"
+    else:
+        key_numbers = (
+            "No completed UMAP/probing/CKA representation artifact; "
+            "representation separation remains unproven."
+        )
+        safe_wording = (
+            "Do not claim proven morphology-rhythm disentanglement. State that the architecture "
+            "is designed to combine complementary streams and that representation separation remains future work."
+        )
+        blocker = "No completed UMAP/probing/CKA representation artifact."
+        evidence_status = "blocked_representation_probe_missing"
+
+    return {
+        "complete": complete,
+        "status": status,
+        "evidence_status": evidence_status,
+        "key_numbers": key_numbers,
+        "safe_wording": safe_wording,
+        "blocker": blocker,
+        "best_probe": best_probe,
+        "morphology_probe": morphology_probe,
+        "rhythm_probe": rhythm_probe,
+        "morphology_rhythm_cka": morph_rhythm_cka,
+        "best_cka": best_cka,
+    }
+
+
 def artifact(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"path": rel(path), "exists": False, "sha256": "", "size_bytes": 0}
@@ -269,6 +353,10 @@ def main() -> None:
     optional_paths = {
         "paired_raw_mamba": METRIC_DIR / "paired_full_vs_raw_mamba_comparison.json",
         "external_protocol_gate_summary": METRIC_DIR / "external_protocol_gate_summary.csv",
+        "representation_evidence_status": METRIC_DIR / "representation_evidence_status.json",
+        "representation_probe_summary": METRIC_DIR / "representation_probe_summary.json",
+        "representation_probe_table": TABLE_DIR / "table_representation_probe.csv",
+        "representation_cka_table": TABLE_DIR / "table_representation_cka.csv",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
@@ -287,6 +375,22 @@ def main() -> None:
     paired_raw_mamba = read_json(optional_paths["paired_raw_mamba"], required=False)
     external_gate_rows = read_csv_rows(
         optional_paths["external_protocol_gate_summary"],
+        required=False,
+    )
+    representation_status = read_json(
+        optional_paths["representation_evidence_status"],
+        required=False,
+    )
+    representation_probe_summary = read_json(
+        optional_paths["representation_probe_summary"],
+        required=False,
+    )
+    representation_probe_rows = read_csv_rows(
+        optional_paths["representation_probe_table"],
+        required=False,
+    )
+    representation_cka_rows = read_csv_rows(
+        optional_paths["representation_cka_table"],
         required=False,
     )
     a0 = read_json(paths["a0_status"], required=args.strict)
@@ -312,6 +416,11 @@ def main() -> None:
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
+    representation_summary = summarize_representation(
+        representation_status or representation_probe_summary,
+        representation_probe_rows,
+        representation_cka_rows,
+    )
     external_gate_by_dataset = {
         str(row.get("dataset", "")).strip().lower(): row
         for row in external_gate_rows
@@ -501,17 +610,16 @@ def main() -> None:
         {
             "claim_id": "C04",
             "claim_topic": "Morphology-rhythm separation",
-            "evidence_status": "blocked_representation_probe_missing",
-            "key_numbers": "No completed UMAP/probing/CKA representation artifact; representation separation remains unproven.",
+            "evidence_status": representation_summary["evidence_status"],
+            "key_numbers": representation_summary["key_numbers"],
             "evidence_paths": (
-                "reports/revision/metrics/robustness_summary.csv;"
-                "reports/revision/metrics/representation_evidence_status.json"
+                "reports/revision/metrics/representation_evidence_status.json;"
+                "reports/revision/metrics/representation_probe_summary.json;"
+                "reports/revision/tables/table_representation_probe.csv;"
+                "reports/revision/tables/table_representation_cka.csv"
             ),
-            "safe_wording": (
-                "Do not claim proven morphology-rhythm disentanglement. State that the architecture "
-                "is designed to combine complementary streams and that representation separation remains future work."
-            ),
-            "blocker": "No completed UMAP/probing/CKA representation artifact.",
+            "safe_wording": representation_summary["safe_wording"],
+            "blocker": representation_summary["blocker"],
             "source_claim_status": claim_by_id.get("C04", {}).get("status", ""),
         },
         {
@@ -620,6 +728,11 @@ def main() -> None:
                 "the external protocol gate; this still does not support zero-shot superiority."
             ),
             "hrv": "Do not describe reserved HRV slots as implemented RMSSD/SDNN/LF-HF features.",
+            "representation": (
+                "Use representation probe/CKA only as a conservative audit. CKA may show branch "
+                "embeddings are not identical, but weak fold-safe linear probes do not support "
+                "proven morphology-rhythm disentanglement."
+            ),
             "raw_mamba": (
                 "Use Raw Mamba only as a comparator-specific fair-baseline result. "
                 "It does not restore global superiority if ResNet1D/CNN remains stronger."
@@ -635,6 +748,7 @@ def main() -> None:
             "deferred": external_gate_deferred,
         },
         "robustness_summary": robustness_summary,
+        "representation_summary": representation_summary,
         "task_status": {
             key: {
                 "status": row.get("status", ""),
