@@ -288,7 +288,7 @@ def summarize_representation(
             "CKA shows the branch embeddings are not identical, but fold-safe linear "
             "probes are near chance and do not support label-aligned morphology-rhythm "
             "disentanglement. Treat branch specialization as suggestive architecture "
-            "analysis and a limitation, not a proven mechanism."
+            "analysis and a limitation, not an established mechanism."
         )
         blocker = (
             "Probe/CKA artifacts are complete, but mechanistic morphology-rhythm "
@@ -620,7 +620,7 @@ def main() -> None:
             ),
             "safe_wording": representation_summary["safe_wording"],
             "blocker": representation_summary["blocker"],
-            "source_claim_status": claim_by_id.get("C04", {}).get("status", ""),
+            "source_claim_status": representation_summary["evidence_status"],
         },
         {
             "claim_id": "C05",
@@ -665,7 +665,7 @@ def main() -> None:
                 "Claim protocol-faithful frozen Chapman OOF evaluation. PTB-XL may be described "
                 "only as a protocol-gated mapped-task external evaluation when its gate passes. "
                 "Georgia and CPSC2021 remain deferred unless their dataset-specific mapping and "
-                "annotation gates pass. Do not claim external zero-shot superiority."
+                "annotation gates pass. No unqualified external-transfer claim is supported."
             ),
             "blocker": (
                 "Deferred blockers remain documented; protocol_ready is distinct from audit_complete. "
@@ -706,11 +706,11 @@ def main() -> None:
         "contract_issues": contract_issues,
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
-            "global_superiority": "Do not claim global superiority over all fair baselines.",
+            "global_superiority": "Do not claim broad superiority over all fair baselines.",
             "resnet_in_domain": (
                 "The completed paired ResNet1D/CNN comparison favors ResNet on frozen Chapman OOF "
-                "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim ECG-RAMBA in-domain superiority "
-                "over fair CNN/ResNet baselines."
+                "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim an ECG-RAMBA in-domain "
+                "performance advantage over fair CNN/ResNet baselines."
             ),
             "operating_point": (
                 "ECG-RAMBA operating-point advantages are comparator-specific. The MiniRocket-only "
@@ -725,17 +725,18 @@ def main() -> None:
             ),
             "external_protocol_gate": (
                 "Use only protocol-gated mapped-task wording for external datasets that pass "
-                "the external protocol gate; this still does not support zero-shot superiority."
+                "the external protocol gate; this still does not support unqualified "
+                "external-transfer or cross-dataset performance claims."
             ),
             "hrv": "Do not describe reserved HRV slots as implemented RMSSD/SDNN/LF-HF features.",
             "representation": (
                 "Use representation probe/CKA only as a conservative audit. CKA may show branch "
                 "embeddings are not identical, but weak fold-safe linear probes do not support "
-                "proven morphology-rhythm disentanglement."
+                "established morphology-rhythm separation."
             ),
             "raw_mamba": (
                 "Use Raw Mamba only as a comparator-specific fair-baseline result. "
-                "It does not restore global superiority if ResNet1D/CNN remains stronger."
+                "It does not restore a broad fair-baseline advantage if ResNet1D/CNN remains stronger."
             ),
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
