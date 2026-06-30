@@ -3,8 +3,9 @@
 This gate intentionally does not run model inference. It reads the experimental
 external outputs produced by ``03_generate_external_predictions.py`` and checks
 whether a dataset-specific artifact set is complete enough to be cited as
-protocol-gated external evidence. Passing this gate does not support zero-shot
-superiority, external SOTA, or clinical deployment claims.
+protocol-gated external evidence. Passing this gate does not support unqualified
+external-transfer advantage, benchmark-leading external performance, or clinical
+deployment claims.
 """
 
 from __future__ import annotations
@@ -676,8 +677,8 @@ def validate_dataset(
             else "External outputs remain experimental and are not manuscript-ready."
         ),
         "unsafe_claims": [
-            "zero-shot superiority",
-            "external SOTA",
+            "unqualified external-transfer advantage",
+            "benchmark-leading external performance",
             "cross-dataset robustness superiority",
             "clinical deployment readiness",
         ],
