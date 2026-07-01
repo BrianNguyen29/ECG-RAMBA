@@ -334,6 +334,8 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
             ),
             "blocker": "PTB-XL few-shot score-calibration artifact is absent or incomplete.",
             "best_fraction": {},
+            "best_f1_fraction": {},
+            "best_pr_auc_fraction": {},
             "zero_fraction": {},
         }
 
@@ -365,21 +367,40 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
 
     finite_fractions = sorted(fraction for fraction in grouped if math.isfinite(fraction))
     zero_fraction = summarize_fraction(0.0 if 0.0 in grouped else finite_fractions[0])
-    best_fraction = max(
-        (summarize_fraction(fraction) for fraction in finite_fractions),
+    fraction_summaries = [summarize_fraction(fraction) for fraction in finite_fractions]
+    best_f1_fraction = max(
+        fraction_summaries,
+        key=lambda item: fnum(item.get("f1_macro_mean")),
+        default={},
+    )
+    best_pr_auc_fraction = max(
+        fraction_summaries,
         key=lambda item: fnum(item.get("pr_auc_macro_mean")),
         default={},
     )
+    f1_gain = fnum(best_f1_fraction.get("f1_macro_mean")) - fnum(
+        zero_fraction.get("f1_macro_mean")
+    )
+    pr_gain = fnum(best_pr_auc_fraction.get("pr_auc_macro_mean")) - fnum(
+        zero_fraction.get("pr_auc_macro_mean")
+    )
+    if not math.isfinite(f1_gain):
+        f1_gain = math.nan
+    if not math.isfinite(pr_gain):
+        pr_gain = math.nan
     key_numbers = (
         "fewshot_status=complete; "
         f"protocol={manifest.get('protocol', '')}; "
         f"adaptation_kind={manifest.get('adaptation_kind', '')}; "
         f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
         f"F1={fmt(zero_fraction.get('f1_macro_mean'))}; "
-        f"best fraction={fmt(best_fraction.get('fraction'), digits=2)}, "
-        f"train_records_mean={fmt(best_fraction.get('train_records_mean'), digits=1)}, "
-        f"PR-AUC={fmt(best_fraction.get('pr_auc_macro_mean'))}, "
-        f"F1={fmt(best_fraction.get('f1_macro_mean'))}"
+        f"F1-best fraction={fmt(best_f1_fraction.get('fraction'), digits=2)}, "
+        f"train_records_mean={fmt(best_f1_fraction.get('train_records_mean'), digits=1)}, "
+        f"F1={fmt(best_f1_fraction.get('f1_macro_mean'))}, "
+        f"F1_gain_vs_zero={fmt(f1_gain)}; "
+        f"rank-best fraction={fmt(best_pr_auc_fraction.get('fraction'), digits=2)}, "
+        f"PR-AUC={fmt(best_pr_auc_fraction.get('pr_auc_macro_mean'))}, "
+        f"PR-AUC_gain_vs_zero={fmt(pr_gain)}"
     )
     return {
         "complete": True,
@@ -387,11 +408,17 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
         "key_numbers": key_numbers,
         "safe_wording": (
             "Report PTB-XL few-shot only as leakage-audited score calibration on frozen "
-            "protocol-gated external predictions. It is not ECG-RAMBA weight fine-tuning "
-            "and does not establish general zero-shot or few-shot superiority."
+            "protocol-gated external predictions. Emphasize fixed-threshold F1 changes "
+            "separately from ranking metrics because score calibration may not improve "
+            "PR-AUC/ROC-AUC. It is not ECG-RAMBA weight fine-tuning and does not establish "
+            "general zero-shot or few-shot superiority."
         ),
         "blocker": "",
-        "best_fraction": best_fraction,
+        "best_fraction": best_f1_fraction,
+        "best_f1_fraction": best_f1_fraction,
+        "best_pr_auc_fraction": best_pr_auc_fraction,
+        "f1_gain_vs_zero": f1_gain,
+        "pr_auc_gain_vs_zero": pr_gain,
         "zero_fraction": zero_fraction,
     }
 
