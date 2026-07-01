@@ -119,8 +119,8 @@ def blocked_payload(args: argparse.Namespace, paths: dict[str, Path], reason: st
         "created_utc": now_utc(),
         "reason": reason,
         "safe_wording": (
-            "Few-shot adaptation remains deferred. Do not state that few-shot "
-            "experiments were added until this runner completes on a protocol-gated dataset."
+            "Few-shot adaptation remains deferred. Report no few-shot evidence until "
+            "this runner completes on a protocol-gated dataset."
         ),
         "required_preconditions": [
             "external protocol gate must pass",

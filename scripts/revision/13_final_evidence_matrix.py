@@ -322,6 +322,80 @@ def summarize_representation(
     }
 
 
+def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> dict[str, Any]:
+    complete = bool(rows) and manifest.get("status") == "complete"
+    if not complete:
+        return {
+            "complete": False,
+            "status": manifest.get("status", "missing"),
+            "key_numbers": "fewshot_status=not_run_or_deferred",
+            "safe_wording": (
+                "Do not claim few-shot adaptation. The few-shot package is absent or incomplete."
+            ),
+            "blocker": "PTB-XL few-shot score-calibration artifact is absent or incomplete.",
+            "best_fraction": {},
+            "zero_fraction": {},
+        }
+
+    grouped: dict[float, list[dict[str, str]]] = {}
+    for row in rows:
+        grouped.setdefault(fnum(row.get("fraction")), []).append(row)
+
+    def summarize_fraction(fraction: float) -> dict[str, Any]:
+        items = grouped.get(fraction, [])
+        out: dict[str, Any] = {"fraction": fraction, "n_seeds": len(items)}
+        if not items:
+            return out
+        metrics = [
+            "train_records",
+            "test_records",
+            "f1_macro",
+            "pr_auc_macro",
+            "roc_auc_macro",
+            "brier_macro",
+            "ece_macro",
+            "adapted_classes",
+        ]
+        for metric in metrics:
+            values = [fnum(row.get(metric)) for row in items]
+            finite = [value for value in values if math.isfinite(value)]
+            out[f"{metric}_mean"] = sum(finite) / len(finite) if finite else math.nan
+        out["mode"] = ",".join(sorted({str(row.get("mode", "")) for row in items}))
+        return out
+
+    finite_fractions = sorted(fraction for fraction in grouped if math.isfinite(fraction))
+    zero_fraction = summarize_fraction(0.0 if 0.0 in grouped else finite_fractions[0])
+    best_fraction = max(
+        (summarize_fraction(fraction) for fraction in finite_fractions),
+        key=lambda item: fnum(item.get("pr_auc_macro_mean")),
+        default={},
+    )
+    key_numbers = (
+        "fewshot_status=complete; "
+        f"protocol={manifest.get('protocol', '')}; "
+        f"adaptation_kind={manifest.get('adaptation_kind', '')}; "
+        f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
+        f"F1={fmt(zero_fraction.get('f1_macro_mean'))}; "
+        f"best fraction={fmt(best_fraction.get('fraction'), digits=2)}, "
+        f"train_records_mean={fmt(best_fraction.get('train_records_mean'), digits=1)}, "
+        f"PR-AUC={fmt(best_fraction.get('pr_auc_macro_mean'))}, "
+        f"F1={fmt(best_fraction.get('f1_macro_mean'))}"
+    )
+    return {
+        "complete": True,
+        "status": "complete",
+        "key_numbers": key_numbers,
+        "safe_wording": (
+            "Report PTB-XL few-shot only as leakage-audited score calibration on frozen "
+            "protocol-gated external predictions. It is not ECG-RAMBA weight fine-tuning "
+            "and does not establish general zero-shot or few-shot superiority."
+        ),
+        "blocker": "",
+        "best_fraction": best_fraction,
+        "zero_fraction": zero_fraction,
+    }
+
+
 def artifact(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"path": rel(path), "exists": False, "sha256": "", "size_bytes": 0}
@@ -357,6 +431,14 @@ def main() -> None:
         "representation_probe_summary": METRIC_DIR / "representation_probe_summary.json",
         "representation_probe_table": TABLE_DIR / "table_representation_probe.csv",
         "representation_cka_table": TABLE_DIR / "table_representation_cka.csv",
+        "fewshot_ptbxl_summary": METRIC_DIR / "fewshot_ptbxl_summary.csv",
+        "fewshot_ptbxl_table": TABLE_DIR / "table_fewshot_ptbxl.csv",
+        "fewshot_ptbxl_bootstrap": METRIC_DIR / "fewshot_ptbxl_bootstrap.json",
+        "fewshot_ptbxl_manifest": MANIFEST_DIR / "fewshot_ptbxl_run_manifest.json",
+        "robustness_multicomparator_summary": METRIC_DIR / "robustness_multicomparator_summary.csv",
+        "robustness_multicomparator_pairwise": METRIC_DIR / "robustness_multicomparator_pairwise.json",
+        "robustness_multicomparator_table": TABLE_DIR / "table_robustness_multicomparator.csv",
+        "robustness_multicomparator_manifest": MANIFEST_DIR / "robustness_multicomparator_manifest.json",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
@@ -393,6 +475,8 @@ def main() -> None:
         optional_paths["representation_cka_table"],
         required=False,
     )
+    fewshot_rows = read_csv_rows(optional_paths["fewshot_ptbxl_summary"], required=False)
+    fewshot_manifest = read_json(optional_paths["fewshot_ptbxl_manifest"], required=False)
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
@@ -421,6 +505,7 @@ def main() -> None:
         representation_probe_rows,
         representation_cka_rows,
     )
+    fewshot_summary = summarize_fewshot(fewshot_rows, fewshot_manifest)
     external_gate_by_dataset = {
         str(row.get("dataset", "")).strip().lower(): row
         for row in external_gate_rows
@@ -653,24 +738,29 @@ def main() -> None:
                 f"external_gate_status={external_gate_status}; "
                 f"external_gate_passed={','.join(external_gate_passed) if external_gate_passed else 'none'}; "
                 f"external_gate_blocked={','.join(external_gate_blocked) if external_gate_blocked else 'none'}; "
-                f"external_gate_deferred={','.join(external_gate_deferred) if external_gate_deferred else 'none'}"
+                f"external_gate_deferred={','.join(external_gate_deferred) if external_gate_deferred else 'none'}; "
+                f"{fewshot_summary['key_numbers']}"
             ),
             "evidence_paths": (
                 "reports/revision/manifests/oof_final_ema_freeze_manifest.json;"
                 "reports/revision/a0_resolution_status.json;"
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
-                "reports/revision/metrics/external_protocol_gate_summary.csv"
+                "reports/revision/metrics/external_protocol_gate_summary.csv;"
+                "reports/revision/metrics/fewshot_ptbxl_summary.csv;"
+                "reports/revision/manifests/fewshot_ptbxl_run_manifest.json"
             ),
             "safe_wording": (
                 "Claim protocol-faithful frozen Chapman OOF evaluation. PTB-XL may be described "
                 "only as a protocol-gated mapped-task external evaluation when its gate passes. "
                 "Georgia and CPSC2021 remain deferred unless their dataset-specific mapping and "
-                "annotation gates pass. No unqualified external-transfer claim is supported."
+                "annotation gates pass. No unqualified external-transfer claim is supported. "
+                f"{fewshot_summary['safe_wording']}"
             ),
             "blocker": (
                 "Deferred blockers remain documented; protocol_ready is distinct from audit_complete. "
                 f"External gate status: {external_gate_status}; "
-                f"deferred external datasets: {','.join(external_gate_deferred) if external_gate_deferred else 'none'}."
+                f"deferred external datasets: {','.join(external_gate_deferred) if external_gate_deferred else 'none'}. "
+                f"Few-shot blocker: {fewshot_summary['blocker']}"
             ),
             "source_claim_status": claim_by_id.get("C06", {}).get("status", ""),
         },
@@ -717,7 +807,14 @@ def main() -> None:
                 "F1/Brier/ECE result does not generalize to ResNet1D/CNN."
             ),
             "robustness": (
-                "Use only metric-specific robustness claims supported by paired degradation CIs."
+                "Use only metric-specific robustness claims supported by paired degradation CIs. "
+                "If robustness_multicomparator artifacts are present, treat missing ResNet/Raw-Mamba "
+                "stress predictions as explicit blocked evidence rather than support for broad robustness."
+            ),
+            "fewshot": (
+                "Few-shot evidence is optional and gated. Report it only when the dataset-specific "
+                "external protocol gate passed and scripts/revision/19_fewshot_adaptation.py produced "
+                "a completed leakage-audited sensitivity package; do not describe it as model-weight fine-tuning."
             ),
             "external": (
                 "Use PTB-XL only as a protocol-gated mapped-task external evaluation when its gate passes. "
@@ -748,6 +845,7 @@ def main() -> None:
             "blocked": external_gate_blocked,
             "deferred": external_gate_deferred,
         },
+        "fewshot_summary": fewshot_summary,
         "robustness_summary": robustness_summary,
         "representation_summary": representation_summary,
         "task_status": {
