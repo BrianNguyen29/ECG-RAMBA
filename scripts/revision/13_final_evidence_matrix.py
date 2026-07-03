@@ -410,7 +410,7 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
             "Report PTB-XL few-shot only as leakage-audited score calibration on frozen "
             "protocol-gated external predictions. Emphasize fixed-threshold F1 changes "
             "separately from ranking metrics because score calibration may not improve "
-            "PR-AUC/ROC-AUC. It is not ECG-RAMBA weight fine-tuning and does not establish "
+            "PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights unchanged and does not establish "
             "general zero-shot or few-shot superiority."
         ),
         "blocker": "",
@@ -632,6 +632,12 @@ def main() -> None:
         or row.get("valid") is False
     ]
 
+    fewshot_blocker_text = (
+        f" Few-shot blocker: {fewshot_summary['blocker']}"
+        if fewshot_summary.get("blocker")
+        else ""
+    )
+
     matrix_rows = [
         {
             "claim_id": "C01",
@@ -786,8 +792,8 @@ def main() -> None:
             "blocker": (
                 "Deferred blockers remain documented; protocol_ready is distinct from audit_complete. "
                 f"External gate status: {external_gate_status}; "
-                f"deferred external datasets: {','.join(external_gate_deferred) if external_gate_deferred else 'none'}. "
-                f"Few-shot blocker: {fewshot_summary['blocker']}"
+                f"deferred external datasets: {','.join(external_gate_deferred) if external_gate_deferred else 'none'}."
+                f"{fewshot_blocker_text}"
             ),
             "source_claim_status": claim_by_id.get("C06", {}).get("status", ""),
         },
@@ -841,7 +847,7 @@ def main() -> None:
             "fewshot": (
                 "Few-shot evidence is optional and gated. Report it only when the dataset-specific "
                 "external protocol gate passed and scripts/revision/19_fewshot_adaptation.py produced "
-                "a completed leakage-audited sensitivity package; do not describe it as model-weight fine-tuning."
+                "a completed leakage-audited sensitivity package; do not describe it as model-weight updating."
             ),
             "external": (
                 "Use PTB-XL only as a protocol-gated mapped-task external evaluation when its gate passes. "
