@@ -76,6 +76,20 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual(intervals, [(100, 300), (500, 700)])
         self.assertEqual(external.interval_overlap(intervals, 250, 550), 100)
 
+    def test_cpsc_rhythm_intervals_keep_normal_boundaries(self):
+        annotation = SimpleNamespace(
+            sample=np.asarray([0, 100, 300, 500]),
+            aux_note=["(N", "(AFIB", "(N", "(AFL"],
+        )
+        with patch.object(external.wfdb, "rdann", return_value=annotation):
+            intervals, counts = external.cpsc_rhythm_intervals(Path("record"), signal_length=700)
+        self.assertEqual(
+            intervals,
+            [(0, 100, "normal"), (100, 300, "AF_or_AFL"), (300, 500, "normal"), (500, 700, "AF_or_AFL")],
+        )
+        self.assertEqual(counts["normal_intervals"], 2)
+        self.assertEqual(external.interval_overlap(intervals, 300, 500, "normal"), 200)
+
     def test_georgia_skips_records_without_mapped_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -85,6 +99,30 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual([row["record_id"] for row in rows], ["mapped"])
         self.assertEqual(summary["skipped_records_without_mapped_label"], 1)
         self.assertEqual(summary["unmapped_snomed_codes"], {"999999999": 1})
+
+    def test_georgia_review_file_disables_unreviewed_builtin_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            review = root / "review.csv"
+            review.write_text(
+                "source_code,source_label,action,mapped_target,rationale,source_reference\n"
+                "428750005,Nonspecific ST-T abnormality,defer_requires_domain_review,,No exact target,test\n",
+                encoding="utf-8",
+            )
+            (root / "unreviewed_builtin.hea").write_text("#Dx: 164889003\n", encoding="utf-8")
+            (root / "deferred.hea").write_text("#Dx: 428750005\n", encoding="utf-8")
+            rows, summary = external.georgia_metadata(root, limit=0, mapping_review_path=review)
+        self.assertEqual(rows, [])
+        self.assertEqual(summary["mapping_review_mapped_codes"], 0)
+        self.assertEqual(summary["skipped_records_without_mapped_label"], 2)
+        self.assertEqual(summary["unmapped_snomed_codes"], {"428750005": 1, "164889003": 1})
+
+    def test_georgia_explicit_missing_review_file_fails_fast(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mapped.hea").write_text("#Dx: 164889003\n", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                external.georgia_metadata(root, limit=0, mapping_review_path=root / "missing_review.csv")
 
     def test_ptb_uses_positive_likelihood_not_only_100(self):
         with tempfile.TemporaryDirectory() as tmp:

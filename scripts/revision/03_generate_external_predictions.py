@@ -42,6 +42,7 @@ from scripts.revision.common import (  # noqa: E402
     MANIFEST_DIR,
     POWER_MEAN_IMPLEMENTATION,
     PTB_SUPERCLASS_MAPPING,
+    TABLE_DIR,
     aggregate_record_probabilities,
     ensure_revision_dirs,
     multilabel_metrics,
@@ -113,6 +114,27 @@ def parse_args() -> argparse.Namespace:
         "--allow-experimental",
         action="store_true",
         help="Required acknowledgement: external outputs are not manuscript-ready.",
+    )
+    parser.add_argument(
+        "--georgia-mapping-review",
+        type=Path,
+        default=PROJECT_ROOT / "docs" / "revision_plan" / "georgia_label_mapping_review_20260703.csv",
+        help=(
+            "Optional reviewed Georgia SNOMED-to-Chapman mapping CSV. "
+            "Rows are used only when action is map/include and mapped_target is one of the frozen classes."
+        ),
+    )
+    parser.add_argument(
+        "--georgia-code-inventory-out",
+        type=Path,
+        default=TABLE_DIR / "table_georgia_snomed_code_inventory.csv",
+        help="Audit table of Georgia diagnosis codes, counts, built-in mappings, and reviewed decisions.",
+    )
+    parser.add_argument(
+        "--cpsc-annotation-audit-out",
+        type=Path,
+        default=TABLE_DIR / "table_cpsc2021_annotation_audit.csv",
+        help="Per-record CPSC2021 annotation/window audit table.",
     )
     parser.add_argument("--extract-root", type=Path, default=Path("/content/ecg_ramba_runtime/external"))
     return parser.parse_args()
@@ -284,23 +306,67 @@ def ptb_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
 def dx_codes(header: Path) -> list[str]:
     for line in header.read_text(encoding="utf-8", errors="ignore").splitlines():
         if line.startswith("#Dx:"):
-            return [code.strip() for code in line.split(":", 1)[1].split(",")]
+            return [code.strip() for code in line.split(":", 1)[1].split(",") if code.strip()]
     return []
 
 
-def georgia_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
+def load_georgia_mapping_review(path: Path) -> tuple[dict[str, int], dict[str, dict]]:
+    """Load reviewed Georgia mappings and reject non-frozen target labels."""
+
+    review_rows: dict[str, dict] = {}
+    mapping: dict[str, int] = {}
+    if not path.exists():
+        raise FileNotFoundError(f"Georgia mapping review file does not exist: {path}")
+    if path.stat().st_size == 0:
+        raise ValueError(f"Georgia mapping review file is empty: {path}")
+    df = pd.read_csv(path, dtype=str).fillna("")
+    required = {"source_code", "mapped_target", "action"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Georgia mapping review missing required columns: {sorted(missing)}")
+    for row in df.to_dict(orient="records"):
+        code = str(row.get("source_code", "")).strip()
+        if not code:
+            continue
+        action = str(row.get("action", "")).strip().lower()
+        target = str(row.get("mapped_target", "")).strip()
+        review_rows[code] = row
+        if action in {"map", "include"}:
+            if target not in CLASS_TO_IDX:
+                raise ValueError(
+                    f"Georgia mapping review maps code {code!r} to non-frozen class {target!r}. "
+                    "Use one of the frozen Chapman classes or mark the row defer/unsupported."
+                )
+            mapping[code] = int(CLASS_TO_IDX[target])
+    return mapping, review_rows
+
+
+def georgia_metadata(
+    root: Path,
+    limit: int,
+    mapping_review_path: Path | None = None,
+    inventory_out: Path | None = None,
+) -> tuple[list[dict], dict]:
     headers = sorted(root.rglob("*.hea"))
     if limit:
         headers = headers[:limit]
     rows = []
     skipped_unmapped_records = 0
     unmapped_codes: dict[str, int] = {}
+    code_counts: dict[str, int] = {}
+    reviewed_mapping, review_rows = load_georgia_mapping_review(mapping_review_path) if mapping_review_path else ({}, {})
     for header in headers:
         y = np.zeros(len(CLASSES), dtype=np.float32)
         source_codes = dx_codes(header)
         mapped_count = 0
         for code in source_codes:
-            mapped = SNOMED_MAPPING.get(code)
+            code_counts[code] = code_counts.get(code, 0) + 1
+            if review_rows:
+                # A review file makes Georgia mapping explicit: reviewed map/include rows are used,
+                # reviewed defer/unsupported rows and unreviewed codes remain unmapped.
+                mapped = reviewed_mapping.get(code)
+            else:
+                mapped = SNOMED_MAPPING.get(code)
             if isinstance(mapped, int):
                 y[mapped] = 1.0
                 mapped_count += 1
@@ -316,34 +382,67 @@ def georgia_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
                 "y_true": y,
             }
         )
+    inventory_rows = []
+    for code, count in sorted(code_counts.items(), key=lambda item: (-item[1], item[0])):
+        built_in = SNOMED_MAPPING.get(code)
+        review = review_rows.get(code, {})
+        inventory_rows.append(
+            {
+                "source_code": code,
+                "count_records": int(count),
+                "built_in_mapped_target": CLASSES[int(built_in)] if isinstance(built_in, int) else "",
+                "review_action": str(review.get("action", "")).strip(),
+                "review_mapped_target": str(review.get("mapped_target", "")).strip(),
+                "review_label": str(review.get("source_label", "")).strip(),
+                "review_rationale": str(review.get("rationale", "")).strip(),
+            }
+        )
+    if inventory_out is not None:
+        save_csv(inventory_out, inventory_rows)
     return rows, {
         "label_protocol": "chapman_27_class_snomed_intersection",
+        "mapping_review_file": str(mapping_review_path) if mapping_review_path else "",
+        "mapping_review_file_exists": bool(mapping_review_path and mapping_review_path.exists()),
+        "mapping_review_mapped_codes": len(reviewed_mapping),
+        "mapping_inventory_csv": str(inventory_out) if inventory_out is not None else "",
+        "total_distinct_snomed_codes": len(code_counts),
         "skipped_records_without_mapped_label": skipped_unmapped_records,
         "unmapped_snomed_codes": unmapped_codes,
     }
 
 
-def cpsc_af_intervals(record_path: Path, signal_length: int) -> list[tuple[int, int]]:
+def cpsc_rhythm_intervals(record_path: Path, signal_length: int) -> tuple[list[tuple[int, int, str]], dict]:
     patch_wfdb_annotation_numpy2_overflow()
     annotation = wfdb.rdann(str(record_path), "atr")
     events = []
     for sample, note in zip(annotation.sample, annotation.aux_note):
         normalized = str(note).strip("\x00").strip().upper()
         if "AFIB" in normalized or "AFL" in normalized:
-            events.append((int(sample), True))
+            events.append((int(sample), "AF_or_AFL"))
         elif normalized in {"(N", "N", "(NSR", "NSR"}:
-            events.append((int(sample), False))
+            events.append((int(sample), "normal"))
     if not events:
         raise ValueError("CPSC annotation has no recognized AF/AFL/normal rhythm boundaries")
     events.sort(key=lambda item: item[0])
     intervals = []
-    for idx, (start, is_af) in enumerate(events):
+    for idx, (start, label) in enumerate(events):
         stop = events[idx + 1][0] if idx + 1 < len(events) else signal_length
         start = max(0, min(start, signal_length))
         stop = max(start, min(stop, signal_length))
-        if is_af and stop > start:
-            intervals.append((start, stop))
-    return intervals
+        if stop > start:
+            intervals.append((start, stop, label))
+    return intervals, {
+        "recognized_intervals": len(intervals),
+        "af_intervals": sum(1 for _, _, label in intervals if label == "AF_or_AFL"),
+        "normal_intervals": sum(1 for _, _, label in intervals if label == "normal"),
+    }
+
+
+def cpsc_af_intervals(record_path: Path, signal_length: int) -> list[tuple[int, int]]:
+    """Backward-compatible AF/AFL-only view of CPSC rhythm intervals."""
+
+    intervals, _counts = cpsc_rhythm_intervals(record_path, signal_length)
+    return [(start, stop) for start, stop, label in intervals if label == "AF_or_AFL"]
 
 
 def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
@@ -359,16 +458,36 @@ def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
             for header in headers
         ],
         {
-            "label_protocol": "annotation_aligned_nonoverlapping_10s_windows_majority_af",
+            "label_protocol": "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
         },
     )
 
 
-def interval_overlap(intervals: list[tuple[int, int]], start: int, stop: int) -> int:
-    return sum(max(0, min(stop, right) - max(start, left)) for left, right in intervals)
+def interval_overlap(
+    intervals: list[tuple[int, int]] | list[tuple[int, int, str]],
+    start: int,
+    stop: int,
+    label: str | None = None,
+) -> int:
+    return sum(
+        max(0, min(stop, right) - max(start, left))
+        for interval in intervals
+        for left, right, interval_label in [
+            (
+                int(interval[0]),
+                int(interval[1]),
+                str(interval[2]) if len(interval) > 2 else None,
+            )
+        ]
+        if label is None or interval_label == label
+    )
 
 
-def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+def load_cpsc_windows(
+    root: Path,
+    limit: int,
+    annotation_audit_out: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     metadata, metadata_summary = cpsc_metadata(root, limit)
     signals, labels, record_ids = [], [], []
     skipped_annotation = 0
@@ -378,14 +497,39 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
     preprocessing_skip_examples = []
     transition_windows = 0
     positive_windows = 0
+    negative_windows = 0
+    ambiguous_windows = 0
     missing_leads = []
+    audit_rows = []
     for row in tqdm(metadata, desc="Loading cpsc2021 windows"):
+        audit = {
+            "record_id": str(row["record_id"]),
+            "status": "started",
+            "source_fs": "",
+            "signal_length": "",
+            "recognized_intervals": 0,
+            "af_intervals": 0,
+            "normal_intervals": 0,
+            "loaded_windows": 0,
+            "positive_windows": 0,
+            "negative_windows": 0,
+            "transition_windows": 0,
+            "ambiguous_windows": 0,
+            "missing_leads": "",
+            "error": "",
+        }
         try:
             record = wfdb.rdrecord(str(row["record_path"]))
             raw = record.p_signal.T if record.p_signal is not None else record.d_signal.T.astype(np.float32)
             raw, missing = align_leads(raw, list(record.sig_name) if record.sig_name else None)
+            audit["source_fs"] = float(record.fs)
+            audit["signal_length"] = int(raw.shape[-1])
+            audit["missing_leads"] = int(missing)
         except Exception as exc:
             skipped_signal += 1
+            audit["status"] = "skipped_signal"
+            audit["error"] = str(exc)
+            audit_rows.append(audit)
             if len(signal_skip_examples) < 10:
                 signal_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
@@ -393,9 +537,13 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             continue
 
         try:
-            intervals = cpsc_af_intervals(row["record_path"], raw.shape[-1])
+            intervals, interval_counts = cpsc_rhythm_intervals(row["record_path"], raw.shape[-1])
+            audit.update(interval_counts)
         except Exception as exc:
             skipped_annotation += 1
+            audit["status"] = "skipped_annotation"
+            audit["error"] = str(exc)
+            audit_rows.append(audit)
             if len(annotation_skip_examples) < 10:
                 annotation_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
@@ -408,26 +556,37 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             record_ids_for_windows = []
             record_transition_windows = 0
             record_positive_windows = 0
+            record_negative_windows = 0
+            record_ambiguous_windows = 0
             source_fs = float(record.fs)
             if source_fs != FS:
                 raw = resample_poly(raw, int(FS), int(round(source_fs)), axis=-1).astype(np.float32)
             filtered = bandpass_filter(raw, fs=FS).astype(np.float32)
             scale = FS / source_fs
             target_intervals = [
-                (int(round(start * scale)), int(round(stop * scale)))
-                for start, stop in intervals
+                (int(round(start * scale)), int(round(stop * scale)), label)
+                for start, stop, label in intervals
             ]
             for start in range(0, filtered.shape[-1], 5000):
                 stop = min(start + 5000, filtered.shape[-1])
                 valid_length = stop - start
                 if valid_length < 2500:
                     continue
-                af_samples = interval_overlap(target_intervals, start, stop)
+                af_samples = interval_overlap(target_intervals, start, stop, "AF_or_AFL")
+                normal_samples = interval_overlap(target_intervals, start, stop, "normal")
                 af_fraction = af_samples / valid_length
+                normal_fraction = normal_samples / valid_length
                 if 0.0 < af_fraction < 1.0:
                     record_transition_windows += 1
-                label = float(af_fraction >= 0.5)
-                record_positive_windows += int(label)
+                if af_fraction >= 0.5:
+                    label = 1.0
+                    record_positive_windows += 1
+                elif normal_fraction >= 0.5:
+                    label = 0.0
+                    record_negative_windows += 1
+                else:
+                    record_ambiguous_windows += 1
+                    continue
                 segment = pad_or_truncate(filtered[:, start:stop], target_len=5000).astype(np.float32)
                 normalized = normalize_signal(segment).astype(np.float32)
                 if not np.isfinite(normalized).all():
@@ -441,12 +600,26 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             missing_leads.extend([missing] * len(record_signals))
             transition_windows += record_transition_windows
             positive_windows += record_positive_windows
+            negative_windows += record_negative_windows
+            ambiguous_windows += record_ambiguous_windows
+            audit["status"] = "loaded" if record_signals else "skipped_no_majority_windows"
+            audit["loaded_windows"] = len(record_signals)
+            audit["positive_windows"] = record_positive_windows
+            audit["negative_windows"] = record_negative_windows
+            audit["transition_windows"] = record_transition_windows
+            audit["ambiguous_windows"] = record_ambiguous_windows
+            audit_rows.append(audit)
         except Exception as exc:
             skipped_signal += 1
+            audit["status"] = "skipped_preprocessing"
+            audit["error"] = str(exc)
+            audit_rows.append(audit)
             if len(preprocessing_skip_examples) < 10:
                 preprocessing_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping preprocessing {row['record_id']}: {exc}")
+    if annotation_audit_out is not None:
+        save_csv(annotation_audit_out, audit_rows)
     if not signals:
         raise RuntimeError(
             "No usable CPSC2021 annotation-aligned windows were loaded. "
@@ -469,22 +642,37 @@ def load_cpsc_windows(root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, n
             "metadata_records": len(metadata),
             "loaded_windows": len(signals),
             "positive_windows": positive_windows,
+            "negative_windows": negative_windows,
             "transition_windows": transition_windows,
+            "ambiguous_windows": ambiguous_windows,
             "skipped_annotation_records": skipped_annotation,
             "skipped_signal_records": skipped_signal,
+            "annotation_audit_csv": str(annotation_audit_out) if annotation_audit_out is not None else "",
             "missing_leads_mean": float(np.mean(missing_leads)),
             "windows_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
         },
     )
 
 
-def load_records(dataset: str, root: Path, limit: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+def load_records(
+    dataset: str,
+    root: Path,
+    limit: int,
+    args: argparse.Namespace,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if dataset == "cpsc2021":
-        return load_cpsc_windows(root, limit)
-    metadata, metadata_summary = {
-        "ptbxl": ptb_metadata,
-        "georgia": georgia_metadata,
-    }[dataset](root, limit)
+        return load_cpsc_windows(root, limit, args.cpsc_annotation_audit_out)
+    if dataset == "ptbxl":
+        metadata, metadata_summary = ptb_metadata(root, limit)
+    elif dataset == "georgia":
+        metadata, metadata_summary = georgia_metadata(
+            root,
+            limit,
+            args.georgia_mapping_review,
+            args.georgia_code_inventory_out,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
     signals, labels, record_ids = [], [], []
     skipped = 0
     skipped_examples = []
@@ -887,6 +1075,7 @@ def main() -> None:
         args.dataset,
         root,
         args.limit_records,
+        args,
     )
 
     hydra_by_fold, hrv, feature_cache, feature_cache_hit = generate_features(

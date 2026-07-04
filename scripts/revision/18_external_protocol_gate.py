@@ -47,11 +47,11 @@ from scripts.revision.common import (  # noqa: E402
 
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
-GATE_SCHEMA_VERSION = 2
+GATE_SCHEMA_VERSION = 3
 EXPECTED_EXTERNAL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
-    "cpsc2021": "annotation_aligned_nonoverlapping_10s_windows_majority_af",
+    "cpsc2021": "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
 }
 EXPECTED_CLASS_NAMES = {
     "ptbxl": tuple(PTB_SUPERCLASS_MAPPING.keys()),
@@ -115,6 +115,13 @@ def project_relative(path: Path) -> str:
         return resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
     except ValueError:
         return resolved.as_posix()
+
+
+def resolve_payload_path(value: Any) -> Path | None:
+    if value is None or str(value).strip() == "":
+        return None
+    path = Path(str(value))
+    return path if path.is_absolute() else PROJECT_ROOT / path
 
 
 def file_fingerprint(path: Path) -> str:
@@ -355,8 +362,18 @@ def validate_dataset(
             "metrics_table": metrics_table,
             "gate_manifest": gate_manifest,
         }
-        cache_outputs_exist = all(path.exists() and path.stat().st_size > 0 for path in cache_artifacts.values())
         cached_artifacts = cached.get("artifacts", {})
+        supplemental_keys = []
+        if dataset == "georgia":
+            supplemental_keys.append("georgia_mapping_inventory")
+        elif dataset == "cpsc2021":
+            supplemental_keys.append("cpsc_annotation_audit")
+        for key in supplemental_keys:
+            cached_path = resolve_payload_path((cached_artifacts.get(key) or {}).get("path"))
+            if cached_path is not None:
+                cache_artifacts[key] = cached_path
+        cache_outputs_exist = all(path.exists() and path.stat().st_size > 0 for path in cache_artifacts.values())
+        cache_outputs_exist = cache_outputs_exist and all(key in cache_artifacts for key in supplemental_keys)
         cache_outputs_match = True
         for name, path in cache_artifacts.items():
             if name == "gate_json":
@@ -562,20 +579,47 @@ def validate_dataset(
     elif dataset == "georgia":
         skipped = load_summary.get("skipped_records_without_mapped_label")
         checks["georgia_reports_unmapped_skips"] = isinstance(skipped, int) and skipped >= 0
+        inventory_path = resolve_payload_path(load_summary.get("mapping_inventory_csv"))
+        checks["georgia_mapping_review_exists"] = bool(load_summary.get("mapping_review_file_exists"))
+        checks["georgia_review_has_mapped_codes"] = int(load_summary.get("mapping_review_mapped_codes", 0)) > 0
+        checks["georgia_reports_mapping_inventory"] = bool(
+            inventory_path is not None and inventory_path.exists() and inventory_path.stat().st_size > 0
+        )
         if not checks["georgia_reports_unmapped_skips"]:
             issues.append("Georgia gate requires skipped_records_without_mapped_label")
+        if not checks["georgia_mapping_review_exists"]:
+            issues.append("Georgia gate requires a reviewed mapping CSV, even if all reviewed rows are deferred")
+        if not checks["georgia_review_has_mapped_codes"]:
+            issues.append("Georgia gate requires at least one reviewed map/include row for the frozen taxonomy")
+        if not checks["georgia_reports_mapping_inventory"]:
+            issues.append("Georgia gate requires a non-empty reviewed mapping/code inventory table")
     elif dataset == "cpsc2021":
         checks["cpsc_reports_annotation_skips"] = "skipped_annotation_records" in load_summary
         checks["cpsc_has_positive_and_negative_windows"] = bool(
             y_true.shape[1] == 1 and 0 < np.sum(y_true[:, 0]) < y_true.shape[0]
         )
         checks["cpsc_windows_loaded"] = int(load_summary.get("loaded_windows", 0)) == int(y_true.shape[0])
+        checks["cpsc_reports_negative_windows"] = int(load_summary.get("negative_windows", 0)) > 0
+        checks["cpsc_reports_ambiguous_windows"] = "ambiguous_windows" in load_summary
+        audit_path = resolve_payload_path(load_summary.get("annotation_audit_csv"))
+        checks["cpsc_annotation_audit_exists"] = bool(
+            load_summary.get("annotation_audit_csv")
+            and audit_path is not None
+            and audit_path.exists()
+            and audit_path.stat().st_size > 0
+        )
         if not checks["cpsc_reports_annotation_skips"]:
             issues.append("CPSC gate requires skipped_annotation_records")
         if not checks["cpsc_has_positive_and_negative_windows"]:
             issues.append("CPSC gate requires both positive and negative annotation windows")
         if not checks["cpsc_windows_loaded"]:
             issues.append("CPSC loaded_windows does not match prediction rows")
+        if not checks["cpsc_reports_negative_windows"]:
+            issues.append("CPSC gate requires explicitly counted normal/negative windows")
+        if not checks["cpsc_reports_ambiguous_windows"]:
+            issues.append("CPSC gate requires ambiguous_windows audit count")
+        if not checks["cpsc_annotation_audit_exists"]:
+            issues.append("CPSC gate requires a non-empty per-record annotation audit table")
         warnings.append("CPSC is evaluated on annotation-aligned windows, not official episode score.")
 
     archive = archive_path(dataset)
@@ -679,7 +723,7 @@ def validate_dataset(
         "unsafe_claims": [
             "unqualified external-transfer advantage",
             "benchmark-leading external performance",
-            "cross-dataset robustness superiority",
+            "unqualified cross-dataset robustness advantage",
             "clinical deployment readiness",
         ],
         "issues": issues,
@@ -699,6 +743,12 @@ def validate_dataset(
             "label_table": artifact(label_table),
             "metrics_table": artifact(metrics_table),
             "gate_manifest": artifact(gate_manifest),
+            "georgia_mapping_inventory": artifact(resolve_payload_path(load_summary.get("mapping_inventory_csv")))
+            if dataset == "georgia" and resolve_payload_path(load_summary.get("mapping_inventory_csv")) is not None
+            else {"path": "", "exists": False, "size_bytes": 0, "sha256": ""},
+            "cpsc_annotation_audit": artifact(resolve_payload_path(load_summary.get("annotation_audit_csv")))
+            if dataset == "cpsc2021" and resolve_payload_path(load_summary.get("annotation_audit_csv")) is not None
+            else {"path": "", "exists": False, "size_bytes": 0, "sha256": ""},
         },
         "contract": {
             "expected_checkpoint_kind": args.expected_checkpoint_kind,

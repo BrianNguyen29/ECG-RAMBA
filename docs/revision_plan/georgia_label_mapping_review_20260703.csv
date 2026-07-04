@@ -1,0 +1,37 @@
+source_code,source_label,action,mapped_target,rationale,source_reference
+164934002,T wave abnormal,map,TAb,Exact frozen Chapman class available for T wave abnormality.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+426783006,Sinus rhythm,map,SNR,Exact frozen Chapman class available for sinus rhythm.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+426177001,Sinus bradycardia,map,SB,Exact frozen Chapman class available for sinus bradycardia.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+111975006,Long QT interval,map,LQT,Exact frozen Chapman class available for long QT.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+427084000,Sinus tachycardia,map,STach,Exact frozen Chapman class available for sinus tachycardia.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+284470004,Premature atrial contraction,map,PAC,Exact frozen Chapman class available for premature atrial contraction.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+39732003,Left axis deviation,map,LAD,Exact frozen Chapman class available for left axis deviation.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+59931005,T wave inversion,map,TInv,Exact frozen Chapman class available for T wave inversion.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+270492004,First degree atrioventricular block,map,IAVB,Exact frozen Chapman class available for first-degree AV block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164889003,Atrial fibrillation,map,AF,Exact frozen Chapman class available for atrial fibrillation.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+59118001,Right bundle branch block,map,RBBB,Exact frozen Chapman class available for right bundle branch block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164917005,Abnormal Q wave,map,QAb,Exact frozen Chapman class available for Q wave abnormality.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+427393009,Sinus arrhythmia,map,SA,Exact frozen Chapman class available for sinus arrhythmia.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+713426002,Incomplete right bundle branch block,map,IRBBB,Exact frozen Chapman class available for incomplete right bundle branch block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+17338001,Ventricular premature beat,map,VPB,Exact frozen Chapman class available for ventricular premature beat.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+251146004,Low QRS voltage,map,LQRSV,Exact frozen Chapman class available for low QRS voltage.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164909002,Left bundle branch block,map,LBBB,Exact frozen Chapman class available for left bundle branch block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+698252002,Nonspecific intraventricular conduction block,map,NSIVCB,Exact frozen Chapman class available for nonspecific intraventricular conduction block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164890007,Atrial flutter,map,AFL,Exact frozen Chapman class available for atrial flutter.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+445118002,Left anterior fascicular block,map,LAnFB,Exact frozen Chapman class available for left anterior fascicular block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+47665007,Right axis deviation,map,RAD,Exact frozen Chapman class available for right axis deviation.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+713427006,Complete right bundle branch block,map,CRBBB,Exact frozen Chapman class available for complete right bundle branch block.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+426627000,Bradycardia,map,Brady,Exact frozen Chapman class available for bradycardia.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+63593006,Supraventricular premature beat,map,SVPB,Exact frozen Chapman class available for supraventricular premature beat.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+428750005,Nonspecific ST-T abnormality on electrocardiogram,defer_requires_domain_review,,No exact frozen Chapman 27-class target; do not coerce to TAb without review.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164873001,Left ventricular hypertrophy,defer_unsupported,,Frozen Chapman 27-class model has no LVH class.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164930006,ST interval abnormal,defer_requires_domain_review,,No exact frozen Chapman 27-class ST-segment target.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+425623009,Lateral ischaemia,defer_requires_domain_review,,No exact frozen Chapman 27-class ischemia target.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+67741000119109,Left atrial enlargement,defer_unsupported,,Frozen Chapman 27-class model has no left atrial enlargement class.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+425419005,Inferior ischaemia,defer_requires_domain_review,,No exact frozen Chapman 27-class ischemia target.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+426434006,Anterior myocardial ischemia,defer_requires_domain_review,,No exact frozen Chapman 27-class ischemia target.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+428417006,Early repolarization,defer_unsupported,,Frozen Chapman 27-class model has no early repolarization class.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+164931005,ST elevation,defer_requires_domain_review,,No exact frozen Chapman 27-class ST-elevation target.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+6374002,Bundle branch block,defer_requires_domain_review,,Broad bundle-branch code is not equivalent to a specific frozen CRBBB/RBBB/LBBB class.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+251120003,Incomplete left bundle branch block,defer_requires_domain_review,,Frozen class LBBB is not automatically equivalent to incomplete LBBB.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
+89792004,Right ventricular hypertrophy,defer_unsupported,,Frozen Chapman 27-class model has no RVH class.,ECG-RAMBA frozen Chapman/SNOMED taxonomy review 2026-07-03
