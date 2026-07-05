@@ -453,6 +453,7 @@ def main() -> None:
     }
     optional_paths = {
         "paired_raw_mamba": METRIC_DIR / "paired_full_vs_raw_mamba_comparison.json",
+        "paired_transformer": METRIC_DIR / "paired_full_vs_transformer_comparison.json",
         "external_protocol_gate_summary": METRIC_DIR / "external_protocol_gate_summary.csv",
         "representation_evidence_status": METRIC_DIR / "representation_evidence_status.json",
         "representation_probe_summary": METRIC_DIR / "representation_probe_summary.json",
@@ -482,6 +483,7 @@ def main() -> None:
     paired_minirocket = read_json(paths["paired_minirocket"], required=False)
     paired_resnet = read_json(paths["paired_resnet"], required=False)
     paired_raw_mamba = read_json(optional_paths["paired_raw_mamba"], required=False)
+    paired_transformer = read_json(optional_paths["paired_transformer"], required=False)
     external_gate_rows = read_csv_rows(
         optional_paths["external_protocol_gate_summary"],
         required=False,
@@ -525,6 +527,7 @@ def main() -> None:
     hrv_only = baseline_by_name.get("HRV-only", {})
     resnet = baseline_by_name.get("ResNet1D/CNN", {})
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
+    transformer = baseline_by_name.get("Transformer ECG", {})
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
     representation_summary = summarize_representation(
@@ -595,6 +598,7 @@ def main() -> None:
     paired_minirocket_metrics = paired_minirocket.get("metrics", {}) if isinstance(paired_minirocket, dict) else {}
     paired_resnet_metrics = paired_resnet.get("metrics", {}) if isinstance(paired_resnet, dict) else {}
     paired_raw_mamba_metrics = paired_raw_mamba.get("metrics", {}) if isinstance(paired_raw_mamba, dict) else {}
+    paired_transformer_metrics = paired_transformer.get("metrics", {}) if isinstance(paired_transformer, dict) else {}
     paired_f1 = paired_minirocket_metrics.get("f1_macro", {})
     paired_pr = paired_minirocket_metrics.get("pr_auc_macro", {})
     paired_brier = paired_minirocket_metrics.get("brier_macro", {})
@@ -607,6 +611,27 @@ def main() -> None:
     paired_raw_pr = paired_raw_mamba_metrics.get("pr_auc_macro", {})
     paired_raw_brier = paired_raw_mamba_metrics.get("brier_macro", {})
     paired_raw_ece = paired_raw_mamba_metrics.get("ece_macro", {})
+    paired_transformer_f1 = paired_transformer_metrics.get("f1_macro", {})
+    paired_transformer_pr = paired_transformer_metrics.get("pr_auc_macro", {})
+
+    transformer_key_numbers = (
+        f"; Transformer ECG PR-AUC={fmt(transformer.get('pr_auc_macro'))}, "
+        f"F1={fmt(transformer.get('f1_macro'))}"
+        if transformer
+        else ""
+    )
+    transformer_paired_key_numbers = (
+        f"; Transformer paired F1={paired_transformer_f1.get('interpretation', '')}, "
+        f"PR-AUC={paired_transformer_pr.get('interpretation', '')}"
+        if paired_transformer_metrics
+        else "; Transformer paired comparison=not_run_optional"
+    )
+    transformer_evidence_paths = (
+        ";reports/revision/metrics/paired_full_vs_transformer_comparison.json;"
+        "reports/revision/tables/table_paired_full_vs_transformer.csv"
+        if paired_transformer_metrics
+        else ""
+    )
 
     calibration_metrics = calibration.get("metrics", {}) if isinstance(calibration, dict) else {}
     calibration_summary = calibration.get("calibration", {}) if isinstance(calibration, dict) else {}
@@ -648,12 +673,14 @@ def main() -> None:
                 f"MiniRocket PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}; "
                 f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}; "
                 f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
+                f"{transformer_key_numbers}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
                 "reports/revision/metrics/paired_full_vs_minirocket_comparison.json;"
                 "reports/revision/metrics/paired_full_vs_resnet_comparison.json;"
                 "reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json"
+                f"{transformer_evidence_paths}"
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
@@ -686,12 +713,14 @@ def main() -> None:
                 f"Brier={paired_raw_brier.get('interpretation', '')}, "
                 f"ECE={paired_raw_ece.get('interpretation', '')}, "
                 f"PR-AUC={paired_raw_pr.get('interpretation', '')}"
+                f"{transformer_paired_key_numbers}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
                 "reports/revision/tables/table_paired_full_vs_minirocket.csv;"
                 "reports/revision/tables/table_paired_full_vs_resnet.csv;"
                 "reports/revision/tables/table_paired_full_vs_raw_mamba.csv"
+                f"{transformer_evidence_paths}"
             ),
             "safe_wording": (
                 "Frozen OOF supports only metric-specific operating-point statements. ECG-RAMBA "
@@ -867,6 +896,11 @@ def main() -> None:
             "raw_mamba": (
                 "Use Raw Mamba only as a comparator-specific fair-baseline result. "
                 "It does not restore a broad fair-baseline advantage if ResNet1D/CNN remains stronger."
+            ),
+            "transformer": (
+                "Use Transformer ECG only as optional comparator-specific evidence if "
+                "scripts/revision/24_transformer_ecg_baseline.py and paired bootstrap output are complete. "
+                "It must not be used to imply broad model-family superiority."
             ),
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
