@@ -411,7 +411,7 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
             "protocol-gated external predictions. Emphasize fixed-threshold F1 changes "
             "separately from ranking metrics because score calibration may not improve "
             "PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights unchanged and does not establish "
-            "general zero-shot or few-shot superiority."
+            "a general zero-shot or few-shot advantage."
         ),
         "blocker": "",
         "best_fraction": best_f1_fraction,
@@ -578,7 +578,7 @@ def main() -> None:
     external_safe_sentence = (
         f"Protocol-gated mapped-task external evaluation is available only for: {external_passed_text}. "
         f"Keep blocked/deferred external datasets limited: {external_limited_text}. "
-        "No unqualified external-transfer or cross-dataset superiority claim is supported. "
+        "No unqualified external-transfer or cross-dataset performance-advantage claim is supported. "
     )
 
     complete_fair_statuses = {
