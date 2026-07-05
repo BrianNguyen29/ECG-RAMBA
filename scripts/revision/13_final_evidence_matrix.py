@@ -572,6 +572,15 @@ def main() -> None:
     else:
         c06_evidence_status = "oof_supported_external_not_run_or_deferred"
 
+    external_gate_limited = sorted(set(external_gate_blocked) | set(external_gate_deferred))
+    external_passed_text = ",".join(external_gate_passed) if external_gate_passed else "none"
+    external_limited_text = ",".join(external_gate_limited) if external_gate_limited else "none"
+    external_safe_sentence = (
+        f"Protocol-gated mapped-task external evaluation is available only for: {external_passed_text}. "
+        f"Keep blocked/deferred external datasets limited: {external_limited_text}. "
+        "No unqualified external-transfer or cross-dataset superiority claim is supported. "
+    )
+
     complete_fair_statuses = {
         "complete_frozen_oof",
         "complete_feature_baseline_from_notebook05",
@@ -812,10 +821,8 @@ def main() -> None:
                 "reports/revision/manifests/fewshot_ptbxl_run_manifest.json"
             ),
             "safe_wording": (
-                "Claim protocol-faithful frozen Chapman OOF evaluation. PTB-XL may be described "
-                "only as a protocol-gated mapped-task external evaluation when its gate passes. "
-                "Georgia and CPSC2021 remain deferred unless their dataset-specific mapping and "
-                "annotation gates pass. No unqualified external-transfer claim is supported. "
+                "Claim protocol-faithful frozen Chapman OOF evaluation. "
+                f"{external_safe_sentence}"
                 f"{fewshot_summary['safe_wording']}"
             ),
             "blocker": (
@@ -879,8 +886,8 @@ def main() -> None:
                 "a completed leakage-audited sensitivity package; do not describe it as model-weight updating."
             ),
             "external": (
-                "Use PTB-XL only as a protocol-gated mapped-task external evaluation when its gate passes. "
-                "Keep Georgia/CPSC2021 deferred unless their dataset-specific protocol gates pass."
+                f"Use only protocol-gated mapped-task wording for passed external datasets: {external_passed_text}. "
+                f"Keep blocked/deferred external datasets limited: {external_limited_text}."
             ),
             "external_protocol_gate": (
                 "Use only protocol-gated mapped-task wording for external datasets that pass "
