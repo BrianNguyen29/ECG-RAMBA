@@ -86,6 +86,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
+        "--metric-cache-dir",
+        type=Path,
+        default=METRIC_DIR / "robustness_multicomparator_metric_cache",
+        help="Directory for resumable per-stress/per-comparator/per-metric bootstrap caches.",
+    )
+    parser.add_argument("--reuse-metric-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
         "--out-summary",
         type=Path,
         default=METRIC_DIR / "robustness_multicomparator_summary.csv",
@@ -126,6 +133,64 @@ def project_relative(path: Path) -> str:
 
 def parse_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def cache_slug(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def metric_cache_path(cache_dir: Path, stress: str, comparator: str, metric: str) -> Path:
+    return resolve(cache_dir) / f"{cache_slug(stress)}__{cache_slug(comparator)}__{cache_slug(metric)}.json"
+
+
+def cache_metadata(
+    *,
+    args: argparse.Namespace,
+    stress: str,
+    comparator: str,
+    spec: dict[str, Any],
+    full_clean: dict[str, Any],
+    full_stress: dict[str, Any],
+    comp_clean: dict[str, Any],
+    comp_stress: dict[str, Any],
+    seed: int,
+) -> dict[str, Any]:
+    return {
+        "protocol": PROTOCOL,
+        "stress": stress,
+        "comparator": comparator,
+        "metric": spec["name"],
+        "direction": spec["direction"],
+        "threshold": float(args.threshold),
+        "n_bins": int(args.n_bins),
+        "n_boot": int(args.n_boot),
+        "seed": int(seed),
+        "full_clean_sha256": full_clean["sha256"],
+        "full_stress_sha256": full_stress["sha256"],
+        "comp_clean_sha256": comp_clean["sha256"],
+        "comp_stress_sha256": comp_stress["sha256"],
+    }
+
+
+def read_metric_cache(path: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
+    path = resolve(path)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"WARNING: could not read metric cache {path}: {exc}", flush=True)
+        return None
+    if payload.get("metadata") != metadata:
+        return None
+    row = payload.get("row")
+    return row if isinstance(row, dict) else None
+
+
+def write_metric_cache(path: Path, metadata: dict[str, Any], row: dict[str, Any]) -> None:
+    path = resolve(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(path, {"metadata": metadata, "row": row, "created_utc": now_utc()})
 
 
 def load_npz(path: Path) -> dict[str, Any]:
@@ -259,6 +324,7 @@ def main() -> None:
     ensure_revision_dirs()
     for path in [args.out_summary, args.out_pairwise, args.out_table, args.out_manifest]:
         path.parent.mkdir(parents=True, exist_ok=True)
+    resolve(args.metric_cache_dir).mkdir(parents=True, exist_ok=True)
 
     comparators = parse_list(args.comparators)
     stresses = parse_list(args.stress_tests)
@@ -273,6 +339,7 @@ def main() -> None:
     print("=" * 80, flush=True)
     print(f"comparators={comparators}", flush=True)
     print(f"stress_tests={stresses}", flush=True)
+    print(f"metric_cache_dir={resolve(args.metric_cache_dir)} reuse={args.reuse_metric_cache}", flush=True)
 
     clean: dict[str, dict[str, Any]] = {}
     artifact_status: list[dict[str, Any]] = []
@@ -348,6 +415,7 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "metric_cache_dir": project_relative(args.metric_cache_dir),
         "items": {},
     }
 
@@ -406,37 +474,57 @@ def main() -> None:
                 comp_deg = benefit(cs, spec["direction"]) - benefit(cc, spec["direction"])
                 deg_adv = full_deg - comp_deg
                 stressed_adv = benefit(fs, spec["direction"]) - benefit(cs, spec["direction"])
-                boot = paired_bootstrap(
-                    spec,
-                    full_clean,
-                    stress_data["full"],
-                    clean[comp],
-                    stress_data[comp],
-                    args.n_boot,
-                    args.seed + spec_idx,
+                seed = args.seed + spec_idx
+                metadata = cache_metadata(
+                    args=args,
+                    stress=stress,
+                    comparator=comp,
+                    spec=spec,
+                    full_clean=full_clean,
+                    full_stress=stress_data["full"],
+                    comp_clean=clean[comp],
+                    comp_stress=stress_data[comp],
+                    seed=seed,
                 )
-                interp = interpretation(
-                    boot.get("degradation_adv_ci_low", math.nan),
-                    boot.get("degradation_adv_ci_high", math.nan),
-                )
-                row = {
-                    **base_row,
-                    "status": "complete",
-                    "clean_full": fc,
-                    "stress_full": fs,
-                    "degradation_full_benefit": full_deg,
-                    "clean_comparator": cc,
-                    "stress_comparator": cs,
-                    "degradation_comparator_benefit": comp_deg,
-                    "degradation_advantage_full": deg_adv,
-                    "stressed_advantage_full": stressed_adv,
-                    "degradation_adv_ci_low": boot.get("degradation_adv_ci_low"),
-                    "degradation_adv_ci_high": boot.get("degradation_adv_ci_high"),
-                    "stressed_adv_ci_low": boot.get("stressed_adv_ci_low"),
-                    "stressed_adv_ci_high": boot.get("stressed_adv_ci_high"),
-                    "n_boot_valid": boot.get("n_boot_valid"),
-                    "interpretation": interp,
-                }
+                cache_path = metric_cache_path(args.metric_cache_dir, stress, comp, spec["name"])
+                row = read_metric_cache(cache_path, metadata) if args.reuse_metric_cache else None
+                if row is not None:
+                    print(f"{stress} {comp} {spec['name']}: cache hit {project_relative(cache_path)}", flush=True)
+                else:
+                    print(f"{stress} {comp} {spec['name']}: bootstrap start", flush=True)
+                    boot = paired_bootstrap(
+                        spec,
+                        full_clean,
+                        stress_data["full"],
+                        clean[comp],
+                        stress_data[comp],
+                        args.n_boot,
+                        seed,
+                    )
+                    interp = interpretation(
+                        boot.get("degradation_adv_ci_low", math.nan),
+                        boot.get("degradation_adv_ci_high", math.nan),
+                    )
+                    row = {
+                        **base_row,
+                        "status": "complete",
+                        "clean_full": fc,
+                        "stress_full": fs,
+                        "degradation_full_benefit": full_deg,
+                        "clean_comparator": cc,
+                        "stress_comparator": cs,
+                        "degradation_comparator_benefit": comp_deg,
+                        "degradation_advantage_full": deg_adv,
+                        "stressed_advantage_full": stressed_adv,
+                        "degradation_adv_ci_low": boot.get("degradation_adv_ci_low"),
+                        "degradation_adv_ci_high": boot.get("degradation_adv_ci_high"),
+                        "stressed_adv_ci_low": boot.get("stressed_adv_ci_low"),
+                        "stressed_adv_ci_high": boot.get("stressed_adv_ci_high"),
+                        "n_boot_valid": boot.get("n_boot_valid"),
+                        "interpretation": interp,
+                    }
+                    write_metric_cache(cache_path, metadata, row)
+                    print(f"{stress} {comp} {spec['name']}: bootstrap done", flush=True)
                 rows.append(row)
                 pairwise["items"][f"{stress}/{comp}/{spec['name']}"] = row
                 print(

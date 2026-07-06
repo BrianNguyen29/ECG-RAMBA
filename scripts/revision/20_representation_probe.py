@@ -389,7 +389,7 @@ def main() -> None:
         "created_utc": now_utc(),
         "safe_wording": (
             "Representation probes provide suggestive branch-specific evidence only; "
-            "they do not prove strict morphology-rhythm disentanglement."
+            "they do not establish strict morphology-rhythm separation."
         ),
         "embedding_npz": {
             "path": project_relative(emb["path"]),

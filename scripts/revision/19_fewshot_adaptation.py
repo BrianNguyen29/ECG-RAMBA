@@ -1,8 +1,8 @@
 """Few-shot adaptation under a passed external protocol gate.
 
 This runner intentionally starts with a conservative, reproducible adaptation
-mode: per-class score calibration on frozen external predictions. It does not
-fine-tune ECG-RAMBA weights and therefore must not be described as model-level
+mode: per-class score calibration on frozen external predictions. It leaves
+ECG-RAMBA weights unchanged and therefore must not be described as model-level
 few-shot transfer. Its purpose is to provide a leakage-audited target-domain
 few-shot sensitivity analysis after a dataset-specific external gate has passed.
 
@@ -398,7 +398,7 @@ def main() -> None:
         "adaptation_kind": "score_calibration_only",
         "safe_wording": (
             "This is few-shot score calibration on frozen external predictions, "
-            "not model-weight fine-tuning and not evidence of general transfer superiority."
+            "not model-weight updating and not evidence of general transfer superiority."
         ),
         "gate": {
             "path": project_relative(paths["gate_json"]),

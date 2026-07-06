@@ -50,6 +50,9 @@ from src.training_data import build_slice_index  # noqa: E402
 
 PROTOCOL = "resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5"
 FEATURE_CONTRACT = "raw_ecg_12lead"
+RUNNER_DISPLAY_NAME = "ResNet1D/CNN"
+ARCHITECTURE_NAME = "resnet1d_cnn_basicblock"
+CHECKPOINT_STEM = "resnet1d_cnn"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 PREDICTION_PATH = PREDICTION_DIR / "resnet1d_cnn_oof_predictions.npz"
@@ -612,7 +615,7 @@ def record_metrics_for_fold(
 
 
 def fold_prediction_path(fold: int) -> Path:
-    return FOLD_PREDICTION_DIR / f"resnet1d_cnn_fold{fold}_predictions.npz"
+    return FOLD_PREDICTION_DIR / f"{CHECKPOINT_STEM}_fold{fold}_predictions.npz"
 
 
 def fold_prediction_matches(
@@ -882,7 +885,7 @@ def train_one_fold(
 
     if args.save_checkpoints:
         args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        checkpoint_path = args.checkpoint_dir / f"fold{fold}_resnet1d_cnn_final.pt"
+        checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
@@ -1164,7 +1167,7 @@ def main() -> None:
 
     device = select_device(args.device)
     print("=" * 80, flush=True)
-    print("RESNET1D/CNN FAIR BASELINE UNDER FROZEN OOF", flush=True)
+    print(f"{RUNNER_DISPLAY_NAME.upper()} FAIR BASELINE UNDER FROZEN OOF", flush=True)
     print("=" * 80, flush=True)
     print(f"protocol={PROTOCOL}", flush=True)
     print(f"device={device} torch={torch.__version__} cuda={torch.version.cuda}", flush=True)
@@ -1211,7 +1214,7 @@ def main() -> None:
         "limit_records": int(args.limit_records),
     }
     model_params = {
-        "architecture": "resnet1d_cnn_basicblock",
+        "architecture": ARCHITECTURE_NAME,
         "input_shape": [12, int(CONFIG["slice_length"])],
         "slice_length": int(CONFIG["slice_length"]),
         "slice_stride": int(CONFIG["slice_stride"]),
