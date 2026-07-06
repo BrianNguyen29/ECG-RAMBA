@@ -322,17 +322,22 @@ def summarize_representation(
     }
 
 
-def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> dict[str, Any]:
+def summarize_fewshot(
+    rows: list[dict[str, str]],
+    manifest: dict[str, Any],
+    dataset: str,
+) -> dict[str, Any]:
     complete = bool(rows) and manifest.get("status") == "complete"
     if not complete:
         return {
+            "dataset": dataset,
             "complete": False,
             "status": manifest.get("status", "missing"),
             "key_numbers": "fewshot_status=not_run_or_deferred",
             "safe_wording": (
                 "Do not claim few-shot adaptation. The few-shot package is absent or incomplete."
             ),
-            "blocker": "PTB-XL few-shot score-calibration artifact is absent or incomplete.",
+            "blocker": f"{dataset} few-shot score-calibration artifact is absent or incomplete.",
             "best_fraction": {},
             "best_f1_fraction": {},
             "best_pr_auc_fraction": {},
@@ -390,6 +395,7 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
         pr_gain = math.nan
     key_numbers = (
         "fewshot_status=complete; "
+        f"dataset={dataset}; "
         f"protocol={manifest.get('protocol', '')}; "
         f"adaptation_kind={manifest.get('adaptation_kind', '')}; "
         f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
@@ -403,15 +409,16 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
         f"PR-AUC_gain_vs_zero={fmt(pr_gain)}"
     )
     return {
+        "dataset": dataset,
         "complete": True,
         "status": "complete",
         "key_numbers": key_numbers,
         "safe_wording": (
-            "Report PTB-XL few-shot only as leakage-audited score calibration on frozen "
-            "protocol-gated external predictions. Emphasize fixed-threshold F1 changes "
-            "separately from ranking metrics because score calibration may not improve "
-            "PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights unchanged and does not establish "
-            "a general zero-shot or few-shot advantage."
+            f"Report {dataset} few-shot only as leakage-audited dataset-specific score "
+            "calibration on frozen protocol-gated external predictions. Emphasize "
+            "fixed-threshold F1 changes separately from ranking metrics because score "
+            "calibration may not improve PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights "
+            "unchanged and does not establish a general zero-shot or few-shot advantage."
         ),
         "blocker": "",
         "best_fraction": best_f1_fraction,
@@ -420,6 +427,63 @@ def summarize_fewshot(rows: list[dict[str, str]], manifest: dict[str, Any]) -> d
         "f1_gain_vs_zero": f1_gain,
         "pr_auc_gain_vs_zero": pr_gain,
         "zero_fraction": zero_fraction,
+    }
+
+
+def combine_fewshot_summaries(
+    summaries_by_dataset: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    completed = {
+        dataset: summary
+        for dataset, summary in summaries_by_dataset.items()
+        if summary.get("complete") is True
+    }
+    deferred = [
+        dataset
+        for dataset, summary in summaries_by_dataset.items()
+        if summary.get("complete") is not True
+    ]
+    if not completed:
+        return {
+            "complete": False,
+            "status": "not_run_or_deferred",
+            "datasets_complete": [],
+            "datasets_deferred": deferred,
+            "by_dataset": summaries_by_dataset,
+            "key_numbers": "fewshot_status=not_run_or_deferred",
+            "safe_wording": (
+                "Do not claim few-shot adaptation. No dataset-specific few-shot package "
+                "is complete."
+            ),
+            "blocker": "No complete dataset-specific few-shot score-calibration artifact.",
+        }
+
+    completed_names = sorted(completed)
+    key_numbers = "; ".join(
+        f"{dataset}({completed[dataset]['key_numbers']})" for dataset in completed_names
+    )
+    blocker = (
+        "Dataset-specific few-shot score calibration not available for: "
+        + ",".join(deferred)
+        if deferred
+        else ""
+    )
+    return {
+        "complete": True,
+        "status": "complete",
+        "datasets_complete": completed_names,
+        "datasets_deferred": deferred,
+        "by_dataset": summaries_by_dataset,
+        "key_numbers": key_numbers,
+        "safe_wording": (
+            "Report few-shot only as leakage-audited dataset-specific score calibration "
+            "on frozen protocol-gated external predictions for datasets whose gates "
+            "passed and whose few-shot artifacts are complete. Emphasize fixed-threshold "
+            "F1 changes separately from ranking metrics because score calibration may "
+            "not improve PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights unchanged and does "
+            "not establish a general zero-shot or few-shot advantage."
+        ),
+        "blocker": blocker,
     }
 
 
@@ -463,6 +527,14 @@ def main() -> None:
         "fewshot_ptbxl_table": TABLE_DIR / "table_fewshot_ptbxl.csv",
         "fewshot_ptbxl_bootstrap": METRIC_DIR / "fewshot_ptbxl_bootstrap.json",
         "fewshot_ptbxl_manifest": MANIFEST_DIR / "fewshot_ptbxl_run_manifest.json",
+        "fewshot_cpsc2021_summary": METRIC_DIR / "fewshot_cpsc2021_summary.csv",
+        "fewshot_cpsc2021_table": TABLE_DIR / "table_fewshot_cpsc2021.csv",
+        "fewshot_cpsc2021_bootstrap": METRIC_DIR / "fewshot_cpsc2021_bootstrap.json",
+        "fewshot_cpsc2021_manifest": MANIFEST_DIR / "fewshot_cpsc2021_run_manifest.json",
+        "fewshot_georgia_summary": METRIC_DIR / "fewshot_georgia_summary.csv",
+        "fewshot_georgia_table": TABLE_DIR / "table_fewshot_georgia.csv",
+        "fewshot_georgia_bootstrap": METRIC_DIR / "fewshot_georgia_bootstrap.json",
+        "fewshot_georgia_manifest": MANIFEST_DIR / "fewshot_georgia_run_manifest.json",
         "robustness_multicomparator_summary": METRIC_DIR / "robustness_multicomparator_summary.csv",
         "robustness_multicomparator_pairwise": METRIC_DIR / "robustness_multicomparator_pairwise.json",
         "robustness_multicomparator_table": TABLE_DIR / "table_robustness_multicomparator.csv",
@@ -504,8 +576,14 @@ def main() -> None:
         optional_paths["representation_cka_table"],
         required=False,
     )
-    fewshot_rows = read_csv_rows(optional_paths["fewshot_ptbxl_summary"], required=False)
-    fewshot_manifest = read_json(optional_paths["fewshot_ptbxl_manifest"], required=False)
+    fewshot_dataset_summaries = {}
+    for dataset in EXPECTED_EXTERNAL_DATASETS:
+        fewshot_dataset_summaries[dataset] = summarize_fewshot(
+            read_csv_rows(optional_paths[f"fewshot_{dataset}_summary"], required=False),
+            read_json(optional_paths[f"fewshot_{dataset}_manifest"], required=False),
+            dataset,
+        )
+    fewshot_summary = combine_fewshot_summaries(fewshot_dataset_summaries)
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
@@ -535,7 +613,6 @@ def main() -> None:
         representation_probe_rows,
         representation_cka_rows,
     )
-    fewshot_summary = summarize_fewshot(fewshot_rows, fewshot_manifest)
     external_gate_by_dataset = {
         str(row.get("dataset", "")).strip().lower(): row
         for row in external_gate_rows
@@ -667,9 +744,21 @@ def main() -> None:
     ]
 
     fewshot_blocker_text = (
-        f" Few-shot blocker: {fewshot_summary['blocker']}"
+        f" Few-shot deferred note: {fewshot_summary['blocker']}"
         if fewshot_summary.get("blocker")
         else ""
+    )
+    fewshot_evidence_paths = []
+    for dataset in EXPECTED_EXTERNAL_DATASETS:
+        if fewshot_dataset_summaries.get(dataset, {}).get("complete") is True:
+            fewshot_evidence_paths.extend(
+                [
+                    f"reports/revision/metrics/fewshot_{dataset}_summary.csv",
+                    f"reports/revision/manifests/fewshot_{dataset}_run_manifest.json",
+                ]
+            )
+    fewshot_evidence_path_text = (
+        ";" + ";".join(fewshot_evidence_paths) if fewshot_evidence_paths else ""
     )
 
     matrix_rows = [
@@ -816,9 +905,8 @@ def main() -> None:
                 "reports/revision/manifests/oof_final_ema_freeze_manifest.json;"
                 "reports/revision/a0_resolution_status.json;"
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
-                "reports/revision/metrics/external_protocol_gate_summary.csv;"
-                "reports/revision/metrics/fewshot_ptbxl_summary.csv;"
-                "reports/revision/manifests/fewshot_ptbxl_run_manifest.json"
+                "reports/revision/metrics/external_protocol_gate_summary.csv"
+                f"{fewshot_evidence_path_text}"
             ),
             "safe_wording": (
                 "Claim protocol-faithful frozen Chapman OOF evaluation. "
