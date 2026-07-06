@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 import torch
 import wfdb
+from scipy.io import loadmat
 from scipy.signal import resample_poly
 from tqdm.auto import tqdm
 
@@ -219,8 +220,16 @@ def align_leads(signal: np.ndarray, signal_names: list[str] | None) -> tuple[np.
 
 def preprocess_record(record: wfdb.Record) -> tuple[np.ndarray, int]:
     raw = record.p_signal.T if record.p_signal is not None else record.d_signal.T.astype(np.float32)
-    raw, missing_leads = align_leads(raw, list(record.sig_name) if record.sig_name else None)
     source_fs = float(record.fs)
+    return preprocess_aligned_signal(raw, source_fs, list(record.sig_name) if record.sig_name else None)
+
+
+def preprocess_aligned_signal(
+    raw_signal: np.ndarray,
+    source_fs: float,
+    signal_names: list[str] | None,
+) -> tuple[np.ndarray, int]:
+    raw, missing_leads = align_leads(raw_signal.astype(np.float32), signal_names)
     if source_fs != FS:
         numerator = int(FS)
         denominator = int(round(source_fs))
@@ -229,6 +238,86 @@ def preprocess_record(record: wfdb.Record) -> tuple[np.ndarray, int]:
     filtered = pad_or_truncate(filtered, target_len=5000).astype(np.float32)
     normalized = normalize_signal(filtered).astype(np.float32)
     return normalized, missing_leads
+
+
+def georgia_header_signal_info(header_path: Path) -> tuple[float, list[str], np.ndarray, np.ndarray]:
+    """Parse Georgia Challenge .hea files that point to MATLAB .mat signals.
+
+    These headers commonly use record names such as ``E00001.mat`` in the
+    record line, which old wfdb readers reject. Reading the ``val`` array
+    directly keeps the label/protocol gate usable while preserving the same
+    downstream preprocessing as the WFDB path.
+    """
+
+    lines = [
+        line.strip()
+        for line in header_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        raise ValueError(f"empty Georgia header: {header_path}")
+    record_tokens = lines[0].split()
+    if len(record_tokens) < 4:
+        raise ValueError(f"invalid Georgia record line: {lines[0]!r}")
+    try:
+        n_signals = int(record_tokens[1])
+        source_fs = float(record_tokens[2])
+    except ValueError as exc:
+        raise ValueError(f"invalid Georgia record metadata: {lines[0]!r}") from exc
+
+    signal_names: list[str] = []
+    gains: list[float] = []
+    baselines: list[float] = []
+    for signal_line in lines[1 : 1 + n_signals]:
+        if signal_line.startswith("#"):
+            break
+        tokens = signal_line.split()
+        if len(tokens) < 9:
+            raise ValueError(f"invalid Georgia signal line: {signal_line!r}")
+        gain_token = tokens[2].split("/", 1)[0]
+        try:
+            gains.append(float(gain_token))
+            baselines.append(float(tokens[4]))
+        except ValueError as exc:
+            raise ValueError(f"invalid Georgia gain/baseline line: {signal_line!r}") from exc
+        signal_names.append(tokens[-1])
+    if len(signal_names) != n_signals:
+        raise ValueError(
+            f"Georgia header signal count mismatch for {header_path}: "
+            f"expected={n_signals} parsed={len(signal_names)}"
+        )
+    return (
+        source_fs,
+        signal_names,
+        np.asarray(gains, dtype=np.float32),
+        np.asarray(baselines, dtype=np.float32),
+    )
+
+
+def preprocess_georgia_mat_record(record_path: Path) -> tuple[np.ndarray, int]:
+    header_path = record_path.with_suffix(".hea")
+    mat_path = record_path.with_suffix(".mat")
+    if not header_path.exists():
+        raise FileNotFoundError(f"missing Georgia header: {header_path}")
+    if not mat_path.exists():
+        raise FileNotFoundError(f"missing Georgia MAT signal: {mat_path}")
+    source_fs, signal_names, gains, baselines = georgia_header_signal_info(header_path)
+    mat = loadmat(mat_path)
+    if "val" not in mat:
+        raise KeyError(f"Georgia MAT file lacks 'val' array: {mat_path}")
+    raw = np.asarray(mat["val"], dtype=np.float32)
+    if raw.ndim != 2:
+        raise ValueError(f"Georgia MAT val array must be 2D, got shape={raw.shape}")
+    if raw.shape[0] != len(signal_names) and raw.shape[1] == len(signal_names):
+        raw = raw.T
+    if raw.shape[0] != len(signal_names):
+        raise ValueError(
+            f"Georgia MAT/header channel mismatch for {record_path}: "
+            f"mat_shape={raw.shape} header_signals={len(signal_names)}"
+        )
+    gains = np.where(np.isfinite(gains) & (gains != 0), gains, 1.0).astype(np.float32)
+    raw = (raw - baselines[:, None]) / gains[:, None]
+    return preprocess_aligned_signal(raw, source_fs, signal_names)
 
 
 def checkpoint_compatible_hrv36(normalized: np.ndarray) -> np.ndarray:
@@ -679,8 +768,11 @@ def load_records(
     missing_leads = []
     for row in tqdm(metadata, desc=f"Loading {dataset}"):
         try:
-            record = wfdb.rdrecord(str(row["record_path"]))
-            normalized, missing = preprocess_record(record)
+            if dataset == "georgia":
+                normalized, missing = preprocess_georgia_mat_record(Path(row["record_path"]))
+            else:
+                record = wfdb.rdrecord(str(row["record_path"]))
+                normalized, missing = preprocess_record(record)
             if not np.isfinite(normalized).all():
                 raise ValueError("non-finite signal")
             signals.append(normalized)
@@ -708,7 +800,7 @@ def load_records(
                     f"mapped_candidate_records={len(metadata)}; signal_skipped_records={skipped}; "
                     f"skipped_without_mapped_label={metadata_summary.get('skipped_records_without_mapped_label')}; "
                     f"skip_examples={skipped_examples}. "
-                    "Check whether the Georgia archive contains WFDB-compatible signal files next "
+                    "Check whether the Georgia archive contains readable .mat signal files next "
                     "to the headers, or leave Georgia deferred."
                 )
             else:
