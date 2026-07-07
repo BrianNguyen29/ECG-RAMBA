@@ -754,7 +754,7 @@ def train_one_fold(
             }
 
     print("=" * 80, flush=True)
-    print(f"ResNet1D/CNN fold {fold}/5 | train={len(tr_idx)} | val={len(va_idx)}", flush=True)
+    print(f"{RUNNER_DISPLAY_NAME} fold {fold}/5 | train={len(tr_idx)} | val={len(va_idx)}", flush=True)
     slice_length = int(CONFIG["slice_length"])
     slice_stride = int(CONFIG["slice_stride"])
     max_slices = int(CONFIG["max_slices_per_record"])
