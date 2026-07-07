@@ -88,6 +88,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--reuse-predictions", action="store_true")
     parser.add_argument("--force-rerun", action="store_true")
+    parser.add_argument(
+        "--only-folds",
+        default="",
+        help=(
+            "Comma-separated fold numbers to train/cache only, e.g. '1' or '2,3'. "
+            "Subset mode writes fold caches/checkpoints and exits before OOF aggregation/CI."
+        ),
+    )
     parser.add_argument("--save-checkpoints", action="store_true")
     parser.add_argument("--checkpoint-dir", type=Path, default=PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints")
     return parser.parse_args()
@@ -112,6 +120,21 @@ def _git_output(args: list[str]) -> str | None:
 def _resolve_project_path(path: Path) -> Path:
     resolved = path if path.is_absolute() else PROJECT_ROOT / path
     return resolved.resolve()
+
+
+def parse_only_folds(value: str) -> set[int]:
+    selected: set[int] = set()
+    for token in str(value or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            raise ValueError(f"--only-folds must contain comma-separated fold numbers, got {value!r}")
+        fold = int(token)
+        if fold < 1:
+            raise ValueError(f"--only-folds contains an invalid fold number: {fold}")
+        selected.add(fold)
+    return selected
 
 
 def _project_relative(path: Path) -> str:
@@ -970,7 +993,7 @@ def write_prediction_npz(
     load_info: dict,
     model_params: dict,
 ) -> None:
-    print(f"Writing ResNet1D/CNN predictions: {path}", flush=True)
+    print(f"Writing {RUNNER_DISPLAY_NAME} predictions: {path}", flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -1000,7 +1023,7 @@ def write_slice_prediction_npz(
     load_info: dict,
     model_params: dict,
 ) -> None:
-    print(f"Writing ResNet1D/CNN slice predictions: {path}", flush=True)
+    print(f"Writing {RUNNER_DISPLAY_NAME} slice predictions: {path}", flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -1032,7 +1055,7 @@ def load_existing_prediction_npz(
         return None
     if not SLICE_PREDICTION_PATH.exists():
         print(
-            f"Existing ResNet1D/CNN NPZ rejected: missing paired slice artifact {SLICE_PREDICTION_PATH}",
+                f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: missing paired slice artifact {SLICE_PREDICTION_PATH}",
             flush=True,
         )
         return None
@@ -1041,7 +1064,7 @@ def load_existing_prediction_npz(
             required = {"y_true", "y_prob", "record_id", "fold_id", "slice_count", "class_names"}
             missing = required - set(data.files)
             if missing:
-                print(f"Existing ResNet1D/CNN NPZ rejected: missing {sorted(missing)}", flush=True)
+                print(f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: missing {sorted(missing)}", flush=True)
                 return None
             if str(npz_scalar(data, "protocol", "")) != PROTOCOL:
                 return None
@@ -1074,7 +1097,7 @@ def load_existing_prediction_npz(
             if float(np.min(y_prob_existing)) < -1e-6 or float(np.max(y_prob_existing)) > 1.0 + 1e-6:
                 return None
     except Exception as exc:
-        print(f"Existing ResNet1D/CNN NPZ rejected: {exc!r}", flush=True)
+        print(f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: {exc!r}", flush=True)
         return None
 
     try:
@@ -1082,7 +1105,7 @@ def load_existing_prediction_npz(
             required_slice = {"slice_prob", "slice_record_id", "slice_fold_id", "slice_start", "class_names"}
             missing_slice = required_slice - set(slice_data.files)
             if missing_slice:
-                print(f"Existing ResNet1D/CNN NPZ rejected: slice artifact missing {sorted(missing_slice)}", flush=True)
+                print(f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: slice artifact missing {sorted(missing_slice)}", flush=True)
                 return None
             if str(npz_scalar(slice_data, "protocol", "")) != PROTOCOL:
                 return None
@@ -1115,10 +1138,10 @@ def load_existing_prediction_npz(
             return None
         reconstructed_counts = np.bincount(slice_record_id, minlength=len(y)).astype(np.int16)
         if not np.array_equal(reconstructed_counts, slice_count_existing):
-            print("Existing ResNet1D/CNN NPZ rejected: slice_count does not match slice artifact", flush=True)
+            print(f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: slice_count does not match slice artifact", flush=True)
             return None
     except Exception as exc:
-        print(f"Existing ResNet1D/CNN NPZ rejected: could not validate slice artifact: {exc!r}", flush=True)
+        print(f"Existing {RUNNER_DISPLAY_NAME} NPZ rejected: could not validate slice artifact: {exc!r}", flush=True)
         return None
 
     return (
@@ -1183,13 +1206,20 @@ def main() -> None:
         args.oof_predictions,
         limit_records=args.limit_records,
     )
+    selected_folds = parse_only_folds(args.only_folds)
+    available_folds = {int(split["fold"]) for split in folds}
+    unknown_folds = sorted(selected_folds - available_folds)
+    if unknown_folds:
+        raise ValueError(f"--only-folds contains folds not present in the frozen OOF contract: {unknown_folds}")
+    if selected_folds:
+        print(f"Subset fold-cache mode enabled for folds={sorted(selected_folds)}", flush=True)
     if oof_info["oof_records_total"] != int(freeze_contract["validated_records"]):
         raise ValueError(
             "OOF prediction record count does not match freeze manifest: "
             f"{oof_info['oof_records_total']} != {freeze_contract['validated_records']}"
         )
     if int(args.limit_records) == 0 and oof_info["fold_count"] != 5:
-        raise ValueError(f"Canonical ResNet1D/CNN baseline requires five folds, got {oof_info['fold_count']}")
+        raise ValueError(f"Canonical {RUNNER_DISPLAY_NAME} baseline requires five folds, got {oof_info['fold_count']}")
     record_fingerprint = (
         oof_info.get("dataset_record_order_fingerprint")
         or freeze_contract.get("dataset_record_order_fingerprint")
@@ -1239,7 +1269,7 @@ def main() -> None:
         "uses_ecg_ramba_checkpoints": False,
     }
 
-    if args.reuse_predictions and not args.force_rerun:
+    if args.reuse_predictions and not args.force_rerun and not selected_folds:
         reusable = load_existing_prediction_npz(
             PREDICTION_PATH,
             y=y,
@@ -1257,7 +1287,7 @@ def main() -> None:
     all_slice_prob, all_slice_record_id, all_slice_start, all_slice_fold_id = [], [], [], []
     if reusable is not None:
         y_prob, fold_id_out, slice_count = reusable
-        print(f"Reusing existing ResNet1D/CNN predictions: {PREDICTION_PATH}", flush=True)
+        print(f"Reusing existing {RUNNER_DISPLAY_NAME} predictions: {PREDICTION_PATH}", flush=True)
         for fold in sorted(int(x) for x in np.unique(fold_id_out) if int(x) > 0):
             va_idx = np.where(fold_id_out == fold)[0]
             fold_metrics = multilabel_metrics(y[va_idx], y_prob[va_idx], threshold=args.threshold)
@@ -1277,7 +1307,10 @@ def main() -> None:
         y_prob = np.zeros_like(y, dtype=np.float32)
         slice_count = np.zeros(len(y), dtype=np.int16)
         fold_id_out = np.zeros(len(y), dtype=np.int16)
-        for split in folds:
+        splits_to_run = [
+            split for split in folds if not selected_folds or int(split["fold"]) in selected_folds
+        ]
+        for split in splits_to_run:
             fold = int(split["fold"])
             tr_idx = np.asarray(split["tr_idx"], dtype=np.int64)
             va_idx = np.asarray(split["va_idx"], dtype=np.int64)
@@ -1301,10 +1334,38 @@ def main() -> None:
             all_slice_fold_id.append(np.full(len(slice_record_id), fold, dtype=np.int16))
             fold_rows.append(fold_summary)
 
+        if selected_folds:
+            ready_fold_caches = [
+                fold for fold in sorted(available_folds)
+                if fold_prediction_path(fold).exists() and fold_prediction_path(fold).stat().st_size > 0
+            ]
+            ready_checkpoints = []
+            if args.save_checkpoints:
+                for fold in sorted(available_folds):
+                    checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
+                    if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+                        ready_checkpoints.append(fold)
+            payload = {
+                "status": True,
+                "mode": "fold_cache_only",
+                "runner": RUNNER_DISPLAY_NAME,
+                "selected_folds": sorted(selected_folds),
+                "ready_fold_caches": ready_fold_caches,
+                "missing_fold_caches": sorted(available_folds - set(ready_fold_caches)),
+                "ready_checkpoints": ready_checkpoints,
+                "missing_checkpoints": sorted(available_folds - set(ready_checkpoints)) if args.save_checkpoints else [],
+                "next_step": (
+                    "Publish the revision artifacts mirror now. After all five folds are ready, "
+                    "rerun without --only-folds and with --reuse-predictions to aggregate."
+                ),
+            }
+            print(json.dumps(_json_safe(payload), indent=2), flush=True)
+            return
+
         if np.any(fold_id_out <= 0):
-            raise RuntimeError("OOF fold_id coverage incomplete after ResNet1D/CNN training.")
+            raise RuntimeError(f"OOF fold_id coverage incomplete after {RUNNER_DISPLAY_NAME} training.")
         if np.any(slice_count <= 0):
-            raise RuntimeError("Some records have no ResNet1D/CNN slice predictions.")
+            raise RuntimeError(f"Some records have no {RUNNER_DISPLAY_NAME} slice predictions.")
         write_prediction_npz(
             PREDICTION_PATH,
             y=y,
