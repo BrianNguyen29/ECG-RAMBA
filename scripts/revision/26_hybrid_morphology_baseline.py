@@ -319,9 +319,9 @@ def main() -> None:
     print("HYBRID MINIROCKET MORPHOLOGY MLP BASELINE", flush=True)
     print("=" * 80, flush=True)
     freeze_contract = helpers.validate_oof_freeze_contract(
-        args.freeze_manifest,
-        args.oof_predictions,
-        args.expected_checkpoint_kind,
+        freeze_manifest=args.freeze_manifest,
+        oof_predictions=args.oof_predictions,
+        expected_checkpoint_kind=args.expected_checkpoint_kind,
     )
     y, fold_id, record_id, class_names, folds, oof_info = helpers.load_oof_labels_and_folds(
         args.oof_predictions,
