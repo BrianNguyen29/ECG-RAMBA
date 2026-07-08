@@ -2,11 +2,11 @@
 
 This script does not generate new stress predictions. It validates and compares
 existing clean/stressed prediction artifacts for Full ECG-RAMBA, MiniRocket-only,
-ResNet1D/CNN, and Raw Mamba. Missing comparator-stress artifacts are recorded as
+ResNet1D/CNN, Raw Mamba, and Transformer ECG. Missing comparator-stress artifacts are recorded as
 blocked rows rather than silently omitted.
 
 Use this runner only for metric-specific robustness statements. It is designed
-to prevent broad robustness claims when ResNet/Raw-Mamba stress artifacts have
+to prevent broad robustness claims when learned-comparator stress artifacts have
 not been generated.
 """
 
@@ -73,12 +73,17 @@ COMPARATORS = {
         "clean": "raw_mamba_oof_predictions.npz",
         "stress": "robustness_raw_mamba_{stress}_predictions.npz",
     },
+    "transformer": {
+        "label": "Transformer ECG",
+        "clean": "transformer_ecg_oof_predictions.npz",
+        "stress": "robustness_transformer_ecg_{stress}_predictions.npz",
+    },
 }
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--comparators", default="full,minirocket,resnet,raw_mamba")
+    parser.add_argument("--comparators", default="full,minirocket,resnet,raw_mamba,transformer")
     parser.add_argument("--stress-tests", default=",".join(DEFAULT_STRESSES))
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--n-bins", type=int, default=15)

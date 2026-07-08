@@ -1,4 +1,4 @@
-"""Generate stressed predictions for ResNet1D/CNN and Raw Mamba comparators.
+"""Generate stressed predictions for learned raw-ECG comparators.
 
 This runner is intentionally inference-only. It requires comparator checkpoints
 created by the fair-baseline runners with ``--save-checkpoints`` and refuses to
@@ -35,6 +35,7 @@ DEFAULT_OOF = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 DEFAULT_RESNET_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints"
 DEFAULT_RAW_MAMBA_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "raw_mamba_checkpoints"
+DEFAULT_TRANSFORMER_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "transformer_ecg_checkpoints"
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -50,12 +51,13 @@ def load_revision_module(filename: str, module_name: str):
 
 resnet_helpers = load_revision_module("14_resnet1d_cnn_baseline.py", "_stress_resnet_helpers")
 raw_mamba_helpers = load_revision_module("16_raw_mamba_baseline.py", "_stress_raw_mamba_helpers")
+transformer_helpers = load_revision_module("24_transformer_ecg_baseline.py", "_stress_transformer_helpers")
 robust_helpers = load_revision_module("12_robustness_stress.py", "_stress_perturb_helpers")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--comparators", default="resnet,raw_mamba")
+    parser.add_argument("--comparators", default="resnet,raw_mamba,transformer")
     parser.add_argument("--stress-tests", default="snr20db,snr10db,snr5db,random_3_lead_dropout,precordial_dropout,resample_250hz")
     parser.add_argument("--oof-predictions", type=Path, default=DEFAULT_OOF)
     parser.add_argument("--freeze-manifest", type=Path, default=DEFAULT_FREEZE)
@@ -63,6 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-cache", type=Path, default=None)
     parser.add_argument("--resnet-checkpoint-dir", type=Path, default=DEFAULT_RESNET_CKPT_DIR)
     parser.add_argument("--raw-mamba-checkpoint-dir", type=Path, default=DEFAULT_RAW_MAMBA_CKPT_DIR)
+    parser.add_argument("--transformer-checkpoint-dir", type=Path, default=DEFAULT_TRANSFORMER_CKPT_DIR)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto")
@@ -108,7 +111,7 @@ def autocast_resnet(device: torch.device, use_amp: bool):
 
 
 def output_path(comparator: str, stress: str) -> Path:
-    stem = {"resnet": "resnet1d_cnn", "raw_mamba": "raw_mamba"}[comparator]
+    stem = {"resnet": "resnet1d_cnn", "raw_mamba": "raw_mamba", "transformer": "transformer_ecg"}[comparator]
     return PREDICTION_DIR / f"robustness_{stem}_{stress}_predictions.npz"
 
 
@@ -117,6 +120,8 @@ def checkpoint_path(args: argparse.Namespace, comparator: str, fold: int) -> Pat
         return resolve(args.resnet_checkpoint_dir) / f"fold{fold}_resnet1d_cnn_final.pt"
     if comparator == "raw_mamba":
         return resolve(args.raw_mamba_checkpoint_dir) / f"fold{fold}_raw_mamba_final_ema.pt"
+    if comparator == "transformer":
+        return resolve(args.transformer_checkpoint_dir) / f"fold{fold}_transformer_ecg_final.pt"
     raise ValueError(f"Unknown comparator: {comparator}")
 
 
@@ -156,6 +161,27 @@ def load_raw_mamba_model(ckpt: Path, device: torch.device):
     return model.to(device).eval()
 
 
+def load_transformer_model(ckpt: Path, device: torch.device):
+    model_args = argparse.Namespace(base_channels=64, dropout=0.20)
+    payload = torch.load(ckpt, map_location="cpu")
+    if isinstance(payload, dict) and "args" in payload:
+        saved_args = payload.get("args") or {}
+        model_args.base_channels = int(saved_args.get("base_channels", model_args.base_channels))
+        model_args.dropout = float(saved_args.get("dropout", model_args.dropout))
+    embed_dim = int(model_args.base_channels)
+    n_heads = 4 if embed_dim % 4 == 0 else 2
+    model = transformer_helpers.ECGPatchTransformer(
+        n_classes=len(CLASSES),
+        embed_dim=embed_dim,
+        n_heads=n_heads,
+        depth=3,
+        dropout=float(model_args.dropout),
+        max_length=int(CONFIG["slice_length"]),
+    )
+    model.load_state_dict(payload["model_state_dict"] if isinstance(payload, dict) else payload)
+    return model.to(device).eval()
+
+
 def predict_fold(
     *,
     comparator: str,
@@ -191,7 +217,7 @@ def predict_fold(
         seed=int(args.seed) + int(fold),
         device=device,
     )
-    if comparator == "resnet":
+    if comparator in {"resnet", "transformer"}:
         slice_prob, slice_record_id, slice_start = resnet_helpers.predict_slice_probabilities(
             model,
             loader,
@@ -269,7 +295,7 @@ def main() -> None:
     device = select_device(args.device)
     comparators = parse_list(args.comparators)
     stresses = robust_helpers.stress_specs(parse_list(args.stress_tests), int(args.seed))
-    unknown = sorted(set(comparators) - {"resnet", "raw_mamba"})
+    unknown = sorted(set(comparators) - {"resnet", "raw_mamba", "transformer"})
     if unknown:
         raise ValueError(f"Unsupported comparators for this runner: {unknown}")
 
@@ -320,7 +346,14 @@ def main() -> None:
                 va_idx = np.asarray(split["va_idx"], dtype=np.int64)
                 ckpt = checkpoint_path(args, comparator, fold)
                 print(f"{comparator} stress={stress} fold {fold}/5 | val={len(va_idx)} checkpoint={ckpt}", flush=True)
-                model = load_resnet_model(args, ckpt, device) if comparator == "resnet" else load_raw_mamba_model(ckpt, device)
+                if comparator == "resnet":
+                    model = load_resnet_model(args, ckpt, device)
+                elif comparator == "raw_mamba":
+                    model = load_raw_mamba_model(ckpt, device)
+                elif comparator == "transformer":
+                    model = load_transformer_model(ckpt, device)
+                else:
+                    raise ValueError(f"Unknown comparator: {comparator}")
                 fold_prob, fold_slice_count, _slice_prob, _slice_record_id, _slice_start = predict_fold(
                     comparator=comparator,
                     model=model,
