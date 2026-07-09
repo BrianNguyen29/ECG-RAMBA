@@ -88,6 +88,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--n-bins", type=int, default=15)
     parser.add_argument("--n-boot", type=int, default=1000)
+    parser.add_argument(
+        "--metrics",
+        default="pr_auc_macro,roc_auc_macro,f1_macro,brier_macro,ece_macro",
+        help=(
+            "Comma-separated metric subset. Use pr_auc_macro,roc_auc_macro,f1_macro "
+            "for a faster reviewer screening pass; include brier_macro,ece_macro "
+            "for calibration/error robustness."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -260,6 +269,14 @@ def metric_specs(threshold: float, n_bins: int) -> list[dict[str, Any]]:
     ]
 
 
+def filter_metric_specs(specs: list[dict[str, Any]], requested: list[str]) -> list[dict[str, Any]]:
+    available = {spec["name"]: spec for spec in specs}
+    unknown = [name for name in requested if name not in available]
+    if unknown:
+        raise ValueError(f"Unknown metrics: {unknown}; choices={sorted(available)}")
+    return [available[name] for name in requested]
+
+
 def benefit(value: float, direction: str) -> float:
     return value if direction == "higher" else -value
 
@@ -344,6 +361,8 @@ def main() -> None:
     print("=" * 80, flush=True)
     print(f"comparators={comparators}", flush=True)
     print(f"stress_tests={stresses}", flush=True)
+    requested_metrics = parse_list(args.metrics)
+    print(f"metrics={requested_metrics}", flush=True)
     print(f"metric_cache_dir={resolve(args.metric_cache_dir)} reuse={args.reuse_metric_cache}", flush=True)
 
     clean: dict[str, dict[str, Any]] = {}
@@ -411,7 +430,7 @@ def main() -> None:
             )
             del clean[comp]
 
-    specs = metric_specs(args.threshold, args.n_bins)
+    specs = filter_metric_specs(metric_specs(args.threshold, args.n_bins), requested_metrics)
     rows: list[dict[str, Any]] = []
     pairwise: dict[str, Any] = {
         "status": "complete_with_possible_missing_comparators",
@@ -420,6 +439,7 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "metrics": requested_metrics,
         "metric_cache_dir": project_relative(args.metric_cache_dir),
         "items": {},
     }
@@ -556,6 +576,7 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "metrics": requested_metrics,
         "completed_rows": len(completed),
         "blocked_rows": len(blocked),
         "artifact_status": artifact_status,
