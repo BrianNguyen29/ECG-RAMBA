@@ -518,6 +518,10 @@ def main() -> None:
     optional_paths = {
         "paired_raw_mamba": METRIC_DIR / "paired_full_vs_raw_mamba_comparison.json",
         "paired_transformer": METRIC_DIR / "paired_full_vs_transformer_comparison.json",
+        "paired_hybrid_morphology": METRIC_DIR / "paired_full_vs_hybrid_morphology_comparison.json",
+        "hybrid_morphology_summary": METRIC_DIR / "hybrid_morphology_baseline_summary.json",
+        "claim_readiness_gates": METRIC_DIR / "claim_readiness_gates.json",
+        "claim_readiness_table": TABLE_DIR / "table_claim_readiness_gates.csv",
         "external_protocol_gate_summary": METRIC_DIR / "external_protocol_gate_summary.csv",
         "representation_evidence_status": METRIC_DIR / "representation_evidence_status.json",
         "representation_probe_summary": METRIC_DIR / "representation_probe_summary.json",
@@ -556,6 +560,9 @@ def main() -> None:
     paired_resnet = read_json(paths["paired_resnet"], required=False)
     paired_raw_mamba = read_json(optional_paths["paired_raw_mamba"], required=False)
     paired_transformer = read_json(optional_paths["paired_transformer"], required=False)
+    paired_hybrid_morphology = read_json(optional_paths["paired_hybrid_morphology"], required=False)
+    hybrid_morphology_summary = read_json(optional_paths["hybrid_morphology_summary"], required=False)
+    claim_readiness_gates = read_json(optional_paths["claim_readiness_gates"], required=False)
     external_gate_rows = read_csv_rows(
         optional_paths["external_protocol_gate_summary"],
         required=False,
@@ -606,6 +613,14 @@ def main() -> None:
     resnet = baseline_by_name.get("ResNet1D/CNN", {})
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
     transformer = baseline_by_name.get("Transformer ECG", {})
+    hybrid_morphology = (
+        {
+            **(hybrid_morphology_summary.get("metrics", {}) if isinstance(hybrid_morphology_summary, dict) else {}),
+            "status": "complete_optional_morphology_sensitivity",
+        }
+        if isinstance(hybrid_morphology_summary, dict) and hybrid_morphology_summary.get("metrics")
+        else {}
+    )
     q3 = pooling_by_name.get("power_mean_q3", {})
     robustness_summary = summarize_robustness(robustness_rows)
     representation_summary = summarize_representation(
@@ -685,6 +700,9 @@ def main() -> None:
     paired_resnet_metrics = paired_resnet.get("metrics", {}) if isinstance(paired_resnet, dict) else {}
     paired_raw_mamba_metrics = paired_raw_mamba.get("metrics", {}) if isinstance(paired_raw_mamba, dict) else {}
     paired_transformer_metrics = paired_transformer.get("metrics", {}) if isinstance(paired_transformer, dict) else {}
+    paired_hybrid_metrics = (
+        paired_hybrid_morphology.get("metrics", {}) if isinstance(paired_hybrid_morphology, dict) else {}
+    )
     paired_f1 = paired_minirocket_metrics.get("f1_macro", {})
     paired_pr = paired_minirocket_metrics.get("pr_auc_macro", {})
     paired_brier = paired_minirocket_metrics.get("brier_macro", {})
@@ -699,6 +717,8 @@ def main() -> None:
     paired_raw_ece = paired_raw_mamba_metrics.get("ece_macro", {})
     paired_transformer_f1 = paired_transformer_metrics.get("f1_macro", {})
     paired_transformer_pr = paired_transformer_metrics.get("pr_auc_macro", {})
+    paired_hybrid_f1 = paired_hybrid_metrics.get("f1_macro", {})
+    paired_hybrid_pr = paired_hybrid_metrics.get("pr_auc_macro", {})
 
     transformer_key_numbers = (
         f"; Transformer ECG PR-AUC={fmt(transformer.get('pr_auc_macro'))}, "
@@ -716,6 +736,24 @@ def main() -> None:
         ";reports/revision/metrics/paired_full_vs_transformer_comparison.json;"
         "reports/revision/tables/table_paired_full_vs_transformer.csv"
         if paired_transformer_metrics
+        else ""
+    )
+    hybrid_key_numbers = (
+        f"; Hybrid MiniRocket-MLP PR-AUC={fmt(hybrid_morphology.get('pr_auc_macro'))}, "
+        f"F1={fmt(hybrid_morphology.get('f1_macro'))}"
+        if hybrid_morphology
+        else ""
+    )
+    hybrid_paired_key_numbers = (
+        f"; Hybrid MiniRocket-MLP paired F1={paired_hybrid_f1.get('interpretation', '')}, "
+        f"PR-AUC={paired_hybrid_pr.get('interpretation', '')}"
+        if paired_hybrid_metrics
+        else "; Hybrid MiniRocket-MLP paired comparison=not_run_optional"
+    )
+    hybrid_evidence_paths = (
+        ";reports/revision/metrics/paired_full_vs_hybrid_morphology_comparison.json;"
+        "reports/revision/tables/table_paired_full_vs_hybrid_morphology.csv"
+        if paired_hybrid_metrics
         else ""
     )
 
@@ -772,6 +810,7 @@ def main() -> None:
                 f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}; "
                 f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
                 f"{transformer_key_numbers}"
+                f"{hybrid_key_numbers}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
@@ -779,6 +818,7 @@ def main() -> None:
                 "reports/revision/metrics/paired_full_vs_resnet_comparison.json;"
                 "reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json"
                 f"{transformer_evidence_paths}"
+                f"{hybrid_evidence_paths}"
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
@@ -812,6 +852,7 @@ def main() -> None:
                 f"ECE={paired_raw_ece.get('interpretation', '')}, "
                 f"PR-AUC={paired_raw_pr.get('interpretation', '')}"
                 f"{transformer_paired_key_numbers}"
+                f"{hybrid_paired_key_numbers}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/calibration_ci_oof_final_ema_predictions.json;"
@@ -819,6 +860,7 @@ def main() -> None:
                 "reports/revision/tables/table_paired_full_vs_resnet.csv;"
                 "reports/revision/tables/table_paired_full_vs_raw_mamba.csv"
                 f"{transformer_evidence_paths}"
+                f"{hybrid_evidence_paths}"
             ),
             "safe_wording": (
                 "Frozen OOF supports only metric-specific operating-point statements. ECG-RAMBA "
@@ -997,9 +1039,19 @@ def main() -> None:
                 "scripts/revision/24_transformer_ecg_baseline.py and paired bootstrap output are complete. "
                 "It must not be used to imply broad model-family superiority."
             ),
+            "hybrid_morphology": (
+                "Use Hybrid MiniRocket-MLP only as optional morphology-head sensitivity evidence if "
+                "scripts/revision/26_hybrid_morphology_baseline.py and paired bootstrap output are complete. "
+                "It must not be used as causal proof of deterministic morphology, regularization, or disentanglement."
+            ),
+            "claim_readiness_gates": (
+                "Use scripts/revision/28_claim_readiness_gates.py as a blocker ledger for optional or "
+                "not-supported claims; blocked rows must not be converted into positive manuscript claims."
+            ),
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
         "optional_inputs": {name: artifact(path) for name, path in optional_paths.items()},
+        "claim_readiness_gates": claim_readiness_gates if isinstance(claim_readiness_gates, dict) else {},
         "external_gate_summary": {
             "expected_datasets": list(EXPECTED_EXTERNAL_DATASETS),
             "status": external_gate_status,
