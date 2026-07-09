@@ -362,6 +362,8 @@ def main() -> None:
     print(f"comparators={comparators}", flush=True)
     print(f"stress_tests={stresses}", flush=True)
     requested_metrics = parse_list(args.metrics)
+    if not requested_metrics:
+        raise ValueError("--metrics must contain at least one metric name.")
     print(f"metrics={requested_metrics}", flush=True)
     print(f"metric_cache_dir={resolve(args.metric_cache_dir)} reuse={args.reuse_metric_cache}", flush=True)
 
