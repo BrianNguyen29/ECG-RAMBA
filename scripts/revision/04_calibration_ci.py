@@ -347,6 +347,14 @@ def main() -> None:
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
         "seed": args.seed,
+        "bootstrap": {
+            "unit": "chapman_record_subject",
+            "independence_contract": "one_chapman_record_per_subject",
+            "description": (
+                "Rows are resampled as independent Chapman records; the data-loader contract "
+                "defines one record per subject, so this is also subject-level resampling."
+            ),
+        },
         "metrics": metrics,
         "calibration": calibration,
         "calibration_micro": calibration_micro,

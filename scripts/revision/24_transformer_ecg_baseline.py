@@ -41,6 +41,7 @@ class ECGPatchTransformer(nn.Module):
         depth: int = 3,
         patch_size: int = 50,
         patch_stride: int = 25,
+        ff_multiplier: int = 4,
         dropout: float = 0.20,
         max_length: int = 2500,
     ) -> None:
@@ -53,7 +54,7 @@ class ECGPatchTransformer(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=n_heads,
-            dim_feedforward=embed_dim * 4,
+            dim_feedforward=embed_dim * ff_multiplier,
             dropout=dropout,
             activation="gelu",
             batch_first=True,
@@ -64,12 +65,14 @@ class ECGPatchTransformer(nn.Module):
         self.head = nn.Linear(embed_dim, n_classes)
         nn.init.trunc_normal_(self.positional, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         tokens = self.patch(x).transpose(1, 2)
         tokens = tokens + self.positional[:, : tokens.shape[1], :]
         encoded = self.encoder(tokens)
-        pooled = self.norm(encoded.mean(dim=1))
-        return self.head(pooled)
+        return self.norm(encoded.mean(dim=1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.forward_features(x))
 
 
 def main() -> None:
@@ -77,6 +80,7 @@ def main() -> None:
     helpers.PROTOCOL = "transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5"
     helpers.RUNNER_DISPLAY_NAME = "Transformer ECG"
     helpers.ARCHITECTURE_NAME = "patch_transformer_raw_ecg"
+    helpers.MODEL_NAME = "compact_patch_transformer_raw_ecg_baseline"
     helpers.CHECKPOINT_STEM = "transformer_ecg"
     helpers.PREDICTION_PATH = helpers.PREDICTION_DIR / "transformer_ecg_oof_predictions.npz"
     helpers.SLICE_PREDICTION_PATH = helpers.PREDICTION_DIR / "transformer_ecg_slice_predictions.npz"
@@ -98,19 +102,46 @@ def main() -> None:
         return args
 
     def build_transformer(args):
-        embed_dim = int(args.base_channels)
-        n_heads = 4 if embed_dim % 4 == 0 else 2
+        embed_dim = int(args.transformer_embed_dim or args.base_channels)
+        n_heads = int(args.transformer_heads)
+        if embed_dim % n_heads != 0:
+            raise ValueError(
+                f"Transformer embed_dim={embed_dim} must be divisible by heads={n_heads}."
+            )
         return ECGPatchTransformer(
             n_classes=len(helpers.CLASSES),
             embed_dim=embed_dim,
             n_heads=n_heads,
-            depth=3,
+            depth=int(args.transformer_depth),
+            patch_size=int(args.transformer_patch_size),
+            patch_stride=int(args.transformer_patch_stride),
+            ff_multiplier=int(args.transformer_ff_multiplier),
             dropout=float(args.dropout),
             max_length=int(helpers.CONFIG["slice_length"]),
         )
 
+    def extend_transformer_model_params(args, model_params):
+        model_params = dict(model_params)
+        embed_dim = int(args.transformer_embed_dim or args.base_channels)
+        model_params.update(
+            {
+                "embed_dim": embed_dim,
+                "n_heads": int(args.transformer_heads),
+                "depth": int(args.transformer_depth),
+                "patch_size": int(args.transformer_patch_size),
+                "patch_stride": int(args.transformer_patch_stride),
+                "feed_forward_multiplier": int(args.transformer_ff_multiplier),
+                "positional_encoding": "learned_absolute",
+                "token_pooling": "mean_then_layernorm",
+                "norm_order": "pre_norm",
+                "activation": "gelu",
+            }
+        )
+        return model_params
+
     helpers.parse_args = parse_args_with_transformer_defaults
     helpers.build_model = build_transformer
+    helpers.extend_model_params = extend_transformer_model_params
     helpers.main()
 
 

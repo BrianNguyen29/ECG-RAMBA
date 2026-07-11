@@ -49,6 +49,7 @@ from scripts.revision.common import (  # noqa: E402
     multilabel_metrics,
     save_csv,
     save_json,
+    save_npz_compressed_atomic,
 )
 from src.data_loader import bandpass_filter, normalize_signal, pad_or_truncate  # noqa: E402
 from src.features import (  # noqa: E402
@@ -110,6 +111,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--checkpoint-kind", choices=CHECKPOINT_KINDS, default="best")
     parser.add_argument("--limit-records", type=int, default=0)
+    parser.add_argument(
+        "--ptbxl-folds",
+        default="10",
+        help="Comma-separated official PTB-XL strat_fold values. Default 10 preserves the primary test artifact.",
+    )
+    parser.add_argument(
+        "--output-tag",
+        default="",
+        help="Optional filename suffix, e.g. fold9 for a target adaptation-pool export.",
+    )
     parser.add_argument("--force-features", action="store_true")
     parser.add_argument(
         "--allow-experimental",
@@ -164,6 +175,28 @@ def git_commit() -> str:
         ).strip()
     except Exception:
         return ""
+
+
+def canonical_contract() -> dict[str, str]:
+    oof = PROJECT_ROOT / "reports" / "revision" / "predictions" / "oof_final_ema_predictions.npz"
+    freeze = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
+    if not oof.exists() or not freeze.exists():
+        raise FileNotFoundError("Canonical frozen OOF artifacts are required before external prediction export.")
+    payload = json.loads(freeze.read_text(encoding="utf-8"))
+    if payload.get("status") != "frozen" or payload.get("manuscript_ready") is not True:
+        raise RuntimeError("Canonical freeze manifest is not frozen/manuscript_ready.")
+    oof_sha = sha256_file(oof)
+    expected = next(
+        (
+            row.get("sha256")
+            for row in payload.get("artifacts", [])
+            if str(row.get("path", "")).replace("\\", "/").endswith(oof.name)
+        ),
+        None,
+    )
+    if expected != oof_sha:
+        raise RuntimeError(f"Freeze OOF SHA mismatch: {expected} != {oof_sha}")
+    return {"oof_sha256": oof_sha, "freeze_sha256": sha256_file(freeze)}
 
 
 def archive_path(dataset: str) -> Path:
@@ -336,7 +369,14 @@ def checkpoint_compatible_hrv36(normalized: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
-def ptb_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
+def parse_ptbxl_folds(value: str) -> tuple[int, ...]:
+    folds = tuple(sorted({int(item.strip()) for item in str(value).split(",") if item.strip()}))
+    if not folds or any(fold < 1 or fold > 10 for fold in folds):
+        raise ValueError(f"Invalid PTB-XL folds: {folds}")
+    return folds
+
+
+def ptb_metadata(root: Path, limit: int, selected_folds: tuple[int, ...] = (10,)) -> tuple[list[dict], dict]:
     database_candidates = list(root.rglob("ptbxl_database.csv"))
     statement_candidates = list(root.rglob("scp_statements.csv"))
     if not database_candidates or not statement_candidates:
@@ -344,7 +384,7 @@ def ptb_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     database = pd.read_csv(database_candidates[0], index_col="ecg_id")
     statements = pd.read_csv(statement_candidates[0], index_col=0)
     statements.index = statements.index.astype(str)
-    test = database[database["strat_fold"] == 10].copy()
+    test = database[database["strat_fold"].isin(selected_folds)].copy()
     if limit:
         test = test.iloc[:limit]
     data_root = database_candidates[0].parent
@@ -381,10 +421,14 @@ def ptb_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
                 "record_id": str(ecg_id),
                 "record_path": data_root / str(row["filename_hr"]),
                 "y_true": y,
+                "group_id": str(row["patient_id"]),
+                "split_id": f"ptbxl_fold{int(row['strat_fold'])}",
             }
         )
     return rows, {
         "label_protocol": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
+        "selected_strat_folds": list(selected_folds),
+        "group_unit": "patient_id",
         "supported_superclasses": list(PTB_SUPERCLASS_MAPPING),
         "unsupported_superclasses": unsupported_superclasses,
         "unmapped_scp_codes": unmapped_codes,
@@ -469,6 +513,8 @@ def georgia_metadata(
                 "record_id": header.stem,
                 "record_path": header.with_suffix(""),
                 "y_true": y,
+                "group_id": header.stem,
+                "split_id": "georgia_external_pool",
             }
         )
     inventory_rows = []
@@ -497,6 +543,7 @@ def georgia_metadata(
         "total_distinct_snomed_codes": len(code_counts),
         "skipped_records_without_mapped_label": skipped_unmapped_records,
         "unmapped_snomed_codes": unmapped_codes,
+        "group_unit": "record_id_assumed_independent",
     }
 
 
@@ -576,9 +623,9 @@ def load_cpsc_windows(
     root: Path,
     limit: int,
     annotation_audit_out: Path | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     metadata, metadata_summary = cpsc_metadata(root, limit)
-    signals, labels, record_ids = [], [], []
+    signals, labels, record_ids, group_ids, split_ids = [], [], [], [], []
     skipped_annotation = 0
     skipped_signal = 0
     signal_skip_examples = []
@@ -686,6 +733,8 @@ def load_cpsc_windows(
             signals.extend(record_signals)
             labels.extend(record_labels)
             record_ids.extend(record_ids_for_windows)
+            group_ids.extend([str(row["record_id"])] * len(record_signals))
+            split_ids.extend(["cpsc2021_external_pool"] * len(record_signals))
             missing_leads.extend([missing] * len(record_signals))
             transition_windows += record_transition_windows
             positive_windows += record_positive_windows
@@ -726,6 +775,8 @@ def load_cpsc_windows(
         np.asarray(signals, dtype=np.float32),
         np.asarray(labels, dtype=np.float32),
         np.asarray(record_ids),
+        np.asarray(group_ids),
+        np.asarray(split_ids),
         {
             **metadata_summary,
             "metadata_records": len(metadata),
@@ -739,6 +790,8 @@ def load_cpsc_windows(
             "annotation_audit_csv": str(annotation_audit_out) if annotation_audit_out is not None else "",
             "missing_leads_mean": float(np.mean(missing_leads)),
             "windows_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
+            "group_unit": "source_ecg_record",
+            "n_groups": len(set(group_ids)),
         },
     )
 
@@ -748,11 +801,11 @@ def load_records(
     root: Path,
     limit: int,
     args: argparse.Namespace,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     if dataset == "cpsc2021":
         return load_cpsc_windows(root, limit, args.cpsc_annotation_audit_out)
     if dataset == "ptbxl":
-        metadata, metadata_summary = ptb_metadata(root, limit)
+        metadata, metadata_summary = ptb_metadata(root, limit, parse_ptbxl_folds(args.ptbxl_folds))
     elif dataset == "georgia":
         metadata, metadata_summary = georgia_metadata(
             root,
@@ -762,7 +815,7 @@ def load_records(
         )
     else:
         raise ValueError(f"Unsupported dataset: {dataset}")
-    signals, labels, record_ids = [], [], []
+    signals, labels, record_ids, group_ids, split_ids = [], [], [], [], []
     skipped = 0
     skipped_examples = []
     missing_leads = []
@@ -778,6 +831,8 @@ def load_records(
             signals.append(normalized)
             labels.append(row["y_true"])
             record_ids.append(row["record_id"])
+            group_ids.append(row.get("group_id", row["record_id"]))
+            split_ids.append(row.get("split_id", f"{dataset}_external_pool"))
             missing_leads.append(missing)
         except Exception as exc:
             skipped += 1
@@ -817,6 +872,8 @@ def load_records(
         np.asarray(signals, dtype=np.float32),
         np.asarray(labels, dtype=np.float32),
         np.asarray(record_ids),
+        np.asarray(group_ids),
+        np.asarray(split_ids),
         {
             **metadata_summary,
             "metadata_records": len(metadata),
@@ -824,6 +881,7 @@ def load_records(
             "skipped_records": skipped,
             "missing_leads_mean": float(np.mean(missing_leads)),
             "records_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
+            "n_groups": len(set(str(value) for value in group_ids)),
         },
     )
 
@@ -901,7 +959,9 @@ def generate_features(
         "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
     }
     payload.update({key: values for key, values in zip(hydra_keys, hydra)})
-    np.savez_compressed(cache_path, **payload)
+    # Feature construction can run for hours on CPSC2021. A partial cache must
+    # never be mistaken for a valid reusable cache after a Colab disconnect.
+    save_npz_compressed_atomic(cache_path, **payload)
     return hydra, hrv, cache_path, False
 
 
@@ -952,7 +1012,9 @@ def checkpoint_provenance(paths: list[Path], kind: str) -> tuple[list[dict], str
     source_hashes = set()
     dataset_fingerprints = set()
     for fold, path in enumerate(paths, start=1):
-        payload = torch.load(path, map_location="cpu")
+        # Trusted project checkpoints include provenance objects as well as
+        # tensors. PyTorch >=2.6 otherwise defaults to weights_only=True.
+        payload = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict) or "model" not in payload:
             raise ValueError(f"Checkpoint lacks explicit metadata: {path}")
         weights_kind = payload.get("weights_kind")
@@ -1059,7 +1121,7 @@ def infer_ensemble(
         raise ValueError("One fold-specific PCA feature matrix is required per checkpoint")
     for fold, checkpoint in enumerate(checkpoints, start=1):
         print(f"Inference checkpoint {fold}/{len(checkpoints)}: {checkpoint}")
-        state = torch.load(checkpoint, map_location=DEVICE)
+        state = torch.load(checkpoint, map_location=DEVICE, weights_only=False)
         state_dict = state["model"] if isinstance(state, dict) and "model" in state else state
         model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
         model.load_state_dict(state_dict, strict=True)
@@ -1142,6 +1204,13 @@ def update_external_summary(dataset: str, protocol: str, n_records: int, metrics
 
 def main() -> None:
     args = parse_args()
+    canonical = canonical_contract()
+    if args.dataset != "ptbxl" and str(args.ptbxl_folds).strip() != "10":
+        raise ValueError("--ptbxl-folds is valid only for --dataset ptbxl")
+    selected_ptb_folds = parse_ptbxl_folds(args.ptbxl_folds) if args.dataset == "ptbxl" else ()
+    output_tag = str(args.output_tag).strip().replace(" ", "_")
+    if args.dataset == "ptbxl" and selected_ptb_folds != (10,) and not output_tag:
+        output_tag = "folds" + "_".join(str(value) for value in selected_ptb_folds)
     ensure_revision_dirs()
     if not args.allow_experimental:
         raise RuntimeError(
@@ -1163,7 +1232,7 @@ def main() -> None:
     created_utc = datetime.now(timezone.utc).isoformat()
     archive = archive_path(args.dataset)
     root = extract_archive(args.dataset, archive, args.extract_root)
-    signals, y_true, record_ids, load_summary = load_records(
+    signals, y_true, record_ids, group_ids, split_ids, load_summary = load_records(
         args.dataset,
         root,
         args.limit_records,
@@ -1203,11 +1272,12 @@ def main() -> None:
     metrics = multilabel_metrics(y_true, y_prob, threshold=threshold)
     output_root = EXPERIMENTAL_DIR / "external" / args.dataset
     output_root.mkdir(parents=True, exist_ok=True)
-    prediction_path = output_root / f"{args.dataset}_full_predictions.npz"
-    slice_path = output_root / f"{args.dataset}_full_slice_predictions.npz"
-    summary_path = output_root / f"{args.dataset}_full_prediction_summary.json"
-    class_path = output_root / f"{args.dataset}_full_class_summary.csv"
-    manifest_path = output_root / f"{args.dataset}_full_prediction_run_manifest.json"
+    stem = f"{args.dataset}_full" + (f"_{output_tag}" if output_tag else "")
+    prediction_path = output_root / f"{stem}_predictions.npz"
+    slice_path = output_root / f"{stem}_slice_predictions.npz"
+    summary_path = output_root / f"{stem}_prediction_summary.json"
+    class_path = output_root / f"{stem}_class_summary.csv"
+    manifest_path = output_root / f"{stem}_prediction_run_manifest.json"
     pca_info = [
         {
             "fold": fold,
@@ -1223,6 +1293,8 @@ def main() -> None:
         f"experimental_external_{args.checkpoint_kind}_fold_pca_ensemble5_{POWER_MEAN_IMPLEMENTATION}_"
         f"q{aggregation_q:g}_threshold_0.5"
     )
+    if args.dataset == "ptbxl":
+        protocol += "_strat_folds_" + "_".join(str(value) for value in selected_ptb_folds)
     restrictions = [
         "External outputs remain experimental until fair baselines, bootstrap CI, and dataset-specific protocol review are complete.",
         "Current checkpoints use zero amplitude slots 25:30 because of the training feature bug.",
@@ -1236,11 +1308,14 @@ def main() -> None:
             "CPSC2021 is evaluated as annotation-aligned 10-second majority-rhythm windows, not as the official episode-boundary challenge score."
         )
 
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         prediction_path,
         y_true=y_true.astype(np.float32),
         y_prob=y_prob.astype(np.float32),
         record_id=record_ids,
+        group_id=group_ids,
+        group_unit=np.asarray(load_summary.get("group_unit", "group")),
+        split_id=split_ids,
         class_names=class_names,
         dataset=np.asarray(args.dataset),
         protocol=np.asarray(protocol),
@@ -1261,11 +1336,13 @@ def main() -> None:
         restrictions_json=np.asarray(json.dumps(restrictions)),
         threshold=np.asarray(threshold, dtype=np.float32),
     )
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         slice_path,
         slice_prob=mapped_slice_probs.astype(np.float32),
         record_index=slice_record_index,
         record_id=record_ids[slice_record_index],
+        group_id=group_ids[slice_record_index],
+        split_id=split_ids[slice_record_index],
         slice_index=slice_index,
         class_names=class_names,
         dataset=np.asarray(args.dataset),
@@ -1275,8 +1352,9 @@ def main() -> None:
         manuscript_ready=np.asarray(False),
     )
     save_csv(class_path, class_summary(args.dataset, y_true, y_prob, class_names))
+    external_summary_key = args.dataset if not output_tag else f"{args.dataset}_{output_tag}"
     external_summary_path = update_external_summary(
-        args.dataset,
+        external_summary_key,
         protocol,
         len(y_true),
         metrics,
@@ -1293,6 +1371,9 @@ def main() -> None:
         "n_records": len(y_true),
         "n_classes": y_true.shape[1],
         "class_names": [str(x) for x in class_names],
+        "group_unit": load_summary.get("group_unit"),
+        "n_groups": int(len(np.unique(group_ids))),
+        "split_ids": sorted(str(value) for value in np.unique(split_ids)),
         "metrics": metrics,
         "aggregation": {"method": "power_mean", "q": aggregation_q},
         "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
@@ -1317,6 +1398,8 @@ def main() -> None:
         manifest_path,
         {
             **summary,
+            "runner_sha256": sha256_file(Path(__file__).resolve()),
+            "canonical_contract": canonical,
             "archive": {
                 "path": str(archive),
                 "size_bytes": archive.stat().st_size,

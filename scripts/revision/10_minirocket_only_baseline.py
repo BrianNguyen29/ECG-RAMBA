@@ -42,6 +42,8 @@ from scripts.revision.common import (  # noqa: E402
 
 
 PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
+EVALUATED_TRANSFORM_NAME = "fixed_seed_rocket_family_random_convolution_max_ppv"
+CANONICAL_MINIROCKET = False
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 
@@ -1013,6 +1015,14 @@ def main() -> None:
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": "minirocket_raw",
+        "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+        "canonical_minirocket": CANONICAL_MINIROCKET,
+        "transform_contract": {
+            "requested_kernels": 10000,
+            "raw_output_dimension": 20000,
+            "statistics": ["MAX", "PPV"],
+            "bias_generation": "seeded_gaussian_not_train_quantiles",
+        },
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "model": model_name,
         "classifier_params": classifier_params,
@@ -1040,6 +1050,8 @@ def main() -> None:
         "git_commit": _git_output(["rev-parse", "HEAD"]),
         "protocol": PROTOCOL,
         "feature_contract": "minirocket_raw",
+        "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+        "canonical_minirocket": CANONICAL_MINIROCKET,
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "freeze_contract": freeze_contract,
         "load_info": load_info,

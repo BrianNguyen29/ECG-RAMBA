@@ -33,8 +33,8 @@ from scripts.revision.common import (  # noqa: E402
     METRIC_DIR,
     PTB_SUPERCLASS_MAPPING,
     TABLE_DIR,
-    bootstrap_ci,
     calibration_summary,
+    cluster_bootstrap_ci,
     ensure_revision_dirs,
     git_commit,
     macro_pr_auc,
@@ -47,7 +47,7 @@ from scripts.revision.common import (  # noqa: E402
 
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
-GATE_SCHEMA_VERSION = 3
+GATE_SCHEMA_VERSION = 4
 EXPECTED_EXTERNAL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
@@ -224,6 +224,7 @@ def load_oof_checkpoint_contract(path: Path) -> dict[int, dict[str, Any]]:
 def metric_ci(
     y_true: np.ndarray,
     y_prob: np.ndarray,
+    groups: np.ndarray,
     threshold: float,
     n_boot: int,
     seed: int,
@@ -242,11 +243,11 @@ def metric_ci(
         return float(calibration_summary(yt, yp, n_bins=n_bins)["ece_macro"])
 
     return {
-        "macro_pr_auc": bootstrap_ci(y_true, y_prob, macro_pr_auc, n_boot=n_boot, seed=seed),
-        "macro_roc_auc": bootstrap_ci(y_true, y_prob, macro_roc_auc, n_boot=n_boot, seed=seed + 1),
-        "f1_macro": bootstrap_ci(y_true, y_prob, f1_macro, n_boot=n_boot, seed=seed + 2),
-        "brier_macro": bootstrap_ci(y_true, y_prob, brier_macro, n_boot=n_boot, seed=seed + 3),
-        "ece_macro": bootstrap_ci(y_true, y_prob, ece_macro, n_boot=n_boot, seed=seed + 4),
+        "macro_pr_auc": cluster_bootstrap_ci(y_true, y_prob, groups, macro_pr_auc, n_boot=n_boot, seed=seed),
+        "macro_roc_auc": cluster_bootstrap_ci(y_true, y_prob, groups, macro_roc_auc, n_boot=n_boot, seed=seed + 1),
+        "f1_macro": cluster_bootstrap_ci(y_true, y_prob, groups, f1_macro, n_boot=n_boot, seed=seed + 2),
+        "brier_macro": cluster_bootstrap_ci(y_true, y_prob, groups, brier_macro, n_boot=n_boot, seed=seed + 3),
+        "ece_macro": cluster_bootstrap_ci(y_true, y_prob, groups, ece_macro, n_boot=n_boot, seed=seed + 4),
     }
 
 
@@ -396,9 +397,21 @@ def validate_dataset(
     summary = read_json(summary_path)
     manifest = read_json(manifest_path)
     with np.load(prediction_path, allow_pickle=False) as data:
+        prediction_keys = set(data.files)
         y_true = np.asarray(data["y_true"], dtype=np.float32)
         y_prob = np.asarray(data["y_prob"], dtype=np.float32)
         record_id = np.asarray(data["record_id"])
+        group_id = (
+            np.asarray(data["group_id"]).astype(str)
+            if "group_id" in prediction_keys
+            else np.asarray([], dtype=str)
+        )
+        split_id = (
+            np.asarray(data["split_id"]).astype(str)
+            if "split_id" in prediction_keys
+            else np.asarray([], dtype=str)
+        )
+        group_unit = str(as_scalar(data, "group_unit", ""))
         class_names = [str(x) for x in np.asarray(data["class_names"]).tolist()]
         npz_dataset = str(as_scalar(data, "dataset", ""))
         evidence_status = str(as_scalar(data, "evidence_status", ""))
@@ -415,6 +428,8 @@ def validate_dataset(
             "slice_prob",
             "record_index",
             "record_id",
+            "group_id",
+            "split_id",
             "slice_index",
             "class_names",
             "dataset",
@@ -427,6 +442,8 @@ def validate_dataset(
             slice_prob = np.asarray(slice_data["slice_prob"], dtype=np.float32)
             slice_record_index = np.asarray(slice_data["record_index"])
             slice_record_id = np.asarray(slice_data["record_id"])
+            slice_group_id = np.asarray(slice_data["group_id"]).astype(str)
+            slice_split_id = np.asarray(slice_data["split_id"]).astype(str)
             slice_class_names = [str(x) for x in np.asarray(slice_data["class_names"]).tolist()]
             slice_dataset = str(as_scalar(slice_data, "dataset", ""))
             slice_cache_schema = int(as_scalar(slice_data, "cache_schema_version", 0))
@@ -436,6 +453,8 @@ def validate_dataset(
             slice_prob = np.empty((0, 0), dtype=np.float32)
             slice_record_index = np.asarray([], dtype=np.int64)
             slice_record_id = np.asarray([])
+            slice_group_id = np.asarray([], dtype=str)
+            slice_split_id = np.asarray([], dtype=str)
             slice_class_names = []
             slice_dataset = ""
             slice_cache_schema = 0
@@ -445,6 +464,18 @@ def validate_dataset(
     checks["dataset_matches"] = npz_dataset == dataset and summary.get("dataset") == dataset
     checks["shape_matches"] = y_true.shape == y_prob.shape and y_true.ndim == 2
     checks["record_id_count_matches"] = len(record_id) == y_true.shape[0]
+    checks["group_id_present"] = "group_id" in prediction_keys and len(group_id) == y_true.shape[0]
+    checks["split_id_present"] = "split_id" in prediction_keys and len(split_id) == y_true.shape[0]
+    checks["group_ids_nonempty"] = bool(
+        checks["group_id_present"] and np.all(np.char.str_len(group_id.astype(str)) > 0)
+    )
+    checks["split_ids_nonempty"] = bool(
+        checks["split_id_present"] and np.all(np.char.str_len(split_id.astype(str)) > 0)
+    )
+    checks["group_unit_declared"] = bool(group_unit.strip())
+    checks["at_least_two_independent_groups"] = bool(
+        checks["group_id_present"] and len(np.unique(group_id)) >= 2
+    )
     checks["finite_probabilities"] = bool(np.isfinite(y_prob).all())
     checks["probabilities_in_unit_interval"] = bool(np.min(y_prob) >= 0.0 and np.max(y_prob) <= 1.0)
     checks["finite_labels"] = bool(np.isfinite(y_true).all())
@@ -497,6 +528,18 @@ def validate_dataset(
             np.asarray(record_id[slice_record_index_int], dtype=str),
         )
     )
+    checks["slice_group_id_matches_index"] = bool(
+        slice_record_index_valid
+        and checks["group_id_present"]
+        and len(slice_group_id) == len(slice_record_index_int)
+        and np.array_equal(slice_group_id, group_id[slice_record_index_int])
+    )
+    checks["slice_split_id_matches_index"] = bool(
+        slice_record_index_valid
+        and checks["split_id_present"]
+        and len(slice_split_id) == len(slice_record_index_int)
+        and np.array_equal(slice_split_id, split_id[slice_record_index_int])
+    )
     checks["slice_class_names_match"] = tuple(slice_class_names) == tuple(class_names)
     checks["slice_dataset_matches"] = slice_dataset == dataset
     checks["slice_cache_schema_current"] = slice_cache_schema == CACHE_SCHEMA_VERSION
@@ -510,6 +553,14 @@ def validate_dataset(
         issues.append(f"label/prediction shape mismatch: {y_true.shape} vs {y_prob.shape}")
     if not checks["record_id_count_matches"]:
         issues.append("record_id count does not match y_true rows")
+    if not checks["group_id_present"] or not checks["group_ids_nonempty"]:
+        issues.append("group_id is missing, empty, or does not match prediction rows")
+    if not checks["split_id_present"] or not checks["split_ids_nonempty"]:
+        issues.append("split_id is missing, empty, or does not match prediction rows")
+    if not checks["group_unit_declared"]:
+        issues.append("group_unit metadata is missing")
+    if not checks["at_least_two_independent_groups"]:
+        issues.append("external evaluation requires at least two independent groups")
     if not checks["finite_probabilities"] or not checks["probabilities_in_unit_interval"]:
         issues.append("invalid prediction probabilities")
     if not checks["finite_labels"] or not checks["binary_labels"]:
@@ -543,6 +594,10 @@ def validate_dataset(
         issues.append("slice record_index is missing or out of bounds")
     if not checks["slice_record_id_count_matches"] or not checks["slice_record_id_matches_index"]:
         issues.append("slice record_id does not match record_index")
+    if not checks["slice_group_id_matches_index"]:
+        issues.append("slice group_id does not match record_index")
+    if not checks["slice_split_id_matches_index"]:
+        issues.append("slice split_id does not match record_index")
     if not checks["slice_class_names_match"]:
         issues.append("slice class_names do not match record predictions")
     if not checks["slice_dataset_matches"]:
@@ -571,10 +626,18 @@ def validate_dataset(
         records_without = int(load_summary.get("records_without_supported_superclass", -1))
         checks["ptb_reports_unsupported_hyp"] = isinstance(unsupported, dict)
         checks["ptb_reports_records_without_supported_superclass"] = records_without >= 0
+        checks["ptb_official_test_fold_only"] = bool(
+            checks["split_id_present"] and set(split_id.tolist()) == {"ptbxl_fold10"}
+        )
+        checks["ptb_group_unit_patient"] = group_unit == "patient_id"
         if not checks["ptb_reports_unsupported_hyp"]:
             issues.append("PTB gate requires reported unsupported superclass counts")
         if not checks["ptb_reports_records_without_supported_superclass"]:
             issues.append("PTB gate requires records_without_supported_superclass")
+        if not checks["ptb_official_test_fold_only"]:
+            issues.append("Primary PTB-XL gate requires official strat_fold=10 test records only")
+        if not checks["ptb_group_unit_patient"]:
+            issues.append("PTB-XL gate requires patient_id grouping")
         warnings.append("PTB predictions are Chapman proxy superclasses; HYP remains unsupported.")
     elif dataset == "georgia":
         skipped = load_summary.get("skipped_records_without_mapped_label")
@@ -585,6 +648,7 @@ def validate_dataset(
         checks["georgia_reports_mapping_inventory"] = bool(
             inventory_path is not None and inventory_path.exists() and inventory_path.stat().st_size > 0
         )
+        checks["georgia_group_unit_declared"] = group_unit == "record_id_assumed_independent"
         if not checks["georgia_reports_unmapped_skips"]:
             issues.append("Georgia gate requires skipped_records_without_mapped_label")
         if not checks["georgia_mapping_review_exists"]:
@@ -593,6 +657,8 @@ def validate_dataset(
             issues.append("Georgia gate requires at least one reviewed map/include row for the frozen taxonomy")
         if not checks["georgia_reports_mapping_inventory"]:
             issues.append("Georgia gate requires a non-empty reviewed mapping/code inventory table")
+        if not checks["georgia_group_unit_declared"]:
+            issues.append("Georgia gate requires explicit record-level independence assumption")
     elif dataset == "cpsc2021":
         checks["cpsc_reports_annotation_skips"] = "skipped_annotation_records" in load_summary
         checks["cpsc_has_positive_and_negative_windows"] = bool(
@@ -608,6 +674,10 @@ def validate_dataset(
             and audit_path.exists()
             and audit_path.stat().st_size > 0
         )
+        checks["cpsc_group_unit_source_record"] = group_unit == "source_ecg_record"
+        checks["cpsc_multiple_windows_per_group"] = bool(
+            checks["group_id_present"] and len(np.unique(group_id)) < len(group_id)
+        )
         if not checks["cpsc_reports_annotation_skips"]:
             issues.append("CPSC gate requires skipped_annotation_records")
         if not checks["cpsc_has_positive_and_negative_windows"]:
@@ -620,6 +690,10 @@ def validate_dataset(
             issues.append("CPSC gate requires ambiguous_windows audit count")
         if not checks["cpsc_annotation_audit_exists"]:
             issues.append("CPSC gate requires a non-empty per-record annotation audit table")
+        if not checks["cpsc_group_unit_source_record"]:
+            issues.append("CPSC gate requires source_ecg_record grouping")
+        if not checks["cpsc_multiple_windows_per_group"]:
+            issues.append("CPSC gate expected repeated windows clustered by source record")
         warnings.append("CPSC is evaluated on annotation-aligned windows, not official episode score.")
 
     archive = archive_path(dataset)
@@ -681,7 +755,7 @@ def validate_dataset(
     metrics = multilabel_metrics(y_true, y_prob, threshold=args.threshold) if not issues else {}
     calib = calibration_summary(y_true, y_prob, n_bins=args.n_bins) if not issues else {}
     bootstrap = (
-        metric_ci(y_true, y_prob, args.threshold, args.n_boot, args.seed, args.n_bins)
+        metric_ci(y_true, y_prob, group_id, args.threshold, args.n_boot, args.seed, args.n_bins)
         if not issues
         else {}
     )
@@ -692,6 +766,8 @@ def validate_dataset(
             "protocol_gate_passed": not issues,
             "manuscript_ready": not issues,
             "n_records": int(y_true.shape[0]),
+            "n_groups": int(len(np.unique(group_id))) if len(group_id) else 0,
+            "group_unit": group_unit,
             "n_classes": int(y_true.shape[1]),
             "threshold": args.threshold,
             "n_bins": args.n_bins,
@@ -730,6 +806,8 @@ def validate_dataset(
         "warnings": warnings,
         "checks": checks,
         "n_records": int(y_true.shape[0]),
+        "n_groups": int(len(np.unique(group_id))) if len(group_id) else 0,
+        "group_unit": group_unit,
         "n_classes": int(y_true.shape[1]),
         "class_names": class_names,
         "metrics": metrics,
@@ -755,6 +833,8 @@ def validate_dataset(
             "expected_label_protocol": expected_label_protocol,
             "expected_class_names": list(EXPECTED_CLASS_NAMES[dataset]),
             "aggregation": {"method": "power_mean", "q": float(CONFIG["power_mean_q"])},
+            "bootstrap_unit": "patient/source-record group",
+            "group_unit": group_unit,
             "threshold": args.threshold,
             "n_bins": args.n_bins,
             "n_boot": args.n_boot,
@@ -801,6 +881,8 @@ def summary_row(payload: dict[str, Any]) -> dict[str, Any]:
         "protocol_gate_passed": payload.get("protocol_gate_passed", False),
         "manuscript_ready": payload.get("manuscript_ready", False),
         "n_records": payload.get("n_records", 0),
+        "n_groups": payload.get("n_groups", 0),
+        "group_unit": payload.get("group_unit", ""),
         "n_classes": payload.get("n_classes", 0),
         "roc_auc_macro": metrics.get("roc_auc_macro", math.nan),
         "pr_auc_macro": metrics.get("pr_auc_macro", math.nan),

@@ -160,7 +160,7 @@ class ECGRambaV7Advanced(nn.Module):
     # FORWARD
     # ========================================================
 
-    def forward(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
+    def forward_features(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
         """
         Args:
             x: Raw ECG (B, 12, L)
@@ -256,7 +256,17 @@ class ECGRambaV7Advanced(nn.Module):
         for layer in self.layers:
             seq = layer(seq)
 
-        pooled = self.norm(seq).mean(dim=1)
+        return self.norm(seq).mean(dim=1)
+
+    def forward(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
+        pooled = self.forward_features(
+            x,
+            xh,
+            xhr,
+            use_rocket=use_rocket,
+            use_hrv=use_hrv,
+            use_fusion=use_fusion,
+        )
         return self.head(pooled)
 
 

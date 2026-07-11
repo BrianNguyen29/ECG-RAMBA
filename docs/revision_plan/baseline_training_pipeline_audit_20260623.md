@@ -18,7 +18,7 @@ The source-level pipeline audit passes with warnings:
 
 - no failing source-contract checks were found;
 - MiniRocket-only and ResNet1D/CNN artifacts exist in the local Drive mirror;
-- Raw Mamba runner is implemented but does not yet have a manuscript-ready completed artifact in the mirror;
+- Raw Mamba is complete in the canonical final evidence package and is included in the regenerated final evidence tables; a separately downloaded local mirror may still need the full Raw Mamba artifact bundle if artifact-level inspection is required;
 - MiniRocket-only uses un-clipped fold-train `pos_weight` in the torch-linear head, so its strong PR-AUC/ROC-AUC should be interpreted with its poor calibration and high-recall operating behavior.
 
 Machine-readable audit outputs:
@@ -94,12 +94,12 @@ Reason for the weighted-BCE change:
 - the current runner uses fold-train `pos_weight` during BCE warm-up to make the comparator trainable under the same severe multilabel imbalance;
 - this should be reported as a retrained fair-comparator protocol, not as the exact original full ECG-RAMBA training protocol.
 
-Required next validation:
+Completed validation:
 
-- rerun Notebook 04 Raw Mamba cell after pulling the commit with weighted BCE;
-- confirm logs show `BCE pos_weight enabled`;
-- by epoch 2-5, confirm `Pstd > 0`, `P>=thr > 0`, and ROC moves above 0.5;
-- after completion, rerun Notebook 04 matrix and Notebook 07 final evidence.
+- Notebook 04 Raw Mamba used weighted BCE after the unweighted run collapsed;
+- training logs showed `BCE pos_weight enabled`;
+- early epochs showed non-constant probabilities and ROC moved above 0.5;
+- Notebook 04 and Notebook 07 were rerun, producing Raw Mamba rows in the final evidence matrix.
 
 ## Aggregation And Metrics
 
@@ -116,11 +116,11 @@ Safe after current audit:
 
 - MiniRocket-only can be cited as a deterministic feature baseline with rank-vs-calibration tradeoff.
 - ResNet1D/CNN can be cited as a strong in-domain raw ECG baseline that outperforms ECG-RAMBA on frozen Chapman OOF.
-- Raw Mamba can be described only as implemented/pending until artifacts complete.
+- Raw Mamba can be cited as a completed fair comparator, with the restriction that it is stronger than ECG-RAMBA on PR-AUC, ROC-AUC, and F1, while ECG-RAMBA has lower Brier score and ECE.
 
 Unsafe:
 
 - Do not claim ECG-RAMBA in-domain superiority.
-- Do not claim ECG-RAMBA superiority over all fair baselines until Raw Mamba artifacts complete, and even then only if the result supports it.
+- Do not claim ECG-RAMBA superiority over all fair baselines; completed ResNet1D/CNN and Raw Mamba results do not support that claim.
 - Do not claim MiniRocket calibration quality.
 - Do not treat Raw Mamba weighted-BCE results as identical to the original full ECG-RAMBA training recipe.

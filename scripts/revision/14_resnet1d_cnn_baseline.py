@@ -40,7 +40,8 @@ from scripts.revision.common import (  # noqa: E402
     macro_pr_auc,
     macro_roc_auc,
     multilabel_metrics,
-    save_json,
+    save_json_atomic,
+    save_npz_compressed_atomic,
     sha256_file,
 )
 from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabilities  # noqa: E402
@@ -52,6 +53,7 @@ PROTOCOL = "resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5"
 FEATURE_CONTRACT = "raw_ecg_12lead"
 RUNNER_DISPLAY_NAME = "ResNet1D/CNN"
 ARCHITECTURE_NAME = "resnet1d_cnn_basicblock"
+MODEL_NAME = "resnet1d_cnn_raw_baseline"
 CHECKPOINT_STEM = "resnet1d_cnn"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
@@ -62,6 +64,18 @@ MANIFEST_PATH = MANIFEST_DIR / "resnet1d_cnn_baseline_manifest.json"
 PER_CLASS_TABLE = TABLE_DIR / "table_resnet1d_cnn_class_metrics.csv"
 FOLD_TABLE = TABLE_DIR / "table_resnet1d_cnn_fold_summary.csv"
 FOLD_PREDICTION_DIR = PREDICTION_DIR / "folds"
+
+
+def save_torch_atomic(path: Path, payload: dict) -> None:
+    """Persist fold checkpoints safely across interrupted Colab sessions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.20)
     parser.add_argument("--base-channels", type=int, default=64)
+    parser.add_argument("--transformer-embed-dim", type=int, default=0, help="0 reuses --base-channels.")
+    parser.add_argument("--transformer-heads", type=int, default=4)
+    parser.add_argument("--transformer-depth", type=int, default=3)
+    parser.add_argument("--transformer-patch-size", type=int, default=50)
+    parser.add_argument("--transformer-patch-stride", type=int, default=25)
+    parser.add_argument("--transformer-ff-multiplier", type=int, default=4)
     parser.add_argument("--device", default="auto", help="auto, cuda, or cpu")
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--amp", action="store_true", help="Use float16 AMP on CUDA.")
@@ -97,6 +117,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--save-checkpoints", action="store_true")
+    parser.add_argument(
+        "--reuse-checkpoints",
+        action="store_true",
+        help="Regenerate missing fold prediction caches from compatible saved checkpoints without retraining.",
+    )
+    parser.add_argument(
+        "--allow-legacy-checkpoint-metadata",
+        action="store_true",
+        help="Allow trusted older checkpoints that predate model_params metadata after protocol/fold/CLI checks.",
+    )
     parser.add_argument("--checkpoint-dir", type=Path, default=PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints")
     return parser.parse_args()
 
@@ -528,14 +558,17 @@ class ResNet1DCNN(nn.Module):
             nn.Linear(c4, n_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.pool(x)
-        return self.head(x)
+        return torch.flatten(x, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.forward_features(x))
 
 
 def build_model(args: argparse.Namespace) -> nn.Module:
@@ -545,6 +578,12 @@ def build_model(args: argparse.Namespace) -> nn.Module:
         base_channels=args.base_channels,
         dropout=args.dropout,
     )
+
+
+def extend_model_params(args: argparse.Namespace, model_params: dict) -> dict:
+    """Extension point used by architecture wrappers such as the Transformer runner."""
+
+    return model_params
 
 
 def pos_weight_from_labels(y_train: np.ndarray) -> torch.Tensor:
@@ -718,8 +757,7 @@ def save_fold_predictions(
     args: argparse.Namespace,
     model_params: dict,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         fold=np.asarray(int(fold)),
         protocol=np.asarray(PROTOCOL),
@@ -824,70 +862,119 @@ def train_one_fold(
     )
 
     model = build_model(args).to(device)
-    pos_weight = pos_weight_from_labels(y[tr_idx]).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, int(args.epochs)),
-        eta_min=max(args.lr * 0.02, 1e-6),
-    )
-    scaler = make_scaler(device, args.amp)
-
+    checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
+    reused_checkpoint = False
     epoch_rows = []
-    for epoch in range(1, int(args.epochs) + 1):
-        model.train()
-        losses = []
-        for x, target, _rid, _start in train_loader:
-            x = x.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device, args.amp):
-                logits = model(x)
-                loss = criterion(logits, target)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            losses.append(float(loss.detach().cpu().item()))
-        scheduler.step()
-
-        row = {
-            "fold": int(fold),
-            "epoch": int(epoch),
-            "lr": float(optimizer.param_groups[0]["lr"]),
-            "train_loss": float(np.mean(losses)) if losses else math.nan,
-        }
-        if args.eval_every > 0 and (epoch == args.epochs or epoch % args.eval_every == 0):
-            slice_prob, slice_record_id, _slice_start = predict_slice_probabilities(
-                model,
-                val_loader,
-                device=device,
-                use_amp=args.amp,
-            )
-            val_metrics = record_metrics_for_fold(
-                y,
-                slice_prob,
-                slice_record_id,
-                va_idx,
-                threshold=args.threshold,
-            )
-            row.update({f"val_{k}": v for k, v in val_metrics.items()})
-            print(
-                f"Fold {fold} Ep {epoch:03d}/{args.epochs} "
-                f"loss={row['train_loss']:.5f} "
-                f"F1={val_metrics['f1_macro']:.4f} "
-                f"PR={val_metrics['pr_auc_macro']:.4f} "
-                f"ROC={val_metrics['roc_auc_macro']:.4f}",
-                flush=True,
+    if args.reuse_checkpoints and not args.force_rerun and checkpoint_path.exists():
+        print(f"Fold {fold}: checking saved checkpoint {checkpoint_path}", flush=True)
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or "model_state_dict" not in payload:
+            raise ValueError(f"Checkpoint lacks model_state_dict: {checkpoint_path}")
+        if int(payload.get("fold", -1)) != int(fold) or payload.get("protocol") != PROTOCOL:
+            raise ValueError(f"Checkpoint fold/protocol mismatch: {checkpoint_path}")
+        saved_load_info = payload.get("load_info") or {}
+        for key in (
+            "oof_predictions_sha256",
+            "raw_cache_sha256",
+            "dataset_record_order_fingerprint",
+        ):
+            if str(saved_load_info.get(key, "")) != str(load_info.get(key, "")):
+                raise ValueError(
+                    f"Checkpoint input contract mismatch for {key}: {checkpoint_path}"
+                )
+        saved_freeze_sha = (saved_load_info.get("freeze_contract") or {}).get(
+            "freeze_manifest_sha256", ""
+        )
+        current_freeze_sha = (load_info.get("freeze_contract") or {}).get(
+            "freeze_manifest_sha256", ""
+        )
+        if str(saved_freeze_sha) != str(current_freeze_sha):
+            raise ValueError(f"Checkpoint freeze-manifest SHA mismatch: {checkpoint_path}")
+        checkpoint_params = payload.get("model_params")
+        if checkpoint_params is not None:
+            if json.dumps(_json_safe(checkpoint_params), sort_keys=True) != json.dumps(
+                _json_safe(model_params), sort_keys=True
+            ):
+                raise ValueError(f"Checkpoint model_params mismatch: {checkpoint_path}")
+        elif not args.allow_legacy_checkpoint_metadata:
+            raise ValueError(
+                f"Checkpoint predates model_params metadata: {checkpoint_path}. "
+                "Use --allow-legacy-checkpoint-metadata only for trusted checkpoints from this runner."
             )
         else:
-            print(
-                f"Fold {fold} Ep {epoch:03d}/{args.epochs} loss={row['train_loss']:.5f}",
-                flush=True,
-            )
-        epoch_rows.append(row)
+            saved_args = payload.get("args") or {}
+            for key in ("epochs", "base_channels", "dropout", "lr", "weight_decay"):
+                if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
+                    raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+        model.load_state_dict(payload["model_state_dict"], strict=True)
+        model.to(device).eval()
+        reused_checkpoint = True
+        print(f"Fold {fold}: checkpoint accepted; regenerating validation predictions only", flush=True)
+
+    if not reused_checkpoint:
+        pos_weight = pos_weight_from_labels(y[tr_idx]).to(device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, int(args.epochs)),
+            eta_min=max(args.lr * 0.02, 1e-6),
+        )
+        scaler = make_scaler(device, args.amp)
+
+        for epoch in range(1, int(args.epochs) + 1):
+            model.train()
+            losses = []
+            for x, target, _rid, _start in train_loader:
+                x = x.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast_context(device, args.amp):
+                    logits = model(x)
+                    loss = criterion(logits, target)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                losses.append(float(loss.detach().cpu().item()))
+            scheduler.step()
+
+            row = {
+                "fold": int(fold),
+                "epoch": int(epoch),
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "train_loss": float(np.mean(losses)) if losses else math.nan,
+            }
+            if args.eval_every > 0 and (epoch == args.epochs or epoch % args.eval_every == 0):
+                slice_prob_eval, slice_record_id_eval, _slice_start = predict_slice_probabilities(
+                    model,
+                    val_loader,
+                    device=device,
+                    use_amp=args.amp,
+                )
+                val_metrics = record_metrics_for_fold(
+                    y,
+                    slice_prob_eval,
+                    slice_record_id_eval,
+                    va_idx,
+                    threshold=args.threshold,
+                )
+                row.update({f"val_{k}": v for k, v in val_metrics.items()})
+                print(
+                    f"Fold {fold} Ep {epoch:03d}/{args.epochs} "
+                    f"loss={row['train_loss']:.5f} "
+                    f"F1={val_metrics['f1_macro']:.4f} "
+                    f"PR={val_metrics['pr_auc_macro']:.4f} "
+                    f"ROC={val_metrics['roc_auc_macro']:.4f}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"Fold {fold} Ep {epoch:03d}/{args.epochs} loss={row['train_loss']:.5f}",
+                    flush=True,
+                )
+            epoch_rows.append(row)
 
     slice_prob, slice_record_id, slice_start = predict_slice_probabilities(
         model,
@@ -906,19 +993,19 @@ def train_one_fold(
         raise RuntimeError(f"Fold {fold} missing validation predictions: {missing[:10]}")
     final_metrics = multilabel_metrics(y[va_idx], y_prob_all[va_idx], threshold=args.threshold)
 
-    if args.save_checkpoints:
-        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_checkpoints and not reused_checkpoint:
         checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
-        torch.save(
+        save_torch_atomic(
+            checkpoint_path,
             {
                 "model_state_dict": model.state_dict(),
                 "fold": int(fold),
                 "protocol": PROTOCOL,
                 "args": vars(args),
+                "model_params": _json_safe(model_params),
                 "load_info": _json_safe(load_info),
                 "final_metrics": _json_safe(final_metrics),
             },
-            checkpoint_path,
         )
         print(f"Wrote fold checkpoint: {checkpoint_path}", flush=True)
 
@@ -943,6 +1030,7 @@ def train_one_fold(
         "train_slices": int(len(train_record_ids)),
         "validation_slices": int(len(val_record_ids)),
         "reused_fold_predictions": False,
+        "reused_checkpoint": bool(reused_checkpoint),
         "final_epoch": int(args.epochs),
         "epoch_rows_json": json.dumps(_json_safe(epoch_rows), sort_keys=True),
         **{f"final_{k}": v for k, v in final_metrics.items()},
@@ -967,7 +1055,7 @@ def _prediction_metadata(
         "config_hash": np.asarray(CONFIG_HASH),
         "git_commit": np.asarray(_git_output(["rev-parse", "HEAD"]) or ""),
         "manuscript_ready": np.asarray(args.limit_records == 0),
-        "model": np.asarray("resnet1d_cnn_raw_baseline"),
+        "model": np.asarray(MODEL_NAME),
         "model_params_json": np.asarray(json.dumps(_json_safe(model_params), sort_keys=True)),
         "oof_predictions_sha256": np.asarray(load_info.get("oof_predictions_sha256", "")),
         "freeze_manifest_sha256": np.asarray(
@@ -994,8 +1082,7 @@ def write_prediction_npz(
     model_params: dict,
 ) -> None:
     print(f"Writing {RUNNER_DISPLAY_NAME} predictions: {path}", flush=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         y_true=y.astype(np.float32),
         y_prob=y_prob.astype(np.float32),
@@ -1024,8 +1111,7 @@ def write_slice_prediction_npz(
     model_params: dict,
 ) -> None:
     print(f"Writing {RUNNER_DISPLAY_NAME} slice predictions: {path}", flush=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         slice_prob=slice_prob.astype(np.float32),
         slice_record_id=slice_record_id.astype(np.int64),
@@ -1268,6 +1354,7 @@ def main() -> None:
         "uses_pca": False,
         "uses_ecg_ramba_checkpoints": False,
     }
+    model_params = extend_model_params(args, model_params)
 
     if args.reuse_predictions and not args.force_rerun and not selected_folds:
         reusable = load_existing_prediction_npz(
@@ -1430,7 +1517,7 @@ def main() -> None:
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": FEATURE_CONTRACT,
-        "model": "resnet1d_cnn_raw_baseline",
+        "model": MODEL_NAME,
         "model_params": model_params,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
@@ -1449,7 +1536,7 @@ def main() -> None:
         },
         "manuscript_ready": args.limit_records == 0,
     }
-    save_json(SUMMARY_PATH, _json_safe(summary))
+    save_json_atomic(SUMMARY_PATH, _json_safe(summary))
 
     artifact_sha256 = {
         "summary": sha256_file(SUMMARY_PATH),
@@ -1470,7 +1557,7 @@ def main() -> None:
         "artifacts": summary["artifacts"],
         "artifact_sha256": artifact_sha256,
     }
-    save_json(MANIFEST_PATH, _json_safe(manifest))
+    save_json_atomic(MANIFEST_PATH, _json_safe(manifest))
 
     print(
         json.dumps(

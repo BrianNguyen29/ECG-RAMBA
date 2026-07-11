@@ -613,13 +613,53 @@ def write_final_embedding_npz(
     print(f"Wrote representation embeddings: {path}", flush=True)
 
 
+def final_embedding_matches(path: Path, oof: dict[str, Any], checkpoint_kind: str) -> bool:
+    path = resolve(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            required = {
+                "y_true",
+                "record_id",
+                "fold_id",
+                "class_names",
+                "protocol",
+                "checkpoint_kind",
+                "oof_predictions_sha256",
+                "freeze_manifest_sha256",
+                *EMBEDDING_KEYS,
+            }
+            if required - set(data.files):
+                return False
+            if (
+                str(data["protocol"].item()) != PROTOCOL
+                or str(data["checkpoint_kind"].item()) != checkpoint_kind
+                or str(data["oof_predictions_sha256"].item()) != oof["sha256"]
+                or str(data["freeze_manifest_sha256"].item())
+                != str(oof["freeze_manifest_sha256"] or "")
+                or not np.array_equal(np.asarray(data["y_true"], dtype=np.float32), oof["y_true"])
+                or not np.array_equal(np.asarray(data["record_id"]).astype(np.int64), oof["record_id"])
+                or not np.array_equal(np.asarray(data["class_names"]).astype(str), oof["class_names"])
+                or set(np.unique(np.asarray(data["fold_id"]).astype(int))) != {1, 2, 3, 4, 5}
+            ):
+                return False
+            return all(
+                np.asarray(data[key]).ndim == 2
+                and np.asarray(data[key]).shape[0] == len(oof["record_id"])
+                and np.isfinite(np.asarray(data[key], dtype=np.float32)).all()
+                for key in EMBEDDING_KEYS
+            )
+    except Exception:
+        return False
+
+
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
     created_utc = now_utc()
     only_folds = parse_only_folds(args.only_folds)
 
-    gen.validate_runtime_memory(args)
     oof = load_oof_contract(args.oof_predictions, args.freeze_manifest, args.limit_records)
     frozen_kind = (oof.get("freeze_payload") or {}).get("checkpoint_kind")
     if args.limit_records == 0 and frozen_kind and str(frozen_kind) != args.checkpoint_kind:
@@ -637,6 +677,51 @@ def main() -> None:
     print(f"only_folds={sorted(only_folds) if only_folds else 'all'}", flush=True)
     print(f"batch_size={args.batch_size} num_workers={args.num_workers}", flush=True)
     checkpoint_contracts = load_checkpoint_contracts(args.oof_run_manifest, args.checkpoint_kind)
+    if not only_folds and final_embedding_matches(args.out_embedding, oof, args.checkpoint_kind):
+        manifest_path = resolve(args.out_manifest)
+        existing = {}
+        if manifest_path.exists():
+            try:
+                existing = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        existing.update(
+            {
+                "status": "complete",
+                "protocol": PROTOCOL,
+                "created_utc": created_utc,
+                "runner_sha256": sha256_file(Path(__file__).resolve()),
+                "checkpoint_kind": args.checkpoint_kind,
+                "oof_predictions": project_relative(resolve(args.oof_predictions)),
+                "oof_predictions_sha256": oof["sha256"],
+                "freeze_manifest": project_relative(resolve(args.freeze_manifest)),
+                "freeze_manifest_sha256": oof["freeze_manifest_sha256"],
+                "canonical_contract": {
+                    "oof_sha256": oof["sha256"],
+                    "freeze_sha256": oof["freeze_manifest_sha256"],
+                },
+                "n_records": int(len(oof["record_id"])),
+                "n_classes": int(oof["y_true"].shape[1]),
+                "covered_records": int(len(oof["record_id"])),
+                "missing_records": 0,
+                "missing_fold_caches": [],
+                "outputs": {
+                    "embedding_npz": project_relative(resolve(args.out_embedding)),
+                    "embedding_npz_sha256": sha256_file(resolve(args.out_embedding)),
+                    "manifest": project_relative(manifest_path),
+                },
+                "safe_wording": (
+                    "Use downstream representation-probe results as suggestive branch-specific "
+                    "information only; do not claim proven morphology-rhythm disentanglement."
+                ),
+                "reused_verified_final_embedding": True,
+            }
+        )
+        save_json(manifest_path, jsonable(existing))
+        print(f"Reusing verified final representation embedding: {resolve(args.out_embedding)}", flush=True)
+        print(f"Wrote manifest: {manifest_path}", flush=True)
+        return
+    gen.validate_runtime_memory(args)
     validate_mamba_runtime_for_extraction()
 
     from src.features import generate_hrv_cache, generate_raw_rocket_cache
@@ -807,11 +892,16 @@ def main() -> None:
         "status": "complete" if missing_records == 0 else "partial_missing_fold_caches",
         "protocol": PROTOCOL,
         "created_utc": created_utc,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "checkpoint_kind": args.checkpoint_kind,
         "oof_predictions": project_relative(resolve(args.oof_predictions)),
         "oof_predictions_sha256": oof["sha256"],
         "freeze_manifest": project_relative(resolve(args.freeze_manifest)),
         "freeze_manifest_sha256": oof["freeze_manifest_sha256"],
+        "canonical_contract": {
+            "oof_sha256": oof["sha256"],
+            "freeze_sha256": oof["freeze_manifest_sha256"],
+        },
         "dataset_record_order_fingerprint": dataset_record_fingerprint,
         "evaluation_config_hash": EVALUATION_CONFIG_HASH,
         "embedding_views": EMBEDDING_KEYS,
@@ -846,6 +936,9 @@ def main() -> None:
             fold_id=global_fold_id,
             slice_count=global_slice_count,
             payload=payload,
+        )
+        payload["outputs"]["embedding_npz_sha256"] = sha256_file(
+            resolve(args.out_embedding)
         )
     else:
         print(

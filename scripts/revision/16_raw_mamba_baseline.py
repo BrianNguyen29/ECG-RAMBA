@@ -38,7 +38,8 @@ from scripts.revision.common import (  # noqa: E402
     macro_roc_auc,
     multilabel_metrics,
     save_csv,
-    save_json,
+    save_json_atomic,
+    save_npz_compressed_atomic,
     sha256_file,
 )
 from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabilities  # noqa: E402
@@ -229,6 +230,20 @@ def forward_raw_mamba(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return model(x, xh, xhr, use_rocket=False, use_hrv=False, use_fusion=False)
 
 
+def forward_raw_mamba_features(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Return the frozen pooled Raw-Mamba representation before its classifier."""
+
+    xh, xhr = zero_aux(x.shape[0], x.device, x.dtype)
+    return model.forward_features(
+        x,
+        xh,
+        xhr,
+        use_rocket=False,
+        use_hrv=False,
+        use_fusion=False,
+    )
+
+
 def predict_slice_probabilities(
     model: nn.Module,
     loader,
@@ -372,8 +387,7 @@ def save_fold_predictions(
     args: argparse.Namespace,
     model_params: dict,
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         fold=np.asarray(int(fold)),
         protocol=np.asarray(PROTOCOL),
@@ -468,7 +482,7 @@ def write_fold_cache_status(
             "to create canonical OOF predictions, summary, manifest, and paired evidence."
         ),
     }
-    save_json(FOLD_CACHE_STATUS_JSON, _json_safe(payload))
+    save_json_atomic(FOLD_CACHE_STATUS_JSON, _json_safe(payload))
     return payload
 
 
@@ -681,12 +695,12 @@ def train_one_fold(
     final_metrics = multilabel_metrics(y[va_idx], y_prob_all[va_idx], threshold=args.threshold)
 
     if args.save_checkpoints:
-        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = args.checkpoint_dir / f"fold{fold}_raw_mamba_final_{final_weights_kind}.pt"
         if ema is not None:
             ema.apply_shadow(model)
         try:
-            torch.save(
+            resnet_helpers.save_torch_atomic(
+                checkpoint_path,
                 {
                     "model_state_dict": model.state_dict(),
                     "fold": int(fold),
@@ -697,7 +711,6 @@ def train_one_fold(
                     "load_info": _json_safe(load_info),
                     "final_metrics": _json_safe(final_metrics),
                 },
-                checkpoint_path,
             )
         finally:
             if ema is not None:
@@ -772,8 +785,7 @@ def write_prediction_npz(
     model_params: dict,
 ) -> None:
     print(f"Writing Raw Mamba predictions: {path}", flush=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         y_true=y.astype(np.float32),
         y_prob=y_prob.astype(np.float32),
@@ -798,8 +810,7 @@ def write_slice_prediction_npz(
     model_params: dict,
 ) -> None:
     print(f"Writing Raw Mamba slice predictions: {path}", flush=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         slice_prob=slice_prob.astype(np.float32),
         slice_record_id=slice_record_id.astype(np.int64),
@@ -1219,7 +1230,7 @@ def main() -> None:
         },
         "manuscript_ready": args.limit_records == 0,
     }
-    save_json(SUMMARY_PATH, _json_safe(summary))
+    save_json_atomic(SUMMARY_PATH, _json_safe(summary))
 
     artifact_sha256 = {
         "summary": sha256_file(SUMMARY_PATH),
@@ -1240,7 +1251,7 @@ def main() -> None:
         "artifacts": summary["artifacts"],
         "artifact_sha256": artifact_sha256,
     }
-    save_json(MANIFEST_PATH, _json_safe(manifest))
+    save_json_atomic(MANIFEST_PATH, _json_safe(manifest))
 
     print(
         json.dumps(

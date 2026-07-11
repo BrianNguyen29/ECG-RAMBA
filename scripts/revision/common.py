@@ -124,23 +124,63 @@ def ensure_revision_dirs() -> None:
 
 
 def save_json(path: os.PathLike[str] | str, payload: dict) -> None:
+    """Persist JSON atomically so an interrupted job cannot leave a reusable partial file."""
+
+    save_json_atomic(path, payload)
+
+
+def save_json_atomic(path: os.PathLike[str] | str, payload: dict) -> None:
+    """Write JSON through a same-directory temporary file before replacing it."""
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def save_npz_compressed_atomic(path: os.PathLike[str] | str, **arrays: np.ndarray) -> None:
+    """Atomically persist a compressed NPZ cache so interrupted writes are not reusable."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.stem}.{os.getpid()}.partial.npz")
+    try:
+        np.savez_compressed(tmp_path, **arrays)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def save_csv(path: os.PathLike[str] | str, rows: Iterable[dict]) -> None:
     rows = list(rows)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        if not rows:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            with tmp_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def sha256_file(path: os.PathLike[str] | str, chunk_size: int = 1024 * 1024) -> str:
@@ -310,6 +350,163 @@ def bootstrap_ci(
         "hi": float(hi),
         "n_boot_valid": int(len(values)),
     }
+
+
+def cluster_bootstrap_ci(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    groups: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> dict:
+    """Bootstrap complete independent groups rather than individual rows."""
+
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    groups = np.asarray(groups).astype(str)
+    if y_true.shape != y_prob.shape or len(groups) != len(y_true):
+        raise ValueError(
+            f"Cluster bootstrap shape mismatch: y_true={y_true.shape}, "
+            f"y_prob={y_prob.shape}, groups={groups.shape}"
+        )
+    unique_groups, inverse = np.unique(groups, return_inverse=True)
+    if len(unique_groups) < 2:
+        raise ValueError("Cluster bootstrap requires at least two independent groups.")
+    members = [np.where(inverse == idx)[0] for idx in range(len(unique_groups))]
+    rng = np.random.default_rng(seed)
+    values: list[float] = []
+    for _ in range(int(n_boot)):
+        sampled = rng.integers(0, len(unique_groups), size=len(unique_groups))
+        row_idx = np.concatenate([members[int(group_idx)] for group_idx in sampled])
+        try:
+            value = float(metric_fn(y_true[row_idx], y_prob[row_idx]))
+        except (ValueError, RuntimeError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    if not values:
+        return {"mean": math.nan, "lo": math.nan, "hi": math.nan, "n_boot_valid": 0}
+    array = np.asarray(values, dtype=np.float64)
+    return {
+        "mean": float(np.mean(array)),
+        "lo": float(np.quantile(array, alpha / 2)),
+        "hi": float(np.quantile(array, 1 - alpha / 2)),
+        "n_boot_valid": int(len(array)),
+        "n_groups": int(len(unique_groups)),
+        "sample_unit": "group",
+    }
+
+
+def paired_cluster_bootstrap_delta(
+    y_true: np.ndarray,
+    y_prob_a: np.ndarray,
+    y_prob_b: np.ndarray,
+    groups: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    n_boot: int = 1000,
+    seed: int = 42,
+    alpha: float = 0.05,
+) -> dict:
+    """Paired group bootstrap for ``metric(a) - metric(b)``."""
+
+    y_true = np.asarray(y_true)
+    y_prob_a = np.asarray(y_prob_a)
+    y_prob_b = np.asarray(y_prob_b)
+    groups = np.asarray(groups).astype(str)
+    if y_true.shape != y_prob_a.shape or y_true.shape != y_prob_b.shape:
+        raise ValueError("Paired cluster bootstrap prediction shapes differ.")
+    if len(groups) != len(y_true):
+        raise ValueError("Paired cluster bootstrap group length differs from predictions.")
+    unique_groups, inverse = np.unique(groups, return_inverse=True)
+    if len(unique_groups) < 2:
+        raise ValueError("Paired cluster bootstrap requires at least two independent groups.")
+    members = [np.where(inverse == idx)[0] for idx in range(len(unique_groups))]
+    rng = np.random.default_rng(seed)
+    values: list[float] = []
+    for _ in range(int(n_boot)):
+        sampled = rng.integers(0, len(unique_groups), size=len(unique_groups))
+        row_idx = np.concatenate([members[int(group_idx)] for group_idx in sampled])
+        try:
+            value = float(metric_fn(y_true[row_idx], y_prob_a[row_idx])) - float(
+                metric_fn(y_true[row_idx], y_prob_b[row_idx])
+            )
+        except (ValueError, RuntimeError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    if not values:
+        return {"mean": math.nan, "lo": math.nan, "hi": math.nan, "n_boot_valid": 0}
+    array = np.asarray(values, dtype=np.float64)
+    point = float(metric_fn(y_true, y_prob_a)) - float(metric_fn(y_true, y_prob_b))
+    return {
+        "point_delta_a_minus_b": point,
+        "mean": float(np.mean(array)),
+        "lo": float(np.quantile(array, alpha / 2)),
+        "hi": float(np.quantile(array, 1 - alpha / 2)),
+        "n_boot_valid": int(len(array)),
+        "n_groups": int(len(unique_groups)),
+        "sample_unit": "group",
+    }
+
+
+def balanced_group_train_test_split(
+    y_true: np.ndarray,
+    groups: np.ndarray,
+    test_fraction: float,
+    seed: int,
+    n_candidates: int = 128,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Choose a leakage-safe group split with stable label coverage.
+
+    Candidate splits are random group permutations. Selection uses labels only
+    to avoid losing globally evaluable classes and then minimize train/test
+    prevalence drift. No test outcomes are used for model or threshold tuning.
+    """
+
+    y_true = np.asarray(y_true)
+    groups = np.asarray(groups).astype(str)
+    if y_true.ndim != 2 or len(y_true) != len(groups):
+        raise ValueError(f"Group split shape mismatch: y_true={y_true.shape}, groups={groups.shape}")
+    if not 0 < float(test_fraction) < 1:
+        raise ValueError("test_fraction must be in (0,1)")
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < 2:
+        raise ValueError("Group split requires at least two independent groups")
+    n_test = min(max(int(round(len(unique_groups) * float(test_fraction))), 1), len(unique_groups) - 1)
+    globally_evaluable = np.logical_and(y_true.sum(axis=0) > 0, y_true.sum(axis=0) < len(y_true))
+    rng = np.random.default_rng(int(seed))
+    best: tuple[tuple[int, float, float], np.ndarray, np.ndarray, dict] | None = None
+    for candidate in range(max(int(n_candidates), 1)):
+        order = rng.permutation(unique_groups)
+        test_groups = order[:n_test]
+        train_groups = order[n_test:]
+        test_mask = np.isin(groups, test_groups)
+        train_mask = ~test_mask
+        train_y = y_true[train_mask]
+        test_y = y_true[test_mask]
+        train_evaluable = np.logical_and(train_y.sum(axis=0) > 0, train_y.sum(axis=0) < len(train_y))
+        test_evaluable = np.logical_and(test_y.sum(axis=0) > 0, test_y.sum(axis=0) < len(test_y))
+        coverage_failures = int(np.sum(globally_evaluable & ~(train_evaluable & test_evaluable)))
+        prevalence_drift = float(np.mean(np.abs(train_y.mean(axis=0) - test_y.mean(axis=0))))
+        row_fraction_error = abs(float(np.mean(test_mask)) - float(test_fraction))
+        score = (coverage_failures, prevalence_drift, row_fraction_error)
+        audit = {
+            "candidate_index": candidate,
+            "n_candidates": max(int(n_candidates), 1),
+            "coverage_failures": coverage_failures,
+            "prevalence_drift_mean_abs": prevalence_drift,
+            "row_test_fraction": float(np.mean(test_mask)),
+            "target_test_fraction": float(test_fraction),
+            "train_groups": int(len(train_groups)),
+            "test_groups": int(len(test_groups)),
+            "split_policy": "best_of_random_group_candidates_label_coverage_then_prevalence",
+        }
+        if best is None or score < best[0]:
+            best = (score, train_groups, test_groups, audit)
+    assert best is not None
+    return best[1], best[2], best[3]
 
 
 def macro_pr_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:

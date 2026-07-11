@@ -16,7 +16,7 @@ The current manuscript should remain stable unless a workstream below is intenti
 The source-of-truth evidence supports:
 
 - Frozen Chapman OOF as the primary manuscript-ready evidence.
-- PTB-XL only as a protocol-gated mapped-task external evaluation.
+- PTB-XL, Georgia, and CPSC2021 only as protocol-gated mapped-task external evaluations.
 - Fair-baseline results as comparator-specific and metric-specific.
 - HRV as useful but domain-sensitive.
 - Robustness only as metric-specific against MiniRocket-only.
@@ -24,8 +24,8 @@ The source-of-truth evidence supports:
 
 The evidence does not support:
 
-- ECG-RAMBA as SOTA, best in-domain, or globally superior.
-- Zero-shot superiority.
+- ECG-RAMBA as the leading in-domain model or broadly superior model.
+- Unqualified cross-dataset advantage.
 - Proven morphology-rhythm disentanglement.
 - HRV invariance or full HRV feature semantics.
 - General robustness superiority.
@@ -63,7 +63,7 @@ Rerun:
 - Undefined references/citations: 0.
 - Positive forbidden-claim scan: pass.
 - Algorithm 1 still present and referenced.
-- Captions do not imply SOTA, zero-shot superiority, strict disentanglement, or general robustness.
+- Captions do not imply benchmark-leading performance, unqualified cross-dataset advantage, strict mechanism proof, or general robustness.
 
 ## P1: Georgia External Protocol Gate
 
@@ -128,7 +128,7 @@ reports/revision/logs/external_protocol_gate.log
 
 ### Safe Claim If Passed
 
-Georgia can be cited only as a dataset-specific mapped-task external evaluation. It still does not support zero-shot superiority.
+Georgia can be cited only as a dataset-specific mapped-task external evaluation. It still does not support an unqualified cross-dataset advantage.
 
 ## P1: CPSC2021 External Protocol Gate
 
@@ -195,7 +195,7 @@ reports/revision/logs/external_protocol_gate.log
 
 ### Safe Claim If Passed
 
-CPSC2021 can be cited only as annotation-aligned mapped-task evidence. It still does not support broad zero-shot superiority.
+CPSC2021 can be cited only as annotation-aligned mapped-task evidence. It still does not support broad cross-dataset advantage.
 
 ## P2: Few-Shot Adaptation
 
@@ -211,7 +211,7 @@ scripts/revision/19_fewshot_adaptation.py
 
 ### Current Implementation Status
 
-`scripts/revision/19_fewshot_adaptation.py` is implemented as a gated, conservative score-calibration runner on frozen external predictions. It refuses to produce completion evidence unless the dataset-specific external gate has passed. For each seed, the target-domain test split is frozen before any labeled fraction is selected, and the 1/5/10 percent training subsets are nested prefixes of the remaining target-domain pool. This is suitable for a leakage-audited few-shot sensitivity analysis, but it is not model-weight fine-tuning and must not be described as full few-shot transfer.
+`scripts/revision/19_fewshot_adaptation.py` is implemented as a gated, conservative score-calibration runner on frozen external predictions. Notebook 02 now exposes it as an optional disabled-by-default cell after the external protocol gate. The runner refuses to produce completion evidence unless the dataset-specific external gate has passed. For each seed, the target-domain test split is frozen before any labeled fraction is selected, and the 1/5/10 percent training subsets are nested prefixes of the remaining target-domain pool. This is suitable for a leakage-audited few-shot sensitivity analysis, but it is not model-weight fine-tuning and must not be described as full few-shot transfer.
 
 ### Protocol
 
@@ -317,7 +317,7 @@ reports/revision/logs/representation_probe.log
 - Embedding manifest includes OOF/freeze/checkpoint SHA256 values and dataset record-order fingerprint.
 - Probe splits are fold-safe.
 - UMAP is not used as quantitative proof.
-- Summary wording explicitly blocks "proven disentanglement".
+- Summary wording explicitly blocks strict mechanism-proof language.
 
 ### Safe Claim If Complete
 
@@ -393,7 +393,7 @@ or extend `12_robustness_stress.py` into a comparator registry.
 
 ### Current Implementation Status
 
-`scripts/revision/21_robustness_multicomparator.py` is implemented as a low-memory aggregation/gating runner. It validates existing clean/stressed prediction artifacts for each comparator, records missing comparator-stress artifacts as blocked rows, and computes metric-specific paired degradation CIs when inputs are complete. It does not generate ResNet1D/CNN or Raw Mamba stress predictions; those prediction-generation steps remain required before broad multi-comparator robustness evidence exists.
+`scripts/revision/21_robustness_multicomparator.py` is implemented as a low-memory aggregation/gating runner and is now exposed in Notebook 05 after the Full-vs-MiniRocket robustness ledger. It validates existing clean/stressed prediction artifacts for each comparator, records missing comparator-stress artifacts as blocked rows, and computes metric-specific paired degradation CIs when inputs are complete. It does not generate ResNet1D/CNN or Raw Mamba stress predictions; those prediction-generation steps remain required before broad multi-comparator robustness evidence exists.
 
 ### Comparators
 

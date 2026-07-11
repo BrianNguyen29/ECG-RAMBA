@@ -1,11 +1,12 @@
-"""Hybrid MiniRocket morphology baseline under the frozen OOF protocol.
+"""Frozen random-convolution morphology MLP-head control under frozen OOF.
 
-This optional reviewer-facing runner tests whether the MiniRocket morphology
-branch benefits from a partially learnable nonlinear head. It reuses the same
-fold-safe RAW MiniRocket feature cache and frozen OOF contract as the
-MiniRocket-only linear baseline, but replaces the linear logistic head with a
+This optional reviewer-facing runner tests whether the fixed-seed ROCKET-family
+random-convolution morphology branch benefits from a nonlinear head. It reuses
+the same fold-safe MAX+PPV feature cache and frozen OOF contract as the legacy
+linear random-transform baseline, but replaces the linear logistic head with a
 small MLP. It does not alter the ECG-RAMBA checkpoint and must be interpreted
-only as morphology-branch sensitivity evidence.
+only as morphology-branch head-capacity sensitivity evidence; it does not make
+the convolution kernels learnable.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -39,12 +41,14 @@ from scripts.revision.common import (  # noqa: E402
     macro_roc_auc,
     multilabel_metrics,
     save_json,
+    save_npz_compressed_atomic,
     sha256_file,
 )
 
 
-PROTOCOL = "hybrid_morphology_minirocket_mlp_same_folds_threshold_0.5"
-FEATURE_CONTRACT = "minirocket_raw_learnable_mlp_head"
+PROTOCOL = "fixed_seed_rocket_family_max_ppv_mlp_head_same_folds_threshold_0.5"
+FEATURE_CONTRACT = "fixed_seed_rocket_family_random_convolution_max_ppv_frozen_mlp_head"
+EVALUATED_TRANSFORM_NAME = "fixed_seed_rocket_family_random_convolution_max_ppv"
 HELPER_PATH = PROJECT_ROOT / "scripts" / "revision" / "10_minirocket_only_baseline.py"
 
 
@@ -78,6 +82,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--standardize", choices=["train_fold", "none"], default="train_fold")
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-predictions", action="store_true")
+    parser.add_argument("--force-rerun", action="store_true")
+    parser.add_argument(
+        "--only-folds",
+        default="",
+        help="Comma-separated folds to train/cache only; rerun without this flag to aggregate all folds.",
+    )
+    parser.add_argument("--save-checkpoints", action="store_true")
+    parser.add_argument("--reuse-checkpoints", action="store_true")
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=PROJECT_ROOT / "reports" / "revision" / "experimental" / "hybrid_morphology_checkpoints",
+    )
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--oof-predictions", type=Path, default=helpers.DEFAULT_OOF_PREDICTIONS)
     parser.add_argument("--freeze-manifest", type=Path, default=helpers.DEFAULT_FREEZE_MANIFEST)
@@ -109,6 +126,36 @@ def resolve_device_name(requested: str) -> str:
         return "cpu"
 
 
+def parse_only_folds(value: str) -> set[int]:
+    folds = {int(item.strip()) for item in str(value).split(",") if item.strip()}
+    invalid = sorted(fold for fold in folds if fold < 1 or fold > 5)
+    if invalid:
+        raise ValueError(f"Invalid --only-folds values: {invalid}")
+    return folds
+
+
+def fold_cache_path(fold: int) -> Path:
+    return PREDICTION_DIR / "folds" / f"hybrid_morphology_fold{fold}_predictions.npz"
+
+
+def fold_checkpoint_path(args: argparse.Namespace, fold: int) -> Path:
+    return Path(args.checkpoint_dir) / f"fold{fold}_hybrid_morphology_final.pt"
+
+
+def save_torch_atomic(path: Path, payload: dict) -> None:
+    """Prevent a disconnect from leaving a checkpoint that looks reusable."""
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.partial")
+    try:
+        torch.save(payload, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def json_safe(value):
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
@@ -130,6 +177,8 @@ def metadata(args: argparse.Namespace, load_info: dict, model_name: str, classif
         "dataset": np.asarray("chapman_oof"),
         "protocol": np.asarray(PROTOCOL),
         "feature_contract": np.asarray(FEATURE_CONTRACT),
+        "evaluated_transform_name": np.asarray(EVALUATED_TRANSFORM_NAME),
+        "canonical_minirocket": np.asarray(False),
         "feature_preprocessing": np.asarray(
             "fold_train_standardization" if args.standardize == "train_fold" else "none"
         ),
@@ -183,7 +232,15 @@ def load_existing(path: Path, y: np.ndarray, record_id: np.ndarray, class_names:
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id
 
 
-def fit_predict_mlp_oof(X: np.ndarray, y: np.ndarray, folds: list[dict[str, np.ndarray]], *, args: argparse.Namespace):
+def fit_predict_mlp_oof(
+    X: np.ndarray,
+    y: np.ndarray,
+    folds: list[dict[str, np.ndarray]],
+    *,
+    args: argparse.Namespace,
+    load_info: dict,
+    classifier_params: dict,
+):
     import torch
     import torch.nn as nn
 
@@ -193,7 +250,7 @@ def fit_predict_mlp_oof(X: np.ndarray, y: np.ndarray, folds: list[dict[str, np.n
         torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
         torch.backends.cudnn.benchmark = False
     print(
-        f"Hybrid MiniRocket-MLP device={device} batch_size={args.batch_size} "
+        f"Frozen-transform morphology MLP device={device} batch_size={args.batch_size} "
         f"epochs={args.epochs} hidden_dim={args.hidden_dim} dropout={args.dropout}",
         flush=True,
     )
@@ -204,17 +261,73 @@ def fit_predict_mlp_oof(X: np.ndarray, y: np.ndarray, folds: list[dict[str, np.n
     fold_id_out = np.full(n_records, -1, dtype=np.int16)
     fold_rows: list[dict] = []
 
+    selected_folds = parse_only_folds(args.only_folds)
+    params_json = json.dumps(json_safe(classifier_params), sort_keys=True)
     for fold in folds:
         fold_num = int(fold["fold"])
+        if selected_folds and fold_num not in selected_folds:
+            continue
         tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
         va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
+        cache_path = fold_cache_path(fold_num)
+        if not args.force_rerun and cache_path.exists():
+            try:
+                with np.load(cache_path, allow_pickle=False) as cached:
+                    valid = (
+                        str(cached["protocol"].item()) == PROTOCOL
+                        and str(cached["classifier_params_json"].item()) == params_json
+                        and str(cached["oof_predictions_sha256"].item()) == load_info.get("oof_predictions_sha256")
+                        and str(cached["minirocket_cache_sha256"].item()) == load_info.get("minirocket_cache_sha256")
+                        and np.array_equal(np.asarray(cached["val_indices"], dtype=np.int64), va_idx)
+                    )
+                    cached_prob = np.asarray(cached["y_prob"], dtype=np.float32)
+                if valid and cached_prob.shape == (len(va_idx), n_classes) and np.isfinite(cached_prob).all():
+                    y_prob[va_idx] = cached_prob
+                    fold_id_out[va_idx] = fold_num
+                    fold_rows.append(
+                        {
+                            "fold": fold_num,
+                            "train_records": int(len(tr_idx)),
+                            "validation_records": int(len(va_idx)),
+                            "validation_positive_labels": int(np.sum(y[va_idx])),
+                            "classifier": "FrozenTransformMLP",
+                            "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+                            "hidden_dim": int(args.hidden_dim),
+                            "dropout": float(args.dropout),
+                            "epochs": int(args.epochs),
+                            "reused_fold_predictions": True,
+                        }
+                    )
+                    print(f"Fold {fold_num}: reused fold cache {cache_path}", flush=True)
+                    continue
+            except Exception as exc:
+                print(f"Fold {fold_num}: rejected cache {cache_path}: {exc!r}", flush=True)
         rng = np.random.default_rng(int(args.seed) + fold_num)
         torch.manual_seed(int(args.seed) + fold_num)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(int(args.seed) + fold_num)
         print(f"Fold {fold_num}/5 | train={len(tr_idx)} | val={len(va_idx)} | features={n_features}", flush=True)
 
-        if args.standardize == "train_fold":
+        checkpoint_path = fold_checkpoint_path(args, fold_num)
+        checkpoint_payload = None
+        if args.reuse_checkpoints and not args.force_rerun and checkpoint_path.exists():
+            checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if (
+                not isinstance(checkpoint_payload, dict)
+                or checkpoint_payload.get("protocol") != PROTOCOL
+                or int(checkpoint_payload.get("fold", -1)) != fold_num
+                or checkpoint_payload.get("classifier_params") != json_safe(classifier_params)
+                or checkpoint_payload.get("oof_predictions_sha256")
+                != load_info.get("oof_predictions_sha256")
+                or checkpoint_payload.get("minirocket_cache_sha256")
+                != load_info.get("minirocket_cache_sha256")
+            ):
+                raise ValueError(f"Hybrid checkpoint contract mismatch: {checkpoint_path}")
+
+        if checkpoint_payload is not None:
+            mean = np.asarray(checkpoint_payload["feature_mean"], dtype=np.float32)
+            std = np.asarray(checkpoint_payload["feature_std"], dtype=np.float32)
+        elif args.standardize == "train_fold":
             print(f"  fold {fold_num}: computing train-fold feature standardization", flush=True)
             mean, std = helpers.compute_train_standardization(
                 X,
@@ -225,36 +338,62 @@ def fit_predict_mlp_oof(X: np.ndarray, y: np.ndarray, folds: list[dict[str, np.n
             mean = np.zeros(n_features, dtype=np.float32)
             std = np.ones(n_features, dtype=np.float32)
 
-        pos = np.maximum(y[tr_idx].sum(axis=0), 1.0)
-        neg = np.maximum(len(tr_idx) - y[tr_idx].sum(axis=0), 1.0)
-        pos_weight = np.clip(neg / pos, 1.0, 100.0).astype(np.float32)
         model = nn.Sequential(
             nn.Linear(n_features, int(args.hidden_dim)),
             nn.GELU(),
             nn.Dropout(float(args.dropout)),
             nn.Linear(int(args.hidden_dim), n_classes),
         ).to(device)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device))
-        optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
-        def amp_context():
-            return torch.amp.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else nullcontext()
+        reused_checkpoint = checkpoint_payload is not None
+        if reused_checkpoint:
+            model.load_state_dict(checkpoint_payload["model_state_dict"], strict=True)
+            print(f"  fold {fold_num}: reused checkpoint {checkpoint_path}", flush=True)
+        else:
+            pos = np.maximum(y[tr_idx].sum(axis=0), 1.0)
+            neg = np.maximum(len(tr_idx) - y[tr_idx].sum(axis=0), 1.0)
+            pos_weight = np.clip(neg / pos, 1.0, 100.0).astype(np.float32)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device))
+            optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
+            scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-        for epoch in range(1, int(args.epochs) + 1):
-            model.train()
-            total_loss = 0.0
-            total_seen = 0
-            for batch_idx in helpers.iter_index_batches(tr_idx, int(args.batch_size), shuffle=True, rng=rng):
-                xb = (np.asarray(X[batch_idx], dtype=np.float32) - mean) / std
-                xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
-                yb_t = torch.as_tensor(y[batch_idx], dtype=torch.float32, device=device)
-                optimizer.zero_grad(set_to_none=True)
-                with amp_context():
-                    loss = criterion(model(xb_t), yb_t)
-                loss.backward()
-                optimizer.step()
-                total_loss += float(loss.detach().cpu()) * len(batch_idx)
-                total_seen += len(batch_idx)
-            print(f"  fold {fold_num}: epoch {epoch:02d}/{args.epochs} loss={total_loss / max(total_seen, 1):.5f}", flush=True)
+            def amp_context():
+                return torch.amp.autocast("cuda", dtype=torch.float16) if device.type == "cuda" else nullcontext()
+
+            for epoch in range(1, int(args.epochs) + 1):
+                model.train()
+                total_loss = 0.0
+                total_seen = 0
+                for batch_idx in helpers.iter_index_batches(tr_idx, int(args.batch_size), shuffle=True, rng=rng):
+                    xb = (np.asarray(X[batch_idx], dtype=np.float32) - mean) / std
+                    xb_t = torch.as_tensor(xb, dtype=torch.float32, device=device)
+                    yb_t = torch.as_tensor(y[batch_idx], dtype=torch.float32, device=device)
+                    optimizer.zero_grad(set_to_none=True)
+                    with amp_context():
+                        loss = criterion(model(xb_t), yb_t)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    total_loss += float(loss.detach().cpu()) * len(batch_idx)
+                    total_seen += len(batch_idx)
+                print(f"  fold {fold_num}: epoch {epoch:02d}/{args.epochs} loss={total_loss / max(total_seen, 1):.5f}", flush=True)
+
+            if args.save_checkpoints:
+                save_torch_atomic(
+                    checkpoint_path,
+                    {
+                        "model_state_dict": model.state_dict(),
+                        "fold": fold_num,
+                        "protocol": PROTOCOL,
+                        "classifier_params": json_safe(classifier_params),
+                        "feature_mean": mean,
+                        "feature_std": std,
+                        "oof_predictions_sha256": load_info.get("oof_predictions_sha256"),
+                        "minirocket_cache_sha256": load_info.get("minirocket_cache_sha256"),
+                    },
+                )
+                print(f"  fold {fold_num}: wrote checkpoint {checkpoint_path}", flush=True)
 
         model.eval()
         out = np.zeros((len(va_idx), n_classes), dtype=np.float32)
@@ -270,30 +409,42 @@ def fit_predict_mlp_oof(X: np.ndarray, y: np.ndarray, folds: list[dict[str, np.n
                 offset += len(batch_idx)
         y_prob[va_idx] = out
         fold_id_out[va_idx] = fold_num
+        save_npz_compressed_atomic(
+            cache_path,
+            fold=np.asarray(fold_num, dtype=np.int16),
+            protocol=np.asarray(PROTOCOL),
+            classifier_params_json=np.asarray(params_json),
+            oof_predictions_sha256=np.asarray(load_info.get("oof_predictions_sha256", "")),
+            minirocket_cache_sha256=np.asarray(load_info.get("minirocket_cache_sha256", "")),
+            val_indices=va_idx,
+            y_prob=out,
+        )
+        print(f"  fold {fold_num}: wrote fold cache {cache_path}", flush=True)
         fold_rows.append(
             {
                 "fold": fold_num,
                 "train_records": int(len(tr_idx)),
                 "validation_records": int(len(va_idx)),
                 "validation_positive_labels": int(np.sum(y[va_idx])),
-                "classifier": "MiniRocketMLP",
+                "classifier": "FrozenTransformMLP",
+                "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
                 "hidden_dim": int(args.hidden_dim),
                 "dropout": float(args.dropout),
                 "epochs": int(args.epochs),
+                "reused_checkpoint": bool(reused_checkpoint),
             }
         )
 
-    if np.any(fold_id_out < 0):
+    if not selected_folds and np.any(fold_id_out < 0):
         raise RuntimeError("Hybrid morphology OOF prediction coverage is incomplete.")
-    if not np.all(np.isfinite(y_prob)):
+    if not selected_folds and not np.all(np.isfinite(y_prob)):
         raise RuntimeError("Hybrid morphology predictions contain non-finite values.")
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
 def write_prediction_npz(path: Path, *, y, y_prob, record_id, fold_id, class_names, args, load_info, model_name, classifier_params) -> None:
     print(f"Writing Hybrid morphology predictions: {path}", flush=True)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         y_true=y.astype(np.float32),
         y_prob=y_prob.astype(np.float32),
@@ -314,9 +465,10 @@ def bootstrap_metric(name: str, y: np.ndarray, y_prob: np.ndarray, args, fn):
 def main() -> None:
     args = parse_args()
     args.device = resolve_device_name(args.device)
+    args.checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir.is_absolute() else PROJECT_ROOT / args.checkpoint_dir
     ensure_revision_dirs()
     print("=" * 80, flush=True)
-    print("HYBRID MINIROCKET MORPHOLOGY MLP BASELINE", flush=True)
+    print("HYBRID FIXED-SEED ROCKET-FAMILY MORPHOLOGY MLP BASELINE", flush=True)
     print("=" * 80, flush=True)
     freeze_contract = helpers.validate_oof_freeze_contract(
         freeze_manifest=args.freeze_manifest,
@@ -348,7 +500,7 @@ def main() -> None:
     fold_path = TABLE_DIR / "table_hybrid_morphology_fold_summary.csv"
     summary_path = METRIC_DIR / "hybrid_morphology_baseline_summary.json"
     manifest_path = MANIFEST_DIR / "hybrid_morphology_baseline_manifest.json"
-    model_name = "fold_safe_minirocket_mlp_morphology_head"
+    model_name = "fold_safe_frozen_random_convolution_mlp_head"
     classifier_params = {
         "loss": "BCEWithLogitsLoss",
         "optimizer": "AdamW",
@@ -360,16 +512,45 @@ def main() -> None:
         "hidden_dim": int(args.hidden_dim),
         "dropout": float(args.dropout),
         "pos_weight": "fold_train_negative_positive_ratio",
-        "device": args.device,
         "standardize": args.standardize,
+        "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+        "canonical_minirocket": False,
+    }
+    runtime_config = {
+        "device": args.device,
         "allow_tf32": bool(args.allow_tf32),
     }
 
     reusable = None
-    if args.reuse_predictions:
+    selected_folds = parse_only_folds(args.only_folds)
+    if args.reuse_predictions and not selected_folds and not args.force_rerun:
         reusable = load_existing(prediction_path, y, record_id, class_names, args, load_info, model_name, classifier_params)
     if reusable is None:
-        y_prob, fold_id_out, fold_rows = fit_predict_mlp_oof(X, y, folds, args=args)
+        y_prob, fold_id_out, fold_rows = fit_predict_mlp_oof(
+            X,
+            y,
+            folds,
+            args=args,
+            load_info=load_info,
+            classifier_params=classifier_params,
+        )
+        if selected_folds:
+            ready = [fold for fold in range(1, 6) if fold_cache_path(fold).exists()]
+            checkpoints = [fold for fold in range(1, 6) if fold_checkpoint_path(args, fold).exists()]
+            print(
+                json.dumps(
+                    {
+                        "status": True,
+                        "mode": "fold_cache_only",
+                        "selected_folds": sorted(selected_folds),
+                        "ready_fold_caches": ready,
+                        "ready_checkpoints": checkpoints,
+                        "next_step": "Publish the mirror, then rerun without --only-folds to aggregate.",
+                    },
+                    indent=2,
+                )
+            )
+            return
         write_prediction_npz(
             prediction_path,
             y=y,
@@ -435,9 +616,12 @@ def main() -> None:
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": FEATURE_CONTRACT,
+        "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+        "canonical_minirocket": False,
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "model": model_name,
         "classifier_params": classifier_params,
+        "runtime_config": runtime_config,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
         "threshold": float(args.threshold),
@@ -460,9 +644,12 @@ def main() -> None:
         "git_commit": git_output(["rev-parse", "HEAD"]),
         "protocol": PROTOCOL,
         "feature_contract": FEATURE_CONTRACT,
+        "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+        "canonical_minirocket": False,
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "classifier_params": classifier_params,
+        "runtime_config": runtime_config,
         "artifacts": {
             "summary": str(summary_path),
             "predictions": str(prediction_path),

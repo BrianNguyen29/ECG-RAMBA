@@ -130,6 +130,7 @@ class ExternalPredictionContractTests(unittest.TestCase):
             pd.DataFrame(
                 {
                     "ecg_id": [1],
+                    "patient_id": [101],
                     "strat_fold": [10],
                     "scp_codes": ["{'NORM': 50.0, 'HYP': 25.0}"],
                     "filename_hr": ["records/00001_hr"],

@@ -46,7 +46,38 @@ def skip_artifact(relative: Path) -> bool:
 def publish(mirror_root: Path) -> Path:
     ensure_revision_dirs()
     mirror_root.mkdir(parents=True, exist_ok=True)
-    copied = []
+    manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
+    existing_rows: dict[str, dict] = {}
+    if manifest_path.exists():
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for row in normalize_manifest_rows(payload, mirror_root):
+            relative = Path(row["relative_path"])
+            if skip_artifact(relative):
+                continue
+            source = mirror_root / relative
+            if not source.exists():
+                raise FileNotFoundError(
+                    f"Existing mirror manifest references a missing file: {source}"
+                )
+            actual_size = source.stat().st_size
+            actual_sha = sha256_file(source)
+            if row["size_bytes"] >= 0 and actual_size != row["size_bytes"]:
+                raise RuntimeError(
+                    f"Existing mirror size mismatch before publish: {relative}"
+                )
+            if actual_sha != row["sha256"]:
+                raise RuntimeError(
+                    f"Existing mirror checksum mismatch before publish: {relative}"
+                )
+            existing_rows[relative.as_posix()] = {
+                "relative_path": relative.as_posix(),
+                "size_bytes": actual_size,
+                "sha256": actual_sha,
+            }
+
+    merged_rows = dict(existing_rows)
+    published_from_source = 0
+    published_relative_paths: set[str] = set()
     for source in sorted(REVISION_DIR.rglob("*")):
         if not source.is_file() or source.name == ".gitkeep":
             continue
@@ -60,25 +91,34 @@ def publish(mirror_root: Path) -> Path:
         destination_sha = sha256_file(destination)
         if source_sha != destination_sha:
             raise RuntimeError(f"Checksum mismatch after publishing {relative}")
-        copied.append(
-            {
-                "relative_path": relative.as_posix(),
-                "size_bytes": destination.stat().st_size,
-                "sha256": destination_sha,
-            }
-        )
+        merged_rows[relative.as_posix()] = {
+            "relative_path": relative.as_posix(),
+            "size_bytes": destination.stat().st_size,
+            "sha256": destination_sha,
+        }
+        published_from_source += 1
+        published_relative_paths.add(relative.as_posix())
+
+    artifacts = [merged_rows[key] for key in sorted(merged_rows)]
 
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "source_root": str(REVISION_DIR),
         "mirror_root": str(mirror_root),
-        "artifact_count": len(copied),
-        "artifacts": copied,
+        "artifact_count": len(artifacts),
+        "published_from_source_count": published_from_source,
+        "preserved_existing_count": len(
+            set(existing_rows) - published_relative_paths
+        ),
+        "publish_mode": "merge_verified_no_prune",
+        "artifacts": artifacts,
     }
-    manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
     save_json(manifest_path, manifest)
-    print(f"Published and verified {len(copied)} artifacts: {mirror_root}")
+    print(
+        f"Published and verified {published_from_source} source artifacts; "
+        f"merged manifest contains {len(artifacts)} artifacts: {mirror_root}"
+    )
     print(f"Wrote: {manifest_path}")
     return manifest_path
 

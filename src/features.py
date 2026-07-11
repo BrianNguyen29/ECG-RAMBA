@@ -42,8 +42,12 @@ from src.provenance import record_order_fingerprint
 
 class MiniRocketNative(nn.Module):
     """
-    Deterministic MiniRocket transform (Dempster et al.).
-    Optimized for TorchScript / JIT.
+    Legacy fixed-seed ROCKET-family random convolution transform.
+
+    The class name is retained for checkpoint/cache compatibility.  This is not
+    canonical MiniRocket: it uses seeded ternary random kernels, Gaussian
+    biases, and MAX+PPV statistics.  Ten thousand requested kernels produce a
+    20,000-dimensional output before fold-aware PCA.
     """
 
     def __init__(

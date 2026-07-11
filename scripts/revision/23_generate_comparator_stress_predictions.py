@@ -171,23 +171,47 @@ def load_raw_mamba_model(ckpt: Path, device: torch.device):
 
 
 def load_transformer_model(ckpt: Path, device: torch.device):
-    model_args = argparse.Namespace(base_channels=64, dropout=0.20)
     payload = load_trusted_checkpoint(ckpt)
-    if isinstance(payload, dict) and "args" in payload:
-        saved_args = payload.get("args") or {}
-        model_args.base_channels = int(saved_args.get("base_channels", model_args.base_channels))
-        model_args.dropout = float(saved_args.get("dropout", model_args.dropout))
-    embed_dim = int(model_args.base_channels)
-    n_heads = 4 if embed_dim % 4 == 0 else 2
+    if not isinstance(payload, dict) or "model_state_dict" not in payload:
+        raise ValueError(f"Transformer checkpoint lacks model_state_dict: {ckpt}")
+    saved_args = payload.get("args") or {}
+    model_params = payload.get("model_params") or {}
+    base_channels = int(saved_args.get("base_channels", 64))
+    embed_dim = int(
+        model_params.get("embed_dim")
+        or saved_args.get("transformer_embed_dim")
+        or base_channels
+    )
+    n_heads = int(
+        model_params.get("n_heads")
+        or saved_args.get("transformer_heads")
+        or (4 if embed_dim % 4 == 0 else 2)
+    )
+    depth = int(model_params.get("depth") or saved_args.get("transformer_depth") or 3)
+    patch_size = int(model_params.get("patch_size") or saved_args.get("transformer_patch_size") or 50)
+    patch_stride = int(model_params.get("patch_stride") or saved_args.get("transformer_patch_stride") or 25)
+    ff_multiplier = int(
+        model_params.get("feed_forward_multiplier")
+        or saved_args.get("transformer_ff_multiplier")
+        or 4
+    )
+    dropout = float(saved_args.get("dropout", 0.20))
+    if embed_dim % n_heads != 0:
+        raise ValueError(
+            f"Transformer checkpoint architecture is invalid: embed_dim={embed_dim}, heads={n_heads}"
+        )
     model = transformer_helpers.ECGPatchTransformer(
         n_classes=len(CLASSES),
         embed_dim=embed_dim,
         n_heads=n_heads,
-        depth=3,
-        dropout=float(model_args.dropout),
+        depth=depth,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        ff_multiplier=ff_multiplier,
+        dropout=dropout,
         max_length=int(CONFIG["slice_length"]),
     )
-    model.load_state_dict(payload["model_state_dict"] if isinstance(payload, dict) else payload)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
     return model.to(device).eval()
 
 

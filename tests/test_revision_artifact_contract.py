@@ -192,6 +192,46 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     artifact_mirror.restore(mirror, replace_mismatched=True)
 
+    def test_mirror_publish_preserves_verified_artifacts_absent_from_partial_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            first = revision / "predictions" / "fold1.npz"
+            first.parent.mkdir(parents=True)
+            first.write_bytes(b"fold-one")
+
+            with patch.object(artifact_mirror, "REVISION_DIR", revision), patch.object(
+                artifact_mirror,
+                "ensure_revision_dirs",
+                return_value=None,
+            ):
+                artifact_mirror.publish(mirror)
+                first.unlink()
+                second = revision / "predictions" / "fold2.npz"
+                second.write_bytes(b"fold-two")
+                artifact_mirror.publish(mirror)
+
+                manifest = json.loads(
+                    (mirror / "manifests" / "mirror_manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                relative_paths = {
+                    row["relative_path"] for row in manifest["artifacts"]
+                }
+                self.assertEqual(
+                    relative_paths,
+                    {"predictions/fold1.npz", "predictions/fold2.npz"},
+                )
+                self.assertEqual(manifest["publish_mode"], "merge_verified_no_prune")
+                self.assertEqual(manifest["preserved_existing_count"], 1)
+
+                second.unlink()
+                artifact_mirror.restore(mirror, replace_mismatched=True)
+                self.assertEqual(first.read_bytes(), b"fold-one")
+                self.assertEqual(second.read_bytes(), b"fold-two")
+
     def test_restore_ignores_legacy_self_referential_mirror_manifest_row(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

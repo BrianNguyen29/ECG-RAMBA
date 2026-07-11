@@ -26,7 +26,8 @@ from scripts.revision.common import (  # noqa: E402
     TABLE_DIR,
     ensure_revision_dirs,
     git_commit,
-    save_json,
+    save_csv,
+    save_json_atomic,
     sha256_file,
 )
 
@@ -73,6 +74,146 @@ def status_from_required(required: list[Path], complete_status: str, blocked_sta
     return (complete_status, missing) if not missing else (blocked_status, missing)
 
 
+def read_json_if_present(path: Path) -> dict:
+    candidate = resolve(path)
+    if not candidate.exists() or candidate.stat().st_size == 0:
+        return {}
+    try:
+        return json.loads(candidate.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"_read_error": f"{type(exc).__name__}: {exc}"}
+
+
+def nested(payload: dict, *keys: str):
+    value = payload
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def canonical_contract() -> dict[str, str]:
+    oof = PROJECT_ROOT / "reports" / "revision" / "predictions" / "oof_final_ema_predictions.npz"
+    freeze = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
+    if not present(oof) or not present(freeze):
+        return {}
+    return {"oof_sha256": sha256_file(oof), "freeze_sha256": sha256_file(freeze)}
+
+
+def baseline_contract_issues(
+    summary_path: Path,
+    paired_path: Path,
+    *,
+    protocol: str,
+    contract: dict[str, str],
+) -> list[str]:
+    """Validate provenance, not just existence, for an OOF comparator row."""
+    issues: list[str] = []
+    summary = read_json_if_present(summary_path)
+    paired = read_json_if_present(paired_path)
+    if summary.get("_read_error"):
+        return [f"summary_unreadable={summary['_read_error']}"]
+    if paired.get("_read_error"):
+        return [f"paired_unreadable={paired['_read_error']}"]
+    if summary and summary.get("manuscript_ready") is not True:
+        issues.append("summary.manuscript_ready!=true")
+    if summary and summary.get("protocol") != protocol:
+        issues.append(f"summary.protocol={summary.get('protocol')!r}")
+    if contract and summary:
+        if nested(summary, "load_info", "oof_predictions_sha256") != contract["oof_sha256"]:
+            issues.append("summary.load_info.oof_predictions_sha256_mismatch")
+        if nested(summary, "load_info", "freeze_contract", "freeze_manifest_sha256") != contract["freeze_sha256"]:
+            issues.append("summary.load_info.freeze_contract.freeze_manifest_sha256_mismatch")
+    if paired and paired.get("status") not in (True, "complete"):
+        issues.append(f"paired.status={paired.get('status')!r}")
+    if contract and paired:
+        if nested(paired, "inputs", "full_predictions", "sha256") != contract["oof_sha256"]:
+            issues.append("paired.inputs.full_predictions.sha256_mismatch")
+        if nested(paired, "inputs", "freeze_manifest", "sha256") != contract["freeze_sha256"]:
+            issues.append("paired.inputs.freeze_manifest.sha256_mismatch")
+    return issues
+
+
+def manifest_contract_issues(
+    path: Path,
+    *,
+    expected_status: str | bool | None = None,
+    expected_protocol: str | None = None,
+    canonical: dict[str, str] | None = None,
+) -> list[str]:
+    payload = read_json_if_present(path)
+    if not payload:
+        return []
+    if payload.get("_read_error"):
+        return [f"manifest_unreadable={payload['_read_error']}"]
+    issues: list[str] = []
+    if expected_status is not None and payload.get("status") != expected_status:
+        issues.append(f"manifest.status={payload.get('status')!r}")
+    if expected_protocol is not None and payload.get("protocol") != expected_protocol:
+        issues.append(f"manifest.protocol={payload.get('protocol')!r}")
+    if canonical and payload.get("canonical_contract") != canonical:
+        issues.append("manifest.canonical_contract_mismatch")
+    return issues
+
+
+def manifest_runner_issues(path: Path, runner_name: str) -> list[str]:
+    payload = read_json_if_present(path)
+    if not payload or payload.get("_read_error"):
+        return []
+    runner = PROJECT_ROOT / "scripts" / "revision" / runner_name
+    if not runner.exists():
+        return [f"runner_missing={runner_name}"]
+    expected = sha256_file(runner)
+    if payload.get("runner_sha256") != expected:
+        return [f"manifest.runner_sha256_mismatch={runner_name}"]
+    return []
+
+
+def external_comparator_manifest_issues(
+    manifests: list[Path],
+    *,
+    canonical: dict[str, str],
+) -> list[str]:
+    """Check external comparator provenance against the currently frozen Chapman OOF."""
+
+    issues: list[str] = []
+    runner = PROJECT_ROOT / "scripts" / "revision" / "31_generate_external_comparator_predictions.py"
+    runner_sha = sha256_file(runner) if runner.exists() else None
+    for path in manifests:
+        payload = read_json_if_present(path)
+        label = path.name
+        if not payload:
+            continue
+        if payload.get("_read_error"):
+            issues.append(f"{label}:unreadable")
+            continue
+        if payload.get("status") != "complete_experimental_requires_external_comparator_gate":
+            issues.append(f"{label}:status={payload.get('status')!r}")
+        if canonical and payload.get("canonical_contract") != canonical:
+            issues.append(f"{label}:canonical_oof_freeze_mismatch")
+        source = payload.get("source_contract") if isinstance(payload.get("source_contract"), dict) else {}
+        if not source.get("archive_sha256") or not source.get("runner_sha256"):
+            issues.append(f"{label}:missing_source_contract")
+        elif runner_sha and source.get("runner_sha256") != runner_sha:
+            issues.append(f"{label}:runner_sha_mismatch")
+    return issues
+
+
+def complete_if_valid(
+    *,
+    required: list[Path],
+    complete_status: str,
+    blocked_status: str,
+    contract_issues: list[str],
+) -> tuple[str, list[str]]:
+    status, issues = status_from_required(required, complete_status, blocked_status)
+    issues.extend(f"contract:{item}" for item in contract_issues)
+    if contract_issues:
+        status = blocked_status
+    return status, issues
+
+
 def row(
     *,
     claim_id: str,
@@ -103,32 +244,55 @@ def row(
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
-    path = resolve(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = [
-        "claim_id",
-        "claim_area",
-        "status",
-        "manuscript_ready",
-        "evidence_status",
-        "required_artifacts",
-        "existing_artifacts",
-        "missing_artifacts",
-        "safe_wording",
-        "blocker",
-        "next_action",
-    ]
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for item in rows:
-            writer.writerow(item)
+    save_csv(resolve(path), rows)
 
 
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
+    canonical = canonical_contract()
     print("=" * 80, flush=True)
+
+    method_identity_required = [
+        TABLE_DIR / "table_morphology_transform_contract.csv",
+        MANIFEST_DIR / "morphology_transform_identity_gate.json",
+        MANIFEST_DIR / "reviewer_completion_input_contract.json",
+    ]
+    method_identity_payload = read_json_if_present(method_identity_required[1])
+    method_identity_issues = manifest_contract_issues(
+        method_identity_required[1], expected_status="complete", canonical=canonical
+    )
+    if method_identity_payload and method_identity_payload.get("manuscript_ready") is not True:
+        method_identity_issues.append("manifest.manuscript_ready!=true")
+    method_identity_status, method_identity_missing = complete_if_valid(
+        required=method_identity_required,
+        complete_status="complete_custom_transform_identified",
+        blocked_status="blocked_morphology_transform_identity_not_audited",
+        contract_issues=method_identity_issues,
+    )
+
+    presentation_required = [
+        Path("reports/revision/figures/figure_calibration_audit.png"),
+        TABLE_DIR / "table_calibration_ci_compact.csv",
+        TABLE_DIR / "table_paired_baseline_ci_compact.csv",
+        TABLE_DIR / "table_pooling_sensitivity_compact.csv",
+        TABLE_DIR / "table_fold_pca_provenance.csv",
+        TABLE_DIR / "table_training_configuration.csv",
+    ]
+    presentation_status, presentation_missing = complete_if_valid(
+        required=presentation_required,
+        complete_status="complete_reviewer_presentation_assets_available",
+        blocked_status="blocked_reviewer_presentation_assets_missing",
+        contract_issues=manifest_contract_issues(
+            MANIFEST_DIR / "reviewer_completion_input_contract.json",
+            expected_status=True,
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "reviewer_completion_input_contract.json",
+            "29_reviewer_presentation_assets.py",
+        ),
+    )
     print("CLAIM READINESS GATES", flush=True)
     print("=" * 80, flush=True)
 
@@ -140,10 +304,16 @@ def main() -> None:
         TABLE_DIR / "table_paired_full_vs_transformer.csv",
         MANIFEST_DIR / "paired_full_vs_transformer_manifest.json",
     ]
-    transformer_status, transformer_missing = status_from_required(
-        transformer_required,
-        "complete_optional_comparator_available",
-        "not_run_optional_comparator",
+    transformer_status, transformer_missing = complete_if_valid(
+        required=transformer_required,
+        complete_status="complete_optional_comparator_available",
+        blocked_status="not_run_or_stale_optional_comparator",
+        contract_issues=baseline_contract_issues(
+            transformer_required[0],
+            transformer_required[3],
+            protocol="transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5",
+            contract=canonical,
+        ),
     )
 
     hybrid_required = [
@@ -154,10 +324,16 @@ def main() -> None:
         TABLE_DIR / "table_paired_full_vs_hybrid_morphology.csv",
         MANIFEST_DIR / "paired_full_vs_hybrid_morphology_manifest.json",
     ]
-    hybrid_status, hybrid_missing = status_from_required(
-        hybrid_required,
-        "complete_optional_morphology_sensitivity_available",
-        "not_run_optional_morphology_sensitivity",
+    hybrid_status, hybrid_missing = complete_if_valid(
+        required=hybrid_required,
+        complete_status="complete_optional_morphology_sensitivity_available",
+        blocked_status="not_run_or_stale_optional_morphology_sensitivity",
+        contract_issues=baseline_contract_issues(
+            hybrid_required[0],
+            hybrid_required[3],
+            protocol="fixed_seed_rocket_family_max_ppv_mlp_head_same_folds_threshold_0.5",
+            contract=canonical,
+        ),
     )
 
     robustness_required = [
@@ -168,37 +344,168 @@ def main() -> None:
         TABLE_DIR / "table_robustness_multicomparator.csv",
         MANIFEST_DIR / "robustness_multicomparator_manifest.json",
     ]
-    robustness_status, robustness_missing = status_from_required(
-        robustness_required,
-        "complete_multicomparator_robustness_available",
-        "blocked_missing_learned_comparator_stress_evidence",
+    robustness_manifest = MANIFEST_DIR / "robustness_multicomparator_manifest.json"
+    robustness_status, robustness_missing = complete_if_valid(
+        required=robustness_required,
+        complete_status="complete_multicomparator_robustness_available",
+        blocked_status="blocked_missing_or_stale_learned_comparator_stress_evidence",
+        contract_issues=manifest_contract_issues(robustness_manifest, expected_status="complete"),
     )
 
     representation_required = [
         METRIC_DIR / "representation_evidence_status.json",
         METRIC_DIR / "representation_probe_summary.json",
         TABLE_DIR / "table_representation_probe.csv",
+        TABLE_DIR / "table_representation_probe_by_fold.csv",
         TABLE_DIR / "table_representation_cka.csv",
+        Path("reports/revision/figures/figure_representation_audit.png"),
         MANIFEST_DIR / "representation_probe_manifest.json",
     ]
-    representation_status, representation_missing = status_from_required(
-        representation_required,
-        "audit_available_not_mechanistic_proof",
-        "blocked_missing_representation_audit",
+    representation_status, representation_missing = complete_if_valid(
+        required=representation_required,
+        complete_status="audit_available_not_mechanistic_proof",
+        blocked_status="blocked_missing_or_stale_representation_audit",
+        contract_issues=manifest_contract_issues(
+            MANIFEST_DIR / "representation_probe_manifest.json",
+            expected_status="complete",
+            expected_protocol="representation_probe_fold_safe_v3_projection_and_fold_audit",
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "representation_probe_manifest.json",
+            "20_representation_probe.py",
+        ),
+    )
+
+    group_safe_calibration_required = [
+        METRIC_DIR / "group_safe_score_calibration_ptbxl_summary.csv",
+        TABLE_DIR / "table_group_safe_score_calibration_ptbxl.csv",
+        METRIC_DIR / "group_safe_score_calibration_ptbxl_bootstrap.json",
+        MANIFEST_DIR / "group_safe_score_calibration_ptbxl_manifest.json",
+    ]
+    group_safe_calibration_status, group_safe_calibration_missing = complete_if_valid(
+        required=group_safe_calibration_required,
+        complete_status="complete_group_safe_score_calibration",
+        blocked_status="not_run_or_stale_group_safe_score_calibration",
+        contract_issues=manifest_contract_issues(
+            group_safe_calibration_required[-1],
+            expected_status="complete_group_safe_score_calibration",
+            expected_protocol="group_safe_score_calibration_v2_gated_external",
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            group_safe_calibration_required[-1], "33_group_safe_score_calibration.py"
+        ),
+    )
+
+    true_fewshot_required = [
+        METRIC_DIR / "true_fewshot_head_ptbxl_summary.csv",
+        TABLE_DIR / "table_true_fewshot_head_ptbxl.csv",
+        TABLE_DIR / "table_true_fewshot_head_ptbxl_paired.csv",
+        METRIC_DIR / "true_fewshot_head_ptbxl_bootstrap.json",
+        TABLE_DIR / "table_true_fewshot_head_ptbxl_coefficients.csv",
+        MANIFEST_DIR / "true_fewshot_head_ptbxl_splits.npz",
+        MANIFEST_DIR / "true_fewshot_head_ptbxl_manifest.json",
+    ]
+    true_fewshot_status, true_fewshot_missing = complete_if_valid(
+        required=true_fewshot_required,
+        complete_status="complete_true_fewshot_frozen_encoder_head_adaptation",
+        blocked_status="not_run_or_stale_true_fewshot_head_adaptation",
+        contract_issues=manifest_contract_issues(
+            true_fewshot_required[-1],
+            expected_status="complete_true_classifier_head_adaptation",
+            expected_protocol="frozen_encoder_true_linear_head_adaptation_v2_group_safe_gated",
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            true_fewshot_required[-1], "35_true_fewshot_head_adaptation.py"
+        ),
+    )
+
+    external_comparator_required = [
+        METRIC_DIR / "external_comparator_paired_summary.json",
+        TABLE_DIR / "table_external_comparator_paired.csv",
+        MANIFEST_DIR / "external_comparator_paired_manifest.json",
+        MANIFEST_DIR / "external_ptbxl_resnet1d_cnn_manifest.json",
+        MANIFEST_DIR / "external_ptbxl_raw_mamba_manifest.json",
+        MANIFEST_DIR / "external_georgia_resnet1d_cnn_manifest.json",
+        MANIFEST_DIR / "external_georgia_raw_mamba_manifest.json",
+    ]
+    external_comparator_contract_issues = (
+        manifest_contract_issues(
+            MANIFEST_DIR / "external_comparator_paired_manifest.json",
+            expected_status="complete",
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "external_comparator_paired_manifest.json",
+            "32_paired_external_comparators.py",
+        )
+        + external_comparator_manifest_issues(external_comparator_required[3:], canonical=canonical)
+    )
+    external_comparator_status, external_comparator_missing = complete_if_valid(
+        required=external_comparator_required,
+        complete_status="complete_external_learned_comparator_audit",
+        blocked_status="not_run_or_stale_external_learned_comparator_audit",
+        contract_issues=external_comparator_contract_issues,
+    )
+
+    marked_manuscript_required = [MANIFEST_DIR / "marked_manuscript_manifest.json"]
+    marked_payload = read_json_if_present(marked_manuscript_required[0])
+    marked_pdf = Path(str(nested(marked_payload, "outputs", "marked_pdf", "path") or ""))
+    if marked_pdf and marked_pdf.as_posix() not in (".", ""):
+        marked_manuscript_required.append(marked_pdf)
+    marked_contract_issues = manifest_contract_issues(
+        marked_manuscript_required[0], expected_status="complete_marked_manuscript"
+    )
+    if marked_payload and marked_payload.get("editorial_ready") is not True:
+        marked_contract_issues.append("manifest.editorial_ready!=true")
+    marked_status, marked_missing = complete_if_valid(
+        required=marked_manuscript_required,
+        complete_status="complete_marked_manuscript_pdf",
+        blocked_status="blocked_marked_manuscript_pdf_not_built",
+        contract_issues=marked_contract_issues,
     )
 
     rows = [
         row(
-            claim_id="transformer_foundation_baseline",
-            claim_area="Transformer/foundation ECG comparator",
+            claim_id="morphology_transform_identity",
+            claim_area="Morphology transform identity and PCA input dimension",
+            status=method_identity_status,
+            manuscript_ready=method_identity_status.startswith("complete"),
+            evidence_status="method_contract",
+            required_artifacts=method_identity_required,
+            missing_artifacts=method_identity_missing,
+            safe_wording=(
+                "Describe the evaluated branch as a fixed-seed ROCKET-family random-convolution "
+                "MAX+PPV transform (10,000 requested kernels, 20,000 outputs), not canonical MiniRocket."
+            ),
+            blocker="The evaluated transform has not passed the method-identity gate." if method_identity_missing else "",
+            next_action="Run scripts/revision/29_reviewer_presentation_assets.py after restoring canonical artifacts.",
+        ),
+        row(
+            claim_id="reviewer_presentation_assets",
+            claim_area="Reliability, CI, Q=3, PCA, and training appendix assets",
+            status=presentation_status,
+            manuscript_ready=presentation_status.startswith("complete"),
+            evidence_status="presentation_only",
+            required_artifacts=presentation_required,
+            missing_artifacts=presentation_missing,
+            safe_wording="Use generated tables/figure directly; do not type numeric values independently.",
+            blocker="Reviewer-facing presentation assets are incomplete." if presentation_missing else "",
+            next_action="Run scripts/revision/29_reviewer_presentation_assets.py --strict after paired artifacts are current.",
+        ),
+        row(
+            claim_id="transformer_ecg_baseline",
+            claim_area="Compact Transformer ECG fair comparator",
             status=transformer_status,
             manuscript_ready=transformer_status.startswith("complete"),
             evidence_status="optional_comparator_specific",
             required_artifacts=transformer_required,
             missing_artifacts=transformer_missing,
             safe_wording=(
-                "Use only comparator-specific wording if the Transformer ECG baseline and paired bootstrap "
-                "artifacts are complete; otherwise state that this optional comparator was not run."
+                "Use only comparator-specific wording if the compact Transformer ECG baseline and paired "
+                "bootstrap artifacts are complete. It is trained from scratch and is not a foundation model."
             ),
             blocker="Missing Transformer ECG baseline and/or paired Full-vs-Transformer artifacts."
             if transformer_missing
@@ -210,17 +517,18 @@ def main() -> None:
         ),
         row(
             claim_id="hybrid_morphology_mlp",
-            claim_area="Hybrid/partially learnable MiniRocket morphology",
+            claim_area="Frozen ROCKET-family random-convolution MLP-head sensitivity",
             status=hybrid_status,
             manuscript_ready=hybrid_status.startswith("complete"),
             evidence_status="optional_mechanism_sensitivity",
             required_artifacts=hybrid_required,
             missing_artifacts=hybrid_missing,
             safe_wording=(
-                "Use only as morphology-head sensitivity evidence. Do not claim that deterministic "
-                "MiniRocket morphology is causally superior or that the branch is mechanistically isolated."
+                "Use only as a fixed-seed ROCKET-family transform-head sensitivity control. The MLP does "
+                "not make convolution kernels learnable and cannot isolate deterministic kernels from "
+                "regularization, optimization, or head-capacity effects."
             ),
-            blocker="Missing Hybrid MiniRocket-MLP baseline and/or paired comparison artifacts."
+            blocker="Missing frozen-transform MLP-head baseline and/or paired comparison artifacts."
             if hybrid_missing
             else "",
             next_action=(
@@ -229,22 +537,107 @@ def main() -> None:
             ),
         ),
         row(
+            claim_id="fewshot_score_calibration_v1",
+            claim_area="Existing row-split external score calibration",
+            status="blocked_not_group_safe",
+            manuscript_ready=False,
+            evidence_status="exploratory_provenance_only",
+            required_artifacts=[],
+            missing_artifacts=["group_id", "zero_group_overlap_audit", "group_cluster_bootstrap"],
+            safe_wording=(
+                "Do not call the v1 score-calibration analysis leakage-audited or true few-shot adaptation. "
+                "It permutes prediction rows and leaves ECG-RAMBA weights unchanged."
+            ),
+            blocker="Repeated patient/source-record observations are not kept in one split.",
+            next_action=(
+                "Regenerate external predictions with group_id and run the group-safe v2 calibration/adaptation runner."
+            ),
+        ),
+        row(
+            claim_id="group_safe_score_calibration_v2",
+            claim_area="PTB-XL group-safe score calibration on frozen predictions",
+            status=group_safe_calibration_status,
+            manuscript_ready=group_safe_calibration_status.startswith("complete"),
+            evidence_status="calibration_only_not_weight_adaptation",
+            required_artifacts=group_safe_calibration_required,
+            missing_artifacts=group_safe_calibration_missing,
+            safe_wording=(
+                "If complete, describe this only as group-safe, dataset-specific score calibration of "
+                "frozen predictions. It changes decision scores/threshold behavior, not encoder or classifier weights."
+            ),
+            blocker=(
+                "PTB-XL group-safe score-calibration artifacts are absent, stale, or fail their protocol contract."
+                if group_safe_calibration_missing
+                else ""
+            ),
+            next_action=(
+                "Run scripts/revision/33_group_safe_score_calibration.py after the PTB-XL protocol gate, "
+                "then report F1 and ranking metrics separately."
+            ),
+        ),
+        row(
+            claim_id="true_fewshot_frozen_encoder_head_adaptation",
+            claim_area="PTB-XL true few-shot frozen-encoder classifier-head adaptation",
+            status=true_fewshot_status,
+            manuscript_ready=true_fewshot_status.startswith("complete"),
+            evidence_status="parameter_adaptation_not_end_to_end_finetuning",
+            required_artifacts=true_fewshot_required,
+            missing_artifacts=true_fewshot_missing,
+            safe_wording=(
+                "If complete, report PTB-XL results as group-safe adaptation of new linear classifier heads on "
+                "frozen Chapman-trained encoders. This is parameter adaptation, but not end-to-end fine-tuning "
+                "and not evidence of general few-shot superiority."
+            ),
+            blocker=(
+                "No complete group-safe frozen-encoder head-adaptation package is available for PTB-XL."
+                if true_fewshot_missing
+                else ""
+            ),
+            next_action=(
+                "Generate fold-specific external representations and paired external comparator evidence, then run "
+                "scripts/revision/35_true_fewshot_head_adaptation.py for PTB-XL official folds 9/10."
+            ),
+        ),
+        row(
+            claim_id="external_learned_comparator_audit",
+            claim_area="PTB-XL/Georgia learned-comparator zero-target-label audit",
+            status=external_comparator_status,
+            manuscript_ready=external_comparator_status.startswith("complete"),
+            evidence_status="dataset_specific_mapped_task_only",
+            required_artifacts=external_comparator_required,
+            missing_artifacts=external_comparator_missing,
+            safe_wording=(
+                "If complete, report PTB-XL and Georgia separately as zero-target-label mapped-task comparisons "
+                "against the named Chapman-trained comparators. Do not average them with CPSC2021 or infer broad "
+                "external-transfer superiority."
+            ),
+            blocker=(
+                "Required PTB-XL/Georgia comparator predictions or group-paired external comparisons are missing or stale."
+                if external_comparator_missing
+                else ""
+            ),
+            next_action=(
+                "Run scripts/revision/31_generate_external_comparator_predictions.py for ResNet1D/CNN and Raw Mamba, "
+                "then scripts/revision/32_paired_external_comparators.py. Run Transformer only after its in-domain gate completes."
+            ),
+        ),
+        row(
             claim_id="robustness_learned_comparators",
-            claim_area="Robustness vs ResNet1D/CNN and Raw Mamba",
+            claim_area="Robustness vs learned comparators",
             status=robustness_status,
             manuscript_ready=robustness_status.startswith("complete"),
             evidence_status="metric_specific_if_complete",
             required_artifacts=robustness_required,
             missing_artifacts=robustness_missing,
             safe_wording=(
-                "Without learned-comparator stress artifacts, robustness claims remain limited to "
-                "metric-specific Full-vs-MiniRocket evidence."
+                "Use learned-comparator robustness only when the complete paired stress ledger is current. "
+                "All robustness wording remains metric-, stress-, and comparator-specific."
             ),
-            blocker="Missing ResNet1D/CNN and/or Raw Mamba stress prediction comparisons."
+            blocker="Missing or stale ResNet1D/CNN, Raw Mamba, and/or multi-comparator stress evidence."
             if robustness_missing
             else "",
             next_action=(
-                "Save/reuse ResNet and Raw Mamba checkpoints, run comparator stress predictions, then run "
+                "Save/reuse learned-comparator checkpoints, run comparator stress predictions, then run "
                 "scripts/revision/21_robustness_multicomparator.py."
             ),
         ),
@@ -282,6 +675,28 @@ def main() -> None:
             ),
         ),
         row(
+            claim_id="marked_highlighted_manuscript",
+            claim_area="Editorial marked/highlighted manuscript PDF",
+            status=marked_status,
+            manuscript_ready=marked_status.startswith("complete"),
+            evidence_status="editorial_deliverable",
+            required_artifacts=marked_manuscript_required,
+            missing_artifacts=marked_missing,
+            safe_wording=(
+                "Do not state that a marked manuscript has been supplied until latexdiff and LaTeX compilation "
+                "produce the verified marked PDF and its manifest."
+            ),
+            blocker=(
+                "The requested marked/highlighted manuscript PDF has not been built and verified."
+                if marked_missing
+                else ""
+            ),
+            next_action=(
+                "Run scripts/revision/36_build_marked_manuscript.py in an environment with latexdiff and latexmk, "
+                "then retain its manifest with the submission package."
+            ),
+        ),
+        row(
             claim_id="clinical_deployment_readiness",
             claim_area="Clinical deployment/safety readiness",
             status="blocked_no_prospective_or_clinical_utility_validation",
@@ -290,7 +705,7 @@ def main() -> None:
             required_artifacts=[],
             missing_artifacts=["prospective_validation", "clinical_threshold_target", "decision_curve_or_utility_analysis"],
             safe_wording=(
-                "Do not claim clinical deployment readiness, safety readiness, or prospective clinical utility. "
+                "Avoid clinical-use, safety-readiness, or prospective-utility wording. "
                 "Current evidence is retrospective/model-evaluation evidence only."
             ),
             blocker="No prospective validation, clinical utility analysis, or prespecified deployment threshold target.",
@@ -298,7 +713,7 @@ def main() -> None:
         ),
         row(
             claim_id="broad_in_domain_global_superiority",
-            claim_area="Broad in-domain/global superiority",
+            claim_area="Broad in-domain/fair-baseline advantage",
             status="contradicted_by_current_fair_baselines",
             manuscript_ready=False,
             evidence_status="contradicted",
@@ -308,11 +723,11 @@ def main() -> None:
             ],
             missing_artifacts=[],
             safe_wording=(
-                "Do not claim SOTA, best in-domain performance, or broad superiority over fair baselines. "
+                "Avoid performance-leading, best-in-domain, or broad fair-baseline advantage wording. "
                 "Use metric-specific and comparator-specific wording only."
             ),
             blocker="ResNet1D/CNN and Raw Mamba outperform ECG-RAMBA on multiple principal frozen OOF metrics.",
-            next_action="Keep the manuscript framed as structured analysis and evidence-bounded tradeoffs, not global superiority.",
+            next_action="Keep the manuscript framed as structured analysis and evidence-bounded tradeoffs, not broad performance advantage.",
         ),
     ]
 
@@ -330,7 +745,7 @@ def main() -> None:
             "do_not_use": "Do not convert blocked rows into positive claims.",
         },
     }
-    save_json(out_json, payload)
+    save_json_atomic(out_json, payload)
     manifest = {
         "created_utc": now_utc(),
         "git_commit": git_commit(),
@@ -343,7 +758,7 @@ def main() -> None:
             "table": sha256_file(out_table),
         },
     }
-    save_json(out_manifest, manifest)
+    save_json_atomic(out_manifest, manifest)
     print(json.dumps({"status": True, "rows": len(rows), "table": rel(out_table)}, indent=2), flush=True)
     print(f"Wrote: {out_json}", flush=True)
     print(f"Wrote: {out_table}", flush=True)

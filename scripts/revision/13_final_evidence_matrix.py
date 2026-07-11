@@ -29,7 +29,7 @@ from scripts.revision.common import (  # noqa: E402
     ensure_revision_dirs,
     git_commit,
     save_csv,
-    save_json,
+    save_json_atomic,
     sha256_file,
 )
 
@@ -136,6 +136,55 @@ def csv_index(rows: list[dict[str, str]], key: str) -> dict[str, dict[str, str]]
     return {str(row.get(key, "")): row for row in rows}
 
 
+def paired_oof_contract_issues(
+    payload: dict[str, Any],
+    *,
+    label: str,
+    oof_sha256: str,
+    freeze_sha256: str,
+) -> list[str]:
+    if not payload:
+        return [f"{label}: paired payload missing"]
+    if payload.get("status") not in (True, "complete"):
+        return [f"{label}: paired status={payload.get('status')!r}"]
+    inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
+    issues: list[str] = []
+    if ((inputs.get("full_predictions") or {}).get("sha256")) != oof_sha256:
+        issues.append(f"{label}: full OOF SHA mismatch")
+    if ((inputs.get("freeze_manifest") or {}).get("sha256")) != freeze_sha256:
+        issues.append(f"{label}: freeze manifest SHA mismatch")
+    return issues
+
+
+def external_comparator_audit_contract_issues(
+    manifests: list[Path],
+    *,
+    oof_sha256: str,
+    freeze_sha256: str,
+) -> list[str]:
+    """Validate optional external learned-comparator outputs against the current frozen OOF."""
+
+    issues: list[str] = []
+    expected_contract = {"oof_sha256": oof_sha256, "freeze_sha256": freeze_sha256}
+    runner = PROJECT_ROOT / "scripts" / "revision" / "31_generate_external_comparator_predictions.py"
+    runner_sha = sha256_file(runner) if runner.exists() else None
+    for path in manifests:
+        if not path.exists():
+            continue
+        payload = read_json(path, required=False)
+        label = path.name
+        if payload.get("status") != "complete_experimental_requires_external_comparator_gate":
+            issues.append(f"{label}: status={payload.get('status')!r}")
+        if payload.get("canonical_contract") != expected_contract:
+            issues.append(f"{label}: canonical OOF/freeze mismatch")
+        sources = payload.get("source_contract") if isinstance(payload.get("source_contract"), dict) else {}
+        if not sources.get("archive_sha256") or not sources.get("runner_sha256"):
+            issues.append(f"{label}: source contract missing")
+        elif runner_sha and sources.get("runner_sha256") != runner_sha:
+            issues.append(f"{label}: runner SHA mismatch")
+    return issues
+
+
 def assert_robustness_contract(rows: list[dict[str, str]]) -> list[str]:
     issues: list[str] = []
     stresses = {str(row.get("stress_test", "")) for row in rows}
@@ -159,14 +208,14 @@ def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
         if degradation == "full_significantly_less_degraded":
             degradation_wording = "Full ECG-RAMBA degrades less for this stress/metric."
         elif degradation == "minirocket_significantly_less_degraded":
-            degradation_wording = "MiniRocket-only degrades less for this stress/metric."
+            degradation_wording = "The fixed-transform-only comparator degrades less for this stress/metric."
         else:
             degradation_wording = "No paired degradation advantage should be claimed."
 
         if stressed == "full_significantly_better_under_stress":
             stressed_wording = "Full ECG-RAMBA is better under the stressed operating point."
         elif stressed == "minirocket_significantly_better_under_stress":
-            stressed_wording = "MiniRocket-only is better under the stressed operating point."
+            stressed_wording = "The fixed-transform-only comparator is better under the stressed operating point."
         else:
             stressed_wording = "No stressed-performance superiority should be claimed."
 
@@ -240,11 +289,29 @@ def summarize_robustness(rows: list[dict[str, str]]) -> dict[str, Any]:
 
 def summarize_representation(
     status_payload: dict[str, Any],
+    manifest_payload: dict[str, Any],
     probe_rows: list[dict[str, str]],
     cka_rows: list[dict[str, str]],
+    canonical_contract: dict[str, str],
 ) -> dict[str, Any]:
     status = str(status_payload.get("status", "") or "")
-    complete = status in {"complete_probe_available", "complete"} and bool(probe_rows) and bool(cka_rows)
+    runner = PROJECT_ROOT / "scripts" / "revision" / "20_representation_probe.py"
+    runner_sha = sha256_file(runner) if runner.exists() else None
+    complete = (
+        status
+        in {
+            "complete_probe_available",
+            "complete_probe_available_with_disentanglement_limitation",
+            "complete",
+        }
+        and manifest_payload.get("status") == "complete"
+        and manifest_payload.get("protocol") == "representation_probe_fold_safe_v3_projection_and_fold_audit"
+        and manifest_payload.get("canonical_contract") == canonical_contract
+        and runner_sha is not None
+        and manifest_payload.get("runner_sha256") == runner_sha
+        and bool(probe_rows)
+        and bool(cka_rows)
+    )
     complete_probe_rows = [row for row in probe_rows if row.get("status") == "complete"]
     best_probe = max(complete_probe_rows, key=lambda row: fnum(row.get("macro_roc_auc")), default={})
     morphology_probe = next(
@@ -322,22 +389,38 @@ def summarize_representation(
     }
 
 
-def summarize_fewshot(
+def summarize_external_adaptation(
     rows: list[dict[str, str]],
     manifest: dict[str, Any],
     dataset: str,
+    *,
+    expected_status: str,
+    expected_protocol: str,
+    adaptation_label: str,
+    safe_wording: str,
+    canonical_contract: dict[str, str],
+    runner_name: str,
 ) -> dict[str, Any]:
-    complete = bool(rows) and manifest.get("status") == "complete"
+    """Summarize only an explicitly versioned, protocol-valid adaptation package."""
+    runner = PROJECT_ROOT / "scripts" / "revision" / runner_name
+    runner_sha = sha256_file(runner) if runner.exists() else None
+    complete = (
+        bool(rows)
+        and manifest.get("status") == expected_status
+        and manifest.get("protocol") == expected_protocol
+        and manifest.get("zero_group_overlap_all_splits") is True
+        and manifest.get("canonical_contract") == canonical_contract
+        and runner_sha is not None
+        and manifest.get("runner_sha256") == runner_sha
+    )
     if not complete:
         return {
             "dataset": dataset,
             "complete": False,
-            "status": manifest.get("status", "missing"),
-            "key_numbers": "fewshot_status=not_run_or_deferred",
-            "safe_wording": (
-                "Do not claim few-shot adaptation. The few-shot package is absent or incomplete."
-            ),
-            "blocker": f"{dataset} few-shot score-calibration artifact is absent or incomplete.",
+            "status": manifest.get("status", "missing_or_protocol_mismatch"),
+            "key_numbers": f"{adaptation_label}_status=not_run_or_protocol_invalid",
+            "safe_wording": f"Do not claim {adaptation_label}. The required group-safe package is absent or invalid.",
+            "blocker": f"{dataset} {adaptation_label} artifact is absent, incomplete, or uses a different protocol.",
             "best_fraction": {},
             "best_f1_fraction": {},
             "best_pr_auc_fraction": {},
@@ -354,8 +437,8 @@ def summarize_fewshot(
         if not items:
             return out
         metrics = [
-            "train_records",
-            "test_records",
+            "train_records_or_windows",
+            "test_records_or_windows",
             "f1_macro",
             "pr_auc_macro",
             "roc_auc_macro",
@@ -364,7 +447,12 @@ def summarize_fewshot(
             "adapted_classes",
         ]
         for metric in metrics:
-            values = [fnum(row.get(metric)) for row in items]
+            aliases = {
+                "train_records_or_windows": ("train_records_or_windows", "train_records"),
+                "test_records_or_windows": ("test_records_or_windows", "test_records"),
+                "adapted_classes": ("adapted_classes", "fold_heads"),
+            }.get(metric, (metric,))
+            values = [fnum(next((row.get(key) for key in aliases if row.get(key) not in (None, "")), None)) for row in items]
             finite = [value for value in values if math.isfinite(value)]
             out[f"{metric}_mean"] = sum(finite) / len(finite) if finite else math.nan
         out["mode"] = ",".join(sorted({str(row.get("mode", "")) for row in items}))
@@ -394,14 +482,13 @@ def summarize_fewshot(
     if not math.isfinite(pr_gain):
         pr_gain = math.nan
     key_numbers = (
-        "fewshot_status=complete; "
+        f"{adaptation_label}_status=complete; "
         f"dataset={dataset}; "
-        f"protocol={manifest.get('protocol', '')}; "
-        f"adaptation_kind={manifest.get('adaptation_kind', '')}; "
+        f"protocol={expected_protocol}; "
         f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
         f"F1={fmt(zero_fraction.get('f1_macro_mean'))}; "
         f"F1-best fraction={fmt(best_f1_fraction.get('fraction'), digits=2)}, "
-        f"train_records_mean={fmt(best_f1_fraction.get('train_records_mean'), digits=1)}, "
+        f"train_units_mean={fmt(best_f1_fraction.get('train_records_or_windows_mean'), digits=1)}, "
         f"F1={fmt(best_f1_fraction.get('f1_macro_mean'))}, "
         f"F1_gain_vs_zero={fmt(f1_gain)}; "
         f"rank-best fraction={fmt(best_pr_auc_fraction.get('fraction'), digits=2)}, "
@@ -413,13 +500,7 @@ def summarize_fewshot(
         "complete": True,
         "status": "complete",
         "key_numbers": key_numbers,
-        "safe_wording": (
-            f"Report {dataset} few-shot only as leakage-audited dataset-specific score "
-            "calibration on frozen protocol-gated external predictions. Emphasize "
-            "fixed-threshold F1 changes separately from ranking metrics because score "
-            "calibration may not improve PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights "
-            "unchanged and does not establish a general zero-shot or few-shot advantage."
-        ),
+        "safe_wording": safe_wording,
         "blocker": "",
         "best_fraction": best_f1_fraction,
         "best_f1_fraction": best_f1_fraction,
@@ -430,8 +511,11 @@ def summarize_fewshot(
     }
 
 
-def combine_fewshot_summaries(
-    summaries_by_dataset: dict[str, dict[str, Any]]
+def combine_adaptation_summaries(
+    summaries_by_dataset: dict[str, dict[str, Any]],
+    *,
+    label: str,
+    safe_wording: str,
 ) -> dict[str, Any]:
     completed = {
         dataset: summary
@@ -450,12 +534,9 @@ def combine_fewshot_summaries(
             "datasets_complete": [],
             "datasets_deferred": deferred,
             "by_dataset": summaries_by_dataset,
-            "key_numbers": "fewshot_status=not_run_or_deferred",
-            "safe_wording": (
-                "Do not claim few-shot adaptation. No dataset-specific few-shot package "
-                "is complete."
-            ),
-            "blocker": "No complete dataset-specific few-shot score-calibration artifact.",
+            "key_numbers": f"{label}_status=not_run_or_deferred",
+            "safe_wording": f"Do not claim {label}. No protocol-valid dataset-specific package is complete.",
+            "blocker": f"No complete dataset-specific {label} artifact.",
         }
 
     completed_names = sorted(completed)
@@ -463,7 +544,7 @@ def combine_fewshot_summaries(
         f"{dataset}({completed[dataset]['key_numbers']})" for dataset in completed_names
     )
     blocker = (
-        "Dataset-specific few-shot score calibration not available for: "
+        f"Dataset-specific {label} not available for: "
         + ",".join(deferred)
         if deferred
         else ""
@@ -475,15 +556,40 @@ def combine_fewshot_summaries(
         "datasets_deferred": deferred,
         "by_dataset": summaries_by_dataset,
         "key_numbers": key_numbers,
-        "safe_wording": (
-            "Report few-shot only as leakage-audited dataset-specific score calibration "
-            "on frozen protocol-gated external predictions for datasets whose gates "
-            "passed and whose few-shot artifacts are complete. Emphasize fixed-threshold "
-            "F1 changes separately from ranking metrics because score calibration may "
-            "not improve PR-AUC/ROC-AUC. It leaves ECG-RAMBA weights unchanged and does "
-            "not establish a general zero-shot or few-shot advantage."
-        ),
+        "safe_wording": safe_wording,
         "blocker": blocker,
+    }
+
+
+def summarize_external_comparator_audit(
+    rows: list[dict[str, Any]], manifest: dict[str, Any], contract_issues: list[str]
+) -> dict[str, Any]:
+    complete = (
+        bool(rows)
+        and manifest.get("status") == "complete"
+        and not manifest.get("failures")
+        and not contract_issues
+    )
+    datasets = sorted({str(row.get("dataset", "")) for row in rows if row.get("dataset")})
+    comparators = sorted({str(row.get("comparator", "")) for row in rows if row.get("comparator")})
+    return {
+        "complete": complete,
+        "datasets": datasets,
+        "comparators": comparators,
+        "key_numbers": (
+            f"external_learned_comparator_audit={'complete' if complete else 'not_run_or_incomplete'}; "
+            f"datasets={','.join(datasets) if datasets else 'none'}; "
+            f"comparators={','.join(comparators) if comparators else 'none'}; rows={len(rows)}"
+        ),
+        "safe_wording": (
+            "Report paired external results only by dataset, comparator, and metric. PTB-XL and Georgia are "
+            "separate mapped record-level tasks; CPSC2021 remains a separate annotation-aligned window task."
+        ),
+        "blocker": (
+            "External learned-comparator paired audit is incomplete."
+            if not complete and not contract_issues
+            else "; ".join(contract_issues)
+        ),
     }
 
 
@@ -503,6 +609,8 @@ def main() -> None:
     ensure_revision_dirs()
 
     paths = {
+        "oof_predictions": REVISION_DIR / "predictions" / "oof_final_ema_predictions.npz",
+        "freeze_manifest": MANIFEST_DIR / "oof_final_ema_freeze_manifest.json",
         "calibration": METRIC_DIR / "calibration_ci_oof_final_ema_predictions.json",
         "pooling": METRIC_DIR / "pooling_sensitivity.csv",
         "baseline": METRIC_DIR / "baseline_summary.csv",
@@ -526,7 +634,10 @@ def main() -> None:
         "representation_evidence_status": METRIC_DIR / "representation_evidence_status.json",
         "representation_probe_summary": METRIC_DIR / "representation_probe_summary.json",
         "representation_probe_table": TABLE_DIR / "table_representation_probe.csv",
+        "representation_probe_by_fold_table": TABLE_DIR / "table_representation_probe_by_fold.csv",
         "representation_cka_table": TABLE_DIR / "table_representation_cka.csv",
+        "representation_figure": REVISION_DIR / "figures" / "figure_representation_audit.png",
+        "representation_probe_manifest": MANIFEST_DIR / "representation_probe_manifest.json",
         "fewshot_ptbxl_summary": METRIC_DIR / "fewshot_ptbxl_summary.csv",
         "fewshot_ptbxl_table": TABLE_DIR / "table_fewshot_ptbxl.csv",
         "fewshot_ptbxl_bootstrap": METRIC_DIR / "fewshot_ptbxl_bootstrap.json",
@@ -539,6 +650,25 @@ def main() -> None:
         "fewshot_georgia_table": TABLE_DIR / "table_fewshot_georgia.csv",
         "fewshot_georgia_bootstrap": METRIC_DIR / "fewshot_georgia_bootstrap.json",
         "fewshot_georgia_manifest": MANIFEST_DIR / "fewshot_georgia_run_manifest.json",
+        "group_safe_score_calibration_ptbxl_summary": METRIC_DIR / "group_safe_score_calibration_ptbxl_summary.csv",
+        "group_safe_score_calibration_ptbxl_table": TABLE_DIR / "table_group_safe_score_calibration_ptbxl.csv",
+        "group_safe_score_calibration_ptbxl_bootstrap": METRIC_DIR / "group_safe_score_calibration_ptbxl_bootstrap.json",
+        "group_safe_score_calibration_ptbxl_manifest": MANIFEST_DIR / "group_safe_score_calibration_ptbxl_manifest.json",
+        "true_fewshot_head_ptbxl_summary": METRIC_DIR / "true_fewshot_head_ptbxl_summary.csv",
+        "true_fewshot_head_ptbxl_table": TABLE_DIR / "table_true_fewshot_head_ptbxl.csv",
+        "true_fewshot_head_ptbxl_paired": TABLE_DIR / "table_true_fewshot_head_ptbxl_paired.csv",
+        "true_fewshot_head_ptbxl_bootstrap": METRIC_DIR / "true_fewshot_head_ptbxl_bootstrap.json",
+        "true_fewshot_head_ptbxl_coefficients": TABLE_DIR / "table_true_fewshot_head_ptbxl_coefficients.csv",
+        "true_fewshot_head_ptbxl_manifest": MANIFEST_DIR / "true_fewshot_head_ptbxl_manifest.json",
+        "external_comparator_summary": METRIC_DIR / "external_comparator_paired_summary.json",
+        "external_comparator_table": TABLE_DIR / "table_external_comparator_paired.csv",
+        "external_comparator_manifest": MANIFEST_DIR / "external_comparator_paired_manifest.json",
+        "external_ptbxl_resnet_manifest": MANIFEST_DIR / "external_ptbxl_resnet1d_cnn_manifest.json",
+        "external_ptbxl_raw_mamba_manifest": MANIFEST_DIR / "external_ptbxl_raw_mamba_manifest.json",
+        "external_georgia_resnet_manifest": MANIFEST_DIR / "external_georgia_resnet1d_cnn_manifest.json",
+        "external_georgia_raw_mamba_manifest": MANIFEST_DIR / "external_georgia_raw_mamba_manifest.json",
+        "reviewer_presentation_manifest": MANIFEST_DIR / "reviewer_completion_input_contract.json",
+        "marked_manuscript_manifest": MANIFEST_DIR / "marked_manuscript_manifest.json",
         "robustness_multicomparator_summary": METRIC_DIR / "robustness_multicomparator_summary.csv",
         "robustness_multicomparator_pairwise": METRIC_DIR / "robustness_multicomparator_pairwise.json",
         "robustness_multicomparator_table": TABLE_DIR / "table_robustness_multicomparator.csv",
@@ -550,6 +680,17 @@ def main() -> None:
             "Missing required final evidence inputs: "
             + "; ".join(f"{name}={paths[name]}" for name in missing)
         )
+
+    current_oof_sha256 = (
+        sha256_file(paths["oof_predictions"]) if paths["oof_predictions"].exists() else ""
+    )
+    current_freeze_sha256 = (
+        sha256_file(paths["freeze_manifest"]) if paths["freeze_manifest"].exists() else ""
+    )
+    canonical_contract = {
+        "oof_sha256": current_oof_sha256,
+        "freeze_sha256": current_freeze_sha256,
+    }
 
     calibration = read_json(paths["calibration"], required=args.strict)
     pooling_rows = read_csv_rows(paths["pooling"], required=args.strict)
@@ -575,6 +716,10 @@ def main() -> None:
         optional_paths["representation_probe_summary"],
         required=False,
     )
+    representation_probe_manifest = read_json(
+        optional_paths["representation_probe_manifest"],
+        required=False,
+    )
     representation_probe_rows = read_csv_rows(
         optional_paths["representation_probe_table"],
         required=False,
@@ -583,19 +728,153 @@ def main() -> None:
         optional_paths["representation_cka_table"],
         required=False,
     )
-    fewshot_dataset_summaries = {}
+    # Legacy v1 score-calibration outputs are deliberately retained only as
+    # provenance. They were row-split analyses and must never become a final
+    # few-shot claim. The v2 artifacts below have explicit group-overlap audits.
+    legacy_fewshot_dataset_summaries = {}
     for dataset in EXPECTED_EXTERNAL_DATASETS:
-        fewshot_dataset_summaries[dataset] = summarize_fewshot(
-            read_csv_rows(optional_paths[f"fewshot_{dataset}_summary"], required=False),
-            read_json(optional_paths[f"fewshot_{dataset}_manifest"], required=False),
-            dataset,
+        manifest = read_json(optional_paths[f"fewshot_{dataset}_manifest"], required=False)
+        legacy_fewshot_dataset_summaries[dataset] = {
+            "dataset": dataset,
+            "status": manifest.get("status", "missing"),
+            "protocol": manifest.get("protocol", ""),
+            "claim_ready": False,
+            "reason": "legacy_row_split_score_calibration_not_group_safe",
+        }
+    score_calibration_summaries = {
+        "ptbxl": summarize_external_adaptation(
+            read_csv_rows(optional_paths["group_safe_score_calibration_ptbxl_summary"], required=False),
+            read_json(optional_paths["group_safe_score_calibration_ptbxl_manifest"], required=False),
+            "ptbxl",
+            expected_status="complete_group_safe_score_calibration",
+            expected_protocol="group_safe_score_calibration_v2_gated_external",
+            adaptation_label="group_safe_score_calibration",
+            canonical_contract=canonical_contract,
+            runner_name="33_group_safe_score_calibration.py",
+            safe_wording=(
+                "Report PTB-XL only as group-safe, dataset-specific score calibration of frozen predictions. "
+                "It can change fixed-threshold F1/calibration but cannot establish model-weight adaptation, "
+                "few-shot fine-tuning, or broad transfer superiority."
+            ),
         )
-    fewshot_summary = combine_fewshot_summaries(fewshot_dataset_summaries)
+    }
+    score_calibration_summary = combine_adaptation_summaries(
+        score_calibration_summaries,
+        label="group_safe_score_calibration",
+        safe_wording=(
+            "Use group-safe score-calibration results only for the named dataset and distinguish threshold/calibration "
+            "changes from ranking metrics. Frozen model and encoder weights remain unchanged."
+        ),
+    )
+    true_fewshot_summaries = {
+        "ptbxl": summarize_external_adaptation(
+            read_csv_rows(optional_paths["true_fewshot_head_ptbxl_summary"], required=False),
+            read_json(optional_paths["true_fewshot_head_ptbxl_manifest"], required=False),
+            "ptbxl",
+            expected_status="complete_true_classifier_head_adaptation",
+            expected_protocol="frozen_encoder_true_linear_head_adaptation_v2_group_safe_gated",
+            adaptation_label="true_fewshot_frozen_encoder_head",
+            canonical_contract=canonical_contract,
+            runner_name="35_true_fewshot_head_adaptation.py",
+            safe_wording=(
+                "Report PTB-XL results as group-safe fitting of new linear classifier heads on frozen encoder "
+                "representations. This is true parameter adaptation, but not end-to-end encoder fine-tuning and "
+                "not general few-shot superiority."
+            ),
+        )
+    }
+    true_fewshot_summary = combine_adaptation_summaries(
+        true_fewshot_summaries,
+        label="true_fewshot_frozen_encoder_head",
+        safe_wording=(
+            "Use true few-shot results only for the named dataset, frozen encoder, split protocol, and comparator set. "
+            "Do not describe the experiment as end-to-end fine-tuning or broad transfer superiority."
+        ),
+    )
+    fewshot_summary = {
+        "complete": bool(score_calibration_summary.get("complete") or true_fewshot_summary.get("complete")),
+        "status": "complete" if score_calibration_summary.get("complete") or true_fewshot_summary.get("complete") else "not_run_or_deferred",
+        "key_numbers": "; ".join(
+            item["key_numbers"]
+            for item in (score_calibration_summary, true_fewshot_summary)
+            if item.get("complete")
+        ) or "adaptation_status=not_run_or_deferred",
+        "safe_wording": " ".join(
+            item["safe_wording"]
+            for item in (score_calibration_summary, true_fewshot_summary)
+        ),
+        "blocker": "; ".join(
+            item["blocker"]
+            for item in (score_calibration_summary, true_fewshot_summary)
+            if item.get("blocker")
+        ),
+    }
     a0 = read_json(paths["a0_status"], required=args.strict)
     claim_map = read_csv_rows(paths["claim_map"], required=args.strict)
     task_board = read_csv_rows(paths["task_board"], required=False)
 
     contract_issues: list[str] = []
+    external_comparator_payload = read_json(
+        optional_paths["external_comparator_summary"], required=False
+    )
+    external_comparator_contract_issues = external_comparator_audit_contract_issues(
+        [
+            optional_paths["external_ptbxl_resnet_manifest"],
+            optional_paths["external_ptbxl_raw_mamba_manifest"],
+            optional_paths["external_georgia_resnet_manifest"],
+            optional_paths["external_georgia_raw_mamba_manifest"],
+        ],
+        oof_sha256=current_oof_sha256,
+        freeze_sha256=current_freeze_sha256,
+    )
+    external_paired_manifest = read_json(
+        optional_paths["external_comparator_manifest"], required=False
+    )
+    external_paired_runner = (
+        PROJECT_ROOT / "scripts" / "revision" / "32_paired_external_comparators.py"
+    )
+    if external_paired_manifest:
+        if external_paired_manifest.get("status") != "complete":
+            external_comparator_contract_issues.append(
+                f"external paired manifest status={external_paired_manifest.get('status')!r}"
+            )
+        if external_paired_manifest.get("canonical_contract") != canonical_contract:
+            external_comparator_contract_issues.append(
+                "external paired manifest canonical OOF/freeze mismatch"
+            )
+        if (
+            not external_paired_runner.exists()
+            or external_paired_manifest.get("runner_sha256")
+            != sha256_file(external_paired_runner)
+        ):
+            external_comparator_contract_issues.append(
+                "external paired manifest runner SHA mismatch"
+            )
+    external_comparator_audit = summarize_external_comparator_audit(
+        list(external_comparator_payload.get("rows") or []),
+        external_paired_manifest,
+        external_comparator_contract_issues,
+    )
+    if calibration.get("predictions_sha256") != current_oof_sha256:
+        contract_issues.append("Calibration CI: OOF SHA mismatch")
+    if calibration.get("freeze_manifest_sha256") != current_freeze_sha256:
+        contract_issues.append("Calibration CI: freeze manifest SHA mismatch")
+    for label, paired_payload, required in (
+        ("Fixed-transform-only (legacy MiniRocket artifact)", paired_minirocket, True),
+        ("ResNet1D/CNN", paired_resnet, True),
+        ("Raw Mamba", paired_raw_mamba, False),
+        ("Transformer ECG", paired_transformer, False),
+        ("Frozen-transform MLP head", paired_hybrid_morphology, False),
+    ):
+        if paired_payload or required:
+            contract_issues.extend(
+                paired_oof_contract_issues(
+                    paired_payload,
+                    label=label,
+                    oof_sha256=current_oof_sha256,
+                    freeze_sha256=current_freeze_sha256,
+                )
+            )
     if robustness_rows:
         contract_issues.extend(assert_robustness_contract(robustness_rows))
     if args.strict and contract_issues:
@@ -625,8 +904,10 @@ def main() -> None:
     robustness_summary = summarize_robustness(robustness_rows)
     representation_summary = summarize_representation(
         representation_status or representation_probe_summary,
+        representation_probe_manifest,
         representation_probe_rows,
         representation_cka_rows,
+        canonical_contract,
     )
     external_gate_by_dataset = {
         str(row.get("dataset", "")).strip().lower(): row
@@ -739,16 +1020,16 @@ def main() -> None:
         else ""
     )
     hybrid_key_numbers = (
-        f"; Hybrid MiniRocket-MLP PR-AUC={fmt(hybrid_morphology.get('pr_auc_macro'))}, "
+        f"; Hybrid fixed-transform MLP PR-AUC={fmt(hybrid_morphology.get('pr_auc_macro'))}, "
         f"F1={fmt(hybrid_morphology.get('f1_macro'))}"
         if hybrid_morphology
         else ""
     )
     hybrid_paired_key_numbers = (
-        f"; Hybrid MiniRocket-MLP paired F1={paired_hybrid_f1.get('interpretation', '')}, "
+        f"; Hybrid fixed-transform MLP paired F1={paired_hybrid_f1.get('interpretation', '')}, "
         f"PR-AUC={paired_hybrid_pr.get('interpretation', '')}"
         if paired_hybrid_metrics
-        else "; Hybrid MiniRocket-MLP paired comparison=not_run_optional"
+        else "; Hybrid fixed-transform MLP paired comparison=not_run_optional"
     )
     hybrid_evidence_paths = (
         ";reports/revision/metrics/paired_full_vs_hybrid_morphology_comparison.json;"
@@ -787,14 +1068,21 @@ def main() -> None:
         else ""
     )
     fewshot_evidence_paths = []
-    for dataset in EXPECTED_EXTERNAL_DATASETS:
-        if fewshot_dataset_summaries.get(dataset, {}).get("complete") is True:
-            fewshot_evidence_paths.extend(
-                [
-                    f"reports/revision/metrics/fewshot_{dataset}_summary.csv",
-                    f"reports/revision/manifests/fewshot_{dataset}_run_manifest.json",
-                ]
-            )
+    if score_calibration_summary.get("complete"):
+        fewshot_evidence_paths.extend(
+            [
+                "reports/revision/metrics/group_safe_score_calibration_ptbxl_summary.csv",
+                "reports/revision/manifests/group_safe_score_calibration_ptbxl_manifest.json",
+            ]
+        )
+    if true_fewshot_summary.get("complete"):
+        fewshot_evidence_paths.extend(
+            [
+                "reports/revision/metrics/true_fewshot_head_ptbxl_summary.csv",
+                "reports/revision/tables/table_true_fewshot_head_ptbxl_paired.csv",
+                "reports/revision/manifests/true_fewshot_head_ptbxl_manifest.json",
+            ]
+        )
     fewshot_evidence_path_text = (
         ";" + ";".join(fewshot_evidence_paths) if fewshot_evidence_paths else ""
     )
@@ -806,11 +1094,11 @@ def main() -> None:
             "evidence_status": c01_evidence_status,
             "key_numbers": (
                 f"Full PR-AUC={fmt(full.get('pr_auc_macro'))}, F1={fmt(full.get('f1_macro'))}; "
-                f"MiniRocket PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}; "
+                f"Fixed-transform-only PR-AUC={fmt(mini.get('pr_auc_macro'))}, F1={fmt(mini.get('f1_macro'))}; "
                 f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}; "
                 f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
                 f"{transformer_key_numbers}"
-                f"{hybrid_key_numbers}"
+                f"{hybrid_key_numbers}; {external_comparator_audit['key_numbers']}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
@@ -818,16 +1106,18 @@ def main() -> None:
                 "reports/revision/metrics/paired_full_vs_resnet_comparison.json;"
                 "reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json"
                 f"{transformer_evidence_paths}"
-                f"{hybrid_evidence_paths}"
+                f"{hybrid_evidence_paths};reports/revision/metrics/external_comparator_paired_summary.json;"
+                "reports/revision/tables/table_external_comparator_paired.csv"
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
                 "metric-specific paired deltas. In-domain fair comparators show ResNet1D/CNN "
                 "and Raw Mamba are stronger on discrimination/F1 metrics; narrow ECG-RAMBA "
                 "claims to supported calibration tradeoffs, architecture analysis, and "
-                "documented limitations."
+                "documented limitations. "
+                f"{external_comparator_audit['safe_wording']}"
             ),
-            "blocker": c01_blocker,
+            "blocker": "; ".join(item for item in [c01_blocker, external_comparator_audit["blocker"]] if item),
             "source_claim_status": c01_evidence_status,
         },
         {
@@ -864,7 +1154,7 @@ def main() -> None:
             ),
             "safe_wording": (
                 "Frozen OOF supports only metric-specific operating-point statements. ECG-RAMBA "
-                "has calibration/error advantages over MiniRocket-only and Raw Mamba, but "
+                "has calibration/error advantages over the fixed-transform-only comparator and Raw Mamba, but "
                 "ResNet1D/CNN is stronger on PR-AUC, ROC-AUC, F1, Brier, and ECE; do not "
                 "claim a general fixed-threshold or calibration advantage."
             ),
@@ -903,7 +1193,10 @@ def main() -> None:
                 "reports/revision/metrics/representation_evidence_status.json;"
                 "reports/revision/metrics/representation_probe_summary.json;"
                 "reports/revision/tables/table_representation_probe.csv;"
-                "reports/revision/tables/table_representation_cka.csv"
+                "reports/revision/tables/table_representation_probe_by_fold.csv;"
+                "reports/revision/tables/table_representation_cka.csv;"
+                "reports/revision/figures/figure_representation_audit.png;"
+                "reports/revision/manifests/representation_probe_manifest.json"
             ),
             "safe_wording": representation_summary["safe_wording"],
             "blocker": representation_summary["blocker"],
@@ -995,25 +1288,25 @@ def main() -> None:
         "contract_issues": contract_issues,
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
-            "global_superiority": "Do not claim broad superiority over all fair baselines.",
+            "global_superiority": "Avoid broad fair-baseline advantage wording.",
             "resnet_in_domain": (
                 "The completed paired ResNet1D/CNN comparison favors ResNet on frozen Chapman OOF "
                 "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim an ECG-RAMBA in-domain "
                 "performance advantage over fair CNN/ResNet baselines."
             ),
             "operating_point": (
-                "ECG-RAMBA operating-point advantages are comparator-specific. The MiniRocket-only "
+                "ECG-RAMBA operating-point advantages are comparator-specific. The fixed-transform-only "
                 "F1/Brier/ECE result does not generalize to ResNet1D/CNN."
             ),
             "robustness": (
                 "Use only metric-specific robustness claims supported by paired degradation CIs. "
-                "If robustness_multicomparator artifacts are present, treat missing ResNet/Raw-Mamba "
-                "stress predictions as explicit blocked evidence rather than support for broad robustness."
+                "A learned-comparator ledger, when complete, remains stress-, metric-, and comparator-specific; "
+                "it does not support broad robustness superiority."
             ),
             "fewshot": (
-                "Few-shot evidence is optional and gated. Report it only when the dataset-specific "
-                "external protocol gate passed and scripts/revision/19_fewshot_adaptation.py produced "
-                "a completed leakage-audited sensitivity package; do not describe it as model-weight updating."
+                "Legacy row-split score calibration is not claim-ready. Group-safe score calibration changes no "
+                "model weights. True few-shot evidence requires the frozen-encoder linear-head protocol and must "
+                "not be described as end-to-end fine-tuning or broad transfer superiority."
             ),
             "external": (
                 f"Use only protocol-gated mapped-task wording for passed external datasets: {external_passed_text}. "
@@ -1026,9 +1319,8 @@ def main() -> None:
             ),
             "hrv": "Do not describe reserved HRV slots as implemented RMSSD/SDNN/LF-HF features.",
             "representation": (
-                "Use representation probe/CKA only as a conservative audit. CKA may show branch "
-                "embeddings are not identical, but weak fold-safe linear probes do not support "
-                "established morphology-rhythm separation."
+                "Use only the v3 fold-aware projection/probe/CKA audit. CKA may show branch embeddings are not "
+                "identical, but weak fold-safe linear probes do not support established morphology-rhythm separation."
             ),
             "raw_mamba": (
                 "Use Raw Mamba only as a comparator-specific fair-baseline result. "
@@ -1040,9 +1332,17 @@ def main() -> None:
                 "It must not be used to imply broad model-family superiority."
             ),
             "hybrid_morphology": (
-                "Use Hybrid MiniRocket-MLP only as optional morphology-head sensitivity evidence if "
+                "Use the frozen ROCKET-family transform MLP only as optional morphology-head sensitivity evidence if "
                 "scripts/revision/26_hybrid_morphology_baseline.py and paired bootstrap output are complete. "
                 "It must not be used as causal proof of deterministic morphology, regularization, or disentanglement."
+            ),
+            "external_comparators": (
+                "PTB-XL and Georgia learned-comparator audits must remain separate mapped tasks. Run ResNet1D/CNN and "
+                "Raw Mamba first; Transformer external inference is secondary to a complete in-domain Transformer gate. "
+                "CPSC2021 is a separate 10-second AF/AFL mapped-window task."
+            ),
+            "marked_manuscript": (
+                "The editorial marked/highlighted manuscript is complete only after latexdiff and LaTeX create a verified PDF."
             ),
             "claim_readiness_gates": (
                 "Use scripts/revision/28_claim_readiness_gates.py as a blocker ledger for optional or "
@@ -1060,6 +1360,10 @@ def main() -> None:
             "deferred": external_gate_deferred,
         },
         "fewshot_summary": fewshot_summary,
+        "legacy_row_split_score_calibration": legacy_fewshot_dataset_summaries,
+        "group_safe_score_calibration_summary": score_calibration_summary,
+        "true_fewshot_head_adaptation_summary": true_fewshot_summary,
+        "external_learned_comparator_audit": external_comparator_audit,
         "robustness_summary": robustness_summary,
         "representation_summary": representation_summary,
         "task_status": {
@@ -1088,7 +1392,7 @@ def main() -> None:
     save_csv(args.out_safe_wording, safe_rows)
     save_csv(args.out_blockers, blocker_rows)
     save_csv(args.out_robustness, robustness_claims)
-    save_json(args.out_json, payload)
+    save_json_atomic(args.out_json, payload)
 
     output_paths = [
         args.out_json,
@@ -1111,7 +1415,7 @@ def main() -> None:
         "final_ready_for_rebuttal": final_ready,
         "all_claims_supported": False,
     }
-    save_json(args.out_manifest, manifest)
+    save_json_atomic(args.out_manifest, manifest)
 
     print(json.dumps({
         "status": True,

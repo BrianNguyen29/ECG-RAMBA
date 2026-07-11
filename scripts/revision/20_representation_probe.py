@@ -49,7 +49,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL = "representation_probe_fold_safe_v2_maxiter_trace"
+PROTOCOL = "representation_probe_fold_safe_v3_projection_and_fold_audit"
 VIEW_KEYS = {
     "morphology": ("morphology_embedding", "morphology", "rocket_embedding"),
     "rhythm": ("rhythm_embedding", "rhythm", "hrv_embedding"),
@@ -70,10 +70,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--probe-max-iter", type=int, default=5000)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--out-summary", type=Path, default=METRIC_DIR / "representation_probe_summary.json")
     parser.add_argument("--out-probe-table", type=Path, default=TABLE_DIR / "table_representation_probe.csv")
+    parser.add_argument(
+        "--out-fold-probe-table",
+        type=Path,
+        default=TABLE_DIR / "table_representation_probe_by_fold.csv",
+    )
     parser.add_argument("--out-cka-table", type=Path, default=TABLE_DIR / "table_representation_cka.csv")
+    parser.add_argument(
+        "--out-audit-figure",
+        type=Path,
+        default=FIGURE_DIR / "figure_representation_audit.png",
+    )
     parser.add_argument("--out-manifest", type=Path, default=MANIFEST_DIR / "representation_probe_manifest.json")
     return parser.parse_args()
 
@@ -118,7 +128,9 @@ def blocked_payload(args: argparse.Namespace, reason: str) -> dict[str, Any]:
         "outputs": {
             "summary_json": project_relative(args.out_summary),
             "probe_table": project_relative(args.out_probe_table),
+            "fold_probe_table": project_relative(args.out_fold_probe_table),
             "cka_table": project_relative(args.out_cka_table),
+            "audit_figure": project_relative(args.out_audit_figure),
             "manifest": project_relative(args.out_manifest),
         },
         "git_commit": git_commit(),
@@ -129,10 +141,16 @@ def load_embeddings(path: Path) -> dict[str, Any]:
     path = resolve(path)
     if not path.exists():
         raise FileNotFoundError(f"Missing embedding NPZ: {path}")
-    with np.load(path, allow_pickle=True) as data:
+    with np.load(path, allow_pickle=False) as data:
         missing = [key for key in ["y_true", "record_id", "fold_id", "class_names"] if key not in data.files]
         if missing:
             raise KeyError(f"Missing required keys: {missing}")
+        def source_scalar(key: str, default: str = "") -> str:
+            if key not in data.files:
+                return default
+            value = data[key]
+            return str(value.item() if np.ndim(value) == 0 else value)
+
         payload: dict[str, Any] = {
             "y_true": np.asarray(data["y_true"], dtype=np.float32),
             "record_id": np.asarray(data["record_id"]).astype(str),
@@ -141,6 +159,9 @@ def load_embeddings(path: Path) -> dict[str, Any]:
             "views": {},
             "path": path,
             "sha256": sha256_file(path),
+            "source_protocol": source_scalar("protocol"),
+            "source_oof_sha256": source_scalar("oof_predictions_sha256"),
+            "source_freeze_sha256": source_scalar("freeze_manifest_sha256"),
         }
         n = len(payload["record_id"])
         for view, candidates in VIEW_KEYS.items():
@@ -149,12 +170,28 @@ def load_embeddings(path: Path) -> dict[str, Any]:
                     arr = np.asarray(data[key], dtype=np.float32)
                     if arr.ndim != 2 or arr.shape[0] != n:
                         raise ValueError(f"Invalid {key} shape: {arr.shape}; expected ({n}, D)")
+                    if not np.isfinite(arr).all():
+                        raise ValueError(f"Embedding view {key} contains NaN/Inf values")
                     payload["views"][view] = arr
                     break
     if not payload["views"]:
         raise KeyError("No recognized embedding view keys found.")
-    if payload["y_true"].shape[0] != len(payload["record_id"]):
+    if payload["y_true"].ndim != 2 or payload["y_true"].shape[0] != len(payload["record_id"]):
         raise ValueError("y_true row count does not match record_id count.")
+    if len(np.unique(payload["record_id"])) != len(payload["record_id"]):
+        raise ValueError("record_id values are not unique")
+    if len(payload["fold_id"]) != len(payload["record_id"]):
+        raise ValueError("fold_id row count does not match record_id count")
+    if not set(np.unique(payload["fold_id"])).issubset({1, 2, 3, 4, 5}):
+        raise ValueError(f"Unexpected fold identifiers: {sorted(np.unique(payload['fold_id']).tolist())}")
+    if len(payload["class_names"]) != payload["y_true"].shape[1]:
+        raise ValueError("class_names length does not match label width")
+    if payload.get("source_protocol") != "ecg_ramba_final_ema_branch_embedding_extraction_v1":
+        raise RuntimeError("Embedding artifact uses an unsupported or missing extraction protocol")
+    if not payload.get("source_oof_sha256") or not payload.get("source_freeze_sha256"):
+        raise RuntimeError("Embedding artifact lacks canonical OOF/freeze provenance")
+    if not np.isfinite(payload["y_true"]).all() or not np.isin(payload["y_true"], [0.0, 1.0]).all():
+        raise ValueError("y_true must contain finite binary labels")
     return payload
 
 
@@ -206,6 +243,7 @@ def probe_one_view(
     convergence_warning_count = 0
     convergence_limited_estimators = 0
     solver_iter_max = 0
+    fold_rows: list[dict[str, Any]] = []
     for fold in sorted(np.unique(fold_id)):
         train = fold_id != fold
         test = fold_id == fold
@@ -246,6 +284,17 @@ def probe_one_view(
             predicted = np.stack([p[:, 1] for p in predicted], axis=1)
         fold_prob[:, usable_cols] = np.asarray(predicted, dtype=np.float32)
         pred[test] = fold_prob
+        fold_metrics = multilabel_metrics(yv[test], fold_prob, threshold=threshold)
+        fold_metrics["macro_pr_auc"] = macro_pr_auc(yv[test], fold_prob)
+        fold_metrics["macro_roc_auc"] = macro_roc_auc(yv[test], fold_prob)
+        fold_rows.append(
+            {
+                "fold_id": int(fold),
+                "n_records_evaluated": int(np.sum(test)),
+                "n_labels_evaluated": int(len(valid_cols)),
+                **fold_metrics,
+            }
+        )
     covered = np.all(np.isfinite(pred), axis=1)
     if not np.any(covered):
         return {"status": "blocked_no_fold_predictions"}
@@ -258,19 +307,16 @@ def probe_one_view(
     metrics["solver_iter_max"] = int(solver_iter_max)
     metrics["convergence_warning_count"] = int(convergence_warning_count)
     metrics["convergence_limited_estimators"] = int(convergence_limited_estimators)
+    metrics["_fold_rows"] = fold_rows
     metrics["status"] = "complete"
     return metrics
 
 
-def maybe_write_umap(view_name: str, x: np.ndarray, fold_id: np.ndarray, args: argparse.Namespace) -> str:
+def project_embedding(x: np.ndarray, args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, str]:
     try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         from sklearn.decomposition import PCA
     except Exception:
-        return ""
+        return np.asarray([], dtype=np.int64), np.empty((0, 2), dtype=np.float32), "unavailable"
 
     rng = np.random.default_rng(args.seed)
     n = x.shape[0]
@@ -278,16 +324,33 @@ def maybe_write_umap(view_name: str, x: np.ndarray, fold_id: np.ndarray, args: a
     if args.max_plot_records > 0 and n > args.max_plot_records:
         idx = np.sort(rng.choice(n, size=args.max_plot_records, replace=False))
     x_plot = x[idx]
-    fold_plot = fold_id[idx]
     method = "pca"
     try:
         import umap  # type: ignore
 
-        reducer = umap.UMAP(n_components=2, random_state=args.seed)
+        reducer = umap.UMAP(n_components=2, random_state=args.seed, n_jobs=1)
         coords = reducer.fit_transform(x_plot)
         method = "umap"
     except Exception:
         coords = PCA(n_components=2, random_state=args.seed).fit_transform(x_plot)
+    return idx.astype(np.int64), np.asarray(coords, dtype=np.float32), method
+
+
+def write_view_projection(
+    view_name: str,
+    idx: np.ndarray,
+    coords: np.ndarray,
+    method: str,
+    fold_id: np.ndarray,
+) -> str:
+    if not len(idx):
+        return ""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fold_plot = fold_id[idx]
     FIGURE_DIR.mkdir(parents=True, exist_ok=True)
     out = FIGURE_DIR / f"representation_{method}_{view_name}.png"
     plt.figure(figsize=(5, 4))
@@ -302,10 +365,105 @@ def maybe_write_umap(view_name: str, x: np.ndarray, fold_id: np.ndarray, args: a
     return project_relative(out)
 
 
+def representation_label_groups(
+    y_true: np.ndarray,
+    morphology_idx: list[int],
+    rhythm_idx: list[int],
+) -> tuple[np.ndarray, list[str]]:
+    morphology_positive = (
+        np.any(y_true[:, morphology_idx] > 0, axis=1) if morphology_idx else np.zeros(len(y_true), dtype=bool)
+    )
+    rhythm_positive = (
+        np.any(y_true[:, rhythm_idx] > 0, axis=1) if rhythm_idx else np.zeros(len(y_true), dtype=bool)
+    )
+    category = morphology_positive.astype(np.int8) + 2 * rhythm_positive.astype(np.int8)
+    return category, ["neither", "morphology only", "rhythm only", "both"]
+
+
+def write_representation_audit_figure(
+    projections: dict[str, tuple[np.ndarray, np.ndarray, str]],
+    y_true: np.ndarray,
+    fold_id: np.ndarray,
+    morphology_idx: list[int],
+    rhythm_idx: list[int],
+    out_path: Path,
+) -> str:
+    available = [(name, value) for name, value in projections.items() if len(value[0])]
+    if not available:
+        return ""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    category, category_names = representation_label_groups(y_true, morphology_idx, rhythm_idx)
+    fold_colors = plt.get_cmap("tab10")
+    category_colors = ["#808080", "#0072B2", "#D55E00", "#009E73"]
+    fig, axes = plt.subplots(len(available), 2, figsize=(10, 3.1 * len(available)), squeeze=False)
+    for row_index, (view_name, (idx, coords, method)) in enumerate(available):
+        ax_fold, ax_label = axes[row_index]
+        fold_plot = fold_id[idx]
+        category_plot = category[idx]
+        for fold in sorted(np.unique(fold_plot)):
+            mask = fold_plot == fold
+            ax_fold.scatter(
+                coords[mask, 0],
+                coords[mask, 1],
+                s=5,
+                alpha=0.55,
+                color=fold_colors(int(fold) - 1),
+                linewidths=0,
+                label=f"Fold {int(fold)}",
+            )
+        for value, label in enumerate(category_names):
+            mask = category_plot == value
+            if np.any(mask):
+                ax_label.scatter(
+                    coords[mask, 0],
+                    coords[mask, 1],
+                    s=5,
+                    alpha=0.55,
+                    color=category_colors[value],
+                    linewidths=0,
+                    label=label,
+                )
+        ax_fold.set_title(f"{view_name}: OOF fold ({method.upper()})")
+        ax_label.set_title(f"{view_name}: diagnostic label group ({method.upper()})")
+        for axis in (ax_fold, ax_label):
+            axis.set_xlabel("Projection 1")
+            axis.set_ylabel("Projection 2")
+            axis.grid(False)
+    fold_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color=fold_colors(fold - 1), label=f"Fold {fold}")
+        for fold in range(1, 6)
+    ]
+    label_handles = [
+        Line2D([0], [0], marker="o", linestyle="", color=color, label=label)
+        for color, label in zip(category_colors, category_names)
+    ]
+    axes[0, 0].legend(handles=fold_handles, loc="best", fontsize=8, frameon=False)
+    axes[0, 1].legend(handles=label_handles, loc="best", fontsize=8, frameon=False)
+    fig.suptitle("Branch representation audit (descriptive projection; not evidence of disentanglement)")
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    out_path = resolve(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    plt.close(fig)
+    return project_relative(out_path)
+
+
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
-    for path in [args.out_summary, args.out_probe_table, args.out_cka_table, args.out_manifest]:
+    for path in [
+        args.out_summary,
+        args.out_probe_table,
+        args.out_fold_probe_table,
+        args.out_cka_table,
+        args.out_audit_figure,
+        args.out_manifest,
+    ]:
         path.parent.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80, flush=True)
@@ -321,6 +479,7 @@ def main() -> None:
         save_json(args.out_summary, payload)
         save_json(args.out_manifest, payload)
         save_csv(args.out_probe_table, [payload])
+        save_csv(args.out_fold_probe_table, [payload])
         save_csv(args.out_cka_table, [payload])
         print(json.dumps(payload, indent=2), flush=True)
         if args.strict:
@@ -339,9 +498,13 @@ def main() -> None:
     }
 
     probe_rows: list[dict[str, Any]] = []
+    fold_probe_rows: list[dict[str, Any]] = []
     figure_paths: dict[str, str] = {}
+    projections: dict[str, tuple[np.ndarray, np.ndarray, str]] = {}
     for view, x in emb["views"].items():
-        figure_paths[view] = maybe_write_umap(view, x, fold_id, args)
+        projection = project_embedding(x, args)
+        projections[view] = projection
+        figure_paths[view] = write_view_projection(view, *projection, fold_id)
         for group_name, idx in groups.items():
             if not idx:
                 probe_rows.append(
@@ -360,6 +523,18 @@ def main() -> None:
                 args.seed,
                 args.probe_max_iter,
             )
+            view_fold_rows = result.pop("_fold_rows", [])
+            fold_probe_rows.extend(
+                {"view": view, "label_group": group_name, **fold_row}
+                for fold_row in view_fold_rows
+            )
+            if args.strict and (
+                int(result.get("convergence_warning_count", 0)) > 0
+                or int(result.get("convergence_limited_estimators", 0)) > 0
+            ):
+                raise RuntimeError(
+                    f"Probe convergence gate failed for {view}/{group_name}: {result}"
+                )
             probe_rows.append(
                 {
                     "view": view,
@@ -369,24 +544,52 @@ def main() -> None:
             )
             print(f"probe {view}/{group_name}: {result}", flush=True)
 
+    figure_paths["combined_audit"] = write_representation_audit_figure(
+        projections,
+        y_true,
+        fold_id,
+        morphology_idx,
+        rhythm_idx,
+        args.out_audit_figure,
+    )
+
     cka_rows: list[dict[str, Any]] = []
     for left, right in combinations(sorted(emb["views"]), 2):
-        value = linear_cka(emb["views"][left], emb["views"][right], args.max_cka_records, args.seed)
-        cka_rows.append(
-            {
-                "left_view": left,
-                "right_view": right,
-                "linear_cka": float(value),
-                "max_records": int(args.max_cka_records),
-                "status": "complete" if np.isfinite(value) else "blocked_nonfinite",
-            }
+        scopes = [("all_oof", 0, np.ones(len(fold_id), dtype=bool))]
+        scopes.extend(
+            ("held_out_fold", int(fold), fold_id == fold)
+            for fold in sorted(np.unique(fold_id))
         )
-        print(f"cka {left}/{right}: {value:.6f}", flush=True)
+        for scope, fold, mask in scopes:
+            value = linear_cka(
+                emb["views"][left][mask],
+                emb["views"][right][mask],
+                args.max_cka_records,
+                args.seed + int(fold),
+            )
+            cka_rows.append(
+                {
+                    "scope": scope,
+                    "fold_id": int(fold),
+                    "left_view": left,
+                    "right_view": right,
+                    "linear_cka": float(value),
+                    "n_records": int(np.sum(mask)),
+                    "max_records": int(args.max_cka_records),
+                    "status": "complete" if np.isfinite(value) else "blocked_nonfinite",
+                }
+            )
+            print(f"cka {scope}/fold{fold} {left}/{right}: {value:.6f}", flush=True)
 
     payload = {
         "status": "complete",
         "protocol": PROTOCOL,
         "created_utc": now_utc(),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "canonical_contract": {
+            "oof_sha256": emb.get("source_oof_sha256", ""),
+            "freeze_sha256": emb.get("source_freeze_sha256", ""),
+        },
         "safe_wording": (
             "Representation probes provide suggestive branch-specific evidence only; "
             "they do not establish strict morphology-rhythm separation."
@@ -407,14 +610,30 @@ def main() -> None:
         "outputs": {
             "summary_json": project_relative(args.out_summary),
             "probe_table": project_relative(args.out_probe_table),
+            "fold_probe_table": project_relative(args.out_fold_probe_table),
             "cka_table": project_relative(args.out_cka_table),
+            "audit_figure": figure_paths.get("combined_audit", ""),
             "manifest": project_relative(args.out_manifest),
         },
         "git_commit": git_commit(),
     }
     save_csv(args.out_probe_table, probe_rows)
+    save_csv(args.out_fold_probe_table, fold_probe_rows)
     save_csv(args.out_cka_table, cka_rows)
-    save_json(args.out_summary, {**payload, "probe_rows": probe_rows, "cka_rows": cka_rows})
+    payload["artifact_sha256"] = {
+        "probe_table": sha256_file(resolve(args.out_probe_table)),
+        "fold_probe_table": sha256_file(resolve(args.out_fold_probe_table)),
+        "cka_table": sha256_file(resolve(args.out_cka_table)),
+        "audit_figure": (
+            sha256_file(resolve(args.out_audit_figure))
+            if resolve(args.out_audit_figure).exists()
+            else ""
+        ),
+    }
+    save_json(
+        args.out_summary,
+        {**payload, "probe_rows": probe_rows, "fold_probe_rows": fold_probe_rows, "cka_rows": cka_rows},
+    )
     save_json(args.out_manifest, payload)
     print(json.dumps({"status": True, "views": list(emb["views"]), "manifest": project_relative(args.out_manifest)}, indent=2))
 

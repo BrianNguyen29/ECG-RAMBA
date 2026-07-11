@@ -1,4 +1,4 @@
-"""Paired bootstrap comparison between Full ECG-RAMBA and Hybrid MiniRocket morphology MLP.
+"""Paired comparison with the frozen random-convolution morphology MLP head.
 
 This optional reviewer comparator uses the same record-level paired bootstrap
 contract as the ResNet1D/CNN and Raw Mamba comparisons. It is only valid after
@@ -32,9 +32,9 @@ from scripts.revision.common import (  # noqa: E402
 
 
 FULL_LABEL = "Full ECG-RAMBA frozen OOF"
-COMPARATOR_LABEL = "Hybrid MiniRocket morphology MLP"
-EXPECTED_HYBRID_PROTOCOL = "hybrid_morphology_minirocket_mlp_same_folds_threshold_0.5"
-EXPECTED_HYBRID_FEATURE_CONTRACT = "minirocket_raw_learnable_mlp_head"
+COMPARATOR_LABEL = "Frozen-transform morphology MLP head"
+EXPECTED_HYBRID_PROTOCOL = "fixed_seed_rocket_family_max_ppv_mlp_head_same_folds_threshold_0.5"
+EXPECTED_HYBRID_FEATURE_CONTRACT = "fixed_seed_rocket_family_random_convolution_max_ppv_frozen_mlp_head"
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -123,33 +123,33 @@ def validate_hybrid_morphology_artifacts(
     summary_path = resolve_path(summary_path)
     manifest_path = resolve_path(manifest_path)
     if not summary_path.exists():
-        raise FileNotFoundError(f"Missing Hybrid MiniRocket morphology MLP summary JSON: {summary_path}")
+        raise FileNotFoundError(f"Missing frozen-transform morphology MLP-head summary JSON: {summary_path}")
     if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing Hybrid MiniRocket morphology MLP manifest JSON: {manifest_path}")
+        raise FileNotFoundError(f"Missing frozen-transform morphology MLP-head manifest JSON: {manifest_path}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     for source_name, payload in [("summary", summary), ("manifest", manifest)]:
         if payload.get("protocol") != EXPECTED_HYBRID_PROTOCOL:
             raise ValueError(
-                f"Hybrid MiniRocket morphology MLP {source_name} protocol mismatch: "
+                f"Frozen-transform morphology MLP-head {source_name} protocol mismatch: "
                 f"{payload.get('protocol')} != {EXPECTED_HYBRID_PROTOCOL}"
             )
         if payload.get("feature_contract") != EXPECTED_HYBRID_FEATURE_CONTRACT:
             raise ValueError(
-                f"Hybrid MiniRocket morphology MLP {source_name} feature_contract must be "
+                f"Frozen-transform morphology MLP-head {source_name} feature_contract must be "
                 f"{EXPECTED_HYBRID_FEATURE_CONTRACT}."
             )
     if require_manuscript_ready and summary.get("manuscript_ready") is not True:
-        raise ValueError("Hybrid MiniRocket morphology MLP summary is not manuscript_ready=true.")
+        raise ValueError("Frozen-transform morphology MLP-head summary is not manuscript_ready=true.")
     artifact_sha = manifest.get("artifact_sha256", {})
     expected_pred_sha = artifact_sha.get("predictions")
     if expected_pred_sha and expected_pred_sha != comparator.sha256:
-        raise RuntimeError(f"Hybrid MiniRocket morphology MLP prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}")
+        raise RuntimeError(f"Frozen-transform morphology MLP-head prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}")
     if comparator.metadata.get("protocol") not in (None, EXPECTED_HYBRID_PROTOCOL):
-        raise ValueError(f"Hybrid MiniRocket morphology MLP prediction protocol mismatch: {comparator.metadata.get('protocol')}")
+        raise ValueError(f"Frozen-transform morphology MLP-head prediction protocol mismatch: {comparator.metadata.get('protocol')}")
     if comparator.metadata.get("feature_contract") not in (None, EXPECTED_HYBRID_FEATURE_CONTRACT):
         raise ValueError(
-            f"Hybrid MiniRocket morphology MLP prediction feature contract mismatch: {comparator.metadata.get('feature_contract')}"
+            f"Frozen-transform morphology MLP-head prediction feature contract mismatch: {comparator.metadata.get('feature_contract')}"
         )
     return {
         "summary": {
@@ -171,20 +171,20 @@ def validate_hybrid_morphology_artifacts(
 def safe_wording(metric_family: str, interpretation: str) -> str:
     if interpretation == "comparator_significantly_better":
         if metric_family == "ranking":
-            return "Hybrid MiniRocket morphology MLP is stronger for rank-based discrimination on frozen Chapman OOF."
+            return "The frozen-transform morphology MLP head is stronger for rank-based discrimination on frozen Chapman OOF."
         if metric_family == "fixed_threshold":
-            return "Hybrid MiniRocket morphology MLP is stronger at the fixed threshold under the frozen Chapman OOF protocol."
+            return "The frozen-transform morphology MLP head is stronger at the fixed threshold under the frozen Chapman OOF protocol."
         if metric_family == "calibration":
-            return "Hybrid MiniRocket morphology MLP has the lower calibration/error metric under the frozen Chapman OOF protocol."
-        return "Hybrid MiniRocket morphology MLP is stronger for this paired metric under the frozen Chapman OOF protocol."
+            return "The frozen-transform morphology MLP head has the lower calibration/error metric under the frozen Chapman OOF protocol."
+        return "The frozen-transform morphology MLP head is stronger for this paired metric under the frozen Chapman OOF protocol."
     if interpretation == "full_significantly_better":
         if metric_family == "ranking":
-            return "Full ECG-RAMBA is stronger than Hybrid MiniRocket morphology MLP for rank-based discrimination under frozen Chapman OOF."
+            return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head for rank-based discrimination under frozen Chapman OOF."
         if metric_family == "fixed_threshold":
-            return "Full ECG-RAMBA is stronger than Hybrid MiniRocket morphology MLP at the fixed threshold under frozen Chapman OOF."
+            return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head at the fixed threshold under frozen Chapman OOF."
         if metric_family == "calibration":
-            return "Full ECG-RAMBA has the lower calibration/error metric than Hybrid MiniRocket morphology MLP under frozen Chapman OOF."
-        return "Full ECG-RAMBA is stronger than Hybrid MiniRocket morphology MLP for this paired metric under frozen Chapman OOF."
+            return "Full ECG-RAMBA has the lower calibration/error metric than the frozen-transform morphology MLP head under frozen Chapman OOF."
+        return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head for this paired metric under frozen Chapman OOF."
     return "Do not claim a paired Full-vs-Hybrid morphology difference for this metric without qualification."
 
 
@@ -192,7 +192,7 @@ def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
     print("=" * 80, flush=True)
-    print("PAIRED FULL ECG-RAMBA VS HYBRID MINIROCKET MORPHOLOGY MLP COMPARISON", flush=True)
+    print("PAIRED FULL ECG-RAMBA VS FROZEN-TRANSFORM MORPHOLOGY MLP-HEAD COMPARISON", flush=True)
     print("=" * 80, flush=True)
     print(f"Full predictions      : {resolve_path(args.full_predictions)}", flush=True)
     print(f"Comparator predictions: {resolve_path(args.comparator_predictions)}", flush=True)
@@ -203,7 +203,7 @@ def main() -> None:
     full = paired_helpers.load_prediction_set(args.full_predictions, FULL_LABEL)
     comparator = paired_helpers.load_prediction_set(args.comparator_predictions, COMPARATOR_LABEL)
     print(f"Loaded Full: shape={full.y_true.shape} sha256={full.sha256}", flush=True)
-    print(f"Loaded Hybrid MiniRocket morphology MLP: shape={comparator.y_true.shape} sha256={comparator.sha256}", flush=True)
+    print(f"Loaded frozen-transform morphology MLP head: shape={comparator.y_true.shape} sha256={comparator.sha256}", flush=True)
 
     freeze_info = paired_helpers.validate_freeze_manifest(args.freeze_manifest, full, args.expected_checkpoint_kind)
     hybrid_morphology_info = validate_hybrid_morphology_artifacts(
@@ -317,7 +317,7 @@ def main() -> None:
             "manifest": str(out_manifest),
         },
         "claim_guidance": {
-            "hybrid_morphology_comparator": "Use only as comparator-specific evidence after the Hybrid MiniRocket morphology MLP baseline is run.",
+            "hybrid_morphology_comparator": "Use only as comparator-specific evidence after the frozen-transform morphology MLP-head baseline is run.",
             "global_superiority": "Do not claim global superiority from this optional comparator.",
         },
     }

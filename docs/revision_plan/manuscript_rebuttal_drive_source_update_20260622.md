@@ -1,8 +1,8 @@
 # ECG-RAMBA Manuscript/Rebuttal Update From Drive Final Evidence
 
-Date: 2026-06-22
+Date: 2026-06-22; updated 2026-06-27 after Raw Mamba completion and final evidence regeneration
 
-Purpose: use the verified Drive evidence package as the source of truth for rewriting the manuscript and rebuttal. This file supersedes any broader wording that predates the completed ResNet1D/CNN baseline.
+Purpose: use the verified Drive evidence package as the source of truth for rewriting the manuscript and rebuttal. This file supersedes any broader wording that predates the completed ResNet1D/CNN and Raw Mamba fair baselines.
 
 ## Source Of Truth
 
@@ -18,6 +18,12 @@ Canonical mirrored artifacts:
 D:\WorkSpace\ECG\ECG-Ramba\drive\revision_artifacts\reports\revision
 ```
 
+Local downloaded ZIP extraction note: the current local copy under `D:\WorkSpace\ECG\ECG-Ramba\drive\revision_artifacts` is nested one extra level. The verified local artifact root is:
+
+```text
+D:\WorkSpace\ECG\ECG-Ramba\drive\revision_artifacts\revision_artifacts\reports\revision
+```
+
 Required source files:
 
 - `final_evidence_matrix.json`
@@ -29,6 +35,16 @@ Required source files:
 - `metrics/baseline_summary.csv`
 - `tables/table_paired_full_vs_resnet.csv`
 - `tables/table_paired_full_vs_minirocket.csv`
+- `tables/table_paired_full_vs_raw_mamba.csv`
+
+Downloaded verification snapshot used for this manuscript/rebuttal pass:
+
+- `D:\Download\Duong Nguyen\Downloads\table_final_evidence_matrix (2).csv`
+  - SHA256: `689effcdf61a4f5e73fbe20a87a5f0d27934f8fc1ce6ce4a39c9d949f0ea3733`
+  - shape: 6 rows x 8 columns
+- `D:\Download\Duong Nguyen\Downloads\table_final_safe_wording (2).csv`
+  - SHA256: `b5227ee0772774fb92f6a8cb7872ebb11d2d3fb83235afc5ce558be0db885a3b`
+  - shape: 6 rows x 5 columns
 
 Final evidence manifest:
 
@@ -43,13 +59,13 @@ Interpretation: the package is ready for rebuttal writing, but it explicitly doe
 
 ## Main Decision
 
-The completed ResNet1D/CNN fair baseline changes the manuscript posture.
+The completed ResNet1D/CNN and Raw Mamba fair baselines change the manuscript posture.
 
 Do not claim:
 
-- ECG-RAMBA is SOTA.
+- broad SOTA-style performance for ECG-RAMBA.
 - ECG-RAMBA has in-domain superiority on Chapman OOF.
-- ECG-RAMBA is generally superior to fair CNN/ResNet baselines.
+- ECG-RAMBA is generally superior to fair CNN/ResNet/Mamba baselines.
 - ECG-RAMBA is generally more robust than MiniRocket-only.
 - HRV is domain-invariant.
 - The current HRV36 input implements full RMSSD/SDNN/LF-HF HRV.
@@ -57,7 +73,7 @@ Do not claim:
 
 Supported contribution:
 
-> ECG-RAMBA should be presented as a physiologically structured ECG model and evidence package, not as the best in-domain classifier. Under the frozen Chapman OOF protocol, ResNet1D/CNN is the stronger in-domain architecture baseline, while ECG-RAMBA contributes a transparent morphology-rhythm design analysis, a MiniRocket-specific operating-point tradeoff, HRV/domain-sensitivity evidence, and metric-specific robustness behavior.
+> ECG-RAMBA should be presented as a physiologically structured ECG model and evidence package, not as the best in-domain classifier. Under the frozen Chapman OOF protocol, ResNet1D/CNN and Raw Mamba are stronger fair comparators for discrimination/F1 metrics, while ECG-RAMBA contributes transparent morphology-rhythm design analysis, comparator-specific calibration tradeoffs, HRV/domain-sensitivity evidence, and metric-specific robustness behavior.
 
 ## Key Results To Use
 
@@ -67,6 +83,7 @@ Supported contribution:
 |---|---:|---:|---:|---:|---:|
 | Full ECG-RAMBA | 0.8373 | 0.3432 | 0.3998 | 0.0355 | 0.0552 |
 | ResNet1D/CNN | 0.9391 | 0.4899 | 0.4906 | 0.0342 | 0.0414 |
+| Raw Mamba | 0.9284 | 0.4377 | 0.4465 | 0.0401 | 0.1137 |
 | MiniRocket-only | 0.9169 | 0.4508 | 0.2477 | 0.1906 | 0.3759 |
 | HRV-only | 0.8113 | 0.1771 | 0.2077 | 0.1613 | 0.2844 |
 
@@ -87,6 +104,24 @@ Manuscript implication:
 - ResNet1D/CNN must be described as the stronger in-domain architecture baseline.
 - ECG-RAMBA must not be described as an in-domain winner.
 - Any MiniRocket-only advantage for ECG-RAMBA must be explicitly comparator-specific and cannot be generalized to ResNet/CNN.
+
+### Full ECG-RAMBA vs Raw Mamba
+
+The paired Full-minus-Raw-Mamba comparison is comparator-specific. Raw Mamba is stronger for discrimination/F1, while ECG-RAMBA has lower Brier score and ECE:
+
+| Metric | Full | Raw Mamba | Full minus Raw Mamba | Interpretation |
+|---|---:|---:|---:|---|
+| PR-AUC macro | 0.3432 | 0.4377 | negative | Raw Mamba significantly better |
+| ROC-AUC macro | 0.8373 | 0.9284 | negative | Raw Mamba significantly better |
+| F1 macro | 0.3998 | 0.4465 | negative | Raw Mamba significantly better |
+| Brier macro | 0.0355 | 0.0401 | Full lower | Full significantly better |
+| ECE macro | 0.0552 | 0.1137 | Full lower | Full significantly better |
+
+Manuscript implication:
+
+- Raw Mamba must be treated as a completed fair comparator, not a deferred item.
+- ECG-RAMBA must not claim general superiority over Mamba baselines.
+- ECG-RAMBA may only claim Raw-Mamba-specific calibration/error advantages for Brier and ECE.
 
 ### Full ECG-RAMBA vs MiniRocket-only
 
@@ -159,11 +194,11 @@ Manuscript implication:
 
 Use:
 
-> We evaluate ECG-RAMBA under a frozen subject-aware Chapman OOF protocol with calibration, baseline, HRV/domain, pooling, and perturbation analyses. The completed fair-baseline evidence does not support an in-domain superiority claim: a ResNet1D/CNN baseline outperforms ECG-RAMBA on macro PR-AUC, macro ROC-AUC, macro F1, Brier score, and ECE. ECG-RAMBA is therefore framed as a physiologically structured morphology-rhythm model whose value lies in transparent component analysis and metric-specific operating behavior rather than global classification superiority.
+> We evaluate ECG-RAMBA under a frozen subject-aware Chapman OOF protocol with calibration, baseline, HRV/domain, pooling, and perturbation analyses. The completed fair-baseline evidence does not support an in-domain superiority claim: ResNet1D/CNN outperforms ECG-RAMBA on macro PR-AUC, macro ROC-AUC, macro F1, Brier score, and ECE, and Raw Mamba outperforms ECG-RAMBA on discrimination/F1 metrics. ECG-RAMBA is therefore framed as a physiologically structured morphology-rhythm model whose value lies in transparent component analysis and metric-specific operating behavior rather than global classification superiority.
 
 Avoid:
 
-> ECG-RAMBA achieves state-of-the-art performance.
+> Any sentence stating broad state-of-the-art performance for ECG-RAMBA.
 
 Avoid:
 
@@ -183,7 +218,7 @@ Use these contributions:
 
 Use:
 
-> Under the frozen Chapman OOF protocol, Full ECG-RAMBA achieved macro ROC-AUC 0.8373, macro PR-AUC 0.3432, macro F1 0.3998, Brier score 0.0355, and macro ECE 0.0552. The completed ResNet1D/CNN baseline achieved higher in-domain performance across all paired metrics, with macro ROC-AUC 0.9391, macro PR-AUC 0.4899, macro F1 0.4906, Brier score 0.0342, and macro ECE 0.0414. Paired bootstrap intervals favored ResNet1D/CNN for PR-AUC, ROC-AUC, F1, Brier, and ECE. We therefore do not claim in-domain superiority for ECG-RAMBA over fair CNN/ResNet baselines.
+> Under the frozen Chapman OOF protocol, Full ECG-RAMBA achieved macro ROC-AUC 0.8373, macro PR-AUC 0.3432, macro F1 0.3998, Brier score 0.0355, and macro ECE 0.0552. The completed ResNet1D/CNN baseline achieved higher in-domain performance across all paired metrics, with macro ROC-AUC 0.9391, macro PR-AUC 0.4899, macro F1 0.4906, Brier score 0.0342, and macro ECE 0.0414. Raw Mamba also achieved higher discrimination/F1 metrics, with macro ROC-AUC 0.9284, macro PR-AUC 0.4377, and macro F1 0.4465, although ECG-RAMBA had lower Brier and ECE than Raw Mamba. We therefore do not claim in-domain superiority for ECG-RAMBA over fair CNN/ResNet/Mamba baselines.
 
 ### MiniRocket Tradeoff Paragraph
 
@@ -195,7 +230,7 @@ Use:
 
 Use:
 
-> The revised baseline evidence changes the interpretation of the model. ECG-RAMBA should not be presented as the strongest in-domain Chapman classifier. Instead, the fair-baseline results indicate that a conventional ResNet1D/CNN trained under the same frozen protocol is stronger across the principal in-domain metrics. The contribution of ECG-RAMBA is therefore better framed as structured model analysis: it tests a morphology-rhythm design, exposes a MiniRocket-specific tradeoff between ranking and calibrated threshold behavior, and provides explicit evidence about HRV domain sensitivity and perturbation behavior.
+> The revised baseline evidence changes the interpretation of the model. ECG-RAMBA should not be presented as the strongest in-domain Chapman classifier. Instead, the fair-baseline results indicate that ResNet1D/CNN is stronger across all principal in-domain metrics and Raw Mamba is stronger on discrimination/F1 metrics. The contribution of ECG-RAMBA is therefore better framed as structured model analysis: it tests a morphology-rhythm design, exposes comparator-specific tradeoffs between ranking and calibrated threshold behavior, and provides explicit evidence about HRV domain sensitivity and perturbation behavior.
 
 ### Robustness Paragraph
 
@@ -221,7 +256,7 @@ Use:
 
 Use:
 
-> We agree that stronger in-domain baselines are necessary. We therefore added a ResNet1D/CNN baseline under the same frozen subject-aware OOF protocol, threshold, and Q=3 aggregation. This baseline significantly outperformed ECG-RAMBA on PR-AUC, ROC-AUC, F1, Brier, and ECE. We revised the manuscript accordingly and removed any claim of in-domain superiority over fair CNN/ResNet baselines.
+> We agree that stronger in-domain baselines are necessary. We therefore added ResNet1D/CNN and Raw Mamba baselines under the same frozen subject-aware OOF protocol, threshold, and Q=3 aggregation. ResNet1D/CNN significantly outperformed ECG-RAMBA on PR-AUC, ROC-AUC, F1, Brier, and ECE. Raw Mamba outperformed ECG-RAMBA on PR-AUC, ROC-AUC, and F1, while ECG-RAMBA had lower Brier and ECE. We revised the manuscript accordingly and removed any claim of in-domain superiority over fair CNN/ResNet/Mamba baselines.
 
 ### MiniRocket Criticism
 
@@ -251,13 +286,13 @@ Use:
 
 Remove or rewrite any sentence containing these ideas:
 
-- "state-of-the-art"
+- broad state-of-the-art performance
 - "in-domain superiority"
 - "outperforms CNN/ResNet baselines"
 - "globally superior"
 - "more robust" without a metric family and comparator
 - "HRV invariant"
-- "validates disentanglement"
+- validated morphology-rhythm disentanglement
 - "RMSSD/SDNN/LF-HF" for current checkpoint features
 - "external zero-shot/few-shot" as completed manuscript evidence
 - "clinical safety" or safety-oriented claims based only on OOF metrics
@@ -267,17 +302,18 @@ Remove or rewrite any sentence containing these ideas:
 Allowed:
 
 - Protocol-faithful frozen Chapman OOF evaluation.
-- ResNet1D/CNN is stronger in-domain.
+- ResNet1D/CNN is stronger in-domain across the principal metrics.
+- Raw Mamba is stronger on discrimination/F1 metrics.
 - MiniRocket-only shows stronger ranking metrics.
-- ECG-RAMBA shows MiniRocket-specific fixed-threshold/calibration advantages.
+- ECG-RAMBA shows comparator-specific calibration/error advantages only where paired evidence supports them.
 - HRV is useful but domain-sensitive.
 - Robustness is metric-specific.
 - Q=3 is a frozen/sensitivity-tested operating point.
 
 Not allowed:
 
-- ECG-RAMBA is best in-domain.
-- ECG-RAMBA is SOTA.
+- best-in-domain wording for ECG-RAMBA.
+- SOTA-style wording for ECG-RAMBA.
 - ECG-RAMBA is generally robust.
 - ECG-RAMBA generalizes better externally without a separate completed protocol.
 
@@ -286,7 +322,7 @@ Not allowed:
 Update the manuscript in this order:
 
 1. Abstract and Contributions: remove superiority wording.
-2. Results: add the ResNet1D/CNN table before MiniRocket tradeoff interpretation.
+2. Results: include ResNet1D/CNN, Raw Mamba, MiniRocket-only, and HRV-only in the fair-baseline table before tradeoff interpretation.
 3. Discussion: reframe ECG-RAMBA as structured model analysis.
-4. Limitations: add HRV domain sensitivity, external protocol deferral, representation-probe blocker, and Raw Mamba remaining incomplete.
+4. Limitations: add HRV domain sensitivity, external protocol deferral, representation-probe blocker, and comparator-specific baseline limits.
 5. Rebuttal: use the response snippets above and cite `table_final_evidence_matrix.csv`, `table_final_safe_wording.csv`, `table_paired_full_vs_resnet.csv`, `table_paired_full_vs_minirocket.csv`, and `table_final_robustness_claims.csv`.

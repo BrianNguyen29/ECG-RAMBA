@@ -1,6 +1,7 @@
 # ECG-RAMBA Deferred Evidence Implementation Plan
 
 Date: 2026-06-22
+Status update: 2026-06-29 after PTB-XL protocol-gate completion and regenerated final evidence tables.
 
 Purpose: define a technically correct plan for evidence items that remain incomplete or must stay deferred in the current rebuttal package. This document is not a claim source. The current claim source remains:
 
@@ -17,7 +18,7 @@ The current manuscript/rebuttal package is internally consistent only if these r
 
 - Do not claim global or in-domain superiority for ECG-RAMBA. ResNet1D/CNN is stronger on frozen Chapman OOF PR-AUC, ROC-AUC, F1, Brier, and ECE; Raw Mamba is stronger on PR-AUC, ROC-AUC, and F1.
 - Do not claim superiority over all fair baselines. The Raw Mamba fair comparator has completed successfully and Notebook 04/07 have been rerun, but the resulting evidence still supports only comparator-specific, metric-specific statements.
-- Do not claim external or zero-shot superiority because PTB-XL, Georgia, and CPSC remain experimental.
+- Do not claim external or zero-shot superiority. PTB-XL has passed a protocol gate only for a four-class mapped-task evaluation, not for zero-shot superiority. Georgia and CPSC2021 remain deferred because their dataset-specific mapping/annotation gates have not passed.
 - Do not claim few-shot results because no few-shot adaptation package is complete.
 - Do not claim proven morphology-rhythm disentanglement because no representation probe, UMAP, CKA, or probing artifact is complete.
 - Do not claim a full HRV feature set because the current final EMA checkpoints do not implement true RMSSD, SDNN, LF/HF, or full amplitude HRV slots.
@@ -33,7 +34,8 @@ The current manuscript/rebuttal package is internally consistent only if these r
 | HRV-only/domain | Complete with limitation | `scripts/revision/09_hrv_domain_analysis.py` | Manuscript-ready limitation |
 | Robustness vs MiniRocket | Complete with limitation | `scripts/revision/12_robustness_stress.py`, 6 stresses x 5 metrics | Manuscript-ready, metric-specific |
 | Raw Mamba fair comparator | Complete | `scripts/revision/16_raw_mamba_baseline.py`, `scripts/revision/17_paired_full_vs_raw_mamba.py`, paired Full-vs-Raw-Mamba artifacts | Manuscript-ready, metric-specific |
-| External PTB-XL/Georgia/CPSC | Scaffolded with gate runner, but not yet manuscript-ready until dataset gates pass | `scripts/revision/03_generate_external_predictions.py`, `scripts/revision/18_external_protocol_gate.py`, fold PCA builder | Deferred unless gate passes |
+| PTB-XL mapped-task external evaluation | Complete for the gated four-superclass mapped task only | `scripts/revision/03_generate_external_predictions.py`, `scripts/revision/18_external_protocol_gate.py`, `external_ptbxl_protocol_gate.json`, `external_protocol_gate_summary.csv` | Manuscript-ready only as protocol-gated mapped-task evidence; no zero-shot or superiority claim |
+| Georgia/CPSC2021 external evaluation | Deferred | Georgia has no reviewed mapping to the frozen Chapman/SNOMED taxonomy; CPSC2021 requires annotation-window gate completion | Deferred; do not report as manuscript-ready external evidence |
 | Few-shot adaptation | Missing | no runner/artifacts | Deferred |
 | Representation probe | Missing | Notebook 06 records blocked status | Deferred |
 | Full HRV feature set | Not implemented in current checkpoints | HRV36 schema audit | Deferred/retrain-only |
@@ -47,7 +49,7 @@ Raw Mamba is now complete and closes the previous fair-baseline-row gap. It does
 
 ### P2 - External protocol gate
 
-Run only if a transfer/generalization claim is required. The gate runner now exists, but external evidence still needs dataset-specific label/window/PCA checks before it can be cited. Until a dataset passes the gate, it must remain experimental.
+Do not run additional external datasets for the current manuscript unless a new transfer claim is required. PTB-XL has passed the gate for a mapped four-superclass task and can be cited only with that restriction. Georgia and CPSC2021 remain deferred until their own dataset-specific label/window/PCA gates pass.
 
 ### P2 - Representation probe
 
@@ -179,7 +181,7 @@ Raw Mamba is stronger than Full ECG-RAMBA on PR-AUC, ROC-AUC, and F1, while Full
 
 ### Goal
 
-Convert current external exporters from experimental artifacts into protocol-gated evidence, only if external claims are needed.
+Maintain PTB-XL as a protocol-gated mapped-task external evaluation and keep Georgia/CPSC2021 deferred until their dataset-specific gates are technically valid. This workstream is only needed if the manuscript needs additional external claims beyond the current PTB-XL mapped-task result.
 
 ### Existing Code
 
@@ -199,6 +201,14 @@ The exporter already includes important safeguards:
 - CPSC annotation-window handling;
 - checkpoint-compatible HRV36 construction;
 - fold-specific PCA manifest requirement.
+
+### Current Dataset Status
+
+| Dataset | Current status | Allowed manuscript wording | Blocking issue |
+|---|---|---|---|
+| PTB-XL | Gate passed for the four-class mapped task (`NORM`, `MI`, `STTC`, `CD`) | "protocol-gated mapped-task external evaluation" | Does not support zero-shot superiority or full external generalization |
+| Georgia | Deferred | Do not report as manuscript-ready evidence | Existing headers did not map to the frozen Chapman/SNOMED taxonomy without a reviewed mapping; do not coerce unmapped labels to negative |
+| CPSC2021 | Deferred | Do not report as manuscript-ready evidence | Annotation/window parsing and AF/AFL/normal episode gate must pass before evaluation |
 
 ### Required Gate Before Claiming
 
@@ -243,11 +253,11 @@ reports/revision/manifests/external_<dataset>_protocol_gate_manifest.json
 
 ### Claim Gate
 
-Until all gates are complete:
+For datasets without a passing gate:
 
 > External outputs remain experimental and are not manuscript-ready.
 
-If complete, the safe claim is still narrow:
+For datasets with a passing gate, the safe claim is still narrow:
 
 > We report protocol-gated external evaluation under mapped label/task definitions.
 
@@ -462,18 +472,19 @@ Write only if supported:
 Recommended order if new evidence is required after the current manuscript/rebuttal package:
 
 1. Keep the current manuscript/rebuttal wording fixed to the regenerated final evidence tables.
-2. If transfer claims are needed, implement Workstream B external protocol gate.
-3. Only after Workstream B, consider Workstream C few-shot.
-4. If architecture interpretation is challenged, implement Workstream D representation probe.
-5. Avoid Workstream E unless full HRV claims are unavoidable.
-6. Avoid Workstream F unless a reviewer explicitly asks for general robustness against CNN/ResNet.
+2. Treat PTB-XL as the only currently protocol-gated external mapped-task evidence.
+3. If additional transfer claims are needed, first complete Georgia/CPSC2021 dataset-specific gates; do not run few-shot before those gates.
+4. Only after a target external dataset passes its gate, consider Workstream C few-shot.
+5. If architecture interpretation is challenged, implement Workstream D representation probe.
+6. Avoid Workstream E unless full HRV claims are unavoidable.
+7. Avoid Workstream F unless a reviewer explicitly asks for general robustness against CNN/ResNet.
 
 ## Notebook/Script Update Map
 
 | Workstream | Scripts to add/update | Notebooks to update | Final evidence update |
 |---|---|---|---|
 | Raw Mamba | completed `16_raw_mamba_baseline.py` and `17_paired_full_vs_raw_mamba.py`; included in regenerated final evidence tables | Notebook 04 | `13_final_evidence_matrix.py`, task board, registry |
-| External gate | implemented `18_external_protocol_gate.py`; update `03_generate_external_predictions.py` only if a gate issue reveals an exporter defect | Notebook 02 | `13_final_evidence_matrix.py`, claim map |
+| External gate | PTB-XL gate complete; update `03_generate_external_predictions.py` only if Georgia/CPSC2021 gate issues reveal exporter defects | Notebook 02 | `13_final_evidence_matrix.py`, claim map |
 | Few-shot | add `19_fewshot_adaptation.py` | new optional notebook or Notebook 02 extension | `13_final_evidence_matrix.py` |
 | Representation | add `20_representation_probe.py`, minor model hook support | Notebook 06 | `13_final_evidence_matrix.py` |
 | Full HRV | update feature extraction/model config/training | Notebook 00/02a/03/04/05/07 | new evidence protocol, not current final EMA |
@@ -481,6 +492,6 @@ Recommended order if new evidence is required after the current manuscript/rebut
 
 ## Current Recommendation
 
-For the current resubmission, do not open all remaining deferred workstreams unless a reviewer explicitly requires additional evidence. Workstream A is complete and narrows the claims further: Raw Mamba is stronger on discrimination/F1 metrics, while ECG-RAMBA has lower Brier/ECE.
+For the current resubmission, do not open all remaining deferred workstreams unless a reviewer explicitly requires additional evidence. Workstream A is complete and narrows the claims further: Raw Mamba is stronger on discrimination/F1 metrics, while ECG-RAMBA has lower Brier/ECE. Workstream B is partially complete only for PTB-XL mapped-task evidence; Georgia and CPSC2021 should stay deferred rather than being forced through invalid mappings or annotation assumptions.
 
-The current response is scientifically defensible because it explicitly acknowledges the stronger ResNet1D/CNN baseline, reports the Raw Mamba tradeoff, and removes unsupported global-superiority, external-transfer, full-HRV, and disentanglement claims.
+The current response is scientifically defensible because it explicitly acknowledges the stronger ResNet1D/CNN baseline, reports the Raw Mamba tradeoff, limits PTB-XL to protocol-gated mapped-task wording, and removes unsupported global-superiority, zero-shot/external-superiority, full-HRV, and disentanglement claims.
