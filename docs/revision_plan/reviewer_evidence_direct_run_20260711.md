@@ -12,6 +12,31 @@ The evaluated morphology transform is a **fixed-seed ROCKET-family random
 convolution MAX+PPV transform**, not canonical MiniRocket. The compact
 Transformer is a trained patch Transformer, not a pretrained foundation model.
 
+## Canonical Drive Layout
+
+Use exactly one operational source for revision artifacts:
+
+```text
+/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision
+```
+
+The related paths have different roles:
+
+- `/content/ECG-RAMBA`: ephemeral active source checkout and runtime outputs.
+- `ECG-Ramba/revision_artifacts/reports/revision`: canonical mirror for every
+  artifact restore, reuse decision, and publish.
+- `ECG-Ramba/ECG-RAMBA`: legacy Drive checkout; source/archive only, never an
+  automatic artifact restore source.
+- `ECG-Ramba/final_evidence_tables`: manuscript convenience export, not a
+  training or evaluation cache.
+- `revision_feature_cache`, `revision_external_cache`, and
+  `revision_pca_models`: large keyed feature caches with separate contracts.
+
+Notebook 00 runs `37_artifact_source_audit.py`. Leave
+`MIGRATE_LEGACY_ONLY_ARTIFACTS=False` during normal runs. Set it to `True` once
+only after reviewing `table_artifact_source_audit.csv`; migration imports
+legacy-only paths and never overwrites a conflicting canonical artifact.
+
 ## Evidence Boundaries
 
 - PTB-XL and Georgia are separate mapped, record-level external tasks. Never

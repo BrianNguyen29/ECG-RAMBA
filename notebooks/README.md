@@ -4,6 +4,20 @@ Use these notebooks on Colab as the execution layer for the reviewer-revision
 plan. Large data and model files stay on Google Drive; GitHub only transports
 code, notebooks, and planning metadata.
 
+## Drive Artifact Source
+
+All notebooks restore and publish revision artifacts through one canonical
+mirror:
+
+```text
+/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision
+```
+
+`/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA` is a legacy source checkout and
+must not be used to decide whether an experiment cache exists. Notebook 00
+audits that legacy tree and can import legacy-only files without overwriting
+canonical conflicts.
+
 ## Recommended Order
 
 1. `00_colab_bootstrap.ipynb`: mount Drive, pull the current branch, validate
