@@ -134,6 +134,26 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("final_evidence_export_manifest.json", source)
         self.assertIn("Final export source is not current in canonical mirror", source)
 
+    def test_notebook00_reads_storage_audit_from_canonical_drive(self):
+        notebook = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "notebooks"
+                / "00_colab_bootstrap.ipynb"
+            ).read_text(encoding="utf-8")
+        )
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook.get("cells", [])
+        )
+        self.assertIn(
+            "storage_audit_json = CANONICAL_REVISION_MIRROR / 'metrics' / 'pipeline_storage_audit.json'",
+            source,
+        )
+        self.assertNotIn(
+            "REPO_DIR / 'reports/revision/metrics/pipeline_storage_audit.json'",
+            source,
+        )
+
     def test_notebook_restore_paths_require_canonical_manifest_authentication(self):
         notebook_dir = Path(__file__).resolve().parents[1] / "notebooks"
         sources = {}
