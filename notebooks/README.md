@@ -18,6 +18,41 @@ must not be used to decide whether an experiment cache exists. Notebook 00
 audits that legacy tree and can import legacy-only files without overwriting
 canonical conflicts.
 
+Long-running state is written directly below the canonical mirror:
+
+- `predictions/folds/`: resumable OOF, baseline, and representation fold caches.
+- `experimental/*_checkpoints/`: ResNet, Raw Mamba, Transformer, and optional
+  frozen-transform head checkpoints.
+- `logs/`: live command traces, flushed while a cell is running.
+
+The five core Full ECG-RAMBA checkpoints remain under the immutable
+`model_runs/<run_id>/` directory selected by
+`current_final_ema_model_dir.txt`; their paths and SHA256 values are frozen in
+`oof_final_ema_prediction_run_manifest.json`. They are not duplicated into the
+revision mirror.
+
+`revision_pca_models`, `revision_feature_cache`, and
+`revision_external_cache` are separate manifest-keyed storage tiers, not
+alternative evidence sources. `final_evidence_tables` is output-only and has
+its own export checksum manifest. A partial Windows Drive download may omit
+these large tiers; verify cloud presence from Colab before scheduling a rerun.
+
+Logs intentionally stay outside the immutable checksum manifest because a
+rerun may rewrite the same log path. Fold caches, checkpoints, predictions,
+tables, metrics, and manifests remain checksum-tracked evidence artifacts.
+Existence alone is never a reuse contract: restore cells require a manifest
+row plus matching size and SHA256. Interrupted `.partial`, `.tmp`, and `.lock`
+files are excluded from mirror discovery. A completed direct-to-Drive fold is
+durable immediately, but run its publish step before a later notebook consumes
+it as evidence.
+
+Notebook 00 also writes `metrics/pipeline_storage_audit.json` and
+`tables/table_pipeline_storage_audit.csv`. The audit verifies each required
+fold and each named stress separately, so duplicate cache variants or a
+MiniRocket clean-reference file cannot hide a missing fold/stress. An
+incomplete bootstrap audit is informational; use
+`38_pipeline_storage_audit.py --strict --full-sha` only for the final package.
+
 ## Recommended Order
 
 1. `00_colab_bootstrap.ipynb`: mount Drive, pull the current branch, validate
@@ -53,11 +88,21 @@ resume-audited rather than overwritten.
 - Rerun the current notebook from **Setup** after a Colab disconnect.
 - Keep `FORCE_RERUN_* = False`, fold selectors on `auto`, checkpoint saving
   enabled, and reuse controls enabled unless an artifact is known to be bad.
-- A completed heavy fold is reusable only after its checkpoint/fold prediction
-  and the subsequent `Published and verified ... artifacts` message appear.
+- A completed heavy fold survives immediately after its atomic checkpoint and
+  fold-cache write to the canonical Drive path. The following publish step
+  registers their SHA256 values in the mirror manifest.
+- If a fold cache is missing but a compatible checkpoint remains, ResNet,
+  Raw Mamba, Transformer, and the frozen-transform MLP regenerate validation
+  predictions without training. Contract mismatches are rejected.
+- Full external inference authenticates its five checkpoints against the OOF
+  run manifest before loading them. Learned external comparators use their
+  baseline checkpoint manifests, and true few-shot adaptation requires current
+  embedding manifests as well as embedding NPZ files.
 - Normal command output is streamed to the notebook and written under
-  `reports/revision/logs/`. The verified mirror is
-  `/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision`.
+  local `reports/revision/logs/` and canonical Drive `logs/` simultaneously.
+- Frequent intermediate publishes use size verification for unchanged
+  manifest rows while always SHA-verifying new/overwritten files. Notebook 07
+  performs the final full-manifest checksum pass.
 - Fresh Colab clones can run this suite only after the current notebooks and
   revision scripts are committed and pushed to the selected branch.
 

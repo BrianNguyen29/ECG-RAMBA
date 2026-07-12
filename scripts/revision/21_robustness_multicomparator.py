@@ -13,6 +13,7 @@ not been generated.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
 import sys
@@ -60,25 +61,37 @@ COMPARATORS = {
     },
     "minirocket": {
         "label": "MiniRocket-only",
-        "clean": "minirocket_only_oof_predictions.npz",
+        # Stress predictions use the dedicated robustness heads. Degradation
+        # must therefore use the clean reference from those exact heads, not
+        # the separately trained canonical MiniRocket-only baseline.
+        "clean": "robustness_minirocket_clean_ref_predictions.npz",
         "stress": "robustness_minirocket_{stress}_predictions.npz",
     },
     "resnet": {
         "label": "ResNet1D/CNN",
         "clean": "resnet1d_cnn_oof_predictions.npz",
         "stress": "robustness_resnet1d_cnn_{stress}_predictions.npz",
+        "baseline_manifest": "resnet1d_cnn_baseline_manifest.json",
+        "baseline_protocol": "resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5",
     },
     "raw_mamba": {
         "label": "Raw Mamba",
         "clean": "raw_mamba_oof_predictions.npz",
         "stress": "robustness_raw_mamba_{stress}_predictions.npz",
+        "baseline_manifest": "raw_mamba_baseline_manifest.json",
+        "baseline_protocol": "raw_mamba_retrained_weighted_bce_same_folds_power_mean_v2_q3_threshold_0.5",
     },
     "transformer": {
         "label": "Transformer ECG",
         "clean": "transformer_ecg_oof_predictions.npz",
         "stress": "robustness_transformer_ecg_{stress}_predictions.npz",
+        "baseline_manifest": "transformer_ecg_baseline_manifest.json",
+        "baseline_protocol": "transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5",
     },
 }
+OOF_RUN_MANIFEST = MANIFEST_DIR / "oof_final_ema_prediction_run_manifest.json"
+OOF_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
+MINIROCKET_HEADS_MANIFEST = MANIFEST_DIR / "robustness_minirocket_heads_manifest.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +111,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--bootstrap-jobs",
+        type=int,
+        default=1,
+        help=(
+            "Thread workers for bootstrap replicate evaluation. RNG indices are still "
+            "generated serially, so changing this value does not change sampled records."
+        ),
+    )
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--metric-cache-dir",
@@ -157,6 +179,24 @@ def metric_cache_path(cache_dir: Path, stress: str, comparator: str, metric: str
     return resolve(cache_dir) / f"{cache_slug(stress)}__{cache_slug(comparator)}__{cache_slug(metric)}.json"
 
 
+def output_profile_name(out_pairwise: Path) -> str:
+    stem = Path(out_pairwise).stem
+    canonical_stem = "robustness_multicomparator_pairwise"
+    if stem == canonical_stem:
+        return "canonical"
+    profile = stem.replace("robustness_multicomparator", "", 1)
+    profile = profile.replace("_pairwise", "").strip("_")
+    return cache_slug(profile) if profile else "custom"
+
+
+def comparator_sidecar_path(out_pairwise: Path, comparator: str) -> Path:
+    profile = output_profile_name(out_pairwise)
+    profile_suffix = "" if profile == "canonical" else f"_{profile}"
+    return resolve(out_pairwise).parent / (
+        f"robustness_full_vs_{cache_slug(comparator)}{profile_suffix}_comparison.json"
+    )
+
+
 def cache_metadata(
     *,
     args: argparse.Namespace,
@@ -211,8 +251,8 @@ def load_npz(path: Path) -> dict[str, Any]:
     path = resolve(path)
     if not path.exists():
         raise FileNotFoundError(path)
-    with np.load(path, allow_pickle=True) as data:
-        required = ["y_true", "y_prob", "record_id", "class_names"]
+    with np.load(path, allow_pickle=False) as data:
+        required = ["y_true", "y_prob", "record_id", "class_names", "fold_id"]
         missing = [key for key in required if key not in data.files]
         if missing:
             raise KeyError(f"{path} missing keys={missing}")
@@ -221,11 +261,24 @@ def load_npz(path: Path) -> dict[str, Any]:
     payload["y_prob"] = np.asarray(payload["y_prob"], dtype=np.float32)
     payload["record_id"] = np.asarray(payload["record_id"]).astype(str)
     payload["class_names"] = np.asarray(payload["class_names"]).astype(str)
-    payload["fold_id"] = np.asarray(payload.get("fold_id", np.zeros(len(payload["record_id"])))).astype(int)
+    payload["fold_id"] = np.asarray(payload["fold_id"]).astype(int)
     if payload["y_true"].shape != payload["y_prob"].shape:
         raise ValueError(f"{path} shape mismatch: {payload['y_true'].shape} vs {payload['y_prob'].shape}")
+    if payload["y_true"].ndim != 2:
+        raise ValueError(f"{path} predictions must be a two-dimensional record-by-class matrix")
+    n_records, n_classes = payload["y_true"].shape
+    if len(payload["record_id"]) != n_records or len(payload["fold_id"]) != n_records:
+        raise ValueError(f"{path} record/fold arrays do not match the prediction row count")
+    if len(payload["class_names"]) != n_classes:
+        raise ValueError(f"{path} class_names do not match the prediction column count")
+    if np.any(~np.isfinite(payload["y_true"])) or not np.all(
+        np.logical_or(payload["y_true"] == 0.0, payload["y_true"] == 1.0)
+    ):
+        raise ValueError(f"{path} y_true must contain finite binary labels")
     if np.any(~np.isfinite(payload["y_prob"])):
         raise ValueError(f"{path} contains non-finite probabilities")
+    if np.any((payload["y_prob"] < 0.0) | (payload["y_prob"] > 1.0)):
+        raise ValueError(f"{path} contains probabilities outside [0, 1]")
     payload["path"] = path
     payload["sha256"] = sha256_file(path)
     return payload
@@ -237,6 +290,183 @@ def validate_same_contract(reference: dict[str, Any], other: dict[str, Any], lab
             continue
         if not np.array_equal(reference[key], other[key]):
             raise ValueError(f"{label} differs from Full contract on {key}")
+
+
+def scalar(payload: dict[str, Any], key: str, default: Any = "") -> Any:
+    if key not in payload:
+        return default
+    value = np.asarray(payload[key])
+    return value.item() if value.ndim == 0 else value
+
+
+def _checkpoint_sha_rows(rows: list[dict[str, Any]], *, label: str) -> list[str]:
+    try:
+        ordered = sorted(rows, key=lambda row: int(row["fold"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"{label} checkpoint rows are malformed") from exc
+    folds = [int(row.get("fold", -1)) for row in ordered]
+    hashes = [str(row.get("sha256") or row.get("checkpoint_sha256") or "") for row in ordered]
+    if folds != [1, 2, 3, 4, 5] or any(not value for value in hashes):
+        raise RuntimeError(f"{label} checkpoint contract must cover exact folds 1..5 with SHA256")
+    return hashes
+
+
+def load_clean_checkpoint_contract(comparator: str, clean_data: dict[str, Any]) -> list[str]:
+    clean_sha256 = str(clean_data.get("sha256") or "")
+    if comparator == "full":
+        if not OOF_RUN_MANIFEST.exists() or OOF_RUN_MANIFEST.stat().st_size == 0:
+            raise FileNotFoundError(f"Missing Full OOF run manifest: {OOF_RUN_MANIFEST}")
+        payload = json.loads(OOF_RUN_MANIFEST.read_text(encoding="utf-8"))
+        if payload.get("protocol") != "fold_final_ema_power_mean_v2_q3_threshold_0.5":
+            raise RuntimeError("Full clean prediction run manifest has an unexpected protocol")
+        expected_clean_sha = (
+            (payload.get("outputs") or {}).get("prediction_file") or {}
+        ).get("sha256")
+        if expected_clean_sha != clean_sha256:
+            raise RuntimeError(
+                "Full clean prediction SHA does not match its OOF run manifest: "
+                f"{clean_sha256} != {expected_clean_sha}"
+            )
+        return _checkpoint_sha_rows(
+            list((payload.get("inputs") or {}).get("checkpoints") or []),
+            label="Full ECG-RAMBA",
+        )
+
+    if comparator == "minirocket":
+        if not MINIROCKET_HEADS_MANIFEST.exists() or MINIROCKET_HEADS_MANIFEST.stat().st_size == 0:
+            raise FileNotFoundError(f"Missing MiniRocket robustness-head manifest: {MINIROCKET_HEADS_MANIFEST}")
+        payload = json.loads(MINIROCKET_HEADS_MANIFEST.read_text(encoding="utf-8"))
+        if payload.get("protocol") != "minirocket_clean_heads_for_robustness_v1":
+            raise RuntimeError("MiniRocket robustness-head manifest has an unexpected protocol")
+        if payload.get("clean_prediction_sha256") != clean_sha256:
+            raise RuntimeError("MiniRocket clean reference SHA does not match its robustness-head manifest")
+        fold_rows = sorted(payload.get("fold_rows") or [], key=lambda row: int(row.get("fold", -1)))
+        if (
+            [int(row.get("fold", -1)) for row in fold_rows] != [1, 2, 3, 4, 5]
+            or any(not row.get("head_sha256") for row in fold_rows)
+            or not payload.get("params_hash")
+        ):
+            raise RuntimeError("MiniRocket robustness-head contract is incomplete")
+        return []
+
+    manifest_name = COMPARATORS[comparator].get("baseline_manifest")
+    if not manifest_name:
+        return []
+    path = MANIFEST_DIR / manifest_name
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing {comparator} baseline manifest: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected_protocol = COMPARATORS[comparator].get("baseline_protocol")
+    if expected_protocol and payload.get("protocol") != expected_protocol:
+        raise RuntimeError(f"{comparator} baseline manifest has an unexpected protocol: {path}")
+    expected_clean_sha = (payload.get("artifact_sha256") or {}).get("predictions")
+    if expected_clean_sha != clean_sha256:
+        raise RuntimeError(
+            f"{comparator} clean prediction SHA does not match baseline manifest: "
+            f"{clean_sha256} != {expected_clean_sha}"
+        )
+    contract = payload.get("checkpoint_contract") or {}
+    rows = sorted(contract.get("checkpoints") or [], key=lambda row: int(row["fold"]))
+    if (
+        contract.get("status") != "complete"
+        or [int(row.get("fold", -1)) for row in rows] != [1, 2, 3, 4, 5]
+        or any(not row.get("sha256") for row in rows)
+    ):
+        raise RuntimeError(f"{comparator} baseline checkpoint contract is incomplete: {path}")
+    expected_hashes = np.asarray([str(row["sha256"]) for row in rows])
+    embedded_folds = np.asarray(clean_data.get("checkpoint_folds", []), dtype=np.int16)
+    embedded_hashes = np.asarray(clean_data.get("checkpoint_sha256", [])).astype(str)
+    if not np.array_equal(embedded_folds, np.asarray([1, 2, 3, 4, 5], dtype=np.int16)):
+        raise RuntimeError(f"{comparator} clean predictions lack the exact five-fold checkpoint contract")
+    if not np.array_equal(embedded_hashes, expected_hashes):
+        raise RuntimeError(
+            f"{comparator} clean prediction checkpoint SHA contract differs from its baseline manifest"
+        )
+    return expected_hashes.tolist()
+
+
+def load_canonical_contract(clean_sha256: str) -> dict[str, str]:
+    if not OOF_FREEZE_MANIFEST.exists() or OOF_FREEZE_MANIFEST.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing frozen OOF manifest: {OOF_FREEZE_MANIFEST}")
+    payload = json.loads(OOF_FREEZE_MANIFEST.read_text(encoding="utf-8"))
+    if payload.get("status") != "frozen" or payload.get("checkpoint_kind") != "final_ema":
+        raise RuntimeError("Frozen OOF manifest is not the canonical final_ema contract")
+    prediction_rows = [
+        row
+        for row in payload.get("artifacts") or []
+        if str(row.get("path", "")).endswith("/oof_final_ema_predictions.npz")
+    ]
+    if len(prediction_rows) != 1 or prediction_rows[0].get("sha256") != clean_sha256:
+        raise RuntimeError("Full clean prediction SHA does not match the frozen OOF manifest")
+    return {
+        "oof_sha256": clean_sha256,
+        "freeze_sha256": sha256_file(OOF_FREEZE_MANIFEST),
+    }
+
+
+def validate_stress_provenance(
+    comparator: str,
+    stress: str,
+    clean: dict[str, Any],
+    stress_data: dict[str, Any],
+) -> None:
+    if comparator == "full":
+        expected = np.asarray(clean.get("checkpoint_sha256", [])).astype(str)
+        metadata = json.loads(str(scalar(stress_data, "metadata_json", "{}")))
+        fold_rows = list(metadata.get("fold_rows") or [])
+        try:
+            actual = np.asarray(
+                [
+                    str(row.get("checkpoint_sha256") or "")
+                    for row in sorted(fold_rows, key=lambda row: int(row.get("fold", -1)))
+                ]
+            )
+            actual_folds = [
+                int(row.get("fold", -1))
+                for row in sorted(fold_rows, key=lambda row: int(row.get("fold", -1)))
+            ]
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"full/{stress} checkpoint metadata is malformed") from exc
+        if expected.shape != (5,) or actual_folds != [1, 2, 3, 4, 5] or not np.array_equal(actual, expected):
+            raise RuntimeError(f"full/{stress} stress checkpoints do not match the frozen Full OOF contract")
+
+    if comparator in {"resnet", "raw_mamba", "transformer"}:
+        expected = np.asarray(clean.get("checkpoint_sha256", [])).astype(str)
+        actual = np.asarray(stress_data.get("checkpoint_sha256", [])).astype(str)
+        if expected.shape != (5,) or not np.array_equal(actual, expected):
+            raise RuntimeError(
+                f"{comparator}/{stress} stress checkpoints do not match the clean baseline contract"
+            )
+        if str(scalar(stress_data, "protocol")) != "comparator_stress_predictions_v1_same_folds_power_mean_v2_q3":
+            raise RuntimeError(f"{comparator}/{stress} has an unexpected stress protocol")
+        if str(scalar(stress_data, "comparator")) != comparator:
+            raise RuntimeError(f"{comparator}/{stress} comparator tag mismatch")
+        if str(scalar(stress_data, "stress_test")) != stress:
+            raise RuntimeError(f"{comparator}/{stress} stress tag mismatch")
+        return
+
+    if str(scalar(stress_data, "protocol")) != "robustness_full_vs_minirocket_perturbation_v1":
+        raise RuntimeError(f"{comparator}/{stress} has an unexpected stress protocol")
+    if str(scalar(stress_data, "stress_name")) != stress:
+        raise RuntimeError(f"{comparator}/{stress} stress tag mismatch")
+    expected_model = "Full ECG-RAMBA" if comparator == "full" else "MiniRocket-only"
+    if str(scalar(stress_data, "model_label")) != expected_model:
+        raise RuntimeError(f"{comparator}/{stress} model tag mismatch")
+    if comparator == "minirocket":
+        manifest_path = MINIROCKET_HEADS_MANIFEST
+        if not manifest_path.exists():
+            raise FileNotFoundError(manifest_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("clean_prediction_sha256") != clean.get("sha256"):
+            raise RuntimeError("MiniRocket robustness clean reference does not match its head manifest")
+        metadata = json.loads(str(scalar(stress_data, "metadata_json", "{}")))
+        cached_manifest = metadata.get("minirocket_heads_manifest") or {}
+        if cached_manifest.get("params_hash") != manifest.get("params_hash"):
+            raise RuntimeError(
+                f"minirocket/{stress} was generated by a different robustness head contract"
+            )
+        if cached_manifest.get("clean_prediction_sha256") != clean.get("sha256"):
+            raise RuntimeError(f"minirocket/{stress} references a different clean robustness prediction")
 
 
 def metric_specs(threshold: float, n_bins: int) -> list[dict[str, Any]]:
@@ -299,23 +529,84 @@ def paired_bootstrap(
     comp_stress: dict[str, Any],
     n_boot: int,
     seed: int,
+    n_jobs: int = 1,
+    shared_full_cache: dict[tuple[Any, ...], list[tuple[float, float]]] | None = None,
+    shared_full_cache_key: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
     rng = np.random.default_rng(seed)
     n = len(full_clean["y_true"])
     values = []
     stressed_values = []
-    for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        fc = metric_value(spec, full_clean, idx)
-        fs = metric_value(spec, full_stress, idx)
+
+    cached_full_values = (
+        shared_full_cache.get(shared_full_cache_key)
+        if shared_full_cache is not None and shared_full_cache_key is not None
+        else None
+    )
+    if cached_full_values is not None and len(cached_full_values) != n_boot:
+        raise RuntimeError("Shared Full bootstrap cache length does not match n_boot")
+
+    def evaluate(item: tuple[int, np.ndarray]) -> tuple[tuple[float, float], tuple[float, float] | None]:
+        ordinal, idx = item
+        if cached_full_values is None:
+            fc = metric_value(spec, full_clean, idx)
+            fs = metric_value(spec, full_stress, idx)
+        else:
+            fc, fs = cached_full_values[ordinal]
         cc = metric_value(spec, comp_clean, idx)
         cs = metric_value(spec, comp_stress, idx)
+        full_pair = (float(fc), float(fs))
         if not all(np.isfinite([fc, fs, cc, cs])):
-            continue
+            return full_pair, None
         full_deg = benefit(fs, spec["direction"]) - benefit(fc, spec["direction"])
         comp_deg = benefit(cs, spec["direction"]) - benefit(cc, spec["direction"])
-        values.append(float(full_deg - comp_deg))
-        stressed_values.append(float(benefit(fs, spec["direction"]) - benefit(cs, spec["direction"])))
+        return full_pair, (
+            float(full_deg - comp_deg),
+            float(benefit(fs, spec["direction"]) - benefit(cs, spec["direction"])),
+        )
+
+    n_jobs = max(1, min(int(n_jobs), int(n_boot)))
+    batch_size = max(1, n_jobs * 2)
+    executor_context = (
+        concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs)
+        if n_jobs > 1
+        else None
+    )
+    computed_full_values: list[tuple[float, float]] = []
+    ordinal = 0
+    try:
+        for start in range(0, n_boot, batch_size):
+            count = min(batch_size, n_boot - start)
+            # Generate indices in the caller thread and in the same order as
+            # the historical sequential implementation. Executor.map returns
+            # results in input order, preserving deterministic quantiles.
+            indices = [rng.integers(0, n, size=n) for _ in range(count)]
+            indexed = list(enumerate(indices, start=ordinal))
+            ordinal += count
+            results = (
+                executor_context.map(evaluate, indexed)
+                if executor_context is not None
+                else map(evaluate, indexed)
+            )
+            for full_pair, result in results:
+                if cached_full_values is None:
+                    computed_full_values.append(full_pair)
+                if result is None:
+                    continue
+                degradation_value, stressed_value = result
+                values.append(degradation_value)
+                stressed_values.append(stressed_value)
+    finally:
+        if executor_context is not None:
+            executor_context.shutdown(wait=True)
+    if (
+        cached_full_values is None
+        and shared_full_cache is not None
+        and shared_full_cache_key is not None
+    ):
+        if len(computed_full_values) != n_boot:
+            raise RuntimeError("Could not build the complete shared Full bootstrap cache")
+        shared_full_cache[shared_full_cache_key] = computed_full_values
     if not values:
         return {"n_boot_valid": 0, "degradation_adv_ci_low": math.nan, "degradation_adv_ci_high": math.nan}
     lo, hi = np.quantile(values, [0.025, 0.975])
@@ -339,6 +630,16 @@ def interpretation(ci_low: float, ci_high: float) -> str:
     if ci_high < 0:
         return "comparator_significantly_less_degraded"
     return "no_significant_degradation_difference"
+
+
+def row_interpretation(row: dict[str, Any]) -> str:
+    cached = str(row.get("interpretation") or "").strip()
+    if cached:
+        return cached
+    return interpretation(
+        float(row.get("degradation_adv_ci_low", math.nan)),
+        float(row.get("degradation_adv_ci_high", math.nan)),
+    )
 
 
 def main() -> None:
@@ -365,6 +666,9 @@ def main() -> None:
     if not requested_metrics:
         raise ValueError("--metrics must contain at least one metric name.")
     print(f"metrics={requested_metrics}", flush=True)
+    if args.bootstrap_jobs < 1:
+        raise ValueError("--bootstrap-jobs must be at least 1")
+    print(f"bootstrap_jobs={args.bootstrap_jobs}", flush=True)
     print(f"metric_cache_dir={resolve(args.metric_cache_dir)} reuse={args.reuse_metric_cache}", flush=True)
 
     clean: dict[str, dict[str, Any]] = {}
@@ -373,6 +677,12 @@ def main() -> None:
         path = PREDICTION_DIR / COMPARATORS[comp]["clean"]
         try:
             clean[comp] = load_npz(path)
+            checkpoint_sha = load_clean_checkpoint_contract(
+                comp,
+                clean[comp],
+            )
+            if checkpoint_sha:
+                clean[comp]["checkpoint_sha256"] = np.asarray(checkpoint_sha)
             artifact_status.append(
                 {
                     "comparator": comp,
@@ -414,6 +724,7 @@ def main() -> None:
         return
 
     full_clean = clean["full"]
+    canonical_contract = load_canonical_contract(full_clean["sha256"])
     for comp, data in list(clean.items()):
         if comp == "full":
             continue
@@ -441,13 +752,20 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "bootstrap_jobs": args.bootstrap_jobs,
         "metrics": requested_metrics,
         "metric_cache_dir": project_relative(args.metric_cache_dir),
+        "output_profile": output_profile_name(args.out_pairwise),
+        "comparators": comparators,
+        "stress_tests": stresses,
+        "canonical_contract": canonical_contract,
+        "runner_sha256": sha256_file(Path(__file__)),
         "items": {},
     }
 
     for stress in stresses:
         stress_data: dict[str, dict[str, Any]] = {}
+        shared_full_bootstrap_cache: dict[tuple[Any, ...], list[tuple[float, float]]] = {}
         for comp in comparators:
             if comp not in clean:
                 continue
@@ -455,6 +773,7 @@ def main() -> None:
             try:
                 stress_data[comp] = load_npz(stress_path)
                 validate_same_contract(full_clean, stress_data[comp], f"{comp}/{stress}")
+                validate_stress_provenance(comp, stress, clean[comp], stress_data[comp])
                 artifact_status.append(
                     {
                         "comparator": comp,
@@ -485,6 +804,10 @@ def main() -> None:
                     "comparator_label": COMPARATORS.get(comp, {}).get("label", comp),
                     "metric": spec["name"],
                     "direction": spec["direction"],
+                    "output_profile": output_profile_name(args.out_pairwise),
+                    "threshold": args.threshold,
+                    "n_bins": args.n_bins,
+                    "n_boot": args.n_boot,
                 }
                 if comp not in clean:
                     rows.append({**base_row, "status": "blocked_missing_clean_comparator"})
@@ -527,6 +850,15 @@ def main() -> None:
                         stress_data[comp],
                         args.n_boot,
                         seed,
+                        args.bootstrap_jobs,
+                        shared_full_bootstrap_cache,
+                        (
+                            stress,
+                            spec["name"],
+                            seed,
+                            args.n_boot,
+                            stress_data["full"]["sha256"],
+                        ),
                     )
                     interp = interpretation(
                         boot.get("degradation_adv_ci_low", math.nan),
@@ -552,6 +884,7 @@ def main() -> None:
                     }
                     write_metric_cache(cache_path, metadata, row)
                     print(f"{stress} {comp} {spec['name']}: bootstrap done", flush=True)
+                interp = row_interpretation(row)
                 rows.append(row)
                 pairwise["items"][f"{stress}/{comp}/{spec['name']}"] = row
                 print(
@@ -564,6 +897,7 @@ def main() -> None:
     blocked = [row for row in rows if row.get("status") != "complete"]
     pairwise["completed_rows"] = len(completed)
     pairwise["blocked_rows"] = len(blocked)
+    pairwise["status"] = "complete_with_blockers" if blocked else "complete"
     pairwise["artifact_status"] = artifact_status
     pairwise["safe_wording"] = (
         "Use only metric-specific and comparator-specific robustness statements. "
@@ -578,7 +912,9 @@ def main() -> None:
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "bootstrap_jobs": args.bootstrap_jobs,
         "metrics": requested_metrics,
+        "output_profile": output_profile_name(args.out_pairwise),
         "completed_rows": len(completed),
         "blocked_rows": len(blocked),
         "artifact_status": artifact_status,
@@ -588,11 +924,65 @@ def main() -> None:
             "pairwise": project_relative(args.out_pairwise),
             "manifest": project_relative(args.out_manifest),
         },
+        "canonical_contract": canonical_contract,
+        "runner_sha256": sha256_file(Path(__file__)),
         "git_commit": git_commit(),
     }
     save_csv(args.out_summary, rows)
     save_csv(args.out_table, rows)
     save_json(args.out_pairwise, pairwise)
+    pairwise_sha256 = sha256_file(resolve(args.out_pairwise))
+    sidecar_outputs = {}
+    for comp in comparators:
+        # The canonical Full-vs-MiniRocket comparison is owned by script 12 and
+        # has a different schema. Never overwrite it from this ledger.
+        if comp in {"full", "minirocket"}:
+            continue
+        comp_rows = [row for row in rows if row.get("comparator") == comp]
+        comp_blocked = [row for row in comp_rows if row.get("status") != "complete"]
+        expected_rows = len(stresses) * len(requested_metrics)
+        sidecar_path = comparator_sidecar_path(args.out_pairwise, comp)
+        sidecar = {
+            "status": (
+                "complete"
+                if len(comp_rows) == expected_rows and not comp_blocked
+                else "complete_with_blockers"
+            ),
+            "protocol": PROTOCOL,
+            "created_utc": now_utc(),
+            "comparator": comp,
+            "comparator_label": COMPARATORS[comp]["label"],
+            "stress_tests": stresses,
+            "metrics": requested_metrics,
+            "threshold": args.threshold,
+            "n_bins": args.n_bins,
+            "n_boot": args.n_boot,
+            "bootstrap_jobs": args.bootstrap_jobs,
+            "output_profile": output_profile_name(args.out_pairwise),
+            "expected_rows": expected_rows,
+            "completed_rows": len(comp_rows) - len(comp_blocked),
+            "blocked_rows": len(comp_blocked),
+            "rows": comp_rows,
+            "source_pairwise": project_relative(args.out_pairwise),
+            "source_pairwise_sha256": pairwise_sha256,
+            "canonical_contract": canonical_contract,
+            "runner_sha256": sha256_file(Path(__file__)),
+            "safe_wording": (
+                "Use only stress-, metric-, and comparator-specific paired degradation CIs."
+            ),
+        }
+        save_json(sidecar_path, sidecar)
+        sidecar_outputs[comp] = project_relative(sidecar_path)
+    manifest["outputs"]["comparator_sidecars"] = sidecar_outputs
+    manifest["artifact_sha256"] = {
+        "summary": sha256_file(resolve(args.out_summary)),
+        "table": sha256_file(resolve(args.out_table)),
+        "pairwise": pairwise_sha256,
+        "comparator_sidecars": {
+            comp: sha256_file(comparator_sidecar_path(args.out_pairwise, comp))
+            for comp in sidecar_outputs
+        },
+    }
     save_json(args.out_manifest, manifest)
     print(json.dumps({"status": True, "completed_rows": len(completed), "blocked_rows": len(blocked)}, indent=2))
     if args.strict and blocked:

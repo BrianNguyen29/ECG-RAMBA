@@ -181,6 +181,11 @@ def embedding_path(args: argparse.Namespace, model: str, adaptation: bool) -> Pa
     return resolve(args.embedding_root) / f"external_{args.dataset}_{MODEL_STEMS[model]}{suffix}_record_embeddings.npz"
 
 
+def embedding_manifest_path(args: argparse.Namespace, model: str, adaptation: bool) -> Path:
+    suffix = "_fold9" if adaptation and args.dataset == "ptbxl" else ""
+    return MANIFEST_DIR / f"external_{args.dataset}_{MODEL_STEMS[model]}{suffix}_embedding_manifest.json"
+
+
 def scalar(data: np.lib.npyio.NpzFile, key: str, default=None):
     if key not in data.files:
         return default
@@ -233,10 +238,19 @@ def load_prediction(path: Path, dataset: str) -> dict[str, Any]:
     return out
 
 
-def load_embeddings(path: Path, prediction: dict[str, Any], model: str) -> dict[str, Any]:
+def load_embeddings(
+    path: Path,
+    manifest_path: Path,
+    prediction: dict[str, Any],
+    model: str,
+    canonical: dict[str, str],
+) -> dict[str, Any]:
     path = resolve(path)
+    manifest_path = resolve(manifest_path)
     if not path.exists():
         raise FileNotFoundError(path)
+    if not manifest_path.exists() or manifest_path.stat().st_size == 0:
+        raise FileNotFoundError(manifest_path)
     with np.load(path, allow_pickle=False) as data:
         required = {"fold_embeddings", "y_true", "record_id", "group_id", "split_id", "class_names", "model", "source_prediction_sha256"}
         missing = required - set(data.files)
@@ -260,7 +274,32 @@ def load_embeddings(path: Path, prediction: dict[str, Any], model: str) -> dict[
         raise ValueError(f"{path}: invalid fold_embeddings shape {embeddings.shape}")
     if not np.isfinite(embeddings).all():
         raise ValueError(f"{path}: non-finite embeddings")
-    return {"embedding": embeddings, "path": path, "sha256": sha256_file(path)}
+    output_sha = sha256_file(path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    extractor = PROJECT_ROOT / "scripts" / "revision" / "34_extract_external_representations.py"
+    checkpoint_rows = manifest.get("checkpoints") or []
+    checkpoint_folds = [int(row.get("fold", -1)) for row in checkpoint_rows if isinstance(row, dict)]
+    checkpoint_hashes = [str(row.get("sha256") or "") for row in checkpoint_rows if isinstance(row, dict)]
+    if (
+        manifest.get("status") != "complete"
+        or manifest.get("protocol") != "frozen_encoder_external_record_representation_v1"
+        or manifest.get("runner_sha256") != sha256_file(extractor)
+        or manifest.get("canonical_contract") != canonical
+        or (manifest.get("source_prediction") or {}).get("sha256") != prediction["sha256"]
+        or (manifest.get("output") or {}).get("sha256") != output_sha
+        or checkpoint_folds != [1, 2, 3, 4, 5]
+        or any(len(value) != 64 for value in checkpoint_hashes)
+        or not manifest.get("checkpoint_source_contract")
+    ):
+        raise RuntimeError(f"Embedding manifest is stale or incomplete: {manifest_path}")
+    return {
+        "embedding": embeddings,
+        "path": path,
+        "sha256": output_sha,
+        "manifest_path": manifest_path,
+        "manifest_sha256": sha256_file(manifest_path),
+        "checkpoint_sha256": checkpoint_hashes,
+    }
 
 
 def validate_external_evidence_gates(
@@ -514,10 +553,22 @@ def main() -> None:
     model_data: dict[str, dict[str, Any]] = {}
     for model in models:
         test_pred = load_prediction(source_prediction_path(args, model, False), args.dataset)
-        test_emb = load_embeddings(embedding_path(args, model, False), test_pred, model)
+        test_emb = load_embeddings(
+            embedding_path(args, model, False),
+            embedding_manifest_path(args, model, False),
+            test_pred,
+            model,
+            canonical,
+        )
         if args.dataset == "ptbxl":
             adapt_pred = load_prediction(source_prediction_path(args, model, True), args.dataset)
-            adapt_emb = load_embeddings(embedding_path(args, model, True), adapt_pred, model)
+            adapt_emb = load_embeddings(
+                embedding_path(args, model, True),
+                embedding_manifest_path(args, model, True),
+                adapt_pred,
+                model,
+                canonical,
+            )
             if set(test_pred["split_id"]) != {"ptbxl_fold10"} or set(adapt_pred["split_id"]) != {"ptbxl_fold9"}:
                 raise RuntimeError("PTB-XL requires fold9 adaptation and fold10 test")
             if set(test_pred["group_id"]) & set(adapt_pred["group_id"]):
@@ -873,8 +924,10 @@ def main() -> None:
                 model: {
                     "test_prediction_sha256": data["test_pred"]["sha256"],
                     "test_embedding_sha256": data["test_emb"]["sha256"],
+                    "test_embedding_manifest_sha256": data["test_emb"]["manifest_sha256"],
                     "adaptation_prediction_sha256": data["adapt_pred"]["sha256"],
                     "adaptation_embedding_sha256": data["adapt_emb"]["sha256"],
+                    "adaptation_embedding_manifest_sha256": data["adapt_emb"]["manifest_sha256"],
                 }
                 for model, data in model_data.items()
             },

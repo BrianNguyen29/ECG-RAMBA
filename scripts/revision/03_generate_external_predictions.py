@@ -1058,6 +1058,64 @@ def checkpoint_provenance(paths: list[Path], kind: str) -> tuple[list[dict], str
     return rows, next(iter(source_hashes))
 
 
+def validate_checkpoint_files_against_oof_run_manifest(
+    paths: list[Path],
+    checkpoint_kind: str,
+    expected_oof_sha256: str,
+) -> dict[str, str]:
+    """Bind external inference to the exact checkpoints that produced frozen OOF.
+
+    This check intentionally runs before ``torch.load``. Besides preventing a
+    silently changed model pointer from producing external evidence, it keeps
+    the pickle trust boundary limited to files already authenticated by the
+    canonical OOF run manifest.
+    """
+
+    stem = "oof_full" if checkpoint_kind == "best" else f"oof_{checkpoint_kind}"
+    manifest_path = MANIFEST_DIR / f"{stem}_prediction_run_manifest.json"
+    if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"Missing OOF run manifest for checkpoint authentication: {manifest_path}"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_prediction_sha = (
+        ((payload.get("outputs") or {}).get("prediction_file") or {}).get("sha256")
+    )
+    if manifest_prediction_sha != expected_oof_sha256:
+        raise RuntimeError(
+            "OOF run manifest is stale for the canonical frozen prediction file: "
+            f"{manifest_prediction_sha} != {expected_oof_sha256}"
+        )
+
+    rows = (payload.get("inputs") or {}).get("checkpoints") or []
+    by_fold = {
+        int(row["fold"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("fold") is not None
+    }
+    if sorted(by_fold) != [1, 2, 3, 4, 5] or len(paths) != 5:
+        raise RuntimeError("OOF run manifest must authenticate exact checkpoint folds 1..5")
+
+    for fold, path in enumerate(paths, start=1):
+        path = Path(path).expanduser()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"Missing fold {fold} checkpoint: {path}")
+        expected = by_fold[fold]
+        expected_size = int(expected.get("size_bytes", -1))
+        if expected_size >= 0 and path.stat().st_size != expected_size:
+            raise RuntimeError(f"Fold {fold} checkpoint size differs from OOF run manifest")
+        expected_sha = str(expected.get("sha256") or "")
+        actual_sha = sha256_file(path)
+        if len(expected_sha) != 64 or actual_sha != expected_sha:
+            raise RuntimeError(f"Fold {fold} checkpoint SHA differs from OOF run manifest")
+
+    return {
+        "path": str(manifest_path),
+        "sha256": sha256_file(manifest_path),
+        "prediction_sha256": str(manifest_prediction_sha),
+    }
+
+
 def fold_pca_paths(
     expected_folds: int,
     expected_source_config_hash: str,
@@ -1219,6 +1277,11 @@ def main() -> None:
             "will be stored under reports/revision/experimental with manuscript_ready=false."
         )
     checkpoints = checkpoint_paths(args.checkpoint_kind)
+    oof_checkpoint_contract = validate_checkpoint_files_against_oof_run_manifest(
+        checkpoints,
+        args.checkpoint_kind,
+        canonical["oof_sha256"],
+    )
     checkpoint_info, source_config_hash = checkpoint_provenance(
         checkpoints,
         args.checkpoint_kind,
@@ -1367,6 +1430,7 @@ def main() -> None:
         "restrictions": restrictions,
         "protocol": protocol,
         "checkpoint_kind": args.checkpoint_kind,
+        "oof_checkpoint_contract": oof_checkpoint_contract,
         "inference_amp_dtype": AMP_DTYPE_NAME,
         "n_records": len(y_true),
         "n_classes": y_true.shape[1],

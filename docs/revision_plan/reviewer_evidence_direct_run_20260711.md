@@ -25,17 +25,43 @@ The related paths have different roles:
 - `/content/ECG-RAMBA`: ephemeral active source checkout and runtime outputs.
 - `ECG-Ramba/revision_artifacts/reports/revision`: canonical mirror for every
   artifact restore, reuse decision, and publish.
+- `ECG-Ramba/model_runs/<run_id>`: immutable core Full ECG-RAMBA checkpoints;
+  the current run pointer and OOF run manifest freeze their exact paths/SHA256.
 - `ECG-Ramba/ECG-RAMBA`: legacy Drive checkout; source/archive only, never an
   automatic artifact restore source.
 - `ECG-Ramba/final_evidence_tables`: manuscript convenience export, not a
-  training or evaluation cache.
+  training or evaluation cache. Notebook 07 recreates it and writes
+  `final_evidence_export_manifest.json`; no notebook restores inputs from it.
 - `revision_feature_cache`, `revision_external_cache`, and
   `revision_pca_models`: large keyed feature caches with separate contracts.
+
+Within the canonical mirror, resumable fold caches live in
+`predictions/folds/`, learned-comparator checkpoints live in
+`experimental/*_checkpoints/`, and live command traces live in `logs/`.
+Baseline and representation runners write fold state directly to these Drive
+paths using atomic file replacement. The `/content/ECG-RAMBA` copies of final
+metrics/tables are disposable staging outputs.
+
+A partially downloaded Windows folder is not an authority on cloud presence.
+For example, a local sync may contain only `revision_artifacts` and
+`final_evidence_tables` while omitting `model_runs`, `revision_pca_models`, or
+multi-GB checkpoint directories. Use the Colab storage audit against the
+mounted canonical root before concluding that a cache/checkpoint is absent.
+The local audit maps manifest paths beginning with
+`/content/drive/MyDrive/ECG-Ramba/` into the local Drive root when those tiers
+have actually been synchronized.
 
 Notebook 00 runs `37_artifact_source_audit.py`. Leave
 `MIGRATE_LEGACY_ONLY_ARTIFACTS=False` during normal runs. Set it to `True` once
 only after reviewing `table_artifact_source_audit.csv`; migration imports
 legacy-only paths and never overwrites a conflicting canonical artifact.
+
+Notebook 00 then runs `38_pipeline_storage_audit.py` in non-strict mode. Its
+JSON/CSV outputs check each expected fold and each of the six named stresses,
+including manifest coverage, rather than relying on aggregate file counts.
+Before final packaging, run the same command with `--strict --full-sha`; this
+is intentionally deferred because hashing all learned checkpoints on every
+Colab bootstrap is expensive.
 
 ## Evidence Boundaries
 
@@ -106,7 +132,8 @@ matrix, copy, and publication cells can run on CPU.
 9. Run Notebook 07. It first runs claim-readiness gates, then writes final
    evidence tables only when calibration and paired OOF contracts match the
    active frozen OOF. It mirrors all artifacts and copies the current source
-   tables to `final_evidence_tables`.
+   tables to the output-only `final_evidence_tables` snapshot with an export
+   checksum manifest.
 10. Build the marked manuscript only in an environment with both `latexdiff`
     and `latexmk`/LaTeX. A `blocked_missing_tool` manifest is deliberate and
     must not be called a marked PDF.
@@ -122,23 +149,43 @@ matrix, copy, and publication cells can run on CPU.
 - For model runners, leave `ONLY_FOLDS='auto'`, `SAVE_CHECKPOINTS=True`, and
   `REUSE_CHECKPOINTS=True`. The notebook detects existing per-fold caches and
   skips them.
+- A missing fold cache does not imply retraining when a compatible checkpoint
+  exists. ResNet, Raw Mamba, Transformer, and the frozen-transform MLP first
+  validate checkpoint protocol, fold, frozen OOF/freeze provenance, raw or
+  feature cache provenance, and training parameters, then regenerate only the
+  validation predictions.
 - The external learned-comparator runner reads checkpoints directly from
   `revision_artifacts/reports/revision/experimental/` on Drive. Its final
   manifest includes frozen OOF/freeze SHA256, checkpoint SHA256, archive SHA256,
   mapping SHA256 where relevant, and runner SHA256. Old manifests are
   regenerated from compatible fold caches rather than accepted blindly.
+- Full external inference authenticates all five files against
+  `oof_final_ema_prediction_run_manifest.json` before `torch.load`. Learned
+  comparators authenticate all five files against their baseline checkpoint
+  contracts. External representation and true few-shot runners additionally
+  require current embedding manifests, so a stale NPZ cannot enter adaptation.
 - Metric caches use input/protocol-derived cache keys. A changed prediction,
   group split, threshold, bootstrap count, or seed produces a new cache entry.
 - Notebook 02 `auto` cells re-enter the lightweight paired/calibration/head
   runners so they can validate canonical OOF/freeze and runner SHA contracts;
   compatible metric/head caches are reused and model inference is skipped.
-- Every heavy cell writes an ordinary command log under
-  `reports/revision/logs/` and publishes to the Drive mirror after successful
-  fold or aggregate completion.
+- Every heavy cell streams output and dual-writes its command log to local
+  `reports/revision/logs/` and canonical Drive `logs/`. Logs are deliberately
+  excluded from the immutable artifact manifest so rerunning a command can
+  safely update the same trace path.
 - Mirror publication is merge-only and checksum-verified: a partial Colab
   runtime updates artifacts it owns but preserves previously verified fold
   checkpoints/caches in the manifest. It does not prune artifacts that are
   absent from the current runtime.
+- A file that merely exists below the mirror path is not evidence until it has
+  a mirror-manifest row. Notebook restores reject unmanifested active files,
+  and mirror discovery ignores interrupted atomic-write names such as
+  `.partial`, `.tmp`, and `.lock`. Run the publish cell after a completed fold
+  or stress so its final file becomes checksum-addressable.
+- Intermediate publishes use `--verify-existing size` to avoid repeatedly
+  hashing multi-GB preserved checkpoints; every new or overwritten artifact is
+  still SHA256-verified. Notebook 07 uses the default full verification pass
+  before final evidence export.
 
 ## Required Completion Artifacts
 
@@ -166,8 +213,16 @@ pair:
 - `reports/revision/tables/table_final_safe_wording.csv`
 
 The convenience copies in Drive are for handoff only. Before submission,
-rerun Notebook 07, compile the manuscript, create fresh PDF text, and run the
-forbidden-claim scan. Do not claim SOTA, broad in-domain superiority,
+rerun Notebook 07, then run:
+
+```bash
+python -u scripts/revision/38_pipeline_storage_audit.py \
+  --canonical-root "/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision" \
+  --strict --full-sha
+```
+
+Compile the manuscript, create fresh PDF text, and run the forbidden-claim
+scan. Do not claim SOTA, broad in-domain superiority,
 zero-shot superiority, general external superiority, end-to-end few-shot
 fine-tuning, proven disentanglement, general robustness superiority, complete
 HRV, or clinical readiness unless a future protocol-specific artifact makes

@@ -1,4 +1,5 @@
 import importlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,46 @@ external = importlib.import_module("scripts.revision.03_generate_external_predic
 
 
 class ExternalPredictionContractTests(unittest.TestCase):
+    def test_external_checkpoint_files_must_match_oof_run_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = []
+            rows = []
+            for fold in range(1, 6):
+                path = root / f"fold{fold}_final_ema.pt"
+                path.write_bytes(f"trusted-fold-{fold}".encode())
+                paths.append(path)
+                rows.append(
+                    {
+                        "fold": fold,
+                        "sha256": external.sha256_file(path),
+                        "size_bytes": path.stat().st_size,
+                    }
+                )
+            manifest_dir = root / "manifests"
+            manifest_dir.mkdir()
+            expected_oof_sha = "a" * 64
+            manifest = manifest_dir / "oof_final_ema_prediction_run_manifest.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "inputs": {"checkpoints": rows},
+                        "outputs": {"prediction_file": {"sha256": expected_oof_sha}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(external, "MANIFEST_DIR", manifest_dir):
+                contract = external.validate_checkpoint_files_against_oof_run_manifest(
+                    paths, "final_ema", expected_oof_sha
+                )
+                self.assertEqual(contract["prediction_sha256"], expected_oof_sha)
+                paths[2].write_bytes(b"tampered")
+                with self.assertRaises(RuntimeError):
+                    external.validate_checkpoint_files_against_oof_run_manifest(
+                        paths, "final_ema", expected_oof_sha
+                    )
+
     def test_checkpoint_provenance_requires_matching_explicit_ema_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = []

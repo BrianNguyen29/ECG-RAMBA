@@ -32,6 +32,22 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
+ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v1"
+ROBUSTNESS_STRESSES = [
+    "snr20db",
+    "snr10db",
+    "snr5db",
+    "random_3_lead_dropout",
+    "precordial_dropout",
+    "resample_250hz",
+]
+ROBUSTNESS_COMPARATORS = ["full", "minirocket", "resnet", "raw_mamba", "transformer"]
+ROBUSTNESS_PAIRED_COMPARATORS = ["minirocket", "resnet", "raw_mamba", "transformer"]
+ROBUSTNESS_LEARNED_COMPARATORS = ["resnet", "raw_mamba", "transformer"]
+ROBUSTNESS_METRICS = ["pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro"]
+ROBUSTNESS_N_BOOT = 1000
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -97,8 +113,29 @@ def canonical_contract() -> dict[str, str]:
     oof = PROJECT_ROOT / "reports" / "revision" / "predictions" / "oof_final_ema_predictions.npz"
     freeze = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
     if not present(oof) or not present(freeze):
-        return {}
-    return {"oof_sha256": sha256_file(oof), "freeze_sha256": sha256_file(freeze)}
+        raise FileNotFoundError("Canonical final_ema OOF predictions and freeze manifest are required.")
+    freeze_payload = read_json_if_present(freeze)
+    if (
+        freeze_payload.get("status") != "frozen"
+        or freeze_payload.get("manuscript_ready") is not True
+        or freeze_payload.get("checkpoint_kind") != "final_ema"
+    ):
+        raise RuntimeError("Canonical freeze manifest is not frozen/manuscript_ready final_ema evidence.")
+    oof_sha = sha256_file(oof)
+    frozen_oof_rows = [
+        row
+        for row in freeze_payload.get("artifacts") or []
+        if str(row.get("path", "")).replace("\\", "/").endswith(f"/{oof.name}")
+    ]
+    if len(frozen_oof_rows) != 1 or frozen_oof_rows[0].get("sha256") != oof_sha:
+        raise RuntimeError("Canonical freeze manifest does not bind the current final_ema OOF prediction SHA256.")
+    return {"oof_sha256": oof_sha, "freeze_sha256": sha256_file(freeze)}
+
+
+def contract_matches(actual: object, expected: dict[str, str]) -> bool:
+    """Accept an extended contract only when every canonical key matches exactly."""
+
+    return isinstance(actual, dict) and all(actual.get(key) == value for key, value in expected.items())
 
 
 def baseline_contract_issues(
@@ -152,7 +189,7 @@ def manifest_contract_issues(
         issues.append(f"manifest.status={payload.get('status')!r}")
     if expected_protocol is not None and payload.get("protocol") != expected_protocol:
         issues.append(f"manifest.protocol={payload.get('protocol')!r}")
-    if canonical and payload.get("canonical_contract") != canonical:
+    if canonical and not contract_matches(payload.get("canonical_contract"), canonical):
         issues.append("manifest.canonical_contract_mismatch")
     return issues
 
@@ -168,6 +205,146 @@ def manifest_runner_issues(path: Path, runner_name: str) -> list[str]:
     if payload.get("runner_sha256") != expected:
         return [f"manifest.runner_sha256_mismatch={runner_name}"]
     return []
+
+
+def read_csv_if_present(path: Path) -> list[dict[str, str]]:
+    candidate = resolve(path)
+    if not candidate.exists() or candidate.stat().st_size == 0:
+        return []
+    try:
+        with candidate.open("r", encoding="utf-8-sig", newline="") as handle:
+            return list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return []
+
+
+def int_or_zero(value) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def robustness_contract_issues(
+    *,
+    manifest_path: Path,
+    pairwise_path: Path,
+    summary_path: Path,
+    table_path: Path,
+    sidecar_paths: dict[str, Path],
+    canonical: dict[str, str],
+) -> list[str]:
+    """Require the canonical 6-stress/5-metric/1000-bootstrap ledger."""
+
+    issues: list[str] = []
+    manifest = read_json_if_present(manifest_path)
+    pairwise = read_json_if_present(pairwise_path)
+    runner = PROJECT_ROOT / "scripts" / "revision" / "21_robustness_multicomparator.py"
+    runner_sha = sha256_file(runner) if runner.exists() else None
+    expected_rows = len(ROBUSTNESS_STRESSES) * len(ROBUSTNESS_PAIRED_COMPARATORS) * len(ROBUSTNESS_METRICS)
+
+    for label, payload in [("manifest", manifest), ("pairwise", pairwise)]:
+        if not payload:
+            continue
+        if payload.get("_read_error"):
+            issues.append(f"{label}_unreadable")
+            continue
+        if payload.get("status") != "complete":
+            issues.append(f"{label}.status={payload.get('status')!r}")
+        if payload.get("protocol") != ROBUSTNESS_PROTOCOL:
+            issues.append(f"{label}.protocol={payload.get('protocol')!r}")
+        if payload.get("output_profile") != "canonical":
+            issues.append(f"{label}.output_profile={payload.get('output_profile')!r}")
+        if not contract_matches(payload.get("canonical_contract"), canonical):
+            issues.append(f"{label}.canonical_contract_mismatch")
+        if runner_sha is None or payload.get("runner_sha256") != runner_sha:
+            issues.append(f"{label}.runner_sha256_mismatch")
+        if list(payload.get("comparators") or []) != ROBUSTNESS_COMPARATORS:
+            issues.append(f"{label}.comparators_incomplete")
+        if list(payload.get("stress_tests") or []) != ROBUSTNESS_STRESSES:
+            issues.append(f"{label}.stress_tests_incomplete")
+        if list(payload.get("metrics") or []) != ROBUSTNESS_METRICS:
+            issues.append(f"{label}.metrics_incomplete")
+        if int_or_zero(payload.get("n_boot")) != ROBUSTNESS_N_BOOT:
+            issues.append(f"{label}.n_boot={payload.get('n_boot')!r}")
+        if int_or_zero(payload.get("blocked_rows")) != 0:
+            issues.append(f"{label}.blocked_rows={payload.get('blocked_rows')!r}")
+        if int_or_zero(payload.get("completed_rows")) != expected_rows:
+            issues.append(f"{label}.completed_rows={payload.get('completed_rows')!r}")
+
+    if pairwise and len(pairwise.get("items") or {}) != expected_rows:
+        issues.append(f"pairwise.items_count={len(pairwise.get('items') or {})}")
+
+    expected_pairwise_rel = rel(pairwise_path)
+    pairwise_sha = sha256_file(resolve(pairwise_path)) if present(pairwise_path) else ""
+    for comparator, path in sidecar_paths.items():
+        payload = read_json_if_present(path)
+        label = path.name
+        if not payload:
+            continue
+        if payload.get("status") != "complete":
+            issues.append(f"{label}:status={payload.get('status')!r}")
+        if payload.get("protocol") != ROBUSTNESS_PROTOCOL:
+            issues.append(f"{label}:protocol_mismatch")
+        if payload.get("comparator") != comparator:
+            issues.append(f"{label}:comparator_mismatch")
+        if payload.get("output_profile") != "canonical":
+            issues.append(f"{label}:not_canonical")
+        if not contract_matches(payload.get("canonical_contract"), canonical):
+            issues.append(f"{label}:canonical_contract_mismatch")
+        if runner_sha is None or payload.get("runner_sha256") != runner_sha:
+            issues.append(f"{label}:runner_sha256_mismatch")
+        if payload.get("source_pairwise") != expected_pairwise_rel:
+            issues.append(f"{label}:source_pairwise_mismatch")
+        if payload.get("source_pairwise_sha256") != pairwise_sha:
+            issues.append(f"{label}:source_pairwise_sha256_mismatch")
+        if list(payload.get("stress_tests") or []) != ROBUSTNESS_STRESSES:
+            issues.append(f"{label}:stress_tests_incomplete")
+        if list(payload.get("metrics") or []) != ROBUSTNESS_METRICS:
+            issues.append(f"{label}:metrics_incomplete")
+        if int_or_zero(payload.get("n_boot")) != ROBUSTNESS_N_BOOT:
+            issues.append(f"{label}:n_boot={payload.get('n_boot')!r}")
+        expected_sidecar_rows = len(ROBUSTNESS_STRESSES) * len(ROBUSTNESS_METRICS)
+        if int_or_zero(payload.get("blocked_rows")) != 0:
+            issues.append(f"{label}:blocked_rows={payload.get('blocked_rows')!r}")
+        if int_or_zero(payload.get("completed_rows")) != expected_sidecar_rows:
+            issues.append(f"{label}:completed_rows={payload.get('completed_rows')!r}")
+        if len(payload.get("rows") or []) != expected_sidecar_rows:
+            issues.append(f"{label}:rows_count={len(payload.get('rows') or [])}")
+
+    for label, path in [("summary", summary_path), ("table", table_path)]:
+        rows = read_csv_if_present(path)
+        if not rows:
+            continue
+        if len(rows) != expected_rows:
+            issues.append(f"{label}.rows={len(rows)}")
+        if any(row.get("status") != "complete" for row in rows):
+            issues.append(f"{label}.contains_noncomplete_rows")
+        if {row.get("stress") for row in rows} != set(ROBUSTNESS_STRESSES):
+            issues.append(f"{label}.stress_set_mismatch")
+        if {row.get("comparator") for row in rows} != set(ROBUSTNESS_PAIRED_COMPARATORS):
+            issues.append(f"{label}.comparator_set_mismatch")
+        if {row.get("metric") for row in rows} != set(ROBUSTNESS_METRICS):
+            issues.append(f"{label}.metric_set_mismatch")
+        if any(row.get("output_profile") != "canonical" for row in rows):
+            issues.append(f"{label}.contains_noncanonical_rows")
+        if any(int_or_zero(row.get("n_boot")) != ROBUSTNESS_N_BOOT for row in rows):
+            issues.append(f"{label}.n_boot_mismatch")
+
+    artifact_sha = manifest.get("artifact_sha256") if isinstance(manifest, dict) else {}
+    expected_hashes = {
+        "summary": sha256_file(resolve(summary_path)) if present(summary_path) else "",
+        "table": sha256_file(resolve(table_path)) if present(table_path) else "",
+        "pairwise": pairwise_sha,
+    }
+    for key, value in expected_hashes.items():
+        if value and (artifact_sha or {}).get(key) != value:
+            issues.append(f"manifest.artifact_sha256.{key}_mismatch")
+    sidecar_hashes = (artifact_sha or {}).get("comparator_sidecars") or {}
+    for comparator, path in sidecar_paths.items():
+        if present(path) and sidecar_hashes.get(comparator) != sha256_file(resolve(path)):
+            issues.append(f"manifest.artifact_sha256.sidecar_{comparator}_mismatch")
+    return issues
 
 
 def external_comparator_manifest_issues(
@@ -190,7 +367,7 @@ def external_comparator_manifest_issues(
             continue
         if payload.get("status") != "complete_experimental_requires_external_comparator_gate":
             issues.append(f"{label}:status={payload.get('status')!r}")
-        if canonical and payload.get("canonical_contract") != canonical:
+        if canonical and not contract_matches(payload.get("canonical_contract"), canonical):
             issues.append(f"{label}:canonical_oof_freeze_mismatch")
         source = payload.get("source_contract") if isinstance(payload.get("source_contract"), dict) else {}
         if not source.get("archive_sha256") or not source.get("runner_sha256"):
@@ -339,17 +516,30 @@ def main() -> None:
     robustness_required = [
         METRIC_DIR / "robustness_full_vs_resnet_comparison.json",
         METRIC_DIR / "robustness_full_vs_raw_mamba_comparison.json",
+        METRIC_DIR / "robustness_full_vs_transformer_comparison.json",
         METRIC_DIR / "robustness_multicomparator_pairwise.json",
         METRIC_DIR / "robustness_multicomparator_summary.csv",
         TABLE_DIR / "table_robustness_multicomparator.csv",
         MANIFEST_DIR / "robustness_multicomparator_manifest.json",
     ]
     robustness_manifest = MANIFEST_DIR / "robustness_multicomparator_manifest.json"
+    robustness_sidecars = {
+        "resnet": METRIC_DIR / "robustness_full_vs_resnet_comparison.json",
+        "raw_mamba": METRIC_DIR / "robustness_full_vs_raw_mamba_comparison.json",
+        "transformer": METRIC_DIR / "robustness_full_vs_transformer_comparison.json",
+    }
     robustness_status, robustness_missing = complete_if_valid(
         required=robustness_required,
         complete_status="complete_multicomparator_robustness_available",
         blocked_status="blocked_missing_or_stale_learned_comparator_stress_evidence",
-        contract_issues=manifest_contract_issues(robustness_manifest, expected_status="complete"),
+        contract_issues=robustness_contract_issues(
+            manifest_path=robustness_manifest,
+            pairwise_path=METRIC_DIR / "robustness_multicomparator_pairwise.json",
+            summary_path=METRIC_DIR / "robustness_multicomparator_summary.csv",
+            table_path=TABLE_DIR / "table_robustness_multicomparator.csv",
+            sidecar_paths=robustness_sidecars,
+            canonical=canonical,
+        ),
     )
 
     representation_required = [

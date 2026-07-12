@@ -195,12 +195,26 @@ def load_predictions(path: Path, expected_dataset: str) -> dict[str, Any]:
         }
     if payload["dataset"] != expected_dataset:
         raise ValueError(f"Dataset mismatch: {payload['dataset']} != {expected_dataset}")
-    if payload["y_true"].shape != payload["y_prob"].shape:
+    if payload["y_true"].ndim != 2 or payload["y_true"].shape != payload["y_prob"].shape:
         raise ValueError(f"{path}: label/prediction shape mismatch")
-    if len(payload["group_id"]) != len(payload["y_true"]):
-        raise ValueError(f"{path}: group_id length mismatch")
-    if not np.isfinite(payload["y_prob"]).all():
-        raise ValueError(f"{path}: non-finite probabilities")
+    n_records, n_classes = payload["y_true"].shape
+    for key in ("record_id", "group_id", "split_id"):
+        if len(payload[key]) != n_records:
+            raise ValueError(f"{path}: {key} length mismatch")
+        if np.any(np.char.str_len(payload[key].astype(str)) == 0):
+            raise ValueError(f"{path}: {key} contains empty identifiers")
+    if len(np.unique(payload["record_id"])) != n_records:
+        raise ValueError(f"{path}: record_id values are not unique")
+    if len(payload["class_names"]) != n_classes:
+        raise ValueError(f"{path}: class_names length mismatch")
+    if not np.isfinite(payload["y_true"]).all() or not np.isfinite(payload["y_prob"]).all():
+        raise ValueError(f"{path}: labels or probabilities contain NaN/Inf")
+    if not np.isin(payload["y_true"], [0.0, 1.0]).all():
+        raise ValueError(f"{path}: labels must be binary")
+    if float(payload["y_prob"].min()) < 0.0 or float(payload["y_prob"].max()) > 1.0:
+        raise ValueError(f"{path}: probabilities must be in [0,1]")
+    if len(np.unique(payload["group_id"])) < 2:
+        raise ValueError(f"{path}: fewer than two independent groups")
     payload["path"] = path
     payload["sha256"] = sha256_file(path)
     return payload

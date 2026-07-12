@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import shutil
 import sys
@@ -29,6 +30,8 @@ IGNORED_PATHS = {
     "manifests/mirror_restore_report.json",
     "manifests/artifact_source_audit.json",
     "tables/table_artifact_source_audit.csv",
+    "metrics/pipeline_storage_audit.json",
+    "tables/table_pipeline_storage_audit.csv",
 }
 
 
@@ -53,6 +56,11 @@ def parse_args() -> argparse.Namespace:
             "Copy legacy-only files into the active reports/revision tree and publish "
             "them to the canonical mirror. Conflicts are never overwritten."
         ),
+    )
+    parser.add_argument(
+        "--reuse-existing",
+        action="store_true",
+        help="Reuse a prior canonical audit when both source-tree metadata fingerprints match.",
     )
     parser.add_argument(
         "--keep-canonical-on-conflict",
@@ -93,6 +101,26 @@ def inventory(root: Path) -> dict[str, dict[str, object]]:
             "sha256": sha256_file(path),
         }
     return rows
+
+
+def quick_tree_fingerprint(root: Path) -> str:
+    """Hash relative path, size, and mtime without reading multi-GB file contents."""
+
+    digest = hashlib.sha256()
+    if not root.exists():
+        digest.update(b"missing")
+        return digest.hexdigest()
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if ignored(relative):
+            continue
+        stat = path.stat()
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(str(stat.st_size).encode("ascii"))
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    return digest.hexdigest()
 
 
 def audit_sources(canonical_root: Path, legacy_root: Path) -> list[AuditRow]:
@@ -171,6 +199,24 @@ def main() -> None:
     args = parse_args()
     canonical_root = args.canonical_root.expanduser().resolve()
     legacy_root = args.legacy_root.expanduser().resolve()
+    quick_fingerprints = {
+        "canonical": quick_tree_fingerprint(canonical_root),
+        "legacy": quick_tree_fingerprint(legacy_root),
+    }
+    cached_json = canonical_root / "manifests" / "artifact_source_audit.json"
+    cached_csv = canonical_root / "tables" / "table_artifact_source_audit.csv"
+    if args.reuse_existing and not args.apply_legacy_only and cached_json.exists():
+        cached = json.loads(cached_json.read_text(encoding="utf-8"))
+        if cached.get("quick_tree_fingerprints") == quick_fingerprints:
+            save_json(args.out_json, cached)
+            if cached_csv.exists() and cached_csv.resolve() != args.out_csv.resolve():
+                args.out_csv.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cached_csv, args.out_csv)
+            print("Artifact source audit: reused cached SHA audit")
+            print("counts   :", cached.get("counts", {}))
+            print(f"Wrote: {args.out_json}")
+            print(f"Wrote: {args.out_csv}")
+            return
     rows = audit_sources(canonical_root, legacy_root)
 
     def status_counts(items: list[AuditRow]) -> dict[str, int]:
@@ -198,6 +244,10 @@ def main() -> None:
     # second audit pass to confirm that legacy-only files became identical.
     if copied:
         rows = audit_sources(canonical_root, legacy_root)
+        quick_fingerprints = {
+            "canonical": quick_tree_fingerprint(canonical_root),
+            "legacy": quick_tree_fingerprint(legacy_root),
+        }
     counts = status_counts(rows)
 
     payload = {
@@ -207,6 +257,7 @@ def main() -> None:
         "legacy_root": str(legacy_root),
         "canonical_is_authoritative": True,
         "ignored_prefixes": list(IGNORED_PREFIXES),
+        "quick_tree_fingerprints": quick_fingerprints,
         "pre_migration_counts": pre_migration_counts,
         "counts": counts,
         "migration_requested": bool(args.apply_legacy_only),

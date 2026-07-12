@@ -121,7 +121,10 @@ def runtime_metadata(args: argparse.Namespace, created_utc: str) -> dict:
     return {
         "created_utc": created_utc,
         "command": " ".join([Path(sys.executable).name, *sys.argv]),
-        "args": vars(args),
+        "args": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
         "project_root": str(PROJECT_ROOT),
         "cwd": str(Path.cwd()),
         "git": {
@@ -351,10 +354,10 @@ def fold_prediction_cache_path(
     fold_num: int,
     checkpoint_kind: str,
     checkpoint_sha256: str,
+    fold_cache_dir: Path,
 ) -> Path:
     return (
-        PREDICTION_DIR
-        / "folds"
+        fold_cache_dir
         / (
             f"oof_fold{fold_num}_{checkpoint_kind}_{EVALUATION_CONFIG_HASH}_"
             f"{checkpoint_sha256[:12]}_v{CACHE_SCHEMA_VERSION}.npz"
@@ -569,6 +572,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-resume-fold-cache", dest="resume_fold_cache", action="store_false")
     parser.add_argument("--force-rerun-folds", action="store_true", default=False)
     parser.add_argument(
+        "--fold-cache-dir",
+        type=Path,
+        default=PREDICTION_DIR / "folds",
+        help=(
+            "Directory for resumable per-fold OOF caches. Point this to the canonical "
+            "Drive mirror in Colab so completed folds survive runtime disconnects."
+        ),
+    )
+    parser.add_argument(
         "--allow-checkpoint-fallback",
         action="store_true",
         help="Legacy/debug only. Manuscript exports must use the exact requested checkpoint files.",
@@ -688,7 +700,10 @@ def validate_checkpoint_weights_kind(checkpoint_kind: str, actual: str | None, p
 
 
 def load_checkpoint_payload(path: Path, checkpoint_kind: str) -> tuple[dict, dict]:
-    checkpoint = torch.load(path, map_location="cpu")
+    # These are user-owned training checkpoints selected from the frozen model
+    # run. PyTorch 2.6+ defaults to weights_only=True, which rejects the rich
+    # metadata dictionaries (for example Path values) stored by train.py.
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict) or "model" not in checkpoint:
         raise ValueError(
             f"Checkpoint lacks the explicit metadata contract: {path}"
@@ -923,6 +938,12 @@ def generate_oof(args: argparse.Namespace) -> None:
     )
     from src.utils import set_seed
 
+    args.fold_cache_dir = (
+        args.fold_cache_dir
+        if args.fold_cache_dir.is_absolute()
+        else PROJECT_ROOT / args.fold_cache_dir
+    ).resolve()
+    args.fold_cache_dir.mkdir(parents=True, exist_ok=True)
     ensure_revision_dirs()
     set_seed(CONFIG["seeds"][0])
     created_utc = datetime.now(timezone.utc).isoformat()
@@ -1000,6 +1021,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             fold_num,
             args.checkpoint_kind,
             checkpoint_sha256,
+            args.fold_cache_dir,
         )
         if args.resume_fold_cache and not args.force_rerun_folds:
             cached_summary = load_fold_prediction_cache(

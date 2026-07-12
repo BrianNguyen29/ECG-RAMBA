@@ -422,6 +422,7 @@ def main() -> None:
     fingerprint = input_fingerprint(base_source)
     source_by_model: dict[str, dict[str, Any]] = {}
     checkpoints_by_model: dict[str, list[Path]] = {}
+    checkpoint_sources_by_model: dict[str, dict[str, Any]] = {}
     for model_name in models:
         source = load_source_contract(args, model_name)
         if not all(
@@ -435,8 +436,24 @@ def main() -> None:
         missing = [path for path in checkpoints if not path.exists()]
         if missing:
             raise FileNotFoundError("; ".join(str(path) for path in missing))
+        if model_name == "full":
+            checkpoint_source = external.validate_checkpoint_files_against_oof_run_manifest(
+                checkpoints,
+                args.checkpoint_kind,
+                canonical["oof_sha256"],
+            )
+        else:
+            hashes = comparators.model_loaders.validate_checkpoint_set(model_name, checkpoints)
+            checkpoint_source = {
+                "baseline_manifest": str(MANIFEST_DIR / comparators.MANIFEST_FILENAMES[model_name]),
+                "baseline_manifest_sha256": sha256_file(
+                    MANIFEST_DIR / comparators.MANIFEST_FILENAMES[model_name]
+                ),
+                "checkpoint_sha256": hashes,
+            }
         source_by_model[model_name] = source
         checkpoints_by_model[model_name] = checkpoints
+        checkpoint_sources_by_model[model_name] = checkpoint_source
 
     if args.reuse_existing and not args.force_rerun and not selected_folds and all(
         final_output_matches(
@@ -654,6 +671,7 @@ def main() -> None:
                     {"fold": fold, "path": str(path), "sha256": hashes[fold - 1]}
                     for fold, path in enumerate(ckpts, start=1)
                 ],
+                "checkpoint_source_contract": checkpoint_sources_by_model[model_name],
                 "fold_caches": [
                     {"fold": fold, "path": str(path), "sha256": sha256_file(path)}
                     for fold, path in enumerate(caches, start=1)

@@ -25,7 +25,14 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from configs.config import CLASSES, CONFIG  # noqa: E402
-from scripts.revision.common import MANIFEST_DIR, PREDICTION_DIR, ensure_revision_dirs, save_json, sha256_file  # noqa: E402
+from scripts.revision.common import (  # noqa: E402
+    MANIFEST_DIR,
+    PREDICTION_DIR,
+    ensure_revision_dirs,
+    save_json,
+    save_npz_compressed_atomic,
+    sha256_file,
+)
 from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabilities  # noqa: E402
 from src.training_data import build_slice_index  # noqa: E402
 
@@ -36,6 +43,20 @@ DEFAULT_FREEZE = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 DEFAULT_RESNET_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints"
 DEFAULT_RAW_MAMBA_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "raw_mamba_checkpoints"
 DEFAULT_TRANSFORMER_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "transformer_ecg_checkpoints"
+BASELINE_CHECKPOINT_CONTRACTS = {
+    "resnet": (
+        "resnet1d_cnn_baseline_manifest.json",
+        "resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5",
+    ),
+    "raw_mamba": (
+        "raw_mamba_baseline_manifest.json",
+        "raw_mamba_retrained_weighted_bce_same_folds_power_mean_v2_q3_threshold_0.5",
+    ),
+    "transformer": (
+        "transformer_ecg_baseline_manifest.json",
+        "transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5",
+    ),
+}
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -73,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--finalize-manifest-only",
+        action="store_true",
+        help="Validate existing stress artifacts and rebuild the combined manifest without loading raw ECG.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--out-manifest", type=Path, default=MANIFEST_DIR / "comparator_stress_prediction_manifest.json")
@@ -125,7 +151,70 @@ def checkpoint_path(args: argparse.Namespace, comparator: str, fold: int) -> Pat
     raise ValueError(f"Unknown comparator: {comparator}")
 
 
-def validate_existing(path: Path, y: np.ndarray, fold_id: np.ndarray) -> bool:
+def validate_checkpoint_set(comparator: str, paths: list[Path]) -> list[str]:
+    manifest_name, expected_protocol = BASELINE_CHECKPOINT_CONTRACTS[comparator]
+    manifest_path = MANIFEST_DIR / manifest_name
+    if not manifest_path.is_file() or manifest_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing {comparator} baseline manifest: {manifest_path}")
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("protocol") != expected_protocol:
+        raise RuntimeError(f"{comparator} baseline manifest protocol mismatch: {manifest_path}")
+    contract = payload.get("checkpoint_contract") or {}
+    rows = contract.get("checkpoints") or []
+    by_fold = {
+        int(row["fold"]): row
+        for row in rows
+        if isinstance(row, dict) and row.get("fold") is not None
+    }
+    if contract.get("status") != "complete" or sorted(by_fold) != [1, 2, 3, 4, 5]:
+        raise RuntimeError(f"{comparator} baseline checkpoint contract is incomplete")
+    if len(paths) != 5:
+        raise RuntimeError(f"{comparator} stress inference requires exact checkpoint folds 1..5")
+
+    hashes: list[str] = []
+    for fold, path in enumerate(paths, start=1):
+        path = resolve(path).resolve()
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"Missing {comparator} fold {fold} checkpoint: {path}")
+        row = by_fold[fold]
+        declared_path = Path(str(row.get("path") or "")).expanduser()
+        if not declared_path.is_absolute():
+            declared_path = PROJECT_ROOT / declared_path
+        if declared_path.resolve() != path:
+            raise RuntimeError(
+                f"{comparator} fold {fold} checkpoint path differs from baseline manifest: "
+                f"{path} != {declared_path.resolve()}"
+            )
+        expected_size = int(row.get("size_bytes", -1))
+        if expected_size >= 0 and path.stat().st_size != expected_size:
+            raise RuntimeError(f"{comparator} fold {fold} checkpoint size mismatch")
+        expected_sha = str(row.get("sha256") or "")
+        actual_sha = sha256_file(path)
+        if not expected_sha or actual_sha != expected_sha:
+            raise RuntimeError(f"{comparator} fold {fold} checkpoint SHA mismatch")
+        hashes.append(actual_sha)
+    return hashes
+
+
+def scalar(data: Any, key: str, default: Any = "") -> Any:
+    if key not in data.files:
+        return default
+    value = np.asarray(data[key])
+    return value.item() if value.ndim == 0 else value
+
+
+def validate_existing(
+    path: Path,
+    y: np.ndarray,
+    fold_id: np.ndarray,
+    record_id: np.ndarray,
+    class_names: list[str],
+    *,
+    comparator: str,
+    stress: str,
+    freeze_contract: dict[str, Any],
+    checkpoint_hashes: list[str],
+) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
     try:
@@ -137,6 +226,24 @@ def validate_existing(path: Path, y: np.ndarray, fold_id: np.ndarray) -> bool:
                 and np.asarray(data["y_prob"]).shape == y.shape
                 and np.array_equal(np.asarray(data["y_true"], dtype=np.float32), y)
                 and np.array_equal(np.asarray(data["fold_id"], dtype=np.int16), fold_id)
+                and np.array_equal(np.asarray(data["record_id"], dtype=np.int64), record_id)
+                and np.asarray(data["class_names"]).astype(str).tolist() == class_names
+                and np.isfinite(np.asarray(data["y_prob"], dtype=np.float32)).all()
+                and float(np.min(np.asarray(data["y_prob"], dtype=np.float32))) >= -1e-6
+                and float(np.max(np.asarray(data["y_prob"], dtype=np.float32))) <= 1.0 + 1e-6
+                and str(scalar(data, "protocol")) == PROTOCOL
+                and str(scalar(data, "comparator")) == comparator
+                and str(scalar(data, "stress_test")) == stress
+                and str(scalar(data, "aggregation_implementation")) == POWER_MEAN_IMPLEMENTATION
+                and float(scalar(data, "power_mean_q", -1.0)) == float(CONFIG["power_mean_q"])
+                and str(scalar(data, "oof_predictions_sha256"))
+                == str(freeze_contract.get("oof_predictions_sha256", ""))
+                and str(scalar(data, "freeze_manifest_sha256"))
+                == str(freeze_contract.get("freeze_manifest_sha256", ""))
+                and np.array_equal(
+                    np.asarray(data["checkpoint_sha256"]).astype(str),
+                    np.asarray(checkpoint_hashes).astype(str),
+                )
             )
     except Exception:
         return False
@@ -290,11 +397,12 @@ def write_stress_npz(
     class_names: list[str],
     stress_meta: dict[str, Any],
     checkpoint_paths: list[Path],
+    checkpoint_hashes: list[str],
     raw_cache_info: dict[str, Any],
     freeze_contract: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         y_true=y.astype(np.float32),
         y_prob=y_prob.astype(np.float32),
@@ -311,7 +419,7 @@ def write_stress_npz(
         aggregation_implementation=np.asarray(POWER_MEAN_IMPLEMENTATION),
         power_mean_q=np.asarray(float(CONFIG["power_mean_q"])),
         checkpoint_paths=np.asarray([project_relative(path) for path in checkpoint_paths]),
-        checkpoint_sha256=np.asarray([sha256_file(path) for path in checkpoint_paths]),
+        checkpoint_sha256=np.asarray(checkpoint_hashes),
         raw_cache_sha256=np.asarray(raw_cache_info.get("raw_cache_sha256", "")),
         freeze_manifest_sha256=np.asarray(freeze_contract.get("freeze_manifest_sha256", "")),
         oof_predictions_sha256=np.asarray(freeze_contract.get("oof_predictions_sha256", "")),
@@ -325,7 +433,7 @@ def main() -> None:
     if args.allow_tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-    device = select_device(args.device)
+    device = torch.device("cpu") if args.finalize_manifest_only else select_device(args.device)
     comparators = parse_list(args.comparators)
     stresses = robust_helpers.stress_specs(parse_list(args.stress_tests), int(args.seed))
     unknown = sorted(set(comparators) - {"resnet", "raw_mamba", "transformer"})
@@ -346,6 +454,74 @@ def main() -> None:
         args.oof_predictions,
         limit_records=int(args.limit_records),
     )
+    folds = sorted(folds, key=lambda split: int(split["fold"]))
+    checkpoint_contracts: dict[str, dict[str, Any]] = {}
+    for comparator in comparators:
+        paths = [checkpoint_path(args, comparator, int(split["fold"])) for split in folds]
+        absent = [str(path) for path in paths if not path.exists() or path.stat().st_size == 0]
+        hashes = validate_checkpoint_set(comparator, paths) if not absent else []
+        checkpoint_contracts[comparator] = {
+            "paths": paths,
+            "absent": absent,
+            "sha256": hashes,
+        }
+
+    if args.finalize_manifest_only:
+        artifacts: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for spec in stresses:
+            stress = spec["name"]
+            for comparator in comparators:
+                contract = checkpoint_contracts[comparator]
+                if contract["absent"]:
+                    missing.append(
+                        f"{comparator}/{stress} missing checkpoints: " + "; ".join(contract["absent"])
+                    )
+                    continue
+                out = output_path(comparator, stress)
+                if not validate_existing(
+                    out,
+                    y,
+                    fold_id,
+                    record_id,
+                    class_names,
+                    comparator=comparator,
+                    stress=stress,
+                    freeze_contract=freeze_contract,
+                    checkpoint_hashes=contract["sha256"],
+                ):
+                    missing.append(f"{comparator}/{stress} missing or stale prediction: {out}")
+                    continue
+                artifacts.append(
+                    {
+                        "comparator": comparator,
+                        "stress": stress,
+                        "path": project_relative(out),
+                        "sha256": sha256_file(out),
+                        "reused": True,
+                    }
+                )
+        payload = {
+            "status": "complete" if not missing else "blocked_missing_or_stale_artifacts",
+            "protocol": PROTOCOL,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "comparators": comparators,
+            "stress_tests": [spec["name"] for spec in stresses],
+            "artifacts": artifacts,
+            "missing": missing,
+            "device": "not_loaded_manifest_only",
+            "finalize_manifest_only": True,
+            "canonical_contract": freeze_contract,
+            "runner_sha256": sha256_file(Path(__file__).resolve()),
+            "requires_saved_comparator_checkpoints": True,
+        }
+        save_json(resolve(args.out_manifest), payload)
+        print(json.dumps({"status": payload["status"], "artifacts": len(artifacts), "missing": len(missing)}, indent=2), flush=True)
+        print(f"Wrote manifest: {resolve(args.out_manifest)}", flush=True)
+        if missing and args.strict:
+            raise RuntimeError("Missing/stale comparator stress artifacts prevent manifest finalization.")
+        return
+
     raw_x, raw_cache_info = resnet_helpers.load_raw_cache(
         expected_y=y,
         expected_record_fingerprint=oof_info.get("dataset_record_order_fingerprint", ""),
@@ -361,12 +537,23 @@ def main() -> None:
         stressed_x, stress_meta = robust_helpers.perturb_signals(raw_x, spec)
         for comparator in comparators:
             out = output_path(comparator, stress)
-            if args.reuse_existing and validate_existing(out, y, fold_id):
+            contract = checkpoint_contracts[comparator]
+            if args.reuse_existing and not contract["absent"] and validate_existing(
+                out,
+                y,
+                fold_id,
+                record_id,
+                class_names,
+                comparator=comparator,
+                stress=stress,
+                freeze_contract=freeze_contract,
+                checkpoint_hashes=contract["sha256"],
+            ):
                 print(f"Reusing existing {comparator}/{stress}: {out}", flush=True)
                 artifacts.append({"comparator": comparator, "stress": stress, "path": project_relative(out), "sha256": sha256_file(out), "reused": True})
                 continue
-            ckpts = [checkpoint_path(args, comparator, int(split["fold"])) for split in folds]
-            absent = [str(path) for path in ckpts if not path.exists() or path.stat().st_size == 0]
+            ckpts = contract["paths"]
+            absent = contract["absent"]
             if absent:
                 msg = f"{comparator}/{stress} missing checkpoints: " + "; ".join(absent)
                 print("BLOCKED:", msg, flush=True)
@@ -416,6 +603,7 @@ def main() -> None:
                 class_names=class_names,
                 stress_meta=stress_meta,
                 checkpoint_paths=ckpts,
+                checkpoint_hashes=contract["sha256"],
                 raw_cache_info=raw_cache_info,
                 freeze_contract=freeze_contract,
             )
@@ -431,6 +619,8 @@ def main() -> None:
         "artifacts": artifacts,
         "missing": missing,
         "device": str(device),
+        "canonical_contract": freeze_contract,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "requires_saved_comparator_checkpoints": True,
     }
     save_json(resolve(args.out_manifest), payload)

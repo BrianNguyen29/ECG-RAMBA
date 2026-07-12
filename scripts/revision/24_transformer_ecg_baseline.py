@@ -82,6 +82,7 @@ def main() -> None:
     helpers.ARCHITECTURE_NAME = "patch_transformer_raw_ecg"
     helpers.MODEL_NAME = "compact_patch_transformer_raw_ecg_baseline"
     helpers.CHECKPOINT_STEM = "transformer_ecg"
+    helpers.RUNNER_SOURCE_PATH = Path(__file__).resolve()
     helpers.PREDICTION_PATH = helpers.PREDICTION_DIR / "transformer_ecg_oof_predictions.npz"
     helpers.SLICE_PREDICTION_PATH = helpers.PREDICTION_DIR / "transformer_ecg_slice_predictions.npz"
     helpers.SUMMARY_PATH = helpers.METRIC_DIR / "transformer_ecg_baseline_summary.json"

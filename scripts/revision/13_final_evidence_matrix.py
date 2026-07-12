@@ -673,6 +673,9 @@ def main() -> None:
         "robustness_multicomparator_pairwise": METRIC_DIR / "robustness_multicomparator_pairwise.json",
         "robustness_multicomparator_table": TABLE_DIR / "table_robustness_multicomparator.csv",
         "robustness_multicomparator_manifest": MANIFEST_DIR / "robustness_multicomparator_manifest.json",
+        "robustness_full_vs_resnet": METRIC_DIR / "robustness_full_vs_resnet_comparison.json",
+        "robustness_full_vs_raw_mamba": METRIC_DIR / "robustness_full_vs_raw_mamba_comparison.json",
+        "robustness_full_vs_transformer": METRIC_DIR / "robustness_full_vs_transformer_comparison.json",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:

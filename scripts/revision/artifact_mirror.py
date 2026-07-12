@@ -27,23 +27,83 @@ def parse_args() -> argparse.Namespace:
     for command in ("publish", "restore"):
         sub = subparsers.add_parser(command)
         sub.add_argument("--mirror-root", type=Path, required=True)
+    subparsers.choices["publish"].add_argument(
+        "--verify-existing",
+        choices=("full", "size"),
+        default="full",
+        help=(
+            "Verification for manifest rows preserved from an earlier publish. "
+            "New/overwritten files are always SHA256-verified. Use size for frequent "
+            "checkpoint publishes; restore still performs full SHA256 verification."
+        ),
+    )
+    subparsers.choices["publish"].add_argument(
+        "--source-conflict-policy",
+        choices=("newer", "fail", "source"),
+        default="newer",
+        help=(
+            "When a local reports/revision file differs from an existing canonical mirror file: "
+            "newer publishes only if the local mtime is newer, fail rejects the conflict, and "
+            "source explicitly overwrites. The default prevents stale Colab runtimes from rolling "
+            "the canonical mirror backward."
+        ),
+    )
     subparsers.choices["restore"].add_argument(
         "--replace-mismatched",
         action="store_true",
         help="Replace an existing destination only after the mirror file passes its manifest checksum.",
+    )
+    subparsers.choices["restore"].add_argument(
+        "--include-prefix",
+        action="append",
+        default=[],
+        help="Restore only rows whose relative path begins with this prefix. Repeatable.",
+    )
+    subparsers.choices["restore"].add_argument(
+        "--include-path",
+        action="append",
+        default=[],
+        help="Restore this exact relative path. Repeatable.",
+    )
+    subparsers.choices["restore"].add_argument(
+        "--exclude-cache-dirs",
+        action="store_true",
+        help="Exclude rows located below a directory whose name contains 'cache'.",
     )
     return parser.parse_args()
 
 
 def skip_artifact(relative: Path) -> bool:
     normalized = relative.as_posix()
+    name = relative.name.lower()
     return (
         normalized == "manifests/mirror_manifest.json"
-        or relative.parts[:1] == ("logs",) and "mirror" in relative.name
+        # Atomic writers use same-directory hidden partial files. A Colab
+        # disconnect can leave one behind before the finally block runs; it
+        # must never be discovered and certified as reviewer evidence.
+        or ".partial" in name
+        or name.endswith((".tmp", ".part", ".lock"))
+        # Logs are durable operational traces, not immutable evidence. They are
+        # intentionally kept on Drive but excluded from the checksum manifest
+        # so rerunning a command can safely truncate/append the same log path.
+        or relative.parts[:1] == ("logs",)
+        # Storage-audit outputs describe the mirror manifest and are written
+        # directly to Drive. Including them would create a self-referential
+        # manifest whose SHA changes immediately after every audit.
+        or normalized == "metrics/pipeline_storage_audit.json"
+        or normalized == "tables/table_pipeline_storage_audit.csv"
     )
 
 
-def publish(mirror_root: Path) -> Path:
+def publish(
+    mirror_root: Path,
+    verify_existing: str = "full",
+    source_conflict_policy: str = "newer",
+) -> Path:
+    if verify_existing not in {"full", "size"}:
+        raise ValueError(f"Unsupported existing verification mode: {verify_existing}")
+    if source_conflict_policy not in {"newer", "fail", "source"}:
+        raise ValueError(f"Unsupported source conflict policy: {source_conflict_policy}")
     ensure_revision_dirs()
     mirror_root.mkdir(parents=True, exist_ok=True)
     manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
@@ -60,24 +120,49 @@ def publish(mirror_root: Path) -> Path:
                     f"Existing mirror manifest references a missing file: {source}"
                 )
             actual_size = source.stat().st_size
-            actual_sha = sha256_file(source)
             if row["size_bytes"] >= 0 and actual_size != row["size_bytes"]:
                 raise RuntimeError(
                     f"Existing mirror size mismatch before publish: {relative}"
                 )
-            if actual_sha != row["sha256"]:
-                raise RuntimeError(
-                    f"Existing mirror checksum mismatch before publish: {relative}"
-                )
+            # Old manifests may not carry size_bytes. In that case the fast
+            # path has no trustworthy metadata and must fall back to SHA256.
+            if verify_existing == "full" or row["size_bytes"] < 0:
+                actual_sha = sha256_file(source)
+                if actual_sha != row["sha256"]:
+                    raise RuntimeError(
+                        f"Existing mirror checksum mismatch before publish: {relative}"
+                    )
+            else:
+                actual_sha = row["sha256"]
             existing_rows[relative.as_posix()] = {
                 "relative_path": relative.as_posix(),
                 "size_bytes": actual_size,
                 "sha256": actual_sha,
             }
 
+    # Long-running runners may write resumable fold/stress caches directly to
+    # the canonical Drive tree. Discover them on the next publish so they enter
+    # the verified manifest instead of remaining invisible to future restores.
+    discovered_unmanifested = 0
+    for source in sorted(mirror_root.rglob("*")):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(mirror_root)
+        key = relative.as_posix()
+        if skip_artifact(relative) or key in existing_rows:
+            continue
+        actual_sha = sha256_file(source)
+        existing_rows[key] = {
+            "relative_path": key,
+            "size_bytes": source.stat().st_size,
+            "sha256": actual_sha,
+        }
+        discovered_unmanifested += 1
+
     merged_rows = dict(existing_rows)
     published_from_source = 0
     published_relative_paths: set[str] = set()
+    skipped_stale_source_paths: list[str] = []
     for source in sorted(REVISION_DIR.rglob("*")):
         if not source.is_file() or source.name == ".gitkeep":
             continue
@@ -86,8 +171,40 @@ def publish(mirror_root: Path) -> Path:
             continue
         destination = mirror_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
         source_sha = sha256_file(source)
+        destination_sha = None
+        if destination.exists():
+            existing_row = merged_rows.get(relative.as_posix())
+            if (
+                existing_row
+                and int(existing_row.get("size_bytes", -1)) == destination.stat().st_size
+                and existing_row.get("sha256")
+            ):
+                destination_sha = str(existing_row["sha256"])
+            else:
+                destination_sha = sha256_file(destination)
+
+        if destination_sha == source_sha:
+            merged_rows[relative.as_posix()] = {
+                "relative_path": relative.as_posix(),
+                "size_bytes": destination.stat().st_size,
+                "sha256": destination_sha,
+            }
+            continue
+
+        if destination.exists() and destination_sha != source_sha:
+            if source_conflict_policy == "fail":
+                raise RuntimeError(
+                    f"Local/canonical publish conflict for {relative}; rerun with an explicit policy"
+                )
+            if (
+                source_conflict_policy == "newer"
+                and source.stat().st_mtime_ns <= destination.stat().st_mtime_ns
+            ):
+                skipped_stale_source_paths.append(relative.as_posix())
+                continue
+
+        shutil.copy2(source, destination)
         destination_sha = sha256_file(destination)
         if source_sha != destination_sha:
             raise RuntimeError(f"Checksum mismatch after publishing {relative}")
@@ -112,6 +229,11 @@ def publish(mirror_root: Path) -> Path:
             set(existing_rows) - published_relative_paths
         ),
         "publish_mode": "merge_verified_no_prune",
+        "existing_verification_mode": verify_existing,
+        "source_conflict_policy": source_conflict_policy,
+        "skipped_stale_source_count": len(skipped_stale_source_paths),
+        "skipped_stale_source_paths": skipped_stale_source_paths,
+        "discovered_unmanifested_count": discovered_unmanifested,
         "artifacts": artifacts,
     }
     save_json(manifest_path, manifest)
@@ -146,7 +268,13 @@ def normalize_manifest_rows(payload: dict, mirror_root: Path) -> list[dict]:
     return normalized
 
 
-def restore(mirror_root: Path, replace_mismatched: bool) -> Path:
+def restore(
+    mirror_root: Path,
+    replace_mismatched: bool,
+    include_prefixes: list[str] | None = None,
+    include_paths: list[str] | None = None,
+    exclude_cache_dirs: bool = False,
+) -> Path:
     manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Verified restore requires: {manifest_path}")
@@ -154,6 +282,33 @@ def restore(mirror_root: Path, replace_mismatched: bool) -> Path:
     rows = normalize_manifest_rows(payload, mirror_root)
     if not rows:
         raise ValueError("Mirror manifest contains no artifacts")
+
+    prefixes = tuple(
+        Path(item).as_posix().rstrip("/") + "/"
+        for item in (include_prefixes or [])
+        if Path(item).as_posix().rstrip("/")
+    )
+    exact_paths = {Path(item).as_posix() for item in (include_paths or [])}
+    if prefixes or exact_paths:
+        rows = [
+            row
+            for row in rows
+            if row["relative_path"] in exact_paths
+            or row["relative_path"].startswith(prefixes)
+        ]
+        if not rows:
+            raise ValueError("Mirror selection matched no manifest artifacts")
+    if exclude_cache_dirs:
+        rows = [
+            row
+            for row in rows
+            if not any(
+                "cache" in part.lower()
+                for part in Path(row["relative_path"]).parts[:-1]
+            )
+        ]
+        if not rows:
+            raise ValueError("Mirror selection contains only excluded cache-directory artifacts")
 
     restored, reused = [], []
     for row in rows:
@@ -192,6 +347,11 @@ def restore(mirror_root: Path, replace_mismatched: bool) -> Path:
         "mirror_manifest": str(manifest_path),
         "mirror_manifest_sha256": sha256_file(manifest_path),
         "verified_artifact_count": len(restored) + len(reused),
+        "selection": {
+            "include_prefixes": list(include_prefixes or []),
+            "include_paths": sorted(exact_paths),
+            "exclude_cache_dirs": bool(exclude_cache_dirs),
+        },
         "restored": restored,
         "reused": reused,
     }
@@ -206,9 +366,15 @@ def restore(mirror_root: Path, replace_mismatched: bool) -> Path:
 def main() -> None:
     args = parse_args()
     if args.command == "publish":
-        publish(args.mirror_root)
+        publish(args.mirror_root, args.verify_existing, args.source_conflict_policy)
     else:
-        restore(args.mirror_root, args.replace_mismatched)
+        restore(
+            args.mirror_root,
+            args.replace_mismatched,
+            args.include_prefix,
+            args.include_path,
+            args.exclude_cache_dirs,
+        )
 
 
 if __name__ == "__main__":

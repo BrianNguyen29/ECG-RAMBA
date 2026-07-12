@@ -28,6 +28,7 @@ import platform
 import subprocess
 import sys
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,7 @@ from scripts.revision.common import (  # noqa: E402
     macro_roc_auc,
     multilabel_metrics,
     save_json,
+    save_npz_compressed_atomic,
     sha256_file,
 )
 from src.aggregation import POWER_MEAN_IMPLEMENTATION, power_mean  # noqa: E402
@@ -899,7 +901,11 @@ def predict_minirocket_heads(
     for fold in folds:
         fold_num = int(fold["fold"])
         va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
-        head = torch.load(heads.head_dir / f"fold{fold_num}_head.pt", map_location="cpu")
+        head = torch.load(
+            heads.head_dir / f"fold{fold_num}_head.pt",
+            map_location="cpu",
+            weights_only=False,
+        )
         weight = head["weight"].to(device=device, dtype=torch.float32)
         bias = head["bias"].to(device=device, dtype=torch.float32)
         mean = head["mean"].detach().cpu().numpy().astype(np.float32)
@@ -1043,7 +1049,7 @@ def predict_full_model(
 
 def write_prediction(path: Path, *, y: np.ndarray, prob: np.ndarray, fold_id: np.ndarray, stress: dict, model_label: str, metadata: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         path,
         y_true=y.astype(np.float32),
         y_prob=prob.astype(np.float32),
@@ -1066,20 +1072,124 @@ def write_prediction(path: Path, *, y: np.ndarray, prob: np.ndarray, fold_id: np
     print(f"Wrote predictions: {path}", flush=True)
 
 
-def load_existing_prediction(path: Path, *, y: np.ndarray, fold_id: np.ndarray) -> np.ndarray | None:
+def load_existing_prediction(
+    path: Path,
+    *,
+    y: np.ndarray,
+    fold_id: np.ndarray,
+    expected_stress: str,
+    expected_model_label: str,
+    expected_contract_hash: str | None,
+    expected_checkpoint_sha_by_fold: dict[int, str] | None = None,
+    expected_minirocket_params_hash: str | None = None,
+    expected_minirocket_clean_prediction_sha256: str | None = None,
+) -> np.ndarray | None:
     if not path.exists():
         return None
-    with np.load(path, allow_pickle=False) as data:
-        if "y_true" not in data.files or "y_prob" not in data.files or "fold_id" not in data.files:
-            return None
-        cached_y = np.asarray(data["y_true"], dtype=np.float32)
-        cached_prob = np.asarray(data["y_prob"], dtype=np.float32)
-        cached_fold = np.asarray(data["fold_id"], dtype=np.int16)
-    if cached_y.shape == y.shape and cached_prob.shape == y.shape and np.array_equal(cached_y, y) and np.array_equal(cached_fold, fold_id):
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            required = {"y_true", "y_prob", "fold_id"}
+            if not required.issubset(data.files):
+                return None
+            cached_y = np.asarray(data["y_true"], dtype=np.float32)
+            cached_prob = np.asarray(data["y_prob"], dtype=np.float32)
+            cached_fold = np.asarray(data["fold_id"], dtype=np.int16)
+            cached_protocol = str(np.asarray(data["protocol"]).item()) if "protocol" in data.files else ""
+            cached_stress = str(np.asarray(data["stress_name"]).item()) if "stress_name" in data.files else ""
+            cached_model = str(np.asarray(data["model_label"]).item()) if "model_label" in data.files else ""
+            metadata = (
+                json.loads(str(np.asarray(data["metadata_json"]).item()))
+                if "metadata_json" in data.files
+                else {}
+            )
+    except (OSError, ValueError, EOFError, zipfile.BadZipFile) as exc:
+        print(f"Rejecting unreadable stress prediction {path}: {exc}", flush=True)
+        return None
+
+    cached_contract_hash = metadata.get("prediction_contract_hash")
+    contract_matches = bool(
+        expected_contract_hash
+        and cached_contract_hash
+        and cached_contract_hash == expected_contract_hash
+    )
+    if not contract_matches and expected_model_label == "Full ECG-RAMBA":
+        fold_rows = metadata.get("fold_rows") or []
+        cached_checkpoint_sha = {
+            int(row["fold"]): str(row.get("checkpoint_sha256") or "")
+            for row in fold_rows
+            if row.get("fold") is not None
+        }
+        contract_matches = bool(
+            expected_checkpoint_sha_by_fold
+            and all(
+                cached_checkpoint_sha.get(fold) == sha
+                for fold, sha in expected_checkpoint_sha_by_fold.items()
+            )
+        )
+    if not contract_matches and expected_model_label == "MiniRocket-only":
+        cached_head_manifest = metadata.get("minirocket_heads_manifest") or {}
+        contract_matches = bool(
+            expected_minirocket_params_hash
+            and expected_minirocket_clean_prediction_sha256
+            and cached_head_manifest.get("params_hash")
+            == expected_minirocket_params_hash
+            and cached_head_manifest.get("clean_prediction_sha256")
+            == expected_minirocket_clean_prediction_sha256
+        )
+    if (
+        cached_y.shape == y.shape
+        and cached_prob.shape == y.shape
+        and np.array_equal(cached_y, y)
+        and np.array_equal(cached_fold, fold_id)
+        and cached_protocol == PROTOCOL
+        and cached_stress == expected_stress
+        and cached_model == expected_model_label
+        and contract_matches
+    ):
         if np.isfinite(cached_prob).all():
             print(f"Reusing existing stress prediction: {path}", flush=True)
             return np.clip(cached_prob, 0.0, 1.0).astype(np.float32)
     return None
+
+
+def prediction_contract_hash(
+    *,
+    model_label: str,
+    checkpoint_contract_payload: dict | None = None,
+    minirocket_heads_manifest: dict | None = None,
+) -> str | None:
+    if model_label == "Full ECG-RAMBA":
+        payload = checkpoint_contract_payload or {}
+        checkpoints = payload.get("checkpoints") or {}
+        checkpoint_sha = {
+            str(fold): row.get("sha256")
+            for fold, row in sorted(checkpoints.items())
+        }
+        if not checkpoint_sha or any(not value for value in checkpoint_sha.values()):
+            return None
+        contract = {
+            "protocol": PROTOCOL,
+            "model_label": model_label,
+            "oof_run_manifest_sha256": payload.get("sha256"),
+            "checkpoint_sha256_by_fold": checkpoint_sha,
+        }
+    else:
+        manifest = minirocket_heads_manifest or {}
+        if not manifest.get("params_hash"):
+            return None
+        contract = {
+            "protocol": PROTOCOL,
+            "model_label": model_label,
+            "minirocket_head_protocol": manifest.get("protocol"),
+            "minirocket_head_params_hash": manifest.get("params_hash"),
+            "minirocket_clean_prediction_sha256": manifest.get(
+                "clean_prediction_sha256"
+            ),
+        }
+    encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def load_existing_minirocket_clean_reference(*, y: np.ndarray, fold_id: np.ndarray) -> MiniRocketHeads | None:
@@ -1265,6 +1375,24 @@ def main() -> None:
         print(f"Debug limit active: {len(y)} records", flush=True)
 
     specs = stress_specs(args.stress_tests.split(","), args.seed)
+    reusable_heads = (
+        load_existing_minirocket_clean_reference(y=y, fold_id=fold_id)
+        if args.reuse_existing
+        else None
+    )
+    expected_checkpoint_sha_by_fold = {
+        int(fold): str(row.get("sha256"))
+        for fold, row in checkpoint_contract.items()
+        if row.get("sha256")
+    }
+    full_prediction_contract_hash = prediction_contract_hash(
+        model_label="Full ECG-RAMBA",
+        checkpoint_contract_payload=checkpoint_contract_payload,
+    )
+    mini_prediction_contract_hash = prediction_contract_hash(
+        model_label="MiniRocket-only",
+        minirocket_heads_manifest=(reusable_heads.manifest if reusable_heads else None),
+    )
     existing_stress_probs: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     missing_existing: list[str] = []
     if args.reuse_existing:
@@ -1272,8 +1400,33 @@ def main() -> None:
             stress_name = stress["name"]
             full_pred_path = PREDICTION_DIR / f"robustness_full_{stress_name}_predictions.npz"
             mini_pred_path = PREDICTION_DIR / f"robustness_minirocket_{stress_name}_predictions.npz"
-            full_prob = load_existing_prediction(full_pred_path, y=y, fold_id=fold_id)
-            mini_prob = load_existing_prediction(mini_pred_path, y=y, fold_id=fold_id)
+            full_prob = load_existing_prediction(
+                full_pred_path,
+                y=y,
+                fold_id=fold_id,
+                expected_stress=stress_name,
+                expected_model_label="Full ECG-RAMBA",
+                expected_contract_hash=full_prediction_contract_hash,
+                expected_checkpoint_sha_by_fold=expected_checkpoint_sha_by_fold,
+            )
+            mini_prob = load_existing_prediction(
+                mini_pred_path,
+                y=y,
+                fold_id=fold_id,
+                expected_stress=stress_name,
+                expected_model_label="MiniRocket-only",
+                expected_contract_hash=mini_prediction_contract_hash,
+                expected_minirocket_params_hash=(
+                    reusable_heads.manifest.get("params_hash")
+                    if reusable_heads
+                    else None
+                ),
+                expected_minirocket_clean_prediction_sha256=(
+                    reusable_heads.manifest.get("clean_prediction_sha256")
+                    if reusable_heads
+                    else None
+                ),
+            )
             if full_prob is None:
                 missing_existing.append(project_relative(full_pred_path))
             if mini_prob is None:
@@ -1282,7 +1435,7 @@ def main() -> None:
                 existing_stress_probs[stress_name] = (full_prob, mini_prob)
 
     aggregation_only = bool(args.reuse_existing and not missing_existing)
-    heads = load_existing_minirocket_clean_reference(y=y, fold_id=fold_id) if aggregation_only else None
+    heads = reusable_heads if aggregation_only else None
     if args.require_existing_stress_predictions and (missing_existing or heads is None):
         missing = list(missing_existing)
         if heads is None:
@@ -1350,6 +1503,10 @@ def main() -> None:
         )
         mini_clean_ref = heads.clean_prob
 
+    mini_prediction_contract_hash = prediction_contract_hash(
+        model_label="MiniRocket-only",
+        minirocket_heads_manifest=heads.manifest,
+    )
     rows: list[dict] = []
     sample_rows: list[dict] = []
     artifact_rows: list[dict] = []
@@ -1390,8 +1547,33 @@ def main() -> None:
         if stress_name in existing_stress_probs:
             full_prob, mini_prob = existing_stress_probs[stress_name]
         else:
-            full_prob = load_existing_prediction(full_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
-            mini_prob = load_existing_prediction(mini_pred_path, y=y, fold_id=fold_id) if args.reuse_existing else None
+            full_prob = load_existing_prediction(
+                full_pred_path,
+                y=y,
+                fold_id=fold_id,
+                expected_stress=stress_name,
+                expected_model_label="Full ECG-RAMBA",
+                expected_contract_hash=full_prediction_contract_hash,
+                expected_checkpoint_sha_by_fold=expected_checkpoint_sha_by_fold,
+            ) if args.reuse_existing else None
+            mini_prob = load_existing_prediction(
+                mini_pred_path,
+                y=y,
+                fold_id=fold_id,
+                expected_stress=stress_name,
+                expected_model_label="MiniRocket-only",
+                expected_contract_hash=mini_prediction_contract_hash,
+                expected_minirocket_params_hash=(
+                    heads.manifest.get("params_hash")
+                    if heads
+                    else None
+                ),
+                expected_minirocket_clean_prediction_sha256=(
+                    heads.manifest.get("clean_prediction_sha256")
+                    if heads
+                    else None
+                ),
+            ) if args.reuse_existing else None
         feature_infos = {}
         perturb_meta = {}
         if full_prob is None or mini_prob is None:
@@ -1442,6 +1624,7 @@ def main() -> None:
                     metadata={
                         "threshold": args.threshold,
                         "n_bins": args.n_bins,
+                        "prediction_contract_hash": full_prediction_contract_hash,
                         "feature_infos": feature_infos,
                         "fold_rows": full_fold_rows,
                         "slice_count_min": int(slice_count.min()),
@@ -1467,6 +1650,7 @@ def main() -> None:
                     metadata={
                         "threshold": args.threshold,
                         "n_bins": args.n_bins,
+                        "prediction_contract_hash": mini_prediction_contract_hash,
                         "feature_infos": feature_infos,
                         "minirocket_heads_manifest": heads.manifest,
                     },

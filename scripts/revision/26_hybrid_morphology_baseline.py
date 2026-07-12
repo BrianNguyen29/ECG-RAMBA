@@ -49,6 +49,7 @@ from scripts.revision.common import (  # noqa: E402
 PROTOCOL = "fixed_seed_rocket_family_max_ppv_mlp_head_same_folds_threshold_0.5"
 FEATURE_CONTRACT = "fixed_seed_rocket_family_random_convolution_max_ppv_frozen_mlp_head"
 EVALUATED_TRANSFORM_NAME = "fixed_seed_rocket_family_random_convolution_max_ppv"
+FOLD_CACHE_DIR = PREDICTION_DIR / "folds"
 HELPER_PATH = PROJECT_ROOT / "scripts" / "revision" / "10_minirocket_only_baseline.py"
 
 
@@ -88,12 +89,26 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated folds to train/cache only; rerun without this flag to aggregate all folds.",
     )
-    parser.add_argument("--save-checkpoints", action="store_true")
+    parser.add_argument(
+        "--save-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist exact fold checkpoints (default: enabled; required for reusable reviewer evidence).",
+    )
     parser.add_argument("--reuse-checkpoints", action="store_true")
     parser.add_argument(
         "--checkpoint-dir",
         type=Path,
         default=PROJECT_ROOT / "reports" / "revision" / "experimental" / "hybrid_morphology_checkpoints",
+    )
+    parser.add_argument(
+        "--fold-cache-dir",
+        type=Path,
+        default=FOLD_CACHE_DIR,
+        help=(
+            "Directory for resumable per-fold prediction caches. Point this to the "
+            "canonical Drive mirror so completed folds survive Colab disconnects."
+        ),
     )
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument("--oof-predictions", type=Path, default=helpers.DEFAULT_OOF_PREDICTIONS)
@@ -135,7 +150,7 @@ def parse_only_folds(value: str) -> set[int]:
 
 
 def fold_cache_path(fold: int) -> Path:
-    return PREDICTION_DIR / "folds" / f"hybrid_morphology_fold{fold}_predictions.npz"
+    return FOLD_CACHE_DIR / f"hybrid_morphology_fold{fold}_predictions.npz"
 
 
 def fold_checkpoint_path(args: argparse.Namespace, fold: int) -> Path:
@@ -156,6 +171,71 @@ def save_torch_atomic(path: Path, payload: dict) -> None:
             temporary.unlink()
 
 
+def build_checkpoint_contract(args: argparse.Namespace) -> dict:
+    rows = []
+    missing = []
+    for fold in range(1, 6):
+        path = fold_checkpoint_path(args, fold)
+        if not path.exists() or path.stat().st_size == 0:
+            missing.append(fold)
+            continue
+        rows.append(
+            {
+                "fold": fold,
+                "path": helpers._project_relative(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return {
+        "status": "complete" if not missing and len(rows) == 5 else "partial",
+        "expected_folds": [1, 2, 3, 4, 5],
+        "missing_folds": missing,
+        "checkpoints": rows,
+    }
+
+
+def require_complete_checkpoint_contract(checkpoint_contract: dict) -> list[dict]:
+    rows = sorted(
+        [row for row in checkpoint_contract.get("checkpoints", []) if isinstance(row, dict)],
+        key=lambda row: int(row.get("fold", -1)),
+    )
+    folds = [int(row.get("fold", -1)) for row in rows]
+    hashes = [str(row.get("sha256", "")) for row in rows]
+    if (
+        checkpoint_contract.get("status") != "complete"
+        or folds != [1, 2, 3, 4, 5]
+        or any(len(value) != 64 for value in hashes)
+    ):
+        raise RuntimeError(
+            "Hybrid morphology canonical predictions require five exact saved checkpoints; "
+            f"missing_folds={checkpoint_contract.get('missing_folds', [])}. "
+            "Use --save-checkpoints for training or restore the checkpoint directory before reuse."
+        )
+    return rows
+
+
+def checkpoint_contract_metadata(checkpoint_contract: dict) -> dict:
+    rows = require_complete_checkpoint_contract(checkpoint_contract)
+    return {
+        "checkpoint_folds": np.asarray([int(row["fold"]) for row in rows], dtype=np.int16),
+        "checkpoint_sha256": np.asarray([str(row["sha256"]) for row in rows]),
+    }
+
+
+def prediction_checkpoint_contract_matches(data, checkpoint_contract: dict) -> bool:
+    expected = checkpoint_contract_metadata(checkpoint_contract)
+    required = set(expected)
+    if not required.issubset(data.files):
+        print(
+            "Existing Hybrid morphology artifact rejected: missing checkpoint provenance "
+            f"{sorted(required - set(data.files))}",
+            flush=True,
+        )
+        return False
+    return all(np.array_equal(np.asarray(data[key]), value) for key, value in expected.items())
+
+
 def json_safe(value):
     if isinstance(value, dict):
         return {str(k): json_safe(v) for k, v in value.items()}
@@ -172,7 +252,13 @@ def json_safe(value):
     return value
 
 
-def metadata(args: argparse.Namespace, load_info: dict, model_name: str, classifier_params: dict) -> dict:
+def metadata(
+    args: argparse.Namespace,
+    load_info: dict,
+    model_name: str,
+    classifier_params: dict,
+    checkpoint_contract: dict,
+) -> dict:
     return {
         "dataset": np.asarray("chapman_oof"),
         "protocol": np.asarray(PROTOCOL),
@@ -192,10 +278,21 @@ def metadata(args: argparse.Namespace, load_info: dict, model_name: str, classif
         "freeze_manifest_sha256": np.asarray((load_info.get("freeze_contract") or {}).get("freeze_manifest_sha256", "")),
         "minirocket_cache_sha256": np.asarray(load_info.get("minirocket_cache_sha256", "")),
         "dataset_record_order_fingerprint": np.asarray(load_info.get("dataset_record_order_fingerprint", "")),
+        **checkpoint_contract_metadata(checkpoint_contract),
     }
 
 
-def load_existing(path: Path, y: np.ndarray, record_id: np.ndarray, class_names: list[str], args, load_info, model_name, classifier_params):
+def load_existing(
+    path: Path,
+    y: np.ndarray,
+    record_id: np.ndarray,
+    class_names: list[str],
+    args,
+    load_info,
+    model_name,
+    classifier_params,
+    checkpoint_contract: dict,
+):
     if not path.exists():
         return None
     print(f"Checking reusable Hybrid morphology prediction NPZ: {path}", flush=True)
@@ -204,7 +301,13 @@ def load_existing(path: Path, y: np.ndarray, record_id: np.ndarray, class_names:
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"Reusable hybrid prediction NPZ missing keys: {sorted(missing)}")
-        expected_meta = metadata(args, load_info, model_name, classifier_params)
+        expected_meta = metadata(
+            args,
+            load_info,
+            model_name,
+            classifier_params,
+            checkpoint_contract,
+        )
         advisory = {"git_commit"}
         for key, expected in expected_meta.items():
             if key not in data.files:
@@ -220,6 +323,8 @@ def load_existing(path: Path, y: np.ndarray, record_id: np.ndarray, class_names:
         rid_existing = np.asarray(data["record_id"], dtype=np.int64)
         fold_id = np.asarray(data["fold_id"], dtype=np.int16)
         classes_existing = np.asarray(data["class_names"]).astype(str).tolist()
+        if not prediction_checkpoint_contract_matches(data, checkpoint_contract):
+            return None
     if not np.array_equal(y_existing, y.astype(np.float32)):
         raise ValueError("Reusable hybrid prediction y_true differs from frozen OOF labels.")
     if not np.array_equal(rid_existing, record_id.astype(np.int64)):
@@ -230,6 +335,62 @@ def load_existing(path: Path, y: np.ndarray, record_id: np.ndarray, class_names:
         raise ValueError("Reusable hybrid prediction does not cover all five folds.")
     print("Reusable Hybrid morphology prediction NPZ passed contract checks.", flush=True)
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id
+
+
+def load_reusable_fold_cache(
+    *,
+    cache_path: Path,
+    checkpoint_path: Path,
+    val_indices: np.ndarray,
+    n_classes: int,
+    params_json: str,
+    load_info: dict,
+) -> np.ndarray | None:
+    if not cache_path.exists() or not checkpoint_path.exists():
+        return None
+    try:
+        expected_checkpoint_sha256 = sha256_file(checkpoint_path)
+        with np.load(cache_path, allow_pickle=False) as cached:
+            required = {
+                "protocol",
+                "classifier_params_json",
+                "oof_predictions_sha256",
+                "minirocket_cache_sha256",
+                "checkpoint_sha256",
+                "val_indices",
+                "y_prob",
+            }
+            missing = required - set(cached.files)
+            if missing:
+                print(
+                    f"Fold cache rejected {cache_path}: missing {sorted(missing)}",
+                    flush=True,
+                )
+                return None
+            valid = (
+                str(cached["protocol"].item()) == PROTOCOL
+                and str(cached["classifier_params_json"].item()) == params_json
+                and str(cached["oof_predictions_sha256"].item())
+                == load_info.get("oof_predictions_sha256")
+                and str(cached["minirocket_cache_sha256"].item())
+                == load_info.get("minirocket_cache_sha256")
+                and str(cached["checkpoint_sha256"].item()) == expected_checkpoint_sha256
+                and np.array_equal(np.asarray(cached["val_indices"], dtype=np.int64), val_indices)
+            )
+            cached_prob = np.asarray(cached["y_prob"], dtype=np.float32)
+        if (
+            not valid
+            or cached_prob.shape != (len(val_indices), n_classes)
+            or not np.isfinite(cached_prob).all()
+            or float(np.min(cached_prob)) < -1e-6
+            or float(np.max(cached_prob)) > 1.0 + 1e-6
+        ):
+            print(f"Fold cache rejected {cache_path}: contract/value mismatch", flush=True)
+            return None
+        return np.clip(cached_prob, 0.0, 1.0).astype(np.float32)
+    except Exception as exc:
+        print(f"Fold cache rejected {cache_path}: {exc!r}", flush=True)
+        return None
 
 
 def fit_predict_mlp_oof(
@@ -270,45 +431,44 @@ def fit_predict_mlp_oof(
         tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
         va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
         cache_path = fold_cache_path(fold_num)
-        if not args.force_rerun and cache_path.exists():
-            try:
-                with np.load(cache_path, allow_pickle=False) as cached:
-                    valid = (
-                        str(cached["protocol"].item()) == PROTOCOL
-                        and str(cached["classifier_params_json"].item()) == params_json
-                        and str(cached["oof_predictions_sha256"].item()) == load_info.get("oof_predictions_sha256")
-                        and str(cached["minirocket_cache_sha256"].item()) == load_info.get("minirocket_cache_sha256")
-                        and np.array_equal(np.asarray(cached["val_indices"], dtype=np.int64), va_idx)
-                    )
-                    cached_prob = np.asarray(cached["y_prob"], dtype=np.float32)
-                if valid and cached_prob.shape == (len(va_idx), n_classes) and np.isfinite(cached_prob).all():
-                    y_prob[va_idx] = cached_prob
-                    fold_id_out[va_idx] = fold_num
-                    fold_rows.append(
-                        {
-                            "fold": fold_num,
-                            "train_records": int(len(tr_idx)),
-                            "validation_records": int(len(va_idx)),
-                            "validation_positive_labels": int(np.sum(y[va_idx])),
-                            "classifier": "FrozenTransformMLP",
-                            "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
-                            "hidden_dim": int(args.hidden_dim),
-                            "dropout": float(args.dropout),
-                            "epochs": int(args.epochs),
-                            "reused_fold_predictions": True,
-                        }
-                    )
-                    print(f"Fold {fold_num}: reused fold cache {cache_path}", flush=True)
-                    continue
-            except Exception as exc:
-                print(f"Fold {fold_num}: rejected cache {cache_path}: {exc!r}", flush=True)
+        checkpoint_path = fold_checkpoint_path(args, fold_num)
+        cached_prob = None
+        if not args.force_rerun:
+            cached_prob = load_reusable_fold_cache(
+                cache_path=cache_path,
+                checkpoint_path=checkpoint_path,
+                val_indices=va_idx,
+                n_classes=n_classes,
+                params_json=params_json,
+                load_info=load_info,
+            )
+        if cached_prob is not None:
+            checkpoint_sha256 = sha256_file(checkpoint_path)
+            y_prob[va_idx] = cached_prob
+            fold_id_out[va_idx] = fold_num
+            fold_rows.append(
+                {
+                    "fold": fold_num,
+                    "train_records": int(len(tr_idx)),
+                    "validation_records": int(len(va_idx)),
+                    "validation_positive_labels": int(np.sum(y[va_idx])),
+                    "classifier": "FrozenTransformMLP",
+                    "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
+                    "hidden_dim": int(args.hidden_dim),
+                    "dropout": float(args.dropout),
+                    "epochs": int(args.epochs),
+                    "reused_fold_predictions": True,
+                    "checkpoint_sha256": checkpoint_sha256,
+                }
+            )
+            print(f"Fold {fold_num}: reused fold cache {cache_path}", flush=True)
+            continue
         rng = np.random.default_rng(int(args.seed) + fold_num)
         torch.manual_seed(int(args.seed) + fold_num)
         if device.type == "cuda":
             torch.cuda.manual_seed_all(int(args.seed) + fold_num)
         print(f"Fold {fold_num}/5 | train={len(tr_idx)} | val={len(va_idx)} | features={n_features}", flush=True)
 
-        checkpoint_path = fold_checkpoint_path(args, fold_num)
         checkpoint_payload = None
         if args.reuse_checkpoints and not args.force_rerun and checkpoint_path.exists():
             checkpoint_payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -409,6 +569,12 @@ def fit_predict_mlp_oof(
                 offset += len(batch_idx)
         y_prob[va_idx] = out
         fold_id_out[va_idx] = fold_num
+        if not checkpoint_path.exists() or checkpoint_path.stat().st_size == 0:
+            raise RuntimeError(
+                f"Fold {fold_num} has predictions but no durable checkpoint. "
+                "Rerun with --save-checkpoints before publishing reviewer evidence."
+            )
+        checkpoint_sha256 = sha256_file(checkpoint_path)
         save_npz_compressed_atomic(
             cache_path,
             fold=np.asarray(fold_num, dtype=np.int16),
@@ -416,6 +582,7 @@ def fit_predict_mlp_oof(
             classifier_params_json=np.asarray(params_json),
             oof_predictions_sha256=np.asarray(load_info.get("oof_predictions_sha256", "")),
             minirocket_cache_sha256=np.asarray(load_info.get("minirocket_cache_sha256", "")),
+            checkpoint_sha256=np.asarray(checkpoint_sha256),
             val_indices=va_idx,
             y_prob=out,
         )
@@ -432,6 +599,7 @@ def fit_predict_mlp_oof(
                 "dropout": float(args.dropout),
                 "epochs": int(args.epochs),
                 "reused_checkpoint": bool(reused_checkpoint),
+                "checkpoint_sha256": checkpoint_sha256,
             }
         )
 
@@ -442,7 +610,20 @@ def fit_predict_mlp_oof(
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
-def write_prediction_npz(path: Path, *, y, y_prob, record_id, fold_id, class_names, args, load_info, model_name, classifier_params) -> None:
+def write_prediction_npz(
+    path: Path,
+    *,
+    y,
+    y_prob,
+    record_id,
+    fold_id,
+    class_names,
+    args,
+    load_info,
+    model_name,
+    classifier_params,
+    checkpoint_contract,
+) -> None:
     print(f"Writing Hybrid morphology predictions: {path}", flush=True)
     save_npz_compressed_atomic(
         path,
@@ -451,7 +632,7 @@ def write_prediction_npz(path: Path, *, y, y_prob, record_id, fold_id, class_nam
         record_id=record_id.astype(np.int64),
         fold_id=fold_id.astype(np.int16),
         class_names=np.asarray(class_names),
-        **metadata(args, load_info, model_name, classifier_params),
+        **metadata(args, load_info, model_name, classifier_params, checkpoint_contract),
     )
 
 
@@ -463,9 +644,22 @@ def bootstrap_metric(name: str, y: np.ndarray, y_prob: np.ndarray, args, fn):
 
 
 def main() -> None:
+    global FOLD_CACHE_DIR
     args = parse_args()
     args.device = resolve_device_name(args.device)
-    args.checkpoint_dir = args.checkpoint_dir if args.checkpoint_dir.is_absolute() else PROJECT_ROOT / args.checkpoint_dir
+    args.checkpoint_dir = (
+        args.checkpoint_dir
+        if args.checkpoint_dir.is_absolute()
+        else PROJECT_ROOT / args.checkpoint_dir
+    ).resolve()
+    if args.save_checkpoints or args.reuse_checkpoints:
+        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    FOLD_CACHE_DIR = (
+        args.fold_cache_dir
+        if args.fold_cache_dir.is_absolute()
+        else PROJECT_ROOT / args.fold_cache_dir
+    ).resolve()
+    FOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ensure_revision_dirs()
     print("=" * 80, flush=True)
     print("HYBRID FIXED-SEED ROCKET-FAMILY MORPHOLOGY MLP BASELINE", flush=True)
@@ -515,6 +709,8 @@ def main() -> None:
         "standardize": args.standardize,
         "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
         "canonical_minirocket": False,
+        "seed": int(args.seed),
+        "allow_tf32": bool(args.allow_tf32),
     }
     runtime_config = {
         "device": args.device,
@@ -523,8 +719,38 @@ def main() -> None:
 
     reusable = None
     selected_folds = parse_only_folds(args.only_folds)
-    if args.reuse_predictions and not selected_folds and not args.force_rerun:
-        reusable = load_existing(prediction_path, y, record_id, class_names, args, load_info, model_name, classifier_params)
+    checkpoint_contract = build_checkpoint_contract(args)
+    if (
+        not selected_folds
+        and int(args.limit_records) == 0
+        and checkpoint_contract.get("status") != "complete"
+        and not args.save_checkpoints
+    ):
+        raise RuntimeError(
+            "Hybrid morphology canonical run has no complete checkpoint contract. "
+            "Restore the five checkpoints or rerun with --save-checkpoints."
+        )
+    if (
+        args.reuse_predictions
+        and not selected_folds
+        and not args.force_rerun
+        and checkpoint_contract.get("status") == "complete"
+    ):
+        try:
+            reusable = load_existing(
+                prediction_path,
+                y,
+                record_id,
+                class_names,
+                args,
+                load_info,
+                model_name,
+                classifier_params,
+                checkpoint_contract,
+            )
+        except Exception as exc:
+            print(f"Reusable Hybrid morphology NPZ rejected: {exc!r}", flush=True)
+            reusable = None
     if reusable is None:
         y_prob, fold_id_out, fold_rows = fit_predict_mlp_oof(
             X,
@@ -535,8 +761,23 @@ def main() -> None:
             classifier_params=classifier_params,
         )
         if selected_folds:
-            ready = [fold for fold in range(1, 6) if fold_cache_path(fold).exists()]
-            checkpoints = [fold for fold in range(1, 6) if fold_checkpoint_path(args, fold).exists()]
+            params_json = json.dumps(json_safe(classifier_params), sort_keys=True)
+            ready = []
+            checkpoints = []
+            for split in folds:
+                fold_num = int(split["fold"])
+                checkpoint_path = fold_checkpoint_path(args, fold_num)
+                if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+                    checkpoints.append(fold_num)
+                if load_reusable_fold_cache(
+                    cache_path=fold_cache_path(fold_num),
+                    checkpoint_path=checkpoint_path,
+                    val_indices=np.asarray(split["va_idx"], dtype=np.int64),
+                    n_classes=int(y.shape[1]),
+                    params_json=params_json,
+                    load_info=load_info,
+                ) is not None:
+                    ready.append(fold_num)
             print(
                 json.dumps(
                     {
@@ -551,6 +792,8 @@ def main() -> None:
                 )
             )
             return
+        checkpoint_contract = build_checkpoint_contract(args)
+        require_complete_checkpoint_contract(checkpoint_contract)
         write_prediction_npz(
             prediction_path,
             y=y,
@@ -562,6 +805,7 @@ def main() -> None:
             load_info=load_info,
             model_name=model_name,
             classifier_params=classifier_params,
+            checkpoint_contract=checkpoint_contract,
         )
     else:
         y_prob, fold_id_out = reusable
@@ -609,6 +853,7 @@ def main() -> None:
     }
     helpers._save_csv(per_class_path, helpers.per_class_rows(y, y_prob, class_names, float(args.threshold)))
     helpers._save_csv(fold_path, fold_rows)
+    require_complete_checkpoint_contract(checkpoint_contract)
 
     summary = {
         "created_utc": now_utc(),
@@ -631,6 +876,7 @@ def main() -> None:
         "calibration": calibration,
         "bootstrap_ci": ci,
         "load_info": load_info,
+        "checkpoint_contract": checkpoint_contract,
         "artifacts": {
             "predictions_npz": str(prediction_path),
             "per_class_table": str(per_class_path),
@@ -650,6 +896,8 @@ def main() -> None:
         "load_info": load_info,
         "classifier_params": classifier_params,
         "runtime_config": runtime_config,
+        "checkpoint_contract": checkpoint_contract,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "artifacts": {
             "summary": str(summary_path),
             "predictions": str(prediction_path),

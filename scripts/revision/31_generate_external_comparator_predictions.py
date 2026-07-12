@@ -522,13 +522,9 @@ def run_dataset(
     for comparator in comparators:
         in_domain = validate_in_domain_comparator(comparator, contract)
         checkpoints = [checkpoint_path(args, comparator, fold) for fold in range(1, 6)]
-        missing_checkpoints = [path for path in checkpoints if not path.exists()]
-        if missing_checkpoints:
-            raise FileNotFoundError(
-                f"{COMPARATOR_LABELS[comparator]} checkpoints missing: "
-                + "; ".join(str(path) for path in missing_checkpoints)
-            )
-        checkpoint_hashes = [sha256_file(path) for path in checkpoints]
+        # Authenticate every trusted-pickle checkpoint against the completed
+        # in-domain baseline manifest before any ``torch.load`` occurs.
+        checkpoint_hashes = model_loaders.validate_checkpoint_set(comparator, checkpoints)
         if final_artifacts_reusable(args, dataset, comparator, contract, checkpoint_hashes, sources):
             print(f"Reusing verified final external artifact: {dataset}/{comparator}", flush=True)
             result_rows.append(

@@ -59,7 +59,7 @@ def checkpoint_source_hashes(
         path = Path(PATHS["model_dir"]) / f"fold{fold}_{kind}.pt"
         if not path.exists():
             raise FileNotFoundError(f"Missing exact checkpoint for PCA provenance: {path}")
-        payload = torch.load(path, map_location="cpu")
+        payload = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict) or not payload.get("config_hash"):
             raise ValueError(f"Checkpoint lacks config_hash provenance: {path}")
         source_hashes[fold] = str(payload["config_hash"])

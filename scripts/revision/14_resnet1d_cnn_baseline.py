@@ -55,6 +55,7 @@ RUNNER_DISPLAY_NAME = "ResNet1D/CNN"
 ARCHITECTURE_NAME = "resnet1d_cnn_basicblock"
 MODEL_NAME = "resnet1d_cnn_raw_baseline"
 CHECKPOINT_STEM = "resnet1d_cnn"
+RUNNER_SOURCE_PATH = Path(__file__).resolve()
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 PREDICTION_PATH = PREDICTION_DIR / "resnet1d_cnn_oof_predictions.npz"
@@ -76,6 +77,73 @@ def save_torch_atomic(path: Path, payload: dict) -> None:
     finally:
         if temporary.exists():
             temporary.unlink()
+
+
+def build_checkpoint_contract(args: argparse.Namespace) -> dict:
+    rows = []
+    missing = []
+    for fold in range(1, 6):
+        path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
+        if not path.exists() or path.stat().st_size == 0:
+            missing.append(fold)
+            continue
+        rows.append(
+            {
+                "fold": fold,
+                "path": _project_relative(path),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return {
+        "status": "complete" if not missing and len(rows) == 5 else "partial",
+        "checkpoint_stem": CHECKPOINT_STEM,
+        "expected_folds": [1, 2, 3, 4, 5],
+        "missing_folds": missing,
+        "checkpoints": rows,
+    }
+
+
+def require_complete_checkpoint_contract(checkpoint_contract: dict) -> list[dict]:
+    """Return ordered checkpoint rows or fail before publishing canonical evidence."""
+    rows = sorted(
+        [row for row in checkpoint_contract.get("checkpoints", []) if isinstance(row, dict)],
+        key=lambda row: int(row.get("fold", -1)),
+    )
+    folds = [int(row.get("fold", -1)) for row in rows]
+    hashes = [str(row.get("sha256", "")) for row in rows]
+    if (
+        checkpoint_contract.get("status") != "complete"
+        or folds != [1, 2, 3, 4, 5]
+        or any(len(value) != 64 for value in hashes)
+    ):
+        raise RuntimeError(
+            f"{RUNNER_DISPLAY_NAME} canonical predictions require five exact saved checkpoints; "
+            f"missing_folds={checkpoint_contract.get('missing_folds', [])}. "
+            "Use --save-checkpoints for training or restore the checkpoint directory before reuse."
+        )
+    return rows
+
+
+def checkpoint_contract_metadata(checkpoint_contract: dict) -> dict:
+    rows = require_complete_checkpoint_contract(checkpoint_contract)
+    return {
+        "checkpoint_folds": np.asarray([int(row["fold"]) for row in rows], dtype=np.int16),
+        "checkpoint_sha256": np.asarray([str(row["sha256"]) for row in rows]),
+    }
+
+
+def prediction_checkpoint_contract_matches(data, checkpoint_contract: dict) -> bool:
+    expected = checkpoint_contract_metadata(checkpoint_contract)
+    required = set(expected)
+    if not required.issubset(data.files):
+        print(
+            f"Existing {RUNNER_DISPLAY_NAME} artifact rejected: missing checkpoint provenance "
+            f"{sorted(required - set(data.files))}",
+            flush=True,
+        )
+        return False
+    return all(np.array_equal(np.asarray(data[key]), value) for key, value in expected.items())
 
 
 def parse_args() -> argparse.Namespace:
@@ -116,7 +184,12 @@ def parse_args() -> argparse.Namespace:
             "Subset mode writes fold caches/checkpoints and exits before OOF aggregation/CI."
         ),
     )
-    parser.add_argument("--save-checkpoints", action="store_true")
+    parser.add_argument(
+        "--save-checkpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Persist exact fold checkpoints (default: enabled; required for reusable reviewer evidence).",
+    )
     parser.add_argument(
         "--reuse-checkpoints",
         action="store_true",
@@ -128,6 +201,15 @@ def parse_args() -> argparse.Namespace:
         help="Allow trusted older checkpoints that predate model_params metadata after protocol/fold/CLI checks.",
     )
     parser.add_argument("--checkpoint-dir", type=Path, default=PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints")
+    parser.add_argument(
+        "--fold-cache-dir",
+        type=Path,
+        default=FOLD_PREDICTION_DIR,
+        help=(
+            "Directory for resumable per-fold prediction caches. Point this to the "
+            "canonical Drive mirror so completed folds survive Colab disconnects."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -168,7 +250,13 @@ def parse_only_folds(value: str) -> set[int]:
 
 
 def _project_relative(path: Path) -> str:
-    return _resolve_project_path(path).relative_to(PROJECT_ROOT.resolve()).as_posix()
+    resolved = _resolve_project_path(path)
+    try:
+        return resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        # Durable Colab checkpoints intentionally live in the canonical Drive
+        # mirror outside the ephemeral /content/ECG-RAMBA clone.
+        return resolved.as_posix()
 
 
 def _json_safe(value):
@@ -683,17 +771,28 @@ def fold_prediction_path(fold: int) -> Path:
 def fold_prediction_matches(
     path: Path,
     *,
+    checkpoint_path: Path,
     y: np.ndarray,
     val_indices: np.ndarray,
     load_info: dict,
     args: argparse.Namespace,
     model_params: dict,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    if not path.exists():
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    if not path.exists() or not checkpoint_path.exists():
         return None
+    expected_checkpoint_sha256 = sha256_file(checkpoint_path)
     try:
         with np.load(path, allow_pickle=False) as data:
-            required = {"fold", "val_indices", "y_prob", "slice_count", "slice_prob", "slice_record_id", "slice_start"}
+            required = {
+                "fold",
+                "val_indices",
+                "y_prob",
+                "slice_count",
+                "slice_prob",
+                "slice_record_id",
+                "slice_start",
+                "checkpoint_sha256",
+            }
             missing = required - set(data.files)
             if missing:
                 print(f"Fold cache rejected {path}: missing {sorted(missing)}", flush=True)
@@ -704,7 +803,12 @@ def fold_prediction_matches(
                 return None
             if str(npz_scalar(data, "raw_cache_sha256", "")) != load_info["raw_cache_sha256"]:
                 return None
+            if str(npz_scalar(data, "checkpoint_sha256", "")) != expected_checkpoint_sha256:
+                print(f"Fold cache rejected {path}: checkpoint SHA mismatch", flush=True)
+                return None
             if int(npz_scalar(data, "epochs", -1)) != int(args.epochs):
+                return None
+            if int(npz_scalar(data, "seed", -1)) != int(args.seed):
                 return None
             expected_model_params = json.dumps(_json_safe(model_params), sort_keys=True)
             if str(npz_scalar(data, "model_params_json", "")) != expected_model_params:
@@ -753,6 +857,7 @@ def save_fold_predictions(
     slice_prob: np.ndarray,
     slice_record_id: np.ndarray,
     slice_start: np.ndarray,
+    checkpoint_sha256: str,
     load_info: dict,
     args: argparse.Namespace,
     model_params: dict,
@@ -768,6 +873,7 @@ def save_fold_predictions(
         slice_prob=slice_prob.astype(np.float32),
         slice_record_id=slice_record_id.astype(np.int64),
         slice_start=slice_start.astype(np.int32),
+        checkpoint_sha256=np.asarray(checkpoint_sha256),
         oof_predictions_sha256=np.asarray(load_info["oof_predictions_sha256"]),
         raw_cache_sha256=np.asarray(load_info["raw_cache_sha256"]),
         model_params_json=np.asarray(json.dumps(_json_safe(model_params), sort_keys=True)),
@@ -790,9 +896,11 @@ def train_one_fold(
     model_params: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     fold_path = fold_prediction_path(fold)
+    checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
     if not args.force_rerun:
         reusable = fold_prediction_matches(
             fold_path,
+            checkpoint_path=checkpoint_path,
             y=y,
             val_indices=va_idx,
             load_info=load_info,
@@ -810,6 +918,7 @@ def train_one_fold(
                 "train_slices": None,
                 "validation_slices": int(len(slice_record_id)),
                 "reused_fold_predictions": True,
+                "checkpoint_sha256": sha256_file(checkpoint_path),
                 "final_epoch": int(args.epochs),
                 **{f"final_{k}": v for k, v in fold_metrics.items()},
             }
@@ -862,7 +971,6 @@ def train_one_fold(
     )
 
     model = build_model(args).to(device)
-    checkpoint_path = args.checkpoint_dir / f"fold{fold}_{CHECKPOINT_STEM}_final.pt"
     reused_checkpoint = False
     epoch_rows = []
     if args.reuse_checkpoints and not args.force_rerun and checkpoint_path.exists():
@@ -906,6 +1014,10 @@ def train_one_fold(
             for key in ("epochs", "base_channels", "dropout", "lr", "weight_decay"):
                 if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
                     raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+        saved_args = payload.get("args") or {}
+        for key in ("seed", "amp", "allow_tf32"):
+            if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
+                raise ValueError(f"Checkpoint runtime/training argument mismatch for {key}: {checkpoint_path}")
         model.load_state_dict(payload["model_state_dict"], strict=True)
         model.to(device).eval()
         reused_checkpoint = True
@@ -1009,6 +1121,13 @@ def train_one_fold(
         )
         print(f"Wrote fold checkpoint: {checkpoint_path}", flush=True)
 
+    if not checkpoint_path.exists() or checkpoint_path.stat().st_size == 0:
+        raise RuntimeError(
+            f"Fold {fold} has predictions but no durable checkpoint. "
+            "Rerun without --no-save-checkpoints before publishing reviewer evidence."
+        )
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+
     save_fold_predictions(
         fold_path,
         fold=fold,
@@ -1018,6 +1137,7 @@ def train_one_fold(
         slice_prob=slice_prob,
         slice_record_id=slice_record_id,
         slice_start=slice_start,
+        checkpoint_sha256=checkpoint_sha256,
         load_info=load_info,
         args=args,
         model_params=model_params,
@@ -1031,6 +1151,7 @@ def train_one_fold(
         "validation_slices": int(len(val_record_ids)),
         "reused_fold_predictions": False,
         "reused_checkpoint": bool(reused_checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
         "final_epoch": int(args.epochs),
         "epoch_rows_json": json.dumps(_json_safe(epoch_rows), sort_keys=True),
         **{f"final_{k}": v for k, v in final_metrics.items()},
@@ -1043,6 +1164,7 @@ def _prediction_metadata(
     args: argparse.Namespace,
     load_info: dict,
     model_params: dict,
+    checkpoint_contract: dict,
 ) -> dict:
     return {
         "dataset": np.asarray("chapman_oof"),
@@ -1065,6 +1187,7 @@ def _prediction_metadata(
         "dataset_record_order_fingerprint": np.asarray(
             load_info.get("dataset_record_order_fingerprint", "")
         ),
+        **checkpoint_contract_metadata(checkpoint_contract),
     }
 
 
@@ -1080,6 +1203,7 @@ def write_prediction_npz(
     args: argparse.Namespace,
     load_info: dict,
     model_params: dict,
+    checkpoint_contract: dict,
 ) -> None:
     print(f"Writing {RUNNER_DISPLAY_NAME} predictions: {path}", flush=True)
     save_npz_compressed_atomic(
@@ -1094,6 +1218,7 @@ def write_prediction_npz(
             args=args,
             load_info=load_info,
             model_params=model_params,
+            checkpoint_contract=checkpoint_contract,
         ),
     )
 
@@ -1109,6 +1234,7 @@ def write_slice_prediction_npz(
     args: argparse.Namespace,
     load_info: dict,
     model_params: dict,
+    checkpoint_contract: dict,
 ) -> None:
     print(f"Writing {RUNNER_DISPLAY_NAME} slice predictions: {path}", flush=True)
     save_npz_compressed_atomic(
@@ -1122,6 +1248,7 @@ def write_slice_prediction_npz(
             args=args,
             load_info=load_info,
             model_params=model_params,
+            checkpoint_contract=checkpoint_contract,
         ),
     )
 
@@ -1136,6 +1263,7 @@ def load_existing_prediction_npz(
     args: argparse.Namespace,
     load_info: dict,
     model_params: dict,
+    checkpoint_contract: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
     if not path.exists():
         return None
@@ -1159,6 +1287,8 @@ def load_existing_prediction_npz(
             if str(npz_scalar(data, "oof_predictions_sha256", "")) != load_info["oof_predictions_sha256"]:
                 return None
             if str(npz_scalar(data, "raw_cache_sha256", "")) != load_info["raw_cache_sha256"]:
+                return None
+            if not prediction_checkpoint_contract_matches(data, checkpoint_contract):
                 return None
             y_existing = np.asarray(data["y_true"], dtype=np.float32)
             record_existing = np.asarray(data["record_id"], dtype=np.int64)
@@ -1202,6 +1332,8 @@ def load_existing_prediction_npz(
             if str(npz_scalar(slice_data, "oof_predictions_sha256", "")) != load_info["oof_predictions_sha256"]:
                 return None
             if str(npz_scalar(slice_data, "raw_cache_sha256", "")) != load_info["raw_cache_sha256"]:
+                return None
+            if not prediction_checkpoint_contract_matches(slice_data, checkpoint_contract):
                 return None
             slice_prob = np.asarray(slice_data["slice_prob"], dtype=np.float32)
             slice_record_id = np.asarray(slice_data["slice_record_id"], dtype=np.int64)
@@ -1267,7 +1399,21 @@ def per_class_rows(y_true: np.ndarray, y_prob: np.ndarray, class_names: list[str
 
 
 def main() -> None:
+    global FOLD_PREDICTION_DIR
     args = parse_args()
+    FOLD_PREDICTION_DIR = (
+        args.fold_cache_dir
+        if args.fold_cache_dir.is_absolute()
+        else PROJECT_ROOT / args.fold_cache_dir
+    ).resolve()
+    FOLD_PREDICTION_DIR.mkdir(parents=True, exist_ok=True)
+    args.checkpoint_dir = (
+        args.checkpoint_dir
+        if args.checkpoint_dir.is_absolute()
+        else PROJECT_ROOT / args.checkpoint_dir
+    ).resolve()
+    if args.save_checkpoints or args.reuse_checkpoints:
+        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ensure_revision_dirs()
     set_seed(args.seed)
     if args.allow_tf32 and torch.cuda.is_available():
@@ -1355,8 +1501,24 @@ def main() -> None:
         "uses_ecg_ramba_checkpoints": False,
     }
     model_params = extend_model_params(args, model_params)
+    checkpoint_contract = build_checkpoint_contract(args)
+    if (
+        not selected_folds
+        and int(args.limit_records) == 0
+        and checkpoint_contract.get("status") != "complete"
+        and not args.save_checkpoints
+    ):
+        raise RuntimeError(
+            f"{RUNNER_DISPLAY_NAME} canonical run has no complete checkpoint contract. "
+            "Restore the five checkpoints or rerun with --save-checkpoints."
+        )
 
-    if args.reuse_predictions and not args.force_rerun and not selected_folds:
+    if (
+        args.reuse_predictions
+        and not args.force_rerun
+        and not selected_folds
+        and checkpoint_contract.get("status") == "complete"
+    ):
         reusable = load_existing_prediction_npz(
             PREDICTION_PATH,
             y=y,
@@ -1366,6 +1528,7 @@ def main() -> None:
             args=args,
             load_info=load_info,
             model_params=model_params,
+            checkpoint_contract=checkpoint_contract,
         )
     else:
         reusable = None
@@ -1386,6 +1549,11 @@ def main() -> None:
                     "train_slices": None,
                     "validation_slices": int(np.sum(slice_count[va_idx])),
                     "reused_fold_predictions": True,
+                    "checkpoint_sha256": next(
+                        row["sha256"]
+                        for row in checkpoint_contract["checkpoints"]
+                        if int(row["fold"]) == int(fold)
+                    ),
                     "final_epoch": int(args.epochs),
                     **{f"final_{k}": v for k, v in fold_metrics.items()},
                 }
@@ -1453,6 +1621,8 @@ def main() -> None:
             raise RuntimeError(f"OOF fold_id coverage incomplete after {RUNNER_DISPLAY_NAME} training.")
         if np.any(slice_count <= 0):
             raise RuntimeError(f"Some records have no {RUNNER_DISPLAY_NAME} slice predictions.")
+        checkpoint_contract = build_checkpoint_contract(args)
+        require_complete_checkpoint_contract(checkpoint_contract)
         write_prediction_npz(
             PREDICTION_PATH,
             y=y,
@@ -1464,6 +1634,7 @@ def main() -> None:
             args=args,
             load_info=load_info,
             model_params=model_params,
+            checkpoint_contract=checkpoint_contract,
         )
         if all_slice_prob:
             write_slice_prediction_npz(
@@ -1476,6 +1647,7 @@ def main() -> None:
                 args=args,
                 load_info=load_info,
                 model_params=model_params,
+                checkpoint_contract=checkpoint_contract,
             )
 
     print("Computing point metrics...", flush=True)
@@ -1510,6 +1682,7 @@ def main() -> None:
 
     _save_csv(PER_CLASS_TABLE, per_class_rows(y, y_prob, class_names, args.threshold))
     _save_csv(FOLD_TABLE, fold_rows)
+    require_complete_checkpoint_contract(checkpoint_contract)
 
     summary = {
         "created_utc": _now_utc(),
@@ -1528,6 +1701,7 @@ def main() -> None:
         "calibration": calibration,
         "bootstrap_ci": ci,
         "load_info": load_info,
+        "checkpoint_contract": checkpoint_contract,
         "artifacts": {
             "predictions_npz": str(PREDICTION_PATH),
             "slice_predictions_npz": str(SLICE_PREDICTION_PATH) if SLICE_PREDICTION_PATH.exists() else None,
@@ -1554,6 +1728,8 @@ def main() -> None:
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "model_params": model_params,
+        "checkpoint_contract": checkpoint_contract,
+        "runner_sha256": sha256_file(RUNNER_SOURCE_PATH),
         "artifacts": summary["artifacts"],
         "artifact_sha256": artifact_sha256,
     }
