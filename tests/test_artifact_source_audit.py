@@ -178,6 +178,26 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("_restore_verified_revision_artifact_05", sources["05_hrv_domain_and_robustness.ipynb"])
         self.assertIn("verify_active_final_inputs_against_mirror", sources["07_results_freeze.ipynb"])
 
+    def test_notebook02_direct_run_locks_current_oof_and_external_contracts(self):
+        notebook_path = (
+            Path(__file__).resolve().parents[1]
+            / "notebooks"
+            / "02_predictions_and_external_eval.ipynb"
+        )
+        notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook.get("cells", [])
+        )
+
+        self.assertIn("--check-existing-freeze", source)
+        self.assertNotIn("--check-only", source)
+        self.assertIn("metric_implementation_sha256", source)
+        self.assertIn("positive_label_multilabel_reduction", source)
+        self.assertIn("EXTERNAL_GATE_DATASETS = 'ptbxl,georgia,cpsc2021'", source)
+        self.assertIn("EXTERNAL_GATE_STRICT = True", source)
+        self.assertIn("RUN_LEGACY_ROW_SPLIT_SCORE_CALIBRATION = False", source)
+        self.assertIn("revision_artifacts' / 'reports' / 'revision", source)
+
     def test_classifies_identical_unique_and_conflicting_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
