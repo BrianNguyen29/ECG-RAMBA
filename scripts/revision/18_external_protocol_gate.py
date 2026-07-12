@@ -48,6 +48,7 @@ from scripts.revision.common import (  # noqa: E402
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
 GATE_SCHEMA_VERSION = 4
+METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
 EXPECTED_EXTERNAL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
@@ -197,6 +198,7 @@ def gate_cache_key(
         "n_bins": int(args.n_bins),
         "n_boot": int(args.n_boot),
         "seed": int(args.seed),
+        "metric_implementation_sha256": sha256_file(METRIC_IMPLEMENTATION_PATH),
         "external_root": project_relative(args.external_root),
         "oof_run_manifest": artifact(args.oof_run_manifest),
         "source_artifacts": {name: artifact(path) for name, path in sorted(required_paths.items())},
@@ -834,6 +836,8 @@ def validate_dataset(
             "expected_class_names": list(EXPECTED_CLASS_NAMES[dataset]),
             "aggregation": {"method": "power_mean", "q": float(CONFIG["power_mean_q"])},
             "bootstrap_unit": "patient/source-record group",
+            "metric_implementation": artifact(METRIC_IMPLEMENTATION_PATH),
+            "single_label_metric_semantics": "positive_label_multilabel_reduction",
             "group_unit": group_unit,
             "threshold": args.threshold,
             "n_bins": args.n_bins,

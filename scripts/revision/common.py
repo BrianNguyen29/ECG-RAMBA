@@ -305,11 +305,26 @@ def multilabel_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float 
         if tn + fn > 0:
             npv_scores.append(tn / (tn + fn))
 
+    if y_true.shape[1] == 1:
+        # sklearn treats an (N, 1) target as binary rather than multilabel-indicator.
+        # Flatten explicitly so a one-label mapped task retains positive-label
+        # multilabel semantics instead of averaging the negative and positive classes.
+        yt_metric = y_true[:, 0]
+        yp_metric = y_pred[:, 0]
+        f1_macro = f1_micro = f1_score(yt_metric, yp_metric, average="binary", zero_division=0)
+        precision_macro = precision_score(yt_metric, yp_metric, average="binary", zero_division=0)
+        recall_macro = recall_score(yt_metric, yp_metric, average="binary", zero_division=0)
+    else:
+        f1_macro = f1_score(y_true, y_pred, average="macro", zero_division=0)
+        f1_micro = f1_score(y_true, y_pred, average="micro", zero_division=0)
+        precision_macro = precision_score(y_true, y_pred, average="macro", zero_division=0)
+        recall_macro = recall_score(y_true, y_pred, average="macro", zero_division=0)
+
     return {
-        "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
-        "f1_micro": float(f1_score(y_true, y_pred, average="micro", zero_division=0)),
-        "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
-        "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
+        "f1_macro": float(f1_macro),
+        "f1_micro": float(f1_micro),
+        "precision_macro": float(precision_macro),
+        "recall_macro": float(recall_macro),
         "sensitivity_macro": float(np.mean(sensitivity_scores)) if sensitivity_scores else math.nan,
         "specificity_macro": float(np.mean(specificity_scores)) if specificity_scores else math.nan,
         "ppv_macro": float(np.mean(ppv_scores)) if ppv_scores else math.nan,
