@@ -22,6 +22,65 @@ generate_predictions = importlib.import_module("scripts.revision.01_generate_pre
 
 
 class RevisionArtifactContractTests(unittest.TestCase):
+    def test_existing_freeze_validation_authenticates_core_artifacts(self):
+        with tempfile.TemporaryDirectory(dir=freeze_oof.PROJECT_ROOT) as tmp:
+            root = Path(tmp)
+            paths = {
+                name: root / name
+                for name in (
+                    "record.npz",
+                    "slice.npz",
+                    "summary.json",
+                    "class.csv",
+                    "run_manifest.json",
+                )
+            }
+            for name, path in paths.items():
+                path.write_text(name, encoding="utf-8")
+
+            current = {
+                "status": "frozen",
+                "manuscript_ready": True,
+                "dataset": "oof",
+                "expected_records": 2,
+                "validated_records": 2,
+                "n_classes": 1,
+                "class_names": ["A"],
+                "expected_folds": 1,
+                "fold_counts": {"1": 2},
+                "slice_count": 2,
+                "slice_count_min": 1,
+                "slice_count_max": 1,
+                "aggregation": {"method": "power_mean", "q": 3.0},
+                "source_config_hash": "config",
+                "dataset_record_order_fingerprint": "records",
+                "evaluation_config_hash": "evaluation",
+                "current_evaluation_config_hash": "evaluation",
+                "checkpoint_kind": "final_ema",
+                "checkpoint_fingerprints_match": True,
+                "source_checkpoints": [{"fold": 1, "sha256": "checkpoint"}],
+                "current_checkpoints": [{"fold": 1, "sha256": "checkpoint"}],
+            }
+            frozen = dict(current)
+            frozen["artifacts"] = [freeze_oof.artifact_info(path) for path in paths.values()]
+            freeze_manifest = root / "freeze.json"
+            freeze_manifest.write_text(json.dumps(frozen), encoding="utf-8")
+            args = SimpleNamespace(
+                freeze_manifest=freeze_manifest,
+                record_file=paths["record.npz"],
+                slice_file=paths["slice.npz"],
+                summary_file=paths["summary.json"],
+                class_table=paths["class.csv"],
+                run_manifest=paths["run_manifest.json"],
+            )
+
+            payload = freeze_oof.validate_existing_freeze(args, current)
+            self.assertEqual(payload["checkpoint_kind"], "final_ema")
+
+            paths["record.npz"].write_text("changed", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "does not authenticate"):
+                freeze_oof.validate_existing_freeze(args, current)
+
     def test_freeze_artifact_info_accepts_relative_paths(self):
         with tempfile.TemporaryDirectory(dir=freeze_oof.PROJECT_ROOT) as tmp:
             path = Path(tmp) / "relative_artifact.txt"

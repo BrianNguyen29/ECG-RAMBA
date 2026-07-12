@@ -66,6 +66,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--check-only", action="store_true")
+    parser.add_argument(
+        "--check-existing-freeze",
+        action="store_true",
+        help=(
+            "Validate the current OOF/checkpoint contract against the existing freeze manifest "
+            "without requiring a runtime-local generation log or rewriting the freeze manifest."
+        ),
+    )
     parser.add_argument("--allow-missing-log", action="store_true")
     return parser.parse_args()
 
@@ -131,6 +139,73 @@ def artifact_info(path: Path) -> dict:
         "size_bytes": resolved.stat().st_size,
         "sha256": sha256_file(resolved),
     }
+
+
+def validate_existing_freeze(args: argparse.Namespace, current: dict) -> dict:
+    if not args.freeze_manifest.exists() or args.freeze_manifest.stat().st_size == 0:
+        raise FileNotFoundError(f"Existing freeze manifest is missing: {args.freeze_manifest}")
+    frozen = json.loads(args.freeze_manifest.read_text(encoding="utf-8"))
+    stable_fields = (
+        "status",
+        "manuscript_ready",
+        "dataset",
+        "expected_records",
+        "validated_records",
+        "n_classes",
+        "class_names",
+        "expected_folds",
+        "fold_counts",
+        "slice_count",
+        "slice_count_min",
+        "slice_count_max",
+        "aggregation",
+        "source_config_hash",
+        "dataset_record_order_fingerprint",
+        "evaluation_config_hash",
+        "current_evaluation_config_hash",
+        "checkpoint_kind",
+        "checkpoint_fingerprints_match",
+    )
+    mismatched_fields = [field for field in stable_fields if frozen.get(field) != current.get(field)]
+    if mismatched_fields:
+        raise RuntimeError(
+            "Existing freeze manifest differs from the current OOF contract: "
+            + ", ".join(mismatched_fields)
+        )
+
+    for key in ("source_checkpoints", "current_checkpoints"):
+        frozen_rows = normalize_checkpoint_rows(frozen.get(key) or [])
+        current_rows = normalize_checkpoint_rows(current.get(key) or [])
+        if {
+            fold: row["sha256"] for fold, row in frozen_rows.items()
+        } != {
+            fold: row["sha256"] for fold, row in current_rows.items()
+        }:
+            raise RuntimeError(f"Existing freeze manifest has stale {key} SHA256 evidence")
+
+    frozen_artifacts = {
+        str(row.get("path", "")).replace("\\", "/"): row
+        for row in frozen.get("artifacts", [])
+        if isinstance(row, dict) and row.get("path")
+    }
+    for path in (
+        args.record_file,
+        args.slice_file,
+        args.summary_file,
+        args.class_table,
+        args.run_manifest,
+    ):
+        actual = artifact_info(path)
+        row = frozen_artifacts.get(actual["path"])
+        if (
+            row is None
+            or int(row.get("size_bytes", -1)) != actual["size_bytes"]
+            or row.get("sha256") != actual["sha256"]
+        ):
+            raise RuntimeError(
+                f"Existing freeze manifest does not authenticate current artifact: {actual['path']}"
+            )
+    return frozen
 
 
 def validate_oof(args: argparse.Namespace) -> dict:
@@ -367,6 +442,15 @@ def validate_oof(args: argparse.Namespace) -> dict:
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
+    if args.check_existing_freeze:
+        if args.check_only:
+            raise ValueError("Use only one of --check-only and --check-existing-freeze")
+        args.allow_missing_log = True
+        current = validate_oof(args)
+        payload = validate_existing_freeze(args, current)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(f"Validated without rewrite: {args.freeze_manifest}")
+        return
     payload = validate_oof(args)
     print(json.dumps(payload, indent=2, sort_keys=True))
     if not args.check_only:
