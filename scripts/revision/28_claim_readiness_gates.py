@@ -12,9 +12,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,6 +35,7 @@ from scripts.revision.common import (  # noqa: E402
 
 
 ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v1"
+FEWSHOT_SEEDS = (42, 43, 44, 45, 46)
 ROBUSTNESS_STRESSES = [
     "snr20db",
     "snr10db",
@@ -178,6 +181,7 @@ def manifest_contract_issues(
     expected_status: str | bool | None = None,
     expected_protocol: str | None = None,
     canonical: dict[str, str] | None = None,
+    expected_fields: dict[str, Any] | None = None,
 ) -> list[str]:
     payload = read_json_if_present(path)
     if not payload:
@@ -191,6 +195,9 @@ def manifest_contract_issues(
         issues.append(f"manifest.protocol={payload.get('protocol')!r}")
     if canonical and not contract_matches(payload.get("canonical_contract"), canonical):
         issues.append("manifest.canonical_contract_mismatch")
+    for key, expected in (expected_fields or {}).items():
+        if payload.get(key) != expected:
+            issues.append(f"manifest.{key}={payload.get(key)!r}")
     return issues
 
 
@@ -207,6 +214,31 @@ def manifest_runner_issues(path: Path, runner_name: str) -> list[str]:
     return []
 
 
+def manifest_output_issues(manifest_path: Path, required_outputs: list[Path]) -> list[str]:
+    payload = read_json_if_present(manifest_path)
+    if not payload or payload.get("_read_error"):
+        return []
+    rows = {
+        Path(str(row.get("path", ""))).name: row
+        for row in payload.get("outputs", [])
+        if isinstance(row, dict) and row.get("path")
+    }
+    issues: list[str] = []
+    for expected in required_outputs:
+        actual = resolve(expected)
+        row = rows.get(actual.name)
+        if row is None:
+            issues.append(f"manifest.output_missing={actual.name}")
+            continue
+        if not actual.exists() or actual.stat().st_size == 0:
+            continue
+        if int(row.get("size_bytes", -1)) != actual.stat().st_size:
+            issues.append(f"manifest.output_size_mismatch={actual.name}")
+        if row.get("sha256") != sha256_file(actual):
+            issues.append(f"manifest.output_sha256_mismatch={actual.name}")
+    return issues
+
+
 def read_csv_if_present(path: Path) -> list[dict[str, str]]:
     candidate = resolve(path)
     if not candidate.exists() or candidate.stat().st_size == 0:
@@ -216,6 +248,89 @@ def read_csv_if_present(path: Path) -> list[dict[str, str]]:
             return list(csv.DictReader(handle))
     except (OSError, csv.Error):
         return []
+
+
+def csv_field_issues(path: Path, expected_fields: dict[str, str]) -> list[str]:
+    issues: list[str] = []
+    for row_index, row in enumerate(read_csv_if_present(path)):
+        for key, expected in expected_fields.items():
+            if str(row.get(key, "")) != expected:
+                issues.append(f"row{row_index}.{key}={row.get(key)!r}")
+    return issues
+
+
+def adaptation_grid_issues(path: Path, model_filter: str | None = None) -> list[str]:
+    rows = read_csv_if_present(path)
+    if model_filter is not None:
+        rows = [row for row in rows if str(row.get("model", "")) == model_filter]
+    expected = {
+        (seed, fraction)
+        for seed in FEWSHOT_SEEDS
+        for fraction in (0.0, 0.01, 0.05, 0.10)
+    }
+    observed: list[tuple[int, float]] = []
+    for row in rows:
+        try:
+            observed.append((int(float(row["seed"])), float(row["fraction"])))
+        except (KeyError, TypeError, ValueError):
+            return ["adaptation_grid_contains_invalid_seed_or_fraction"]
+    if len(observed) != len(expected) or set(observed) != expected:
+        return [
+            f"adaptation_grid_mismatch=expected{len(expected)}_observed{len(observed)}_unique{len(set(observed))}"
+        ]
+    return []
+
+
+def primary_endpoint_issues(table_path: Path, manifest_path: Path) -> list[str]:
+    rows = read_csv_if_present(table_path)
+    manifest = read_json_if_present(manifest_path)
+    models = [str(model) for model in manifest.get("models", [])]
+    metrics = {"pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro"}
+    expected_adapted = {(model, metric) for model in models for metric in metrics}
+    expected_paired = {
+        (model, metric) for model in models if model != "full" for metric in metrics
+    }
+    observed_adapted = {
+        (str(row.get("model")), str(row.get("metric")))
+        for row in rows
+        if row.get("comparison_type") == "adapted_vs_zero_target_label"
+    }
+    observed_paired = {
+        (str(row.get("comparator")), str(row.get("metric")))
+        for row in rows
+        if row.get("comparison_type") == "full_vs_comparator_at_primary_fraction"
+    }
+    issues: list[str] = []
+    if not models or models[0] != "full":
+        issues.append("primary_endpoint_manifest_models_missing_full")
+    if observed_adapted != expected_adapted:
+        issues.append("primary_endpoint_adapted_grid_mismatch")
+    if observed_paired != expected_paired:
+        issues.append("primary_endpoint_paired_grid_mismatch")
+    expected_n_boot = int((manifest.get("primary_endpoint_inference") or {}).get("n_boot", -1))
+    for row_index, row in enumerate(rows):
+        try:
+            numeric = {
+                key: float(row.get(key, "nan"))
+                for key in (
+                    "primary_fraction",
+                    "n_seeds",
+                    "n_boot_valid",
+                    "improvement_ci_low",
+                    "improvement_ci_high",
+                )
+            }
+        except (TypeError, ValueError):
+            issues.append(f"primary_endpoint_row{row_index}_non_numeric")
+            continue
+        if (
+            not all(math.isfinite(value) for value in numeric.values())
+            or not math.isclose(numeric["primary_fraction"], 0.10, abs_tol=1e-12)
+            or int(numeric["n_seeds"]) != len(FEWSHOT_SEEDS)
+            or int(numeric["n_boot_valid"]) != expected_n_boot
+        ):
+            issues.append(f"primary_endpoint_row{row_index}_contract_mismatch")
+    return issues
 
 
 def int_or_zero(value) -> int:
@@ -571,6 +686,8 @@ def main() -> None:
         METRIC_DIR / "group_safe_score_calibration_ptbxl_summary.csv",
         TABLE_DIR / "table_group_safe_score_calibration_ptbxl.csv",
         METRIC_DIR / "group_safe_score_calibration_ptbxl_bootstrap.json",
+        MANIFEST_DIR / "group_safe_score_calibration_ptbxl_splits.npz",
+        TABLE_DIR / "table_group_safe_score_calibration_ptbxl_coefficients.csv",
         MANIFEST_DIR / "group_safe_score_calibration_ptbxl_manifest.json",
     ]
     group_safe_calibration_status, group_safe_calibration_missing = complete_if_valid(
@@ -582,16 +699,34 @@ def main() -> None:
             expected_status="complete_group_safe_score_calibration",
             expected_protocol="group_safe_score_calibration_v2_gated_external",
             canonical=canonical,
+            expected_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "primary_fraction": 0.10,
+                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            },
         )
         + manifest_runner_issues(
             group_safe_calibration_required[-1], "33_group_safe_score_calibration.py"
-        ),
+        )
+        + manifest_output_issues(
+            group_safe_calibration_required[-1], group_safe_calibration_required[:-1]
+        )
+        + csv_field_issues(
+            group_safe_calibration_required[0],
+            {
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+            },
+        )
+        + adaptation_grid_issues(group_safe_calibration_required[0]),
     )
 
     true_fewshot_required = [
         METRIC_DIR / "true_fewshot_head_ptbxl_summary.csv",
         TABLE_DIR / "table_true_fewshot_head_ptbxl.csv",
         TABLE_DIR / "table_true_fewshot_head_ptbxl_paired.csv",
+        TABLE_DIR / "table_true_fewshot_head_ptbxl_primary.csv",
         METRIC_DIR / "true_fewshot_head_ptbxl_bootstrap.json",
         TABLE_DIR / "table_true_fewshot_head_ptbxl_coefficients.csv",
         MANIFEST_DIR / "true_fewshot_head_ptbxl_splits.npz",
@@ -606,9 +741,30 @@ def main() -> None:
             expected_status="complete_true_classifier_head_adaptation",
             expected_protocol="frozen_encoder_true_linear_head_adaptation_v2_group_safe_gated",
             canonical=canonical,
+            expected_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "primary_fraction": 0.10,
+                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            },
         )
         + manifest_runner_issues(
             true_fewshot_required[-1], "35_true_fewshot_head_adaptation.py"
+        )
+        + manifest_output_issues(
+            true_fewshot_required[-1], true_fewshot_required[:-1]
+        )
+        + csv_field_issues(
+            true_fewshot_required[0],
+            {
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "representation_pooling": "mean_of_preclassifier_slice_embeddings_per_fold",
+            },
+        )
+        + adaptation_grid_issues(true_fewshot_required[0], model_filter="full")
+        + primary_endpoint_issues(
+            TABLE_DIR / "table_true_fewshot_head_ptbxl_primary.csv",
+            true_fewshot_required[-1],
         ),
     )
 
@@ -753,7 +909,8 @@ def main() -> None:
             missing_artifacts=group_safe_calibration_missing,
             safe_wording=(
                 "If complete, describe this only as group-safe, dataset-specific score calibration of "
-                "frozen predictions. It changes decision scores/threshold behavior, not encoder or classifier weights."
+                "frozen predictions, with 10% pre-specified as the primary target-group budget and 1%/5% as "
+                "sensitivity points. It changes decision scores/threshold behavior, not encoder or classifier weights."
             ),
             blocker=(
                 "PTB-XL group-safe score-calibration artifacts are absent, stale, or fail their protocol contract."
@@ -775,8 +932,9 @@ def main() -> None:
             missing_artifacts=true_fewshot_missing,
             safe_wording=(
                 "If complete, report PTB-XL results as group-safe adaptation of new linear classifier heads on "
-                "frozen Chapman-trained encoders. This is parameter adaptation, but not end-to-end fine-tuning "
-                "and not evidence of general few-shot superiority."
+                "mean-pooled record representations from frozen Chapman-trained encoders. Fractions are nested "
+                "fractions of independent target groups and 10% is the pre-specified primary budget. This is "
+                "parameter adaptation, but not end-to-end fine-tuning or general few-shot superiority."
             ),
             blocker=(
                 "No complete group-safe frozen-encoder head-adaptation package is available for PTB-XL."

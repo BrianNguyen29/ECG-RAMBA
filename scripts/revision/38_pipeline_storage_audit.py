@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import json
 import sys
 from dataclasses import asdict, dataclass
@@ -75,6 +76,81 @@ def stress_slots(model: str) -> tuple[tuple[str, str], ...]:
     )
 
 
+EXTERNAL_REPRESENTATION_MODELS = (
+    ("full", "ecg_ramba_full"),
+    ("resnet", "resnet1d_cnn"),
+    ("raw_mamba", "raw_mamba"),
+)
+FEWSHOT_SEEDS = (42, 43, 44, 45, 46)
+FEWSHOT_FRACTION_TAGS = ("0", "0p01", "0p05", "0p1")
+FEWSHOT_METRICS = ("pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro")
+
+
+def external_representation_slots(tag: str) -> tuple[tuple[str, str], ...]:
+    prefix = f"_{tag}" if tag else ""
+    return tuple(
+        (
+            f"{model}_fold{fold}",
+            "predictions/external_representation_folds/"
+            f"ptbxl{prefix}_{stem}_fold{fold}_record_embeddings.npz",
+        )
+        for model, stem in EXTERNAL_REPRESENTATION_MODELS
+        for fold in range(1, 6)
+    )
+
+
+def true_fewshot_prediction_slots(extension: str) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            f"{model}_seed{seed}_frac{fraction}",
+            "predictions/fewshot_head_adaptation_cache/ptbxl/"
+            f"{model}_seed{seed}_frac{fraction}_*.{extension}",
+        )
+        for model, _stem in EXTERNAL_REPRESENTATION_MODELS
+        for seed in FEWSHOT_SEEDS
+        for fraction in FEWSHOT_FRACTION_TAGS
+    )
+
+
+def true_fewshot_metric_slots() -> tuple[tuple[str, str], ...]:
+    adaptation = tuple(
+        (
+            f"{model}_seed{seed}_frac{fraction}_{metric}",
+            "metrics/true_fewshot_head_metric_cache/ptbxl/"
+            f"{model}_seed{seed}_frac{fraction}_{metric}_*.json",
+        )
+        for model, _stem in EXTERNAL_REPRESENTATION_MODELS
+        for seed in FEWSHOT_SEEDS
+        for fraction in FEWSHOT_FRACTION_TAGS
+        for metric in FEWSHOT_METRICS
+    )
+    paired = tuple(
+        (
+            f"full_vs_{model}_seed{seed}_frac{fraction}_{metric}",
+            "metrics/true_fewshot_head_metric_cache/ptbxl/"
+            f"full_vs_{model}_seed{seed}_frac{fraction}_{metric}_*.json",
+        )
+        for model in ("resnet", "raw_mamba")
+        for seed in FEWSHOT_SEEDS
+        for fraction in FEWSHOT_FRACTION_TAGS
+        for metric in FEWSHOT_METRICS
+    )
+    return adaptation + paired
+
+
+def group_safe_calibration_metric_slots() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (
+            f"seed{seed}_frac{fraction}_{metric}",
+            "metrics/group_safe_score_calibration_metric_cache/ptbxl/"
+            f"seed{seed}_frac{fraction}_{metric}_*.json",
+        )
+        for seed in FEWSHOT_SEEDS
+        for fraction in FEWSHOT_FRACTION_TAGS
+        for metric in FEWSHOT_METRICS
+    )
+
+
 STAGES = (
     (
         "oof_fold_cache",
@@ -110,6 +186,48 @@ STAGES = (
         "representation_fold_cache",
         "predictions/folds/representation_final_ema_fold{fold}_*.npz",
         fold_slots("predictions/folds/representation_final_ema_fold{fold}_*.npz"),
+        True,
+    ),
+    (
+        "external_ptbxl_test_representation_fold_cache",
+        "PTB-XL fold-10 source-bound record representations (3 models x 5 folds)",
+        external_representation_slots(""),
+        True,
+    ),
+    (
+        "external_ptbxl_fold9_representation_fold_cache",
+        "PTB-XL fold-9 source-bound record representations (3 models x 5 folds)",
+        external_representation_slots("fold9"),
+        True,
+    ),
+    (
+        "external_ptbxl_archive_hash_cache",
+        "source-bound PTB-XL archive SHA256 sidecar",
+        (("ptbxl", "predictions/external_representation_folds/ptbxl_archive_*_sha256.json"),),
+        True,
+    ),
+    (
+        "group_safe_score_calibration_metric_cache",
+        "PTB-XL group-safe calibration bootstrap cache (5 seeds x 4 budgets x 5 metrics)",
+        group_safe_calibration_metric_slots(),
+        True,
+    ),
+    (
+        "true_fewshot_prediction_cache",
+        "PTB-XL true-head prediction cache (3 models x 5 seeds x 4 budgets)",
+        true_fewshot_prediction_slots("npz"),
+        True,
+    ),
+    (
+        "true_fewshot_coefficient_cache",
+        "PTB-XL true-head coefficient sidecars (3 models x 5 seeds x 4 budgets)",
+        true_fewshot_prediction_slots("coefficients.json"),
+        True,
+    ),
+    (
+        "true_fewshot_metric_cache",
+        "PTB-XL true-head group-bootstrap cache (adapted and paired metrics)",
+        true_fewshot_metric_slots(),
         True,
     ),
     (
@@ -240,19 +358,24 @@ def write_csv(path: Path, rows: list[StageStatus]) -> None:
 
 def audit_stages(root: Path, manifest_rows: dict[str, dict]) -> list[StageStatus]:
     stage_rows: list[StageStatus] = []
+    available_files = {
+        path.relative_to(root).as_posix(): path
+        for path in root.rglob("*")
+        if path.is_file() and path.stat().st_size > 0
+    }
     for stage, pattern, slots, required in STAGES:
         found_labels: list[str] = []
         covered_labels: list[str] = []
         for label, slot_pattern in slots:
             candidates = sorted(
-                path
-                for path in root.glob(slot_pattern)
-                if path.is_file() and path.stat().st_size > 0
+                relative
+                for relative in available_files
+                if fnmatch.fnmatchcase(relative, slot_pattern)
             )
             if not candidates:
                 continue
             found_labels.append(label)
-            if any(path.relative_to(root).as_posix() in manifest_rows for path in candidates):
+            if any(relative in manifest_rows for relative in candidates):
                 covered_labels.append(label)
         expected_labels = [label for label, _ in slots]
         missing_labels = [label for label in expected_labels if label not in found_labels]

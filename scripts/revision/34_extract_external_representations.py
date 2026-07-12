@@ -32,16 +32,19 @@ from configs.config import CONFIG, PATHS  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
     EXPERIMENTAL_DIR,
     MANIFEST_DIR,
+    METRIC_DIR,
     PREDICTION_DIR,
     git_commit,
     save_json,
+    save_json_atomic,
     save_npz_compressed_atomic,
     sha256_file,
 )
 from src.training_data import build_slice_index  # noqa: E402
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
+REPRESENTATION_PROTOCOL = "frozen_encoder_external_record_representation_v2_source_bound"
 MODEL_STEMS = {
     "full": "ecg_ramba_full",
     "resnet": "resnet1d_cnn",
@@ -176,6 +179,18 @@ def source_prediction_path(args: argparse.Namespace, model: str) -> Path:
     return root / f"{args.dataset}_{MODEL_STEMS[model]}{suffix}_predictions.npz"
 
 
+def source_manifest_path(args: argparse.Namespace, model: str) -> Path:
+    tag = tag_for(args)
+    suffix = f"_{tag}" if tag else ""
+    if model == "full":
+        return (
+            resolve(args.external_root)
+            / args.dataset
+            / f"{args.dataset}_full{suffix}_prediction_run_manifest.json"
+        )
+    return MANIFEST_DIR / f"external_{args.dataset}_{MODEL_STEMS[model]}{suffix}_manifest.json"
+
+
 def load_source_contract(args: argparse.Namespace, model: str) -> dict[str, Any]:
     path = source_prediction_path(args, model)
     if not path.exists():
@@ -198,13 +213,136 @@ def load_source_contract(args: argparse.Namespace, model: str) -> dict[str, Any]
     return payload
 
 
-def input_fingerprint(contract: dict[str, Any]) -> str:
+def input_fingerprint(contract: dict[str, Any], source_provenance: dict[str, Any]) -> str:
     digest = hashlib.sha256()
     for key in ("record_id", "group_id", "split_id"):
         digest.update("\n".join(contract[key]).encode())
         digest.update(b"\0")
     digest.update(np.ascontiguousarray(contract["y_true"]).tobytes())
+    digest.update("\n".join(contract["class_names"]).encode())
+    digest.update(contract["sha256"].encode())
+    digest.update(json.dumps(source_provenance, sort_keys=True).encode())
+    digest.update(str(PROTOCOL_VERSION).encode())
     return digest.hexdigest()
+
+
+def current_archive_contract(args: argparse.Namespace) -> dict[str, Any]:
+    archive = external.archive_path(args.dataset)
+    contract = {
+        "path": str(archive),
+        "name": archive.name,
+        "size_bytes": int(archive.stat().st_size),
+        "fingerprint": external.file_fingerprint(archive),
+    }
+    hash_cache = resolve(args.fold_cache_dir) / (
+        f"{args.dataset}_archive_{contract['fingerprint']}_sha256.json"
+    )
+    archive_sha = ""
+    if hash_cache.exists() and hash_cache.stat().st_size > 0:
+        try:
+            cached = json.loads(hash_cache.read_text(encoding="utf-8"))
+            if all(cached.get(key) == contract[key] for key in ("name", "size_bytes", "fingerprint")):
+                candidate = str(cached.get("sha256") or "")
+                if len(candidate) == 64:
+                    archive_sha = candidate
+                    print(f"Reusing dataset archive SHA256 cache: {hash_cache}", flush=True)
+        except (OSError, json.JSONDecodeError):
+            archive_sha = ""
+    if not archive_sha:
+        print(f"Hashing dataset archive once for source-bound representations: {archive}", flush=True)
+        archive_sha = sha256_file(archive)
+        hash_cache.parent.mkdir(parents=True, exist_ok=True)
+        save_json_atomic(hash_cache, {**contract, "sha256": archive_sha})
+        print(f"Wrote dataset archive SHA256 cache: {hash_cache}", flush=True)
+    return {**contract, "sha256": archive_sha}
+
+
+def validate_source_provenance(
+    args: argparse.Namespace,
+    model: str,
+    source: dict[str, Any],
+    archive_contract: dict[str, Any],
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    manifest_path = source_manifest_path(args, model)
+    if not manifest_path.exists() or manifest_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing external source manifest for {model}: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest_sha = sha256_file(manifest_path)
+    if str(manifest.get("dataset")) != args.dataset:
+        raise RuntimeError(f"{model}: external source manifest dataset mismatch")
+
+    if model == "full":
+        outputs = manifest.get("outputs") or {}
+        prediction_row = outputs.get(source["path"].name) or {}
+        manifest_archive = manifest.get("archive") or {}
+        external_runner = PROJECT_ROOT / "scripts" / "revision" / "03_generate_external_predictions.py"
+        if (
+            prediction_row.get("sha256") != source["sha256"]
+            or manifest.get("runner_sha256") != sha256_file(external_runner)
+            or manifest.get("canonical_contract") != canonical
+        ):
+            raise RuntimeError(
+                f"{model}: source prediction is not authenticated by the current runner/canonical contract"
+            )
+        if (
+            int(manifest_archive.get("size_bytes", -1)) != archive_contract["size_bytes"]
+            or manifest_archive.get("fingerprint") != archive_contract["fingerprint"]
+        ):
+            raise RuntimeError(
+                "Full external source archive differs from the archive recorded by the prediction manifest. "
+                "Do not mix a cached prediction with signals reloaded from another archive."
+            )
+        gate_contract = None
+        if not tag_for(args):
+            gate_path = METRIC_DIR / f"external_{args.dataset}_protocol_gate.json"
+            if not gate_path.exists() or gate_path.stat().st_size == 0:
+                raise FileNotFoundError(f"Missing passed external protocol gate: {gate_path}")
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            artifacts = gate.get("artifacts") or {}
+            if (
+                int(gate.get("gate_schema_version", 0)) < 4
+                or gate.get("protocol_gate_passed") is not True
+                or gate.get("manuscript_ready") is not True
+                or ((artifacts.get("prediction") or {}).get("sha256") != source["sha256"])
+                or ((artifacts.get("manifest") or {}).get("sha256") != manifest_sha)
+            ):
+                raise RuntimeError(f"External protocol gate is stale for {args.dataset}: {gate_path}")
+            gate_contract = {
+                "schema_version": int(gate.get("gate_schema_version", 0)),
+                "prediction_sha256": (artifacts.get("prediction") or {}).get("sha256"),
+                "prediction_manifest_sha256": (artifacts.get("manifest") or {}).get("sha256"),
+            }
+        return {
+            "kind": "full_external_prediction_run_manifest",
+            "manifest_sha256": manifest_sha,
+            "archive": archive_contract,
+            "runner_sha256": manifest.get("runner_sha256"),
+            "canonical_contract": manifest.get("canonical_contract"),
+            "protocol_gate": gate_contract,
+        }
+
+    artifacts = manifest.get("artifacts") or {}
+    source_contract = manifest.get("source_contract") or {}
+    archive_row = manifest.get("archive") or {}
+    comparator_runner = PROJECT_ROOT / "scripts" / "revision" / "31_generate_external_comparator_predictions.py"
+    external_loader = PROJECT_ROOT / "scripts" / "revision" / "03_generate_external_predictions.py"
+    if (
+        manifest.get("status") != "complete_experimental_requires_external_comparator_gate"
+        or manifest.get("canonical_contract") != canonical
+        or ((artifacts.get("predictions") or {}).get("sha256") != source["sha256"])
+        or source_contract.get("archive_sha256") != archive_contract["sha256"]
+        or archive_row.get("sha256") != archive_contract["sha256"]
+        or source_contract.get("runner_sha256") != sha256_file(comparator_runner)
+        or source_contract.get("external_loader_sha256") != sha256_file(external_loader)
+    ):
+        raise RuntimeError(f"{model}: external comparator source manifest is stale or incomplete")
+    return {
+        "kind": "learned_comparator_external_manifest",
+        "manifest_sha256": manifest_sha,
+        "archive": archive_contract,
+        "source_contract": source_contract,
+    }
 
 
 def loader_args(args: argparse.Namespace) -> SimpleNamespace:
@@ -272,11 +410,12 @@ def final_output_matches(
         checkpoint_rows = manifest.get("checkpoints") or []
         if (
             manifest.get("status") != "complete"
-            or manifest.get("protocol") != "frozen_encoder_external_record_representation_v1"
+            or manifest.get("protocol") != REPRESENTATION_PROTOCOL
             or manifest.get("runner_sha256") != sha256_file(Path(__file__).resolve())
             or manifest.get("canonical_contract") != canonical
             or manifest.get("input_fingerprint") != fingerprint
             or (manifest.get("source_prediction") or {}).get("sha256") != source["sha256"]
+            or not manifest.get("source_provenance")
             or [row.get("sha256") for row in checkpoint_rows]
             != [sha256_file(path) for path in checkpoints]
             or (manifest.get("output") or {}).get("sha256") != sha256_file(output)
@@ -295,6 +434,7 @@ def final_output_matches(
                 "source_prediction_sha256",
                 "input_fingerprint",
                 "protocol_version",
+                "representation",
             }
             if required - set(data.files):
                 return False
@@ -309,6 +449,8 @@ def final_output_matches(
                 and str(data["source_prediction_sha256"].item()) == source["sha256"]
                 and str(data["input_fingerprint"].item()) == fingerprint
                 and int(data["protocol_version"].item()) == PROTOCOL_VERSION
+                and str(data["representation"].item())
+                == "mean_of_preclassifier_slice_embeddings_per_fold"
                 and np.array_equal(np.asarray(data["y_true"]), source["y_true"])
                 and np.array_equal(np.asarray(data["record_id"]).astype(str), source["record_id"])
                 and np.array_equal(np.asarray(data["group_id"]).astype(str), source["group_id"])
@@ -419,8 +561,10 @@ def main() -> None:
 
     canonical = comparators.canonical_contract(args)
     base_source = load_source_contract(args, "full")
-    fingerprint = input_fingerprint(base_source)
+    archive_contract = current_archive_contract(args)
     source_by_model: dict[str, dict[str, Any]] = {}
+    source_provenance_by_model: dict[str, dict[str, Any]] = {}
+    fingerprint_by_model: dict[str, str] = {}
     checkpoints_by_model: dict[str, list[Path]] = {}
     checkpoint_sources_by_model: dict[str, dict[str, Any]] = {}
     for model_name in models:
@@ -432,6 +576,13 @@ def main() -> None:
             raise RuntimeError(f"{model_name} external source artifact differs from Full")
         if model_name != "full":
             comparators.validate_in_domain_comparator(model_name, canonical)
+        source_provenance = validate_source_provenance(
+            args,
+            model_name,
+            source,
+            archive_contract,
+            canonical,
+        )
         checkpoints = checkpoint_paths(args, model_name)
         missing = [path for path in checkpoints if not path.exists()]
         if missing:
@@ -452,6 +603,8 @@ def main() -> None:
                 "checkpoint_sha256": hashes,
             }
         source_by_model[model_name] = source
+        source_provenance_by_model[model_name] = source_provenance
+        fingerprint_by_model[model_name] = input_fingerprint(source, source_provenance)
         checkpoints_by_model[model_name] = checkpoints
         checkpoint_sources_by_model[model_name] = checkpoint_source
 
@@ -461,7 +614,7 @@ def main() -> None:
             model_name,
             source_by_model[model_name],
             checkpoints_by_model[model_name],
-            fingerprint,
+            fingerprint_by_model[model_name],
             canonical,
         )
         for model_name in models
@@ -564,6 +717,7 @@ def main() -> None:
     status_rows: list[dict[str, Any]] = []
     for model_name in models:
         source = source_by_model[model_name]
+        fingerprint = fingerprint_by_model[model_name]
         ckpts = checkpoints_by_model[model_name]
         hashes = [sha256_file(path) for path in ckpts]
         folds_now = selected_folds or set(range(1, 6))
@@ -660,13 +814,14 @@ def main() -> None:
                 "git_commit": git_commit(),
                 "dataset": args.dataset,
                 "model": model_name,
-                "protocol": "frozen_encoder_external_record_representation_v1",
+                "protocol": REPRESENTATION_PROTOCOL,
                 "runner_sha256": sha256_file(Path(__file__).resolve()),
                 "canonical_contract": canonical,
                 "representation": "mean_of_preclassifier_slice_embeddings_per_fold",
                 "shape": list(stacked.shape),
                 "input_fingerprint": fingerprint,
                 "source_prediction": {"path": str(source["path"]), "sha256": source["sha256"]},
+                "source_provenance": source_provenance_by_model[model_name],
                 "checkpoints": [
                     {"fold": fold, "path": str(path), "sha256": hashes[fold - 1]}
                     for fold, path in enumerate(ckpts, start=1)

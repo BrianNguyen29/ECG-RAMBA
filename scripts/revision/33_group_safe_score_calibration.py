@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptation-predictions", type=Path, default=None)
     parser.add_argument("--gate-json", type=Path, default=None)
     parser.add_argument("--fractions", default="0,0.01,0.05,0.10")
+    parser.add_argument("--primary-fraction", type=float, default=0.10)
     parser.add_argument("--seeds", default="42,43,44,45,46")
     parser.add_argument("--test-fraction", type=float, default=0.50)
     parser.add_argument("--split-candidates", type=int, default=128)
@@ -87,6 +88,14 @@ def resolve(path: Path) -> Path:
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def budget_role(fraction: float, primary_fraction: float) -> str:
+    if fraction == 0:
+        return "zero_target_label_reference"
+    if np.isclose(fraction, primary_fraction, atol=1e-12):
+        return "pre_specified_primary"
+    return "sensitivity"
 
 
 def canonical_contract() -> dict[str, str]:
@@ -371,6 +380,8 @@ def main() -> None:
     seeds = parse_int_list(args.seeds)
     if not fractions or any(value < 0 or value > 1 for value in fractions):
         raise ValueError(f"Invalid fractions: {fractions}")
+    if not any(np.isclose(value, args.primary_fraction, atol=1e-12) for value in fractions):
+        raise ValueError("--primary-fraction must be included in --fractions")
     if not seeds:
         raise ValueError("At least one seed is required")
     if not 0 < args.test_fraction < 1:
@@ -440,6 +451,9 @@ def main() -> None:
                 "mode": mode,
                 "seed": seed,
                 "fraction": fraction,
+                "budget_role": budget_role(fraction, args.primary_fraction),
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
                 "train_groups": int(len(selected_train_groups)),
                 "train_records_or_windows": int(len(train_idx)),
                 "test_groups": int(len(np.unique(zero_groups))),
@@ -590,11 +604,16 @@ def main() -> None:
             "test_predictions": {"path": str(test["path"]), "sha256": test["sha256"]},
             "adaptation_predictions": {"path": str(adaptation["path"]), "sha256": adaptation["sha256"]},
             "fractions": fractions,
+            "primary_fraction": args.primary_fraction,
+            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "fraction_unit": "independent_target_groups_from_adaptation_pool",
+            "fraction_sampling": "nested_random_group_prefix_per_seed",
             "seeds": seeds,
             "split_audits": split_audits,
             "n_boot": args.n_boot,
             "safe_wording": (
-                "Group-safe target-domain score calibration on frozen predictions; model weights were not fine-tuned."
+                "Group-safe target-domain score calibration on frozen predictions with a pre-specified 10% "
+                "primary target-group budget; model weights were not fine-tuned."
             ),
             "outputs": [
                 {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}

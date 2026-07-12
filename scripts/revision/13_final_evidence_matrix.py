@@ -400,10 +400,86 @@ def summarize_external_adaptation(
     safe_wording: str,
     canonical_contract: dict[str, str],
     runner_name: str,
+    required_manifest_fields: dict[str, Any] | None = None,
+    required_row_fields: dict[str, str] | None = None,
+    model_filter: str | None = None,
+    primary_fraction: float = 0.10,
+    expected_fractions: tuple[float, ...] = (0.0, 0.01, 0.05, 0.10),
+    required_output_paths: tuple[Path, ...] = (),
+    primary_rows: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Summarize only an explicitly versioned, protocol-valid adaptation package."""
+    if model_filter is not None:
+        rows = [row for row in rows if str(row.get("model", "")) == model_filter]
     runner = PROJECT_ROOT / "scripts" / "revision" / runner_name
     runner_sha = sha256_file(runner) if runner.exists() else None
+    observed_fractions = {fnum(row.get("fraction")) for row in rows}
+    expected_seed_set = {int(value) for value in manifest.get("seeds", [])}
+    complete_seed_grid = bool(expected_seed_set) and all(
+        {
+            int(seed_value)
+            for row in rows
+            if math.isclose(fnum(row.get("fraction")), fraction, abs_tol=1e-12)
+            for seed_value in [fnum(row.get("seed"))]
+            if math.isfinite(seed_value)
+        }
+        == expected_seed_set
+        for fraction in expected_fractions
+    )
+    manifest_outputs = {
+        Path(str(row.get("path", ""))).name: row
+        for row in manifest.get("outputs", [])
+        if isinstance(row, dict) and row.get("path")
+    }
+    output_contract_complete = all(
+        path.exists()
+        and path.stat().st_size > 0
+        and (manifest_outputs.get(path.name) or {}).get("size_bytes") == path.stat().st_size
+        and (manifest_outputs.get(path.name) or {}).get("sha256") == sha256_file(path)
+        for path in required_output_paths
+    )
+    expected_metrics = {"pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro"}
+    primary_adapted_rows = [
+        row
+        for row in (primary_rows or [])
+        if row.get("comparison_type") == "adapted_vs_zero_target_label"
+        and (model_filter is None or row.get("model") == model_filter)
+        and math.isclose(fnum(row.get("primary_fraction")), primary_fraction, abs_tol=1e-12)
+    ]
+    expected_comparators = {
+        str(model) for model in manifest.get("models", []) if str(model) != "full"
+    }
+    primary_paired_rows = [
+        row
+        for row in (primary_rows or [])
+        if row.get("comparison_type") == "full_vs_comparator_at_primary_fraction"
+        and math.isclose(fnum(row.get("primary_fraction")), primary_fraction, abs_tol=1e-12)
+    ]
+    primary_contract_complete = primary_rows is None or (
+        {str(row.get("metric")) for row in primary_adapted_rows} == expected_metrics
+        and len(primary_adapted_rows) == len(expected_metrics)
+        and {
+            (str(row.get("comparator")), str(row.get("metric")))
+            for row in primary_paired_rows
+        }
+        == {
+            (comparator, metric)
+            for comparator in expected_comparators
+            for metric in expected_metrics
+        }
+        and all(
+            math.isfinite(fnum(row.get("n_boot_valid")))
+            and int(fnum(row.get("n_boot_valid")))
+            == int(manifest.get("primary_endpoint_inference", {}).get("n_boot", -1))
+            and math.isfinite(fnum(row.get("n_seeds")))
+            and int(fnum(row.get("n_seeds"))) == len(expected_seed_set)
+            and all(
+                math.isfinite(fnum(row.get(field)))
+                for field in ("improvement_ci_low", "improvement_ci_high")
+            )
+            for row in primary_adapted_rows + primary_paired_rows
+        )
+    )
     complete = (
         bool(rows)
         and manifest.get("status") == expected_status
@@ -412,6 +488,20 @@ def summarize_external_adaptation(
         and manifest.get("canonical_contract") == canonical_contract
         and runner_sha is not None
         and manifest.get("runner_sha256") == runner_sha
+        and all(
+            manifest.get(key) == value
+            for key, value in (required_manifest_fields or {}).items()
+        )
+        and all(
+            str(row.get(key, "")) == value
+            for row in rows
+            for key, value in (required_row_fields or {}).items()
+        )
+        and observed_fractions == set(expected_fractions)
+        and complete_seed_grid
+        and len(rows) == len(expected_fractions) * len(expected_seed_set)
+        and output_contract_complete
+        and primary_contract_complete
     )
     if not complete:
         return {
@@ -461,38 +551,45 @@ def summarize_external_adaptation(
     finite_fractions = sorted(fraction for fraction in grouped if math.isfinite(fraction))
     zero_fraction = summarize_fraction(0.0 if 0.0 in grouped else finite_fractions[0])
     fraction_summaries = [summarize_fraction(fraction) for fraction in finite_fractions]
-    best_f1_fraction = max(
-        fraction_summaries,
-        key=lambda item: fnum(item.get("f1_macro_mean")),
-        default={},
-    )
-    best_pr_auc_fraction = max(
-        fraction_summaries,
-        key=lambda item: fnum(item.get("pr_auc_macro_mean")),
-        default={},
-    )
-    f1_gain = fnum(best_f1_fraction.get("f1_macro_mean")) - fnum(
+    primary = summarize_fraction(primary_fraction)
+    primary_ci_by_metric = {
+        str(row.get("metric")): row for row in primary_adapted_rows
+    }
+    f1_gain = fnum(primary.get("f1_macro_mean")) - fnum(
         zero_fraction.get("f1_macro_mean")
     )
-    pr_gain = fnum(best_pr_auc_fraction.get("pr_auc_macro_mean")) - fnum(
+    pr_gain = fnum(primary.get("pr_auc_macro_mean")) - fnum(
         zero_fraction.get("pr_auc_macro_mean")
     )
     if not math.isfinite(f1_gain):
         f1_gain = math.nan
     if not math.isfinite(pr_gain):
         pr_gain = math.nan
+    f1_ci_row = primary_ci_by_metric.get("f1_macro")
+    pr_ci_row = primary_ci_by_metric.get("pr_auc_macro")
+    f1_ci_text = (
+        f", F1 95% group CI=[{fmt(f1_ci_row.get('primary_value_ci_low'))}, "
+        f"{fmt(f1_ci_row.get('primary_value_ci_high'))}]"
+        if f1_ci_row
+        else ""
+    )
+    pr_ci_text = (
+        f", PR-AUC 95% group CI=[{fmt(pr_ci_row.get('primary_value_ci_low'))}, "
+        f"{fmt(pr_ci_row.get('primary_value_ci_high'))}]"
+        if pr_ci_row
+        else ""
+    )
     key_numbers = (
         f"{adaptation_label}_status=complete; "
         f"dataset={dataset}; "
         f"protocol={expected_protocol}; "
         f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
         f"F1={fmt(zero_fraction.get('f1_macro_mean'))}; "
-        f"F1-best fraction={fmt(best_f1_fraction.get('fraction'), digits=2)}, "
-        f"train_units_mean={fmt(best_f1_fraction.get('train_records_or_windows_mean'), digits=1)}, "
-        f"F1={fmt(best_f1_fraction.get('f1_macro_mean'))}, "
+        f"pre-specified primary fraction={fmt(primary.get('fraction'), digits=2)}, "
+        f"train_units_mean={fmt(primary.get('train_records_or_windows_mean'), digits=1)}, "
+        f"F1={fmt(primary.get('f1_macro_mean'))}{f1_ci_text}, "
         f"F1_gain_vs_zero={fmt(f1_gain)}; "
-        f"rank-best fraction={fmt(best_pr_auc_fraction.get('fraction'), digits=2)}, "
-        f"PR-AUC={fmt(best_pr_auc_fraction.get('pr_auc_macro_mean'))}, "
+        f"PR-AUC={fmt(primary.get('pr_auc_macro_mean'))}{pr_ci_text}, "
         f"PR-AUC_gain_vs_zero={fmt(pr_gain)}"
     )
     return {
@@ -502,9 +599,12 @@ def summarize_external_adaptation(
         "key_numbers": key_numbers,
         "safe_wording": safe_wording,
         "blocker": "",
-        "best_fraction": best_f1_fraction,
-        "best_f1_fraction": best_f1_fraction,
-        "best_pr_auc_fraction": best_pr_auc_fraction,
+        "primary_fraction": primary,
+        "primary_fraction_policy": "pre_specified_0.10_no_test_set_budget_selection",
+        "primary_endpoint_rows": primary_rows or [],
+        "best_fraction": primary,
+        "best_f1_fraction": primary,
+        "best_pr_auc_fraction": primary,
         "f1_gain_vs_zero": f1_gain,
         "pr_auc_gain_vs_zero": pr_gain,
         "zero_fraction": zero_fraction,
@@ -653,12 +753,16 @@ def main() -> None:
         "group_safe_score_calibration_ptbxl_summary": METRIC_DIR / "group_safe_score_calibration_ptbxl_summary.csv",
         "group_safe_score_calibration_ptbxl_table": TABLE_DIR / "table_group_safe_score_calibration_ptbxl.csv",
         "group_safe_score_calibration_ptbxl_bootstrap": METRIC_DIR / "group_safe_score_calibration_ptbxl_bootstrap.json",
+        "group_safe_score_calibration_ptbxl_splits": MANIFEST_DIR / "group_safe_score_calibration_ptbxl_splits.npz",
+        "group_safe_score_calibration_ptbxl_coefficients": TABLE_DIR / "table_group_safe_score_calibration_ptbxl_coefficients.csv",
         "group_safe_score_calibration_ptbxl_manifest": MANIFEST_DIR / "group_safe_score_calibration_ptbxl_manifest.json",
         "true_fewshot_head_ptbxl_summary": METRIC_DIR / "true_fewshot_head_ptbxl_summary.csv",
         "true_fewshot_head_ptbxl_table": TABLE_DIR / "table_true_fewshot_head_ptbxl.csv",
         "true_fewshot_head_ptbxl_paired": TABLE_DIR / "table_true_fewshot_head_ptbxl_paired.csv",
+        "true_fewshot_head_ptbxl_primary": TABLE_DIR / "table_true_fewshot_head_ptbxl_primary.csv",
         "true_fewshot_head_ptbxl_bootstrap": METRIC_DIR / "true_fewshot_head_ptbxl_bootstrap.json",
         "true_fewshot_head_ptbxl_coefficients": TABLE_DIR / "table_true_fewshot_head_ptbxl_coefficients.csv",
+        "true_fewshot_head_ptbxl_splits": MANIFEST_DIR / "true_fewshot_head_ptbxl_splits.npz",
         "true_fewshot_head_ptbxl_manifest": MANIFEST_DIR / "true_fewshot_head_ptbxl_manifest.json",
         "external_comparator_summary": METRIC_DIR / "external_comparator_paired_summary.json",
         "external_comparator_table": TABLE_DIR / "table_external_comparator_paired.csv",
@@ -754,8 +858,27 @@ def main() -> None:
             adaptation_label="group_safe_score_calibration",
             canonical_contract=canonical_contract,
             runner_name="33_group_safe_score_calibration.py",
+            primary_fraction=0.10,
+            required_output_paths=(
+                optional_paths["group_safe_score_calibration_ptbxl_summary"],
+                optional_paths["group_safe_score_calibration_ptbxl_table"],
+                optional_paths["group_safe_score_calibration_ptbxl_bootstrap"],
+                optional_paths["group_safe_score_calibration_ptbxl_splits"],
+                optional_paths["group_safe_score_calibration_ptbxl_coefficients"],
+            ),
+            required_manifest_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "primary_fraction": 0.10,
+                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            },
+            required_row_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+            },
             safe_wording=(
-                "Report PTB-XL only as group-safe, dataset-specific score calibration of frozen predictions. "
+                "Report PTB-XL only as group-safe, dataset-specific score calibration of frozen predictions, "
+                "using the pre-specified 10% target-group budget as primary and 1%/5% as sensitivity points. "
                 "It can change fixed-threshold F1/calibration but cannot establish model-weight adaptation, "
                 "few-shot fine-tuning, or broad transfer superiority."
             ),
@@ -779,10 +902,34 @@ def main() -> None:
             adaptation_label="true_fewshot_frozen_encoder_head",
             canonical_contract=canonical_contract,
             runner_name="35_true_fewshot_head_adaptation.py",
+            model_filter="full",
+            primary_fraction=0.10,
+            primary_rows=read_csv_rows(
+                optional_paths["true_fewshot_head_ptbxl_primary"], required=False
+            ),
+            required_output_paths=(
+                optional_paths["true_fewshot_head_ptbxl_summary"],
+                optional_paths["true_fewshot_head_ptbxl_table"],
+                optional_paths["true_fewshot_head_ptbxl_paired"],
+                optional_paths["true_fewshot_head_ptbxl_primary"],
+                optional_paths["true_fewshot_head_ptbxl_bootstrap"],
+                optional_paths["true_fewshot_head_ptbxl_coefficients"],
+                optional_paths["true_fewshot_head_ptbxl_splits"],
+            ),
+            required_manifest_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "primary_fraction": 0.10,
+                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            },
+            required_row_fields={
+                "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                "representation_pooling": "mean_of_preclassifier_slice_embeddings_per_fold",
+            },
             safe_wording=(
-                "Report PTB-XL results as group-safe fitting of new linear classifier heads on frozen encoder "
-                "representations. This is true parameter adaptation, but not end-to-end encoder fine-tuning and "
-                "not general few-shot superiority."
+                "Report PTB-XL results as group-safe fitting of new linear classifier heads on frozen encoder, "
+                "mean-pooled record representations. Fractions are nested fractions of independent target groups. "
+                "This is true parameter adaptation, but not end-to-end encoder fine-tuning or general superiority."
             ),
         )
     }
@@ -1075,6 +1222,9 @@ def main() -> None:
         fewshot_evidence_paths.extend(
             [
                 "reports/revision/metrics/group_safe_score_calibration_ptbxl_summary.csv",
+                "reports/revision/tables/table_group_safe_score_calibration_ptbxl.csv",
+                "reports/revision/metrics/group_safe_score_calibration_ptbxl_bootstrap.json",
+                "reports/revision/manifests/group_safe_score_calibration_ptbxl_splits.npz",
                 "reports/revision/manifests/group_safe_score_calibration_ptbxl_manifest.json",
             ]
         )
@@ -1083,6 +1233,9 @@ def main() -> None:
             [
                 "reports/revision/metrics/true_fewshot_head_ptbxl_summary.csv",
                 "reports/revision/tables/table_true_fewshot_head_ptbxl_paired.csv",
+                "reports/revision/tables/table_true_fewshot_head_ptbxl_primary.csv",
+                "reports/revision/metrics/true_fewshot_head_ptbxl_bootstrap.json",
+                "reports/revision/manifests/true_fewshot_head_ptbxl_splits.npz",
                 "reports/revision/manifests/true_fewshot_head_ptbxl_manifest.json",
             ]
         )

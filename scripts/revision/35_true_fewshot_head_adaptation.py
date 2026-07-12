@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +51,8 @@ from scripts.revision.common import (  # noqa: E402
 
 
 PROTOCOL = "frozen_encoder_true_linear_head_adaptation_v2_group_safe_gated"
+REPRESENTATION_PROTOCOL = "frozen_encoder_external_record_representation_v2_source_bound"
+REPRESENTATION_PROTOCOL_VERSION = 2
 MODEL_STEMS = {
     "full": "ecg_ramba_full",
     "resnet": "resnet1d_cnn",
@@ -69,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, choices=["ptbxl", "georgia", "cpsc2021"])
     parser.add_argument("--models", default="full,resnet,raw_mamba,transformer")
     parser.add_argument("--fractions", default="0,0.01,0.05,0.10")
+    parser.add_argument("--primary-fraction", type=float, default=0.10)
     parser.add_argument("--seeds", default="42,43,44,45,46")
     parser.add_argument("--test-fraction", type=float, default=0.50)
     parser.add_argument("--split-candidates", type=int, default=128)
@@ -102,6 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-table", type=Path, default=None)
     parser.add_argument("--out-paired-table", type=Path, default=None)
     parser.add_argument("--out-bootstrap", type=Path, default=None)
+    parser.add_argument("--out-primary-table", type=Path, default=None)
     parser.add_argument("--out-coefficients", type=Path, default=None)
     parser.add_argument("--out-splits", type=Path, default=None)
     parser.add_argument("--out-manifest", type=Path, default=None)
@@ -114,6 +119,29 @@ def resolve(path: Path) -> Path:
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def budget_role(fraction: float, primary_fraction: float) -> str:
+    if fraction == 0:
+        return "zero_target_label_reference"
+    if math.isclose(fraction, primary_fraction, abs_tol=1e-12):
+        return "pre_specified_primary"
+    return "sensitivity"
+
+
+def interval_interpretation(
+    low: float,
+    high: float,
+    *,
+    positive: str,
+    negative: str,
+    inconclusive: str,
+) -> str:
+    if low > 0:
+        return positive
+    if high < 0:
+        return negative
+    return inconclusive
 
 
 def canonical_contract() -> dict[str, str]:
@@ -163,6 +191,7 @@ def default_paths(args: argparse.Namespace) -> dict[str, Path]:
         "table": resolve(args.out_table or TABLE_DIR / f"table_true_fewshot_head_{dataset}.csv"),
         "paired": resolve(args.out_paired_table or TABLE_DIR / f"table_true_fewshot_head_{dataset}_paired.csv"),
         "bootstrap": resolve(args.out_bootstrap or METRIC_DIR / f"true_fewshot_head_{dataset}_bootstrap.json"),
+        "primary": resolve(args.out_primary_table or TABLE_DIR / f"table_true_fewshot_head_{dataset}_primary.csv"),
         "coefficients": resolve(args.out_coefficients or TABLE_DIR / f"table_true_fewshot_head_{dataset}_coefficients.csv"),
         "splits": resolve(args.out_splits or MANIFEST_DIR / f"true_fewshot_head_{dataset}_splits.npz"),
         "manifest": resolve(args.out_manifest or MANIFEST_DIR / f"true_fewshot_head_{dataset}_manifest.json"),
@@ -252,7 +281,19 @@ def load_embeddings(
     if not manifest_path.exists() or manifest_path.stat().st_size == 0:
         raise FileNotFoundError(manifest_path)
     with np.load(path, allow_pickle=False) as data:
-        required = {"fold_embeddings", "y_true", "record_id", "group_id", "split_id", "class_names", "model", "source_prediction_sha256"}
+        required = {
+            "fold_embeddings",
+            "y_true",
+            "record_id",
+            "group_id",
+            "split_id",
+            "class_names",
+            "model",
+            "source_prediction_sha256",
+            "input_fingerprint",
+            "protocol_version",
+            "representation",
+        }
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"{path} missing keys: {sorted(missing)}")
@@ -261,6 +302,11 @@ def load_embeddings(
             raise ValueError(f"{path}: model metadata mismatch")
         if str(data["source_prediction_sha256"].item()) != prediction["sha256"]:
             raise RuntimeError(f"{path}: stale for source predictions")
+        if int(data["protocol_version"].item()) != REPRESENTATION_PROTOCOL_VERSION:
+            raise RuntimeError(f"{path}: stale representation protocol version")
+        if str(data["representation"].item()) != "mean_of_preclassifier_slice_embeddings_per_fold":
+            raise RuntimeError(f"{path}: unsupported representation pooling semantics")
+        input_fingerprint = str(data["input_fingerprint"].item())
         for key in ("y_true", "record_id", "group_id", "split_id", "class_names"):
             actual = np.asarray(data[key])
             expected = prediction[key]
@@ -278,18 +324,23 @@ def load_embeddings(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     extractor = PROJECT_ROOT / "scripts" / "revision" / "34_extract_external_representations.py"
     checkpoint_rows = manifest.get("checkpoints") or []
+    source_provenance = manifest.get("source_provenance") or {}
+    source_archive = source_provenance.get("archive") or {}
     checkpoint_folds = [int(row.get("fold", -1)) for row in checkpoint_rows if isinstance(row, dict)]
     checkpoint_hashes = [str(row.get("sha256") or "") for row in checkpoint_rows if isinstance(row, dict)]
     if (
         manifest.get("status") != "complete"
-        or manifest.get("protocol") != "frozen_encoder_external_record_representation_v1"
+        or manifest.get("protocol") != REPRESENTATION_PROTOCOL
         or manifest.get("runner_sha256") != sha256_file(extractor)
         or manifest.get("canonical_contract") != canonical
+        or manifest.get("input_fingerprint") != input_fingerprint
+        or manifest.get("representation") != "mean_of_preclassifier_slice_embeddings_per_fold"
         or (manifest.get("source_prediction") or {}).get("sha256") != prediction["sha256"]
         or (manifest.get("output") or {}).get("sha256") != output_sha
         or checkpoint_folds != [1, 2, 3, 4, 5]
         or any(len(value) != 64 for value in checkpoint_hashes)
         or not manifest.get("checkpoint_source_contract")
+        or len(str(source_archive.get("sha256") or "")) != 64
     ):
         raise RuntimeError(f"Embedding manifest is stale or incomplete: {manifest_path}")
     return {
@@ -527,6 +578,200 @@ def exact_zero_delta(n_boot: int, n_groups: int) -> dict[str, Any]:
     }
 
 
+def shared_group_bootstrap_indices(groups: np.ndarray, n_boot: int, seed: int) -> list[np.ndarray]:
+    groups = np.asarray(groups).astype(str)
+    unique, inverse = np.unique(groups, return_inverse=True)
+    if len(unique) < 2:
+        raise ValueError("Primary adaptation bootstrap requires at least two independent groups")
+    members = [np.where(inverse == index)[0] for index in range(len(unique))]
+    rng = np.random.default_rng(seed)
+    return [
+        np.concatenate(
+            [members[int(group_index)] for group_index in rng.integers(0, len(unique), size=len(unique))]
+        )
+        for _ in range(int(n_boot))
+    ]
+
+
+def metric_over_seed_ensemble(
+    y_true: np.ndarray,
+    probabilities_by_seed: dict[int, np.ndarray],
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    bootstrap_indices: list[np.ndarray],
+) -> tuple[float, np.ndarray]:
+    ordered = [probabilities_by_seed[seed] for seed in sorted(probabilities_by_seed)]
+    if not ordered:
+        raise ValueError("No seed predictions were provided for the primary endpoint")
+    point = float(np.mean([metric_fn(y_true, probability) for probability in ordered]))
+    values = np.full(len(bootstrap_indices), np.nan, dtype=np.float64)
+    for bootstrap_index, row_index in enumerate(bootstrap_indices):
+        seed_values = [float(metric_fn(y_true[row_index], probability[row_index])) for probability in ordered]
+        finite = [value for value in seed_values if np.isfinite(value)]
+        if finite:
+            values[bootstrap_index] = float(np.mean(finite))
+    return point, values
+
+
+def metric_single_prediction(
+    y_true: np.ndarray,
+    probability: np.ndarray,
+    metric_fn: Callable[[np.ndarray, np.ndarray], float],
+    bootstrap_indices: list[np.ndarray],
+) -> tuple[float, np.ndarray]:
+    point = float(metric_fn(y_true, probability))
+    values = np.full(len(bootstrap_indices), np.nan, dtype=np.float64)
+    for bootstrap_index, row_index in enumerate(bootstrap_indices):
+        value = float(metric_fn(y_true[row_index], probability[row_index]))
+        if np.isfinite(value):
+            values[bootstrap_index] = value
+    return point, values
+
+
+def interval(values: np.ndarray) -> tuple[float, float, int]:
+    finite = np.asarray(values, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if not len(finite):
+        return math.nan, math.nan, 0
+    return (
+        float(np.quantile(finite, 0.025)),
+        float(np.quantile(finite, 0.975)),
+        int(len(finite)),
+    )
+
+
+def primary_endpoint_rows(
+    *,
+    dataset: str,
+    y_true: np.ndarray,
+    groups: np.ndarray,
+    predictions: dict[str, dict[int, np.ndarray]],
+    zero_probabilities: dict[str, np.ndarray],
+    threshold: float,
+    n_bins: int,
+    n_boot: int,
+    primary_fraction: float,
+    bootstrap_seed: int = 20260712,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    indices = shared_group_bootstrap_indices(groups, n_boot, bootstrap_seed)
+    metric_rows: list[dict[str, Any]] = []
+    distributions: dict[tuple[str, str], tuple[float, np.ndarray]] = {}
+    bootstrap_payload: dict[str, Any] = {}
+    specs = metric_functions(threshold, n_bins)
+    for model, model_predictions in predictions.items():
+        if not model_predictions:
+            raise RuntimeError(f"{model}: invalid primary seed prediction map")
+        for metric_name, (metric_fn, higher_is_better) in specs.items():
+            adapted_point, adapted_values = metric_over_seed_ensemble(
+                y_true, model_predictions, metric_fn, indices
+            )
+            zero_point, zero_values = metric_single_prediction(
+                y_true, zero_probabilities[model], metric_fn, indices
+            )
+            distributions[(model, metric_name)] = (adapted_point, adapted_values)
+            adapted_low, adapted_high, adapted_valid = interval(adapted_values)
+            oriented_point = (
+                adapted_point - zero_point if higher_is_better else zero_point - adapted_point
+            )
+            oriented_values = (
+                adapted_values - zero_values if higher_is_better else zero_values - adapted_values
+            )
+            improvement_low, improvement_high, improvement_valid = interval(oriented_values)
+            row = {
+                "dataset": dataset,
+                "comparison_type": "adapted_vs_zero_target_label",
+                "model": model,
+                "model_label": MODEL_LABELS[model],
+                "metric": metric_name,
+                "higher_is_better": higher_is_better,
+                "primary_fraction": primary_fraction,
+                "primary_value_mean_across_seeds": adapted_point,
+                "primary_value_ci_low": adapted_low,
+                "primary_value_ci_high": adapted_high,
+                "zero_target_label_value": zero_point,
+                "improvement_primary_over_zero": oriented_point,
+                "improvement_ci_low": improvement_low,
+                "improvement_ci_high": improvement_high,
+                "n_seeds": len(model_predictions),
+                "n_groups": len(np.unique(groups)),
+                "n_boot_valid": min(adapted_valid, improvement_valid),
+                "bootstrap_seed": bootstrap_seed,
+                "bootstrap_unit": "patient/source-record group",
+                "interpretation": interval_interpretation(
+                    improvement_low,
+                    improvement_high,
+                    positive="primary_ci_favors_adaptation",
+                    negative="primary_ci_favors_zero_target_label",
+                    inconclusive="paired_primary_difference_inconclusive",
+                ),
+            }
+            metric_rows.append(row)
+            bootstrap_payload[f"{model}_{metric_name}"] = {
+                "adapted_mean_across_seeds": adapted_values.tolist(),
+                "zero_target_label": zero_values.tolist(),
+                "oriented_improvement": oriented_values.tolist(),
+            }
+
+    full_predictions = predictions["full"]
+    for comparator in [model for model in predictions if model != "full"]:
+        if set(predictions[comparator]) != set(full_predictions):
+            raise RuntimeError(f"Primary seed grid differs for full vs {comparator}")
+        for metric_name, (_metric_fn, higher_is_better) in specs.items():
+            full_point, full_values = distributions[("full", metric_name)]
+            comparator_point, comparator_values = distributions[(comparator, metric_name)]
+            oriented_point = (
+                full_point - comparator_point
+                if higher_is_better
+                else comparator_point - full_point
+            )
+            oriented_values = (
+                full_values - comparator_values
+                if higher_is_better
+                else comparator_values - full_values
+            )
+            low, high, valid = interval(oriented_values)
+            metric_rows.append(
+                {
+                    "dataset": dataset,
+                    "comparison_type": "full_vs_comparator_at_primary_fraction",
+                    "model": "full",
+                    "model_label": MODEL_LABELS["full"],
+                    "comparator": comparator,
+                    "comparator_label": MODEL_LABELS[comparator],
+                    "metric": metric_name,
+                    "higher_is_better": higher_is_better,
+                    "primary_fraction": primary_fraction,
+                    "primary_value_mean_across_seeds": full_point,
+                    "comparator_value_mean_across_seeds": comparator_point,
+                    "improvement_full_over_comparator": oriented_point,
+                    "improvement_ci_low": low,
+                    "improvement_ci_high": high,
+                    "n_seeds": len(full_predictions),
+                    "n_groups": len(np.unique(groups)),
+                    "n_boot_valid": valid,
+                    "bootstrap_seed": bootstrap_seed,
+                    "bootstrap_unit": "patient/source-record group",
+                    "interpretation": interval_interpretation(
+                        low,
+                        high,
+                        positive="primary_ci_favors_full",
+                        negative="primary_ci_favors_comparator",
+                        inconclusive="paired_primary_difference_inconclusive",
+                    ),
+                }
+            )
+            bootstrap_payload[f"full_vs_{comparator}_{metric_name}"] = {
+                "oriented_improvement": oriented_values.tolist()
+            }
+    return metric_rows, {
+        "primary_fraction": primary_fraction,
+        "bootstrap_seed": bootstrap_seed,
+        "n_boot": n_boot,
+        "n_groups": len(np.unique(groups)),
+        "n_seeds": len(next(iter(predictions.values()))),
+        "items": bootstrap_payload,
+    }
+
+
 def main() -> None:
     args = parse_args()
     canonical = canonical_contract()
@@ -535,6 +780,8 @@ def main() -> None:
     if unknown or "full" not in models:
         raise ValueError(f"Models must include full and valid names; unknown={unknown}")
     fractions = parse_fractions(args.fractions)
+    if not any(math.isclose(item, args.primary_fraction, abs_tol=1e-12) for item in fractions):
+        raise ValueError("--primary-fraction must be included in --fractions")
     seeds = parse_seeds(args.seeds)
     if not 0 < args.test_fraction < 1:
         raise ValueError("--test-fraction must be in (0,1)")
@@ -598,6 +845,10 @@ def main() -> None:
     bootstrap: dict[str, Any] = {}
     split_arrays: dict[str, np.ndarray] = {}
     split_audits: dict[str, Any] = {}
+    primary_predictions: dict[str, dict[int, np.ndarray]] = {model: {} for model in models}
+    primary_zero_probabilities: dict[str, np.ndarray] = {}
+    primary_y_true: np.ndarray | None = None
+    primary_groups: np.ndarray | None = None
     for seed in seeds:
         if args.dataset == "ptbxl":
             pool_groups = np.random.default_rng(seed).permutation(
@@ -724,7 +975,11 @@ def main() -> None:
                     "mode": "zero_target_label" if len(train_idx) == 0 else "frozen_encoder_linear_head_adaptation",
                     "seed": seed,
                     "fraction": fraction,
+                    "budget_role": budget_role(fraction, args.primary_fraction),
+                    "fraction_unit": "independent_target_groups_from_adaptation_pool",
+                    "fraction_sampling": "nested_random_group_prefix_per_seed",
                     "embedding_dimension": int(data["test_emb"]["embedding"].shape[2]),
+                    "representation_pooling": "mean_of_preclassifier_slice_embeddings_per_fold",
                     "fold_heads": 0 if len(train_idx) == 0 else 5,
                     "train_groups": int(len(train_groups)),
                     "train_records_or_windows": int(len(train_idx)),
@@ -794,6 +1049,25 @@ def main() -> None:
                     }
                 bootstrap[f"{model}_{split_key}"] = metric_item
 
+            if args.dataset == "ptbxl" and math.isclose(
+                fraction, args.primary_fraction, abs_tol=1e-12
+            ):
+                if primary_y_true is None:
+                    primary_y_true = y_test.copy()
+                    primary_groups = groups_test.copy()
+                elif not np.array_equal(primary_y_true, y_test) or not np.array_equal(
+                    primary_groups, groups_test
+                ):
+                    raise RuntimeError("PTB-XL primary endpoint test groups differ across seeds")
+                for model in models:
+                    primary_predictions[model][seed] = predictions_by_model[model].copy()
+                    zero = model_data[model]["test_pred"]["y_prob"][test_idx]
+                    if model in primary_zero_probabilities and not np.array_equal(
+                        primary_zero_probabilities[model], zero
+                    ):
+                        raise RuntimeError(f"{model}: zero-target-label test probabilities changed across seeds")
+                    primary_zero_probabilities[model] = zero.copy()
+
             full_prob = predictions_by_model["full"]
             for comparator in [model for model in models if model != "full"]:
                 for metric_name, (metric_fn, higher) in metric_functions(args.threshold, args.n_bins).items():
@@ -860,6 +1134,31 @@ def main() -> None:
                 flush=True,
             )
 
+    primary_rows: list[dict[str, Any]] = []
+    primary_bootstrap: dict[str, Any] = {}
+    if args.dataset == "ptbxl":
+        if primary_y_true is None or primary_groups is None:
+            raise RuntimeError("PTB-XL primary endpoint predictions were not collected")
+        expected_seed_set = set(seeds)
+        incomplete = {
+            model: sorted(expected_seed_set - set(model_predictions))
+            for model, model_predictions in primary_predictions.items()
+            if set(model_predictions) != expected_seed_set
+        }
+        if incomplete:
+            raise RuntimeError(f"Primary endpoint seed grid is incomplete: {incomplete}")
+        primary_rows, primary_bootstrap = primary_endpoint_rows(
+            dataset=args.dataset,
+            y_true=primary_y_true,
+            groups=primary_groups,
+            predictions=primary_predictions,
+            zero_probabilities=primary_zero_probabilities,
+            threshold=args.threshold,
+            n_bins=args.n_bins,
+            n_boot=args.n_boot,
+            primary_fraction=args.primary_fraction,
+        )
+
     save_npz_compressed_atomic(
         paths["splits"],
         protocol=np.asarray(PROTOCOL),
@@ -869,6 +1168,7 @@ def main() -> None:
     save_csv(paths["summary"], rows)
     save_csv(paths["table"], rows)
     save_csv(paths["paired"], paired_rows)
+    save_csv(paths["primary"], primary_rows)
     save_csv(paths["coefficients"], coefficient_rows)
     save_json(
         paths["bootstrap"],
@@ -879,6 +1179,7 @@ def main() -> None:
             "n_boot": args.n_boot,
             "bootstrap_unit": "patient/source-record group",
             "items": bootstrap,
+            "primary_endpoint": primary_bootstrap,
         },
     )
     outputs = list(paths.values())[:-1]
@@ -907,6 +1208,16 @@ def main() -> None:
                 "hyperparameter_selection": "none_fixed_before_evaluation",
             },
             "fractions": fractions,
+            "primary_fraction": args.primary_fraction,
+            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "primary_endpoint_inference": {
+                "point_estimate": "mean_metric_across_pre_specified_adaptation_seeds",
+                "uncertainty": "shared_patient_group_bootstrap_applied_to_all_seeds_and_models",
+                "bootstrap_seed": 20260712,
+                "n_boot": args.n_boot,
+            },
+            "fraction_unit": "independent_target_groups_from_adaptation_pool",
+            "fraction_sampling": "nested_random_group_prefix_per_seed",
             "seeds": seeds,
             "split_audits": split_audits,
             "cache_contract": {
@@ -918,7 +1229,8 @@ def main() -> None:
             "zero_group_overlap_all_splits": True,
             "external_evidence_gates": evidence_gate_contract,
             "safe_wording": (
-                "Few-shot linear-head adaptation with frozen encoders; this is parameter adaptation but not end-to-end fine-tuning."
+                "Few-shot linear-head adaptation on nested fractions of independent target groups using mean-pooled "
+                "pre-classifier record embeddings; this updates new classifier parameters but does not fine-tune encoders."
             ),
             "inputs": {
                 model: {

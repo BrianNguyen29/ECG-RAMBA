@@ -89,6 +89,34 @@ class PipelineStorageAuditTest(unittest.TestCase):
             self.assertEqual(row.unmanifested_items, "fold5")
             self.assertEqual(row.status, "complete_needs_publish")
 
+    def test_external_fewshot_resume_stages_have_exact_expected_slots(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            representation = (
+                root
+                / "predictions"
+                / "external_representation_folds"
+                / "ptbxl_ecg_ramba_full_fold1_record_embeddings.npz"
+            )
+            representation.parent.mkdir(parents=True)
+            representation.write_bytes(b"embedding")
+            head_cache = (
+                root
+                / "predictions"
+                / "fewshot_head_adaptation_cache"
+                / "ptbxl"
+                / "full_seed42_frac0_deadbeef.npz"
+            )
+            head_cache.parent.mkdir(parents=True)
+            head_cache.write_bytes(b"prediction")
+
+            rows = {row.stage: row for row in MODULE.audit_stages(root, manifest_rows={})}
+            self.assertEqual(rows["external_ptbxl_test_representation_fold_cache"].expected_count, 15)
+            self.assertEqual(rows["external_ptbxl_test_representation_fold_cache"].found_count, 1)
+            self.assertEqual(rows["true_fewshot_prediction_cache"].expected_count, 60)
+            self.assertEqual(rows["true_fewshot_prediction_cache"].found_count, 1)
+            self.assertEqual(rows["true_fewshot_metric_cache"].expected_count, 500)
+
     def test_full_model_checkpoint_contract_uses_oof_manifest_sha(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

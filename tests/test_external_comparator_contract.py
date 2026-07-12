@@ -60,6 +60,9 @@ class ExternalComparatorContractTests(unittest.TestCase):
                 class_names=prediction["class_names"],
                 model=np.asarray("full"),
                 source_prediction_sha256=np.asarray(prediction["sha256"]),
+                input_fingerprint=np.asarray("f" * 64),
+                protocol_version=np.asarray(2, dtype=np.int16),
+                representation=np.asarray("mean_of_preclassifier_slice_embeddings_per_fold"),
             )
             canonical = {"oof_sha256": "a" * 64, "freeze_sha256": "b" * 64}
             manifest_path = root / "embedding_manifest.json"
@@ -71,9 +74,11 @@ class ExternalComparatorContractTests(unittest.TestCase):
             )
             manifest = {
                 "status": "complete",
-                "protocol": "frozen_encoder_external_record_representation_v1",
+                "protocol": "frozen_encoder_external_record_representation_v2_source_bound",
                 "runner_sha256": fewshot.sha256_file(extractor),
                 "canonical_contract": canonical,
+                "input_fingerprint": "f" * 64,
+                "representation": "mean_of_preclassifier_slice_embeddings_per_fold",
                 "source_prediction": {"sha256": prediction["sha256"]},
                 "output": {"sha256": fewshot.sha256_file(embedding_path)},
                 "checkpoints": [
@@ -81,6 +86,7 @@ class ExternalComparatorContractTests(unittest.TestCase):
                     for fold in range(1, 6)
                 ],
                 "checkpoint_source_contract": {"status": "authenticated"},
+                "source_provenance": {"archive": {"sha256": "c" * 64}},
             }
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             loaded = fewshot.load_embeddings(
@@ -93,6 +99,18 @@ class ExternalComparatorContractTests(unittest.TestCase):
             np.testing.assert_array_equal(loaded["embedding"], embeddings)
 
             manifest["canonical_contract"] = {"oof_sha256": "stale"}
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                fewshot.load_embeddings(
+                    embedding_path,
+                    manifest_path,
+                    prediction,
+                    "full",
+                    canonical,
+                )
+
+            manifest["canonical_contract"] = canonical
+            manifest["source_provenance"] = {}
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 fewshot.load_embeddings(

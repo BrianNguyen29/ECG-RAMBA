@@ -364,6 +364,12 @@ Use the implemented representation/adaptation runners:
 - `scripts/revision/34_extract_external_representations.py`
 - `scripts/revision/35_true_fewshot_head_adaptation.py`
 
+Representation protocol v2 binds each fold cache to the external source
+prediction manifest, current archive/loader provenance, canonical OOF/freeze
+contract, and exact checkpoint hashes. The record representation is the
+arithmetic mean of pre-classifier slice embeddings; it is deliberately not
+described as the original Q=3 probability aggregation.
+
 Recommended first claim-ready mode:
 
 - Frozen source encoder plus a newly trained target-task linear head.
@@ -378,6 +384,10 @@ For each model, expose the penultimate representation:
 - Transformer: normalized pooled token representation.
 
 Use fixed hyperparameters or an adaptation-only validation group; never select epochs, thresholds, or modes on the held-out test groups.
+The 1%, 5%, and 10% budgets are nested fractions of independent adaptation
+groups, not balanced k-shot counts per class. Treat 10% as the pre-specified
+primary budget and the smaller budgets as sensitivity points; never select the
+reported budget by maximizing held-out test F1.
 
 ### Required comparisons
 

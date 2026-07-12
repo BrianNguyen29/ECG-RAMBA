@@ -37,7 +37,10 @@ The related paths have different roles:
 
 Within the canonical mirror, resumable fold caches live in
 `predictions/folds/`, learned-comparator checkpoints live in
-`experimental/*_checkpoints/`, and live command traces live in `logs/`.
+`experimental/*_checkpoints/`, external source-bound representation folds live
+in `predictions/external_representation_folds/`, group-safe adaptation caches
+live in `predictions/fewshot_head_adaptation_cache/` and
+`metrics/*fewshot*metric_cache/`, and live command traces live in `logs/`.
 Baseline and representation runners write fold state directly to these Drive
 paths using atomic file replacement. The `/content/ECG-RAMBA` copies of final
 metrics/tables are disposable staging outputs.
@@ -58,7 +61,9 @@ legacy-only paths and never overwrites a conflicting canonical artifact.
 
 Notebook 00 then runs `38_pipeline_storage_audit.py` in non-strict mode. Its
 JSON/CSV outputs check each expected fold and each of the six named stresses,
-including manifest coverage, rather than relying on aggregate file counts.
+including manifest coverage, rather than relying on aggregate file counts. It
+also checks the exact PTB-XL fold-9/fold-10 representation slots and expected
+group-safe calibration/true-head cache grid.
 Before final packaging, run the same command with `--strict --full-sha`; this
 is intentionally deferred because hashing all learned checkpoints on every
 Colab bootstrap is expensive.
@@ -72,8 +77,14 @@ Colab bootstrap is expensive.
   episode-boundary challenge score.
 - The group-safe score-calibration runner changes frozen output scores only;
   it does not change model weights.
-- The true few-shot runner fits new linear heads on frozen encoder embeddings;
-  it is not end-to-end fine-tuning.
+- The true few-shot runner fits new fold-specific linear heads on train-only
+  standardized, mean-pooled record embeddings from frozen encoders. Fractions
+  are nested fractions of independent target groups, not k examples per class.
+  The pre-specified 10% budget is the primary endpoint; 1% and 5% are
+  sensitivity points, not test-selected alternatives. It is not end-to-end
+  fine-tuning. `table_true_fewshot_head_ptbxl_primary.csv` uses one shared
+  patient-group bootstrap grid across all five adaptation seeds and matched
+  models, so the reported primary and paired CIs are directly comparable.
 - The frozen-transform MLP is a head-capacity sensitivity control. It does not
   make random-convolution kernels learnable or prove determinism versus
   regularization.
@@ -138,6 +149,59 @@ matrix, copy, and publication cells can run on CPU.
     and `latexmk`/LaTeX. A `blocked_missing_tool` manifest is deliberate and
     must not be called a marked PDF.
 
+## Direct Colab Cell Checklist
+
+Each active notebook has a self-contained **Setup** section. After a Colab
+disconnect, open the notebook that was interrupted and rerun from its Setup
+section; Notebook 00 does not need to be rerun first. The exception is a
+session-local Mamba installation: a fresh runtime must run the Mamba installer
+in Notebook 00, 02, 05, or 06 before the first Full/Raw-Mamba inference cell.
+
+Use the checked-in defaults unless this table explicitly says otherwise:
+
+| Notebook | Run sections | Runtime and controls | Skip/defer rule |
+| --- | --- | --- | --- |
+| 00 | All sections, top to bottom | CPU is enough for storage/audit; GPU only if immediately continuing to Mamba inference. Keep migration disabled and storage audit non-strict. | Do not use legacy migration unless the source-audit table was reviewed and conflict-free. |
+| 01 | All sections | CPU. | None. This is a protocol audit, not model training. |
+| 02 first pass | Setup through **External Protocol Gate**, then **PTB-XL Fold 9 Adaptation-Pool Export** | A100 High-RAM when an OOF/external export is missing. Keep OOF/external force flags false and reuse enabled. | The learned-comparator, representation, and true-head sections may defer before Notebook 04; this is expected. |
+| 03 first pass | Setup through calibration CI and reviewer tables | CPU High-RAM. | Presentation assets may defer until Notebook 04 paired tables exist. |
+| 04 | All sections | A100 High-RAM for the five heavy baseline sections; CPU is enough from **Fair Baseline Completion Matrix** onward. Keep runner mode `auto`, force-rerun false, checkpoint saving/reuse true. | Skip Notebook 02a unless the frozen Full final-EMA checkpoint contract itself is invalid and a paper-level retrain was explicitly chosen. |
+| 02 second pass | **External Learned-Comparator Zero-Target-Label Inference** through **True Few-Shot Frozen-Encoder Head Adaptation**, then inventory/mirror | A100 for external comparator inference and source-bound representation extraction. CPU High-RAM for paired bootstrap, group-safe score calibration, and linear heads. Keep `TRUE_FEWSHOT_PRIMARY_FRACTION=0.10`, seeds 42--46, fractions 0/1/5/10%, reuse true. | Old representation protocol-v1 caches are intentionally rejected once; protocol-v2 fold caches resume thereafter. |
+| 03 second pass | **Build Reviewer Presentation Assets**, then mirror | CPU. | None after paired artifacts are current. |
+| 05 GPU pass | Setup through **Comparator Stress Prediction Generation** | A100 High-RAM, batch 512; lower to 256 only on OOM. Default reviewer-minimal stresses are `snr5db,precordial_dropout`. Each stress is published immediately. | Do not rerun completed stress files; the exact checkpoint/prediction contract is checked before reuse. |
+| 05 CPU pass | **Multi-Comparator Robustness Ledger** through mirror/output | CPU High-RAM. Default `reviewer_minimal` is screening (`n_boot=200`) only. Use `single_stress_final` repeatedly or `core_final` for claim-ready `n_boot=1000` rows. | Do not present reviewer-minimal output as the canonical six-stress ledger. |
+| 06 | All sections | CPU for pooling/probe; A100 plus Mamba only if representation embeddings are missing/stale. | Existing compatible embeddings/probe artifacts are reused. |
+| 07 | All sections | CPU High-RAM. | Run only after the preceding mirror publishes. Any strict failure means the source-of-truth tables must not be used yet. |
+
+For Notebook 02, the direct-run heavy controls should remain:
+
+```python
+RUN_EXTERNAL_LEARNED_COMPARATORS = 'auto'
+RUN_PTBXL_FOLD9_COMPARATORS = 'auto'
+RUN_GROUP_SAFE_SCORE_CALIBRATION = 'auto'
+GROUP_SAFE_CALIBRATION_PRIMARY_FRACTION = 0.10
+RUN_EXTERNAL_REPRESENTATION_EXTRACTION = 'auto'
+RUN_TRUE_FEWSHOT_HEAD_ADAPTATION = 'auto'
+TRUE_FEWSHOT_PRIMARY_FRACTION = 0.10
+TRUE_FEWSHOT_N_BOOT = 1000
+```
+
+For Notebook 05, select the profile before its comparator cells, or set the
+equivalent environment variable before running the section:
+
+```python
+# Fast reviewer screening, not final claim evidence.
+ROBUSTNESS_MULTI_RUN_PROFILE = 'reviewer_minimal'
+
+# Claim-ready one-stress pass; rerun for each required stress while reusing cache.
+ROBUSTNESS_MULTI_RUN_PROFILE = 'single_stress_final'
+ROBUSTNESS_MULTI_SINGLE_STRESS = 'snr5db'
+```
+
+The recommended disconnect boundary is immediately after a cell prints a
+successful canonical mirror publish. Do not disconnect while a checkpoint,
+stress prediction, representation fold, or atomic NPZ is still being written.
+
 ## Restart And Resume Rules
 
 - After a Colab disconnect, rerun the current notebook from **Setup**. Do not
@@ -162,8 +226,11 @@ matrix, copy, and publication cells can run on CPU.
 - Full external inference authenticates all five files against
   `oof_final_ema_prediction_run_manifest.json` before `torch.load`. Learned
   comparators authenticate all five files against their baseline checkpoint
-  contracts. External representation and true few-shot runners additionally
-  require current embedding manifests, so a stale NPZ cannot enter adaptation.
+  contracts. External representation protocol v2 additionally binds every
+  fold cache to the source prediction manifest, current archive/loader
+  provenance, canonical OOF contract, and exact checkpoint SHA256. True
+  few-shot adaptation requires that v2 manifest and NPZ pair, so a stale or
+  cross-archive representation cannot enter adaptation.
 - Metric caches use input/protocol-derived cache keys. A changed prediction,
   group split, threshold, bootstrap count, or seed produces a new cache entry.
 - Notebook 02 `auto` cells re-enter the lightweight paired/calibration/head

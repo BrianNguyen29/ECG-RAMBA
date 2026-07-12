@@ -21,6 +21,11 @@ canonical conflicts.
 Long-running state is written directly below the canonical mirror:
 
 - `predictions/folds/`: resumable OOF, baseline, and representation fold caches.
+- `predictions/external_representation_folds/`: source-bound PTB-XL fold-9/
+  fold-10 record-embedding caches for matched frozen-encoder adaptation.
+- `predictions/fewshot_head_adaptation_cache/` and
+  `metrics/true_fewshot_head_metric_cache/`: group-safe head predictions,
+  coefficient sidecars, and paired group-bootstrap caches.
 - `experimental/*_checkpoints/`: ResNet, Raw Mamba, Transformer, and optional
   frozen-transform head checkpoints.
 - `logs/`: live command traces, flushed while a cell is running.
@@ -50,7 +55,8 @@ Notebook 00 also writes `metrics/pipeline_storage_audit.json` and
 `tables/table_pipeline_storage_audit.csv`. The audit verifies each required
 fold and each named stress separately, so duplicate cache variants or a
 MiniRocket clean-reference file cannot hide a missing fold/stress. An
-incomplete bootstrap audit is informational; use
+complete full-reviewer audit also requires the exact external representation
+and adaptation cache slots. An incomplete bootstrap audit is informational; use
 `38_pipeline_storage_audit.py --strict --full-sha` only for the final package.
 
 ## Recommended Order
@@ -96,8 +102,12 @@ resume-audited rather than overwritten.
   predictions without training. Contract mismatches are rejected.
 - Full external inference authenticates its five checkpoints against the OOF
   run manifest before loading them. Learned external comparators use their
-  baseline checkpoint manifests, and true few-shot adaptation requires current
-  embedding manifests as well as embedding NPZ files.
+  baseline checkpoint manifests. External representation protocol v2 also
+  binds fold caches to the source prediction manifest, dataset archive/loader
+  provenance, canonical OOF, and checkpoint SHA256. True few-shot adaptation
+  requires the matching v2 embedding manifest and NPZ; its 1/5/10% budgets are
+  nested fractions of independent target groups, with 10% pre-specified as the
+  primary endpoint rather than selected on the test set.
 - Normal command output is streamed to the notebook and written under
   local `reports/revision/logs/` and canonical Drive `logs/` simultaneously.
 - Frequent intermediate publishes use size verification for unchanged
