@@ -197,6 +197,8 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("EXTERNAL_GATE_STRICT = True", source)
         self.assertIn("RUN_LEGACY_ROW_SPLIT_SCORE_CALIBRATION = False", source)
         self.assertIn("revision_artifacts' / 'reports' / 'revision", source)
+        self.assertIn("PTB-XL fold 9 artifacts are missing and require GPU model inference", source)
+        self.assertIn("('wfdb', 'torch', 'mamba_ssm', 'causal_conv1d')", source)
 
     def test_classifies_identical_unique_and_conflicting_files(self):
         with tempfile.TemporaryDirectory() as tmp:
