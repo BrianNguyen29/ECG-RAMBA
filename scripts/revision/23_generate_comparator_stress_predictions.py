@@ -167,7 +167,13 @@ def validate_checkpoint_set(comparator: str, paths: list[Path]) -> list[str]:
         if isinstance(row, dict) and row.get("fold") is not None
     }
     if contract.get("status") != "complete" or sorted(by_fold) != [1, 2, 3, 4, 5]:
-        raise RuntimeError(f"{comparator} baseline checkpoint contract is incomplete")
+        raise RuntimeError(
+            f"{comparator} baseline checkpoint contract is incomplete: "
+            f"status={contract.get('status')!r}, declared_folds={sorted(by_fold)}, "
+            f"missing_folds={sorted({1, 2, 3, 4, 5} - set(by_fold))}. "
+            "Rerun the corresponding Notebook 04 baseline cell in aggregate/reuse mode "
+            "with the canonical checkpoint directory, then publish the refreshed manifest."
+        )
     if len(paths) != 5:
         raise RuntimeError(f"{comparator} stress inference requires exact checkpoint folds 1..5")
 
