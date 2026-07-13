@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
             "the canonical mirror backward."
         ),
     )
+    subparsers.choices["publish"].add_argument(
+        "--refresh-existing-prefix",
+        action="append",
+        default=[],
+        help=(
+            "Re-hash existing canonical files below this relative prefix before publishing. "
+            "Use only for resumable cache/checkpoint directories that a successful runner "
+            "writes directly into the canonical mirror. Repeatable."
+        ),
+    )
     subparsers.choices["restore"].add_argument(
         "--replace-mismatched",
         action="store_true",
@@ -95,19 +105,43 @@ def skip_artifact(relative: Path) -> bool:
     )
 
 
+def normalize_refresh_prefixes(prefixes: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in prefixes:
+        path = Path(str(value).strip().replace("\\", "/"))
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError(f"Refresh prefix must be a safe relative path: {value!r}")
+        prefix = path.as_posix().strip("./")
+        if not prefix:
+            raise ValueError("Refresh prefix cannot be empty or the mirror root")
+        normalized.append(prefix)
+    return tuple(dict.fromkeys(normalized))
+
+
+def matches_refresh_prefix(relative: Path, prefixes: tuple[str, ...]) -> bool:
+    normalized = relative.as_posix()
+    return any(
+        normalized == prefix or normalized.startswith(prefix + "/")
+        for prefix in prefixes
+    )
+
+
 def publish(
     mirror_root: Path,
     verify_existing: str = "full",
     source_conflict_policy: str = "newer",
+    refresh_existing_prefixes: list[str] | tuple[str, ...] = (),
 ) -> Path:
     if verify_existing not in {"full", "size"}:
         raise ValueError(f"Unsupported existing verification mode: {verify_existing}")
     if source_conflict_policy not in {"newer", "fail", "source"}:
         raise ValueError(f"Unsupported source conflict policy: {source_conflict_policy}")
+    refresh_prefixes = normalize_refresh_prefixes(refresh_existing_prefixes)
     ensure_revision_dirs()
     mirror_root.mkdir(parents=True, exist_ok=True)
     manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
     existing_rows: dict[str, dict] = {}
+    refreshed_existing_paths: list[str] = []
     if manifest_path.exists():
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         for row in normalize_manifest_rows(payload, mirror_root):
@@ -120,15 +154,17 @@ def publish(
                     f"Existing mirror manifest references a missing file: {source}"
                 )
             actual_size = source.stat().st_size
-            if row["size_bytes"] >= 0 and actual_size != row["size_bytes"]:
-                raise RuntimeError(
-                    f"Existing mirror size mismatch before publish: {relative}"
-                )
-            # Old manifests may not carry size_bytes. In that case the fast
-            # path has no trustworthy metadata and must fall back to SHA256.
-            if verify_existing == "full" or row["size_bytes"] < 0:
+            refresh_allowed = matches_refresh_prefix(relative, refresh_prefixes)
+            size_mismatch = row["size_bytes"] >= 0 and actual_size != row["size_bytes"]
+            if size_mismatch and not refresh_allowed:
+                raise RuntimeError(f"Existing mirror size mismatch before publish: {relative}")
+            # Explicitly refreshed paths are always hashed so same-size direct
+            # canonical updates cannot leave a stale SHA in the manifest.
+            if refresh_allowed or verify_existing == "full" or row["size_bytes"] < 0:
                 actual_sha = sha256_file(source)
-                if actual_sha != row["sha256"]:
+                if (size_mismatch or actual_sha != row["sha256"]) and refresh_allowed:
+                    refreshed_existing_paths.append(relative.as_posix())
+                elif actual_sha != row["sha256"]:
                     raise RuntimeError(
                         f"Existing mirror checksum mismatch before publish: {relative}"
                     )
@@ -231,6 +267,9 @@ def publish(
         "publish_mode": "merge_verified_no_prune",
         "existing_verification_mode": verify_existing,
         "source_conflict_policy": source_conflict_policy,
+        "refresh_existing_prefixes": list(refresh_prefixes),
+        "refreshed_existing_count": len(refreshed_existing_paths),
+        "refreshed_existing_paths": sorted(refreshed_existing_paths),
         "skipped_stale_source_count": len(skipped_stale_source_paths),
         "skipped_stale_source_paths": skipped_stale_source_paths,
         "discovered_unmanifested_count": discovered_unmanifested,
@@ -241,6 +280,11 @@ def publish(
         f"Published and verified {published_from_source} source artifacts; "
         f"merged manifest contains {len(artifacts)} artifacts: {mirror_root}"
     )
+    if refreshed_existing_paths:
+        print(
+            "Re-hashed direct canonical updates: "
+            + ", ".join(sorted(refreshed_existing_paths))
+        )
     print(f"Wrote: {manifest_path}")
     return manifest_path
 
@@ -366,7 +410,12 @@ def restore(
 def main() -> None:
     args = parse_args()
     if args.command == "publish":
-        publish(args.mirror_root, args.verify_existing, args.source_conflict_policy)
+        publish(
+            args.mirror_root,
+            args.verify_existing,
+            args.source_conflict_policy,
+            args.refresh_existing_prefix,
+        )
     else:
         restore(
             args.mirror_root,

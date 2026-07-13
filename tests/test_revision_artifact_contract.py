@@ -377,6 +377,42 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "checksum mismatch"):
                     artifact_mirror.publish(mirror, verify_existing="size")
 
+    def test_explicit_refresh_prefix_certifies_direct_canonical_cache_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            direct = mirror / "predictions" / "folds" / "resnet_fold1.npz"
+            direct.parent.mkdir(parents=True)
+            direct.write_bytes(b"old-cache")
+
+            with patch.object(artifact_mirror, "REVISION_DIR", revision), patch.object(
+                artifact_mirror,
+                "ensure_revision_dirs",
+                return_value=None,
+            ):
+                manifest_path = artifact_mirror.publish(mirror, verify_existing="size")
+                direct.write_bytes(b"new-fold-cache-with-a-different-size")
+                with self.assertRaisesRegex(RuntimeError, "size mismatch"):
+                    artifact_mirror.publish(mirror, verify_existing="size")
+                artifact_mirror.publish(
+                    mirror,
+                    verify_existing="size",
+                    refresh_existing_prefixes=["predictions/folds"],
+                )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = {row["relative_path"]: row for row in payload["artifacts"]}
+            self.assertEqual(payload["refreshed_existing_count"], 1)
+            self.assertEqual(
+                payload["refreshed_existing_paths"],
+                ["predictions/folds/resnet_fold1.npz"],
+            )
+            self.assertEqual(
+                rows["predictions/folds/resnet_fold1.npz"]["sha256"],
+                sha256_file(direct),
+            )
+
     def test_publish_does_not_roll_canonical_mirror_back_from_stale_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

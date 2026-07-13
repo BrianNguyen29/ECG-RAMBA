@@ -82,6 +82,7 @@ class ArtifactSourceAuditTest(unittest.TestCase):
 
         for token in (
             "scripts/revision/10_minirocket_only_baseline.py",
+            "--refresh-existing-prefix predictions/folds",
             "REUSABLE_PREDICTION_MISMATCH_POLICY",
             "reject_and_recompute",
             "a stale prediction NPZ is rejected and refit automatically",
