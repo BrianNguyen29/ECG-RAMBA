@@ -81,6 +81,10 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         )
 
         for token in (
+            "scripts/revision/10_minirocket_only_baseline.py",
+            "REUSABLE_PREDICTION_MISMATCH_POLICY",
+            "reject_and_recompute",
+            "a stale prediction NPZ is rejected and refit automatically",
             "checkpoint_pattern='fold{fold}_resnet1d_cnn_final.pt'",
             "checkpoint_pattern='fold{fold}_raw_mamba_final_ema.pt'",
             "checkpoint_pattern='fold{fold}_transformer_ecg_final.pt'",

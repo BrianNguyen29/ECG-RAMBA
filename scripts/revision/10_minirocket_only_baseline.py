@@ -44,6 +44,7 @@ from scripts.revision.common import (  # noqa: E402
 PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 EVALUATED_TRANSFORM_NAME = "fixed_seed_rocket_family_random_convolution_max_ppv"
 CANONICAL_MINIROCKET = False
+REUSABLE_PREDICTION_MISMATCH_POLICY = "reject_and_recompute"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 
@@ -233,6 +234,14 @@ def load_existing_prediction_npz(
     model_name: str,
     classifier_params: dict,
 ) -> tuple[np.ndarray, np.ndarray] | None:
+    def reject(reason: str) -> None:
+        print(
+            "Reusable MiniRocket-only prediction NPZ rejected; "
+            f"the fold-safe heads will be refit: {reason}",
+            flush=True,
+        )
+        return None
+
     if not path.exists():
         return None
     print(f"Checking reusable MiniRocket-only prediction NPZ: {path}", flush=True)
@@ -240,7 +249,7 @@ def load_existing_prediction_npz(
         required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
         missing = required - set(data.files)
         if missing:
-            raise KeyError(f"Reusable prediction NPZ is missing keys: {sorted(missing)}")
+            return reject(f"missing keys {sorted(missing)}")
         existing_y = np.asarray(data["y_true"], dtype=np.float32)
         y_prob = np.asarray(data["y_prob"], dtype=np.float32)
         existing_record_id = np.asarray(data["record_id"], dtype=np.int64)
@@ -255,7 +264,7 @@ def load_existing_prediction_npz(
         advisory_metadata = {"git_commit"}
         for key, expected in expected_meta.items():
             if key not in data.files:
-                raise KeyError(f"Reusable prediction NPZ lacks metadata key: {key}")
+                return reject(f"missing metadata key {key}")
             actual = data[key]
             actual_value = actual.item() if np.ndim(actual) == 0 else actual
             expected_value = expected.item() if np.ndim(expected) == 0 else expected
@@ -267,22 +276,23 @@ def load_existing_prediction_npz(
                         flush=True,
                     )
                     continue
-                raise ValueError(
-                    f"Reusable prediction NPZ metadata mismatch for {key}: "
-                    f"{actual_value} != {expected_value}"
+                return reject(
+                    f"metadata mismatch for {key}: {actual_value} != {expected_value}"
                 )
     if existing_y.shape != y.shape or y_prob.shape != y.shape:
-        raise ValueError(f"Reusable prediction shape mismatch: y={existing_y.shape}, prob={y_prob.shape}, expected={y.shape}")
+        return reject(
+            f"shape mismatch y={existing_y.shape}, prob={y_prob.shape}, expected={y.shape}"
+        )
     if not np.array_equal(existing_y, y):
-        raise ValueError("Reusable prediction y_true differs from frozen OOF labels.")
+        return reject("y_true differs from the frozen OOF labels")
     if not np.array_equal(existing_record_id, record_id):
-        raise ValueError("Reusable prediction record_id differs from frozen OOF record_id.")
+        return reject("record_id differs from the frozen OOF record order")
     if existing_classes != class_names:
-        raise ValueError("Reusable prediction class_names differ from frozen OOF classes.")
+        return reject("class_names differ from the frozen OOF classes")
     if len(np.unique(fold_id[fold_id > 0])) != 5 and int(args.limit_records) == 0:
-        raise ValueError("Reusable canonical prediction does not cover all five folds.")
+        return reject("canonical predictions do not cover all five folds")
     if not np.all(np.isfinite(y_prob)):
-        raise ValueError("Reusable prediction contains non-finite probabilities.")
+        return reject("probabilities contain non-finite values")
     print("Reusable MiniRocket-only prediction NPZ passed contract checks.", flush=True)
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id
 
