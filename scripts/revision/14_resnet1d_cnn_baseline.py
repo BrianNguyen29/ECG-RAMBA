@@ -66,6 +66,18 @@ PER_CLASS_TABLE = TABLE_DIR / "table_resnet1d_cnn_class_metrics.csv"
 FOLD_TABLE = TABLE_DIR / "table_resnet1d_cnn_fold_summary.csv"
 FOLD_PREDICTION_DIR = PREDICTION_DIR / "folds"
 
+# The first Transformer comparator release (commit ee2a367) constructed the
+# architecture from these fixed values before Transformer-specific CLI fields
+# were added to checkpoint metadata. These values are therefore the only safe
+# inference for trusted legacy Transformer checkpoints.
+LEGACY_PATCH_TRANSFORMER_SOURCE_COMMIT = "ee2a36729c367c6c3acfe9b4fece2fed20acd674"
+LEGACY_PATCH_TRANSFORMER_DEFAULTS = {
+    "transformer_depth": 3,
+    "transformer_patch_size": 50,
+    "transformer_patch_stride": 25,
+    "transformer_ff_multiplier": 4,
+}
+
 
 def save_torch_atomic(path: Path, payload: dict) -> None:
     """Persist fold checkpoints safely across interrupted Colab sessions."""
@@ -889,7 +901,7 @@ def validate_legacy_checkpoint_arguments(
     checkpoint_path: Path,
     *,
     architecture_name: str,
-) -> None:
+) -> dict[str, object]:
     argument_keys = [
         "epochs",
         "batch_size",
@@ -898,26 +910,42 @@ def validate_legacy_checkpoint_arguments(
         "lr",
         "weight_decay",
     ]
-    if architecture_name == "patch_transformer_raw_ecg":
-        argument_keys.extend(
-            [
-                "transformer_embed_dim",
-                "transformer_heads",
-                "transformer_depth",
-                "transformer_patch_size",
-                "transformer_patch_stride",
-                "transformer_ff_multiplier",
-            ]
-        )
     missing = [key for key in argument_keys if key not in saved_args]
     if missing:
         raise ValueError(
-            f"Legacy checkpoint lacks required architecture arguments {missing}: "
+            f"Legacy checkpoint lacks required training arguments {missing}: "
             f"{checkpoint_path}"
         )
     for key in argument_keys:
         if str(saved_args[key]) != str(getattr(args, key)):
             raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+
+    inferred: dict[str, object] = {}
+    if architecture_name == "patch_transformer_raw_ecg":
+        legacy_embed_dim = int(saved_args["base_channels"])
+        legacy_transformer = {
+            "transformer_embed_dim": legacy_embed_dim,
+            "transformer_heads": 4 if legacy_embed_dim % 4 == 0 else 2,
+            **LEGACY_PATCH_TRANSFORMER_DEFAULTS,
+        }
+        for key, historical_value in legacy_transformer.items():
+            if key in saved_args:
+                saved_value = saved_args[key]
+            else:
+                saved_value = historical_value
+                inferred[key] = historical_value
+            current_value = getattr(args, key)
+            if str(saved_value) != str(current_value):
+                provenance = (
+                    f"historical default from {LEGACY_PATCH_TRANSFORMER_SOURCE_COMMIT}"
+                    if key in inferred
+                    else "saved checkpoint argument"
+                )
+                raise ValueError(
+                    f"Legacy checkpoint Transformer argument mismatch for {key}: "
+                    f"{saved_value} ({provenance}) != {current_value}: {checkpoint_path}"
+                )
+    return inferred
 
 
 def train_one_fold(
@@ -1036,6 +1064,7 @@ def train_one_fold(
         if str(saved_freeze_sha) != str(current_freeze_sha):
             raise ValueError(f"Checkpoint freeze-manifest SHA mismatch: {checkpoint_path}")
         checkpoint_params = payload.get("model_params")
+        legacy_inferred_arguments: dict[str, object] = {}
         if checkpoint_params is not None:
             if json.dumps(_json_safe(checkpoint_params), sort_keys=True) != json.dumps(
                 _json_safe(model_params), sort_keys=True
@@ -1048,7 +1077,7 @@ def train_one_fold(
             )
         else:
             saved_args = payload.get("args") or {}
-            validate_legacy_checkpoint_arguments(
+            legacy_inferred_arguments = validate_legacy_checkpoint_arguments(
                 saved_args,
                 args,
                 checkpoint_path,
@@ -1059,6 +1088,26 @@ def train_one_fold(
             if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
                 raise ValueError(f"Checkpoint runtime/training argument mismatch for {key}: {checkpoint_path}")
         model.load_state_dict(payload["model_state_dict"], strict=True)
+        if checkpoint_params is None and args.save_checkpoints:
+            source_checkpoint_sha256 = sha256_file(checkpoint_path)
+            payload["model_params"] = _json_safe(model_params)
+            payload["legacy_metadata_upgrade"] = {
+                "upgraded_utc": _now_utc(),
+                "source_checkpoint_sha256": source_checkpoint_sha256,
+                "inferred_arguments": _json_safe(legacy_inferred_arguments),
+                "historical_transformer_source_commit": (
+                    LEGACY_PATCH_TRANSFORMER_SOURCE_COMMIT
+                    if ARCHITECTURE_NAME == "patch_transformer_raw_ecg"
+                    else None
+                ),
+                "strict_state_dict_validated": True,
+            }
+            save_torch_atomic(checkpoint_path, payload)
+            print(
+                f"Fold {fold}: upgraded trusted legacy checkpoint metadata atomically; "
+                f"source_sha256={source_checkpoint_sha256}",
+                flush=True,
+            )
         model.to(device).eval()
         reused_checkpoint = True
         print(f"Fold {fold}: checkpoint accepted; regenerating validation predictions only", flush=True)

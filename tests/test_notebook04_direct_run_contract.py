@@ -56,6 +56,19 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             self.assertIn(checkpoint_token, self.source)
         self.assertGreaterEqual(self.source.count("manifest repair only"), 4)
 
+    def test_fold_cache_preflight_requires_current_oof_and_checkpoint_sha(self):
+        for token in (
+            "fold_prediction_cache_current_04",
+            "oof_predictions_sha256",
+            "checkpoint_sha256",
+            "expected_checkpoint_sha",
+            "Fold cache needs provenance upgrade",
+            "LEGACY_PATCH_TRANSFORMER_SOURCE_COMMIT",
+            "legacy_metadata_upgrade",
+        ):
+            self.assertIn(token, self.source)
+        self.assertGreaterEqual(self.source.count("fold_prediction_cache_current_04("), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

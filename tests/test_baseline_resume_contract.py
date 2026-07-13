@@ -208,7 +208,7 @@ class RawMambaResumeContractTests(unittest.TestCase):
             self.assertFalse(summary["reused_fold_predictions"])
             self.assertTrue((fold_cache_dir / "resnet1d_cnn_fold1_predictions.npz").exists())
 
-    def test_legacy_transformer_checkpoint_requires_architecture_arguments(self):
+    def test_legacy_transformer_checkpoint_infers_documented_historical_arguments(self):
         args = SimpleNamespace(
             epochs=20,
             batch_size=256,
@@ -224,16 +224,36 @@ class RawMambaResumeContractTests(unittest.TestCase):
             transformer_ff_multiplier=4,
         )
         saved_args = vars(args).copy()
+        for key in (
+            "transformer_embed_dim",
+            "transformer_heads",
+            "transformer_depth",
+            "transformer_patch_size",
+            "transformer_patch_stride",
+            "transformer_ff_multiplier",
+        ):
+            saved_args.pop(key)
         checkpoint_path = Path("fold1_transformer_ecg_final.pt")
-        RESNET.validate_legacy_checkpoint_arguments(
+        inferred = RESNET.validate_legacy_checkpoint_arguments(
             saved_args,
             args,
             checkpoint_path,
             architecture_name="patch_transformer_raw_ecg",
         )
+        self.assertEqual(
+            inferred,
+            {
+                "transformer_embed_dim": 96,
+                "transformer_heads": 4,
+                "transformer_depth": 3,
+                "transformer_patch_size": 50,
+                "transformer_patch_stride": 25,
+                "transformer_ff_multiplier": 4,
+            },
+        )
 
-        saved_args.pop("transformer_heads")
-        with self.assertRaisesRegex(ValueError, "transformer_heads"):
+        args.transformer_heads = 8
+        with self.assertRaisesRegex(ValueError, "historical default"):
             RESNET.validate_legacy_checkpoint_arguments(
                 saved_args,
                 args,
