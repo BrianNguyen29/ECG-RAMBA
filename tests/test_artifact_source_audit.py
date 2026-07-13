@@ -212,6 +212,9 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("canonical manifest mismatch", source)
         self.assertIn("BATCH_SIZE = 256", source)
         self.assertIn("NUM_WORKERS = 2", source)
+        self.assertIn("INSTALL_MODEL_DEPS = 'auto'", source)
+        self.assertIn("MODEL_DEPS_SHOULD_RUN", source)
+        self.assertIn("CPU reuse-only runtime: skipping CUDA/Mamba installation", source)
 
         comparator_runner = (
             Path(__file__).resolve().parents[1]
