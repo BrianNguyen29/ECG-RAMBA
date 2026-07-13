@@ -193,12 +193,27 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertNotIn("--check-only", source)
         self.assertIn("metric_implementation_sha256", source)
         self.assertIn("positive_label_multilabel_reduction", source)
+        self.assertIn("Verified final external comparator artifacts were not reusable", source)
         self.assertIn("EXTERNAL_GATE_DATASETS = 'ptbxl,georgia,cpsc2021'", source)
         self.assertIn("EXTERNAL_GATE_STRICT = True", source)
         self.assertIn("RUN_LEGACY_ROW_SPLIT_SCORE_CALIBRATION = False", source)
         self.assertIn("revision_artifacts' / 'reports' / 'revision", source)
-        self.assertIn("PTB-XL fold 9 artifacts are missing and require GPU model inference", source)
-        self.assertIn("('wfdb', 'torch', 'mamba_ssm', 'causal_conv1d')", source)
+        self.assertIn("def require_gpu_inference_runtime", source)
+        self.assertIn("modules.extend(['mamba_ssm', 'causal_conv1d'])", source)
+        self.assertIn("require_gpu_inference_runtime('Canonical final_ema OOF export')", source)
+        self.assertIn("require_gpu_inference_runtime('External Full-model export')", source)
+        self.assertIn("require_gpu_inference_runtime('PTB-XL fold 9 Full-model export')", source)
+        self.assertIn("BATCH_SIZE = 256", source)
+        self.assertIn("NUM_WORKERS = 2", source)
+
+        comparator_runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "revision"
+            / "31_generate_external_comparator_predictions.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Verified final external comparator artifacts were not reusable", comparator_runner)
+        self.assertIn('device.type != "cuda" and str(args.device).lower() == "auto"', comparator_runner)
 
     def test_classifies_identical_unique_and_conflicting_files(self):
         with tempfile.TemporaryDirectory() as tmp:

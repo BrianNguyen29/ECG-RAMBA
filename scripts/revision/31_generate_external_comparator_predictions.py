@@ -540,6 +540,14 @@ def run_dataset(
             pending.append((comparator, in_domain, checkpoints, checkpoint_hashes))
     if not pending:
         return result_rows
+    if device.type != "cuda" and str(args.device).lower() == "auto":
+        pending_names = ",".join(item[0] for item in pending)
+        raise RuntimeError(
+            "Verified final external comparator artifacts were not reusable and model inference is pending "
+            f"for {dataset}/{pending_names}. Attach a CUDA GPU (A100 High-RAM preferred), then rerun with "
+            "--device auto. Existing per-fold Drive caches remain reusable. Pass --device cpu only when the "
+            "slow CPU inference path is explicitly intended."
+        )
     root = external_helpers.extract_archive(dataset, archive, resolve(args.extract_root))
     signals, y_true, record_ids, group_ids, split_ids, load_summary = external_helpers.load_records(
         dataset,
