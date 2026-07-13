@@ -125,6 +125,122 @@ class RawMambaResumeContractTests(unittest.TestCase):
             self.assertFalse(summary["reused_fold_predictions"])
             self.assertTrue((fold_cache_dir / "raw_mamba_fold1_predictions.npz").exists())
 
+    def test_resnet_trusted_legacy_checkpoint_regenerates_cache_without_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint_dir = root / "checkpoints"
+            fold_cache_dir = root / "folds"
+            checkpoint_dir.mkdir()
+            fold_cache_dir.mkdir()
+
+            model = torch.nn.Linear(1, 1)
+            freeze_contract = {"freeze_manifest_sha256": "freeze-sha"}
+            load_info = {
+                "oof_predictions_sha256": "oof-sha",
+                "raw_cache_sha256": "raw-sha",
+                "dataset_record_order_fingerprint": "record-order",
+                "freeze_contract": freeze_contract,
+            }
+            args = SimpleNamespace(
+                seed=42,
+                force_rerun=False,
+                reuse_checkpoints=True,
+                allow_legacy_checkpoint_metadata=True,
+                checkpoint_dir=checkpoint_dir,
+                save_checkpoints=True,
+                batch_size=2,
+                num_workers=0,
+                threshold=0.5,
+                epochs=20,
+                base_channels=64,
+                dropout=0.2,
+                lr=0.001,
+                weight_decay=0.0001,
+                amp=False,
+                allow_tf32=False,
+            )
+            checkpoint_path = checkpoint_dir / "fold1_resnet1d_cnn_final.pt"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "fold": 1,
+                    "protocol": RESNET.PROTOCOL,
+                    "args": vars(args),
+                    "load_info": load_info,
+                },
+                checkpoint_path,
+            )
+
+            x = np.zeros((2, 12, int(RESNET.CONFIG["slice_length"])), dtype=np.float32)
+            y = np.zeros((2, 27), dtype=np.float32)
+            y[1, 0] = 1.0
+            slice_prob = np.full((1, 27), 0.1, dtype=np.float32)
+            slice_prob[0, 0] = 0.9
+
+            def fail_if_optimizer_is_built(*_args, **_kwargs):
+                raise AssertionError("legacy checkpoint resume unexpectedly entered training")
+
+            with patch.object(RESNET, "FOLD_PREDICTION_DIR", fold_cache_dir), patch.object(
+                RESNET, "build_model", return_value=model
+            ), patch.object(RESNET, "build_loader", return_value=[]), patch.object(
+                RESNET,
+                "predict_slice_probabilities",
+                return_value=(
+                    slice_prob,
+                    np.asarray([1], dtype=np.int64),
+                    np.asarray([0], dtype=np.int32),
+                ),
+            ), patch.object(torch.optim, "AdamW", side_effect=fail_if_optimizer_is_built):
+                result = RESNET.train_one_fold(
+                    fold=1,
+                    X=x,
+                    y=y,
+                    tr_idx=np.asarray([0], dtype=np.int64),
+                    va_idx=np.asarray([1], dtype=np.int64),
+                    device=torch.device("cpu"),
+                    args=args,
+                    load_info=load_info,
+                    model_params={"architecture": RESNET.ARCHITECTURE_NAME},
+                )
+
+            summary = result[-1]
+            self.assertTrue(summary["reused_checkpoint"])
+            self.assertFalse(summary["reused_fold_predictions"])
+            self.assertTrue((fold_cache_dir / "resnet1d_cnn_fold1_predictions.npz").exists())
+
+    def test_legacy_transformer_checkpoint_requires_architecture_arguments(self):
+        args = SimpleNamespace(
+            epochs=20,
+            batch_size=256,
+            base_channels=96,
+            dropout=0.2,
+            lr=0.001,
+            weight_decay=0.0001,
+            transformer_embed_dim=96,
+            transformer_heads=4,
+            transformer_depth=3,
+            transformer_patch_size=50,
+            transformer_patch_stride=25,
+            transformer_ff_multiplier=4,
+        )
+        saved_args = vars(args).copy()
+        checkpoint_path = Path("fold1_transformer_ecg_final.pt")
+        RESNET.validate_legacy_checkpoint_arguments(
+            saved_args,
+            args,
+            checkpoint_path,
+            architecture_name="patch_transformer_raw_ecg",
+        )
+
+        saved_args.pop("transformer_heads")
+        with self.assertRaisesRegex(ValueError, "transformer_heads"):
+            RESNET.validate_legacy_checkpoint_arguments(
+                saved_args,
+                args,
+                checkpoint_path,
+                architecture_name="patch_transformer_raw_ecg",
+            )
+
     def test_resnet_fold_cache_is_bound_to_exact_checkpoint_sha(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -69,6 +69,41 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertNotIn("def restore_learned_comparator_checkpoints_for_05", source05)
         self.assertIn("Durable command log:", source05)
 
+    def test_notebook04_audits_learned_checkpoint_contracts_before_completion(self):
+        notebook_path = (
+            Path(__file__).resolve().parents[1]
+            / "notebooks"
+            / "04_baselines_and_component_checks.ipynb"
+        )
+        notebook = json.loads(notebook_path.read_text(encoding="utf-8"))
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook.get("cells", [])
+        )
+
+        for token in (
+            "checkpoint_pattern='fold{fold}_resnet1d_cnn_final.pt'",
+            "checkpoint_pattern='fold{fold}_raw_mamba_final_ema.pt'",
+            "checkpoint_pattern='fold{fold}_transformer_ecg_final.pt'",
+            "checkpoint_pattern='fold{fold}_hybrid_morphology_final.pt'",
+            "RESNET_ALLOW_LEGACY_CHECKPOINT_METADATA = True",
+            "TRANSFORMER_ALLOW_LEGACY_CHECKPOINT_METADATA = True",
+            "--allow-legacy-checkpoint-metadata",
+            "require_cuda_runtime_for_baseline",
+            "A CPU runtime is valid only when every learned runner reports should_run=False",
+            "scripts/revision/38_pipeline_storage_audit.py",
+            "learned_prediction_checkpoint_contracts",
+            "complete_manifested",
+            "reviewer_required_baseline_outputs",
+            "Notebook 04 reviewer-complete baseline/paired package is incomplete",
+            "CANONICAL_FOLD_CACHE_DIR / f'resnet1d_cnn_fold{i}_predictions.npz'",
+            "RESNET_CHECKPOINT_DIR / f'fold{i}_resnet1d_cnn_final.pt'",
+        ):
+            self.assertIn(token, source)
+        self.assertNotIn(
+            "The remaining model-specific fair baseline runners are not implemented",
+            source,
+        )
+
     def test_all_active_notebooks_fail_fast_on_stale_drive_mount(self):
         notebook_dir = Path(__file__).resolve().parents[1] / "notebooks"
         active = [

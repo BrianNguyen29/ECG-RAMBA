@@ -883,6 +883,43 @@ def save_fold_predictions(
     print(f"Wrote fold prediction cache: {path}", flush=True)
 
 
+def validate_legacy_checkpoint_arguments(
+    saved_args: dict,
+    args: argparse.Namespace,
+    checkpoint_path: Path,
+    *,
+    architecture_name: str,
+) -> None:
+    argument_keys = [
+        "epochs",
+        "batch_size",
+        "base_channels",
+        "dropout",
+        "lr",
+        "weight_decay",
+    ]
+    if architecture_name == "patch_transformer_raw_ecg":
+        argument_keys.extend(
+            [
+                "transformer_embed_dim",
+                "transformer_heads",
+                "transformer_depth",
+                "transformer_patch_size",
+                "transformer_patch_stride",
+                "transformer_ff_multiplier",
+            ]
+        )
+    missing = [key for key in argument_keys if key not in saved_args]
+    if missing:
+        raise ValueError(
+            f"Legacy checkpoint lacks required architecture arguments {missing}: "
+            f"{checkpoint_path}"
+        )
+    for key in argument_keys:
+        if str(saved_args[key]) != str(getattr(args, key)):
+            raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+
+
 def train_one_fold(
     *,
     fold: int,
@@ -1011,9 +1048,12 @@ def train_one_fold(
             )
         else:
             saved_args = payload.get("args") or {}
-            for key in ("epochs", "base_channels", "dropout", "lr", "weight_decay"):
-                if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
-                    raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+            validate_legacy_checkpoint_arguments(
+                saved_args,
+                args,
+                checkpoint_path,
+                architecture_name=ARCHITECTURE_NAME,
+            )
         saved_args = payload.get("args") or {}
         for key in ("seed", "amp", "allow_tf32"):
             if key in saved_args and str(saved_args[key]) != str(getattr(args, key)):
