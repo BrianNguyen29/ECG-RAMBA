@@ -198,6 +198,7 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("EXTERNAL_GATE_STRICT = True", source)
         self.assertIn("EXTERNAL_GATE_INPUT_PATHS", source)
         self.assertIn("external_gate_input_restore.log", source)
+        self.assertIn("external_protocol_gate_immediate_mirror_publish.log", source)
         self.assertIn("External gate input contract: all 15 artifacts are present", source)
         self.assertIn("RUN_LEGACY_ROW_SPLIT_SCORE_CALIBRATION = False", source)
         self.assertIn("revision_artifacts' / 'reports' / 'revision", source)
@@ -206,6 +207,9 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("require_gpu_inference_runtime('Canonical final_ema OOF export')", source)
         self.assertIn("require_gpu_inference_runtime('External Full-model export')", source)
         self.assertIn("require_gpu_inference_runtime('PTB-XL fold 9 Full-model export')", source)
+        self.assertIn("External cache handoff: VERIFIED 15/15", source)
+        self.assertIn("SAFE TO DISCONNECT A100", source)
+        self.assertIn("canonical manifest mismatch", source)
         self.assertIn("BATCH_SIZE = 256", source)
         self.assertIn("NUM_WORKERS = 2", source)
 
