@@ -171,6 +171,17 @@ def save_torch_atomic(path: Path, payload: dict) -> None:
             temporary.unlink()
 
 
+def checkpoint_contract_path(path: Path) -> str:
+    """Serialize repo-local or durable external checkpoint paths without ambiguity."""
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.relative_to(PROJECT_ROOT.resolve()).as_posix()
+    except ValueError:
+        # Canonical Colab checkpoints intentionally live on Drive outside the
+        # ephemeral /content/ECG-RAMBA clone.
+        return resolved.as_posix()
+
+
 def build_checkpoint_contract(args: argparse.Namespace) -> dict:
     rows = []
     missing = []
@@ -182,7 +193,7 @@ def build_checkpoint_contract(args: argparse.Namespace) -> dict:
         rows.append(
             {
                 "fold": fold,
-                "path": helpers._project_relative(path),
+                "path": checkpoint_contract_path(path),
                 "size_bytes": path.stat().st_size,
                 "sha256": sha256_file(path),
             }

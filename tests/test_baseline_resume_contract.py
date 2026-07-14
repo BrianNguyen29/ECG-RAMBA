@@ -383,6 +383,27 @@ class RawMambaResumeContractTests(unittest.TestCase):
                 )
             )
 
+    def test_hybrid_checkpoint_contract_accepts_canonical_path_outside_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_dir = Path(tmp).resolve()
+            checkpoint = checkpoint_dir / "fold1_hybrid_morphology_final.pt"
+            checkpoint.write_bytes(b"hybrid-checkpoint")
+            contract = HYBRID.build_checkpoint_contract(
+                SimpleNamespace(checkpoint_dir=checkpoint_dir)
+            )
+
+            self.assertEqual(contract["status"], "partial")
+            self.assertEqual(contract["missing_folds"], [2, 3, 4, 5])
+            self.assertEqual(len(contract["checkpoints"]), 1)
+            self.assertEqual(
+                contract["checkpoints"][0]["path"],
+                checkpoint.as_posix(),
+            )
+            self.assertEqual(
+                contract["checkpoints"][0]["sha256"],
+                HYBRID.sha256_file(checkpoint),
+            )
+
     def test_final_prediction_contract_requires_all_five_checkpoint_hashes(self):
         contract = {
             "status": "complete",
