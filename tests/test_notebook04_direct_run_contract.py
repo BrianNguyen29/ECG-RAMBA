@@ -107,6 +107,17 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             self.assertIn(token, self.source)
         self.assertGreaterEqual(self.source.count("fold_prediction_cache_current_04("), 5)
 
+    def test_transformer_reuse_adopts_consistent_checkpoint_training_batch_size(self):
+        for token in (
+            "TRANSFORMER_ADOPT_CHECKPOINT_TRAINING_BATCH_SIZE = True",
+            "def _transformer_checkpoint_training_batch_sizes",
+            "Transformer checkpoints were trained with inconsistent batch sizes",
+            "and not transformer_force_retrain_requested",
+            "TRANSFORMER_BATCH_SIZE = checkpoint_training_batch_size",
+            "Resolved Transformer batch size",
+        ):
+            self.assertIn(token, self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

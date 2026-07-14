@@ -261,6 +261,28 @@ class RawMambaResumeContractTests(unittest.TestCase):
                 architecture_name="patch_transformer_raw_ecg",
             )
 
+    def test_legacy_checkpoint_argument_error_reports_saved_and_requested_values(self):
+        args = SimpleNamespace(
+            epochs=20,
+            batch_size=256,
+            base_channels=96,
+            dropout=0.2,
+            lr=0.001,
+            weight_decay=0.0001,
+        )
+        saved_args = vars(args).copy()
+        saved_args["batch_size"] = 128
+        with self.assertRaisesRegex(
+            ValueError,
+            r"batch_size: saved=128 requested=256",
+        ):
+            RESNET.validate_legacy_checkpoint_arguments(
+                saved_args,
+                args,
+                Path("fold1_resnet1d_cnn_final.pt"),
+                architecture_name="resnet1d_raw_ecg",
+            )
+
     def test_resnet_fold_cache_is_bound_to_exact_checkpoint_sha(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

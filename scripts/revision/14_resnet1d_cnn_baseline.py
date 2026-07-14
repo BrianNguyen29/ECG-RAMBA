@@ -918,7 +918,10 @@ def validate_legacy_checkpoint_arguments(
         )
     for key in argument_keys:
         if str(saved_args[key]) != str(getattr(args, key)):
-            raise ValueError(f"Legacy checkpoint argument mismatch for {key}: {checkpoint_path}")
+            raise ValueError(
+                f"Legacy checkpoint argument mismatch for {key}: "
+                f"saved={saved_args[key]!r} requested={getattr(args, key)!r}: {checkpoint_path}"
+            )
 
     inferred: dict[str, object] = {}
     if architecture_name == "patch_transformer_raw_ecg":
