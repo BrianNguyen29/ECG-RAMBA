@@ -25,6 +25,9 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
     def test_fair_baseline_matrix_validates_prediction_payloads(self):
         for token in (
             "CURRENT_OOF_REQUIRED_KEYS",
+            "OOF_PREDICTION_REQUIRED_KEYS_04",
+            "prediction_payload_matches_current_oof_04",
+            "Frozen OOF payload contract failed",
             "_prediction_payload_matches_current_oof",
             "np.array_equal(np.asarray(candidate['y_true']",
             "np.array_equal(np.asarray(candidate['record_id']",
@@ -33,6 +36,41 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             "prediction_contract_ok",
         ):
             self.assertIn(token, self.source)
+
+    def test_runner_reuse_checks_payload_before_skipping(self):
+        self.assertIn("Baseline record prediction payload rejected", self.source)
+        self.assertIn("Baseline artifact SHA binding rejected", self.source)
+        self.assertIn("Baseline checkpoint SHA binding rejected", self.source)
+        self.assertIn("MiniRocket-only prediction payload rejected", self.source)
+        self.assertIn("MiniRocket-only manifest artifact SHA binding rejected", self.source)
+        self.assertIn("require_cuda_runtime_for_baseline('MiniRocket-only baseline')", self.source)
+        self.assertIn("artifact_bindings={", self.source)
+        self.assertGreaterEqual(self.source.count("artifact_bindings={"), 4)
+        self.assertLess(
+            self.source.index("def prediction_payload_matches_current_oof_04"),
+            self.source.index("def _minirocket_artifacts_current"),
+        )
+
+    def test_auto_restore_uses_resolved_runner_state(self):
+        for token in (
+            "globals().get('minirocket_should_run', False)",
+            "globals().get('resnet_should_run', False)",
+            "globals().get('raw_mamba_should_run', False)",
+            "globals().get('transformer_should_run', False)",
+            "globals().get('hybrid_should_run', False)",
+        ):
+            self.assertIn(token, self.source)
+        self.assertNotIn("globals().get('RUN_MINIROCKET_ONLY_BASELINE', False)", self.source)
+
+    def test_paired_reuse_requires_complete_hash_bound_output_package(self):
+        for token in (
+            "def paired_output_artifacts_current_04",
+            "'bootstrap_samples': Path(samples_path)",
+            "manifest.get('artifact_sha256')",
+            "paired output SHA mismatch for",
+        ):
+            self.assertIn(token, self.source)
+        self.assertGreaterEqual(self.source.count("paired_output_artifacts_current_04("), 7)
 
     def test_hybrid_control_is_in_baseline_summary(self):
         for token in (
