@@ -64,6 +64,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "reviewer_minimal",
             "core_final",
             "artifact_mirror.py publish --verify-existing size",
+            "--refresh-existing-cache-dirs",
         ):
             self.assertIn(token, source)
 
@@ -79,6 +80,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "_embedding_is_current()",
             "_probe_is_v3_ready()",
             "representation_probe_fold_safe_v3_projection_and_fold_audit",
+            "--refresh-existing-cache-dirs",
         ):
             self.assertIn(token, source)
 
@@ -92,6 +94,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "learned_comparator_robustness_audit",
             "canonical_gate_ready",
             "final_evidence_tables",
+            "--refresh-existing-cache-dirs",
         ):
             self.assertIn(token, source)
 

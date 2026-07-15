@@ -58,6 +58,15 @@ def parse_args() -> argparse.Namespace:
             "writes directly into the canonical mirror. Repeatable."
         ),
     )
+    subparsers.choices["publish"].add_argument(
+        "--refresh-existing-cache-dirs",
+        action="store_true",
+        help=(
+            "Re-hash existing canonical files below directories whose name contains 'cache'. "
+            "Use after resumable runners write cache files directly to the mirror; non-cache "
+            "evidence and checkpoints retain the normal conflict checks."
+        ),
+    )
     subparsers.choices["restore"].add_argument(
         "--replace-mismatched",
         action="store_true",
@@ -126,11 +135,16 @@ def matches_refresh_prefix(relative: Path, prefixes: tuple[str, ...]) -> bool:
     )
 
 
+def is_cache_artifact(relative: Path) -> bool:
+    return any("cache" in part.lower() for part in relative.parts[:-1])
+
+
 def publish(
     mirror_root: Path,
     verify_existing: str = "full",
     source_conflict_policy: str = "newer",
     refresh_existing_prefixes: list[str] | tuple[str, ...] = (),
+    refresh_existing_cache_dirs: bool = False,
 ) -> Path:
     if verify_existing not in {"full", "size"}:
         raise ValueError(f"Unsupported existing verification mode: {verify_existing}")
@@ -154,7 +168,9 @@ def publish(
                     f"Existing mirror manifest references a missing file: {source}"
                 )
             actual_size = source.stat().st_size
-            refresh_allowed = matches_refresh_prefix(relative, refresh_prefixes)
+            refresh_allowed = matches_refresh_prefix(relative, refresh_prefixes) or (
+                refresh_existing_cache_dirs and is_cache_artifact(relative)
+            )
             size_mismatch = row["size_bytes"] >= 0 and actual_size != row["size_bytes"]
             if size_mismatch and not refresh_allowed:
                 raise RuntimeError(f"Existing mirror size mismatch before publish: {relative}")
@@ -268,6 +284,7 @@ def publish(
         "existing_verification_mode": verify_existing,
         "source_conflict_policy": source_conflict_policy,
         "refresh_existing_prefixes": list(refresh_prefixes),
+        "refresh_existing_cache_dirs": bool(refresh_existing_cache_dirs),
         "refreshed_existing_count": len(refreshed_existing_paths),
         "refreshed_existing_paths": sorted(refreshed_existing_paths),
         "skipped_stale_source_count": len(skipped_stale_source_paths),
@@ -415,6 +432,7 @@ def main() -> None:
             args.verify_existing,
             args.source_conflict_policy,
             args.refresh_existing_prefix,
+            args.refresh_existing_cache_dirs,
         )
     else:
         restore(
