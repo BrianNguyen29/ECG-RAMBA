@@ -1,3 +1,4 @@
+import csv
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -6,7 +7,7 @@ from unittest.mock import patch
 import numpy as np
 
 from configs.config import setup_paths
-from scripts.revision.common import aggregate_record_probabilities, power_mean
+from scripts.revision.common import aggregate_record_probabilities, power_mean, save_csv
 
 
 class PowerMeanTests(unittest.TestCase):
@@ -133,6 +134,38 @@ class DatasetPathTests(unittest.TestCase):
             ):
                 paths = setup_paths(27, 3072, "test")
             self.assertEqual(Path(paths["model_dir"]), model_dir)
+
+
+class CsvOutputTests(unittest.TestCase):
+    def test_heterogeneous_rows_use_stable_union_of_columns(self):
+        rows = [
+            {"dataset": "ptbxl", "model": "full", "primary_value": 0.6},
+            {
+                "dataset": "ptbxl",
+                "model": "full",
+                "comparator": "resnet",
+                "improvement_full_over_comparator": -0.1,
+            },
+        ]
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "primary.csv"
+            save_csv(output, rows)
+            with output.open(newline="", encoding="utf-8") as handle:
+                saved = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            list(saved[0]),
+            [
+                "dataset",
+                "model",
+                "primary_value",
+                "comparator",
+                "improvement_full_over_comparator",
+            ],
+        )
+        self.assertEqual(saved[0]["comparator"], "")
+        self.assertEqual(saved[1]["primary_value"], "")
+        self.assertEqual(saved[1]["comparator"], "resnet")
 
 
 if __name__ == "__main__":

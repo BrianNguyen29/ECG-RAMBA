@@ -172,7 +172,8 @@ def save_csv(path: os.PathLike[str] | str, rows: Iterable[dict]) -> None:
                 os.fsync(f.fileno())
         else:
             with tmp_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
                 f.flush()
