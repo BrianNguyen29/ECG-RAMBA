@@ -613,10 +613,21 @@ def write_final_embedding_npz(
     print(f"Wrote representation embeddings: {path}", flush=True)
 
 
-def final_embedding_matches(path: Path, oof: dict[str, Any], checkpoint_kind: str) -> bool:
+def inspect_final_embedding_reuse(
+    path: Path,
+    oof: dict[str, Any],
+    checkpoint_kind: str,
+    checkpoint_contracts: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
     path = resolve(path)
+    audit: dict[str, Any] = {
+        "reusable": False,
+        "issues": [],
+        "semantic_fields": ["y_true", "record_id", "fold_id", "class_names"],
+    }
     if not path.exists() or path.stat().st_size == 0:
-        return False
+        audit["issues"].append("embedding_missing_or_empty")
+        return audit
     try:
         with np.load(path, allow_pickle=False) as data:
             required = {
@@ -628,30 +639,135 @@ def final_embedding_matches(path: Path, oof: dict[str, Any], checkpoint_kind: st
                 "checkpoint_kind",
                 "oof_predictions_sha256",
                 "freeze_manifest_sha256",
+                "slice_count",
+                "embedding_manifest_json",
                 *EMBEDDING_KEYS,
             }
-            if required - set(data.files):
-                return False
-            if (
-                str(data["protocol"].item()) != PROTOCOL
-                or str(data["checkpoint_kind"].item()) != checkpoint_kind
-                or str(data["oof_predictions_sha256"].item()) != oof["sha256"]
-                or str(data["freeze_manifest_sha256"].item())
-                != str(oof["freeze_manifest_sha256"] or "")
-                or not np.array_equal(np.asarray(data["y_true"], dtype=np.float32), oof["y_true"])
-                or not np.array_equal(np.asarray(data["record_id"]).astype(np.int64), oof["record_id"])
-                or not np.array_equal(np.asarray(data["class_names"]).astype(str), oof["class_names"])
-                or set(np.unique(np.asarray(data["fold_id"]).astype(int))) != {1, 2, 3, 4, 5}
-            ):
-                return False
-            return all(
+            missing = sorted(required - set(data.files))
+            if missing:
+                audit["issues"].append(f"missing_fields={','.join(missing)}")
+                return audit
+
+            source_oof_sha = str(data["oof_predictions_sha256"].item())
+            source_freeze_sha = str(data["freeze_manifest_sha256"].item())
+            audit.update(
+                {
+                    "source_oof_sha256": source_oof_sha,
+                    "source_freeze_sha256": source_freeze_sha,
+                    "current_oof_sha256": oof["sha256"],
+                    "current_freeze_sha256": str(oof["freeze_manifest_sha256"] or ""),
+                    "exact_oof_sha_match": source_oof_sha == oof["sha256"],
+                    "exact_freeze_sha_match": source_freeze_sha
+                    == str(oof["freeze_manifest_sha256"] or ""),
+                }
+            )
+            if str(data["protocol"].item()) != PROTOCOL:
+                audit["issues"].append("protocol_mismatch")
+            if str(data["checkpoint_kind"].item()) != checkpoint_kind:
+                audit["issues"].append("checkpoint_kind_mismatch")
+
+            semantic_match = bool(
+                np.array_equal(np.asarray(data["y_true"], dtype=np.float32), oof["y_true"])
+                and np.array_equal(np.asarray(data["record_id"]).astype(np.int64), oof["record_id"])
+                and np.array_equal(np.asarray(data["fold_id"]).astype(np.int16), oof["fold_id"])
+                and np.array_equal(np.asarray(data["class_names"]).astype(str), oof["class_names"])
+            )
+            audit["semantic_contract_match"] = semantic_match
+            if not semantic_match:
+                audit["issues"].append("oof_semantic_contract_mismatch")
+
+            embedded_manifest = json.loads(str(data["embedding_manifest_json"].item()))
+            audit["existing_semantic_reuse_attestation"] = embedded_manifest.get(
+                "semantic_reuse_attestation"
+            )
+            observed_checkpoint_shas = {
+                int(row.get("fold", -1)): str(row.get("checkpoint_sha256") or "")
+                for row in embedded_manifest.get("fold_summaries", [])
+                if int(row.get("fold", -1)) > 0
+            }
+            expected_checkpoint_shas = {
+                int(fold): str(row.get("sha256") or "")
+                for fold, row in checkpoint_contracts.items()
+                if str(row.get("sha256") or "")
+            }
+            expected_folds = set(range(1, int(CONFIG["n_folds"]) + 1))
+            audit["checkpoint_contract_match"] = bool(
+                set(expected_checkpoint_shas) == expected_folds
+                and observed_checkpoint_shas == expected_checkpoint_shas
+            )
+            audit["checkpoint_sha256_by_fold"] = observed_checkpoint_shas
+            if not audit["checkpoint_contract_match"]:
+                audit["issues"].append("checkpoint_sha_contract_mismatch_or_incomplete")
+
+            embeddings_valid = all(
                 np.asarray(data[key]).ndim == 2
                 and np.asarray(data[key]).shape[0] == len(oof["record_id"])
                 and np.isfinite(np.asarray(data[key], dtype=np.float32)).all()
                 for key in EMBEDDING_KEYS
             )
-    except Exception:
-        return False
+            audit["embedding_arrays_valid"] = embeddings_valid
+            if not embeddings_valid:
+                audit["issues"].append("embedding_arrays_invalid")
+    except Exception as exc:
+        audit["issues"].append(f"{type(exc).__name__}: {exc}")
+        return audit
+
+    audit["exact_source_contract"] = bool(
+        audit.get("exact_oof_sha_match") and audit.get("exact_freeze_sha_match")
+    )
+    audit["reusable"] = not audit["issues"]
+    return audit
+
+
+def refresh_final_embedding_contract(
+    *,
+    path: Path,
+    oof: dict[str, Any],
+    checkpoint_kind: str,
+    reuse_audit: dict[str, Any],
+) -> dict[str, Any]:
+    path = resolve(path)
+    with np.load(path, allow_pickle=False) as data:
+        embeddings = {key: np.asarray(data[key], dtype=np.float32) for key in EMBEDDING_KEYS}
+        fold_id = np.asarray(data["fold_id"], dtype=np.int16)
+        slice_count = np.asarray(data["slice_count"], dtype=np.int16)
+        payload = json.loads(str(data["embedding_manifest_json"].item()))
+
+    attestation = {
+        "status": "verified_semantic_repack",
+        "source_oof_sha256": reuse_audit.get("source_oof_sha256"),
+        "source_freeze_sha256": reuse_audit.get("source_freeze_sha256"),
+        "current_oof_sha256": oof["sha256"],
+        "current_freeze_sha256": str(oof["freeze_manifest_sha256"] or ""),
+        "semantic_contract_match": reuse_audit.get("semantic_contract_match") is True,
+        "checkpoint_contract_match": reuse_audit.get("checkpoint_contract_match") is True,
+        "semantic_fields": reuse_audit.get("semantic_fields", []),
+    }
+    payload.update(
+        {
+            "created_utc": now_utc(),
+            "runner_sha256": sha256_file(Path(__file__).resolve()),
+            "checkpoint_kind": checkpoint_kind,
+            "oof_predictions": project_relative(oof["path"]),
+            "oof_predictions_sha256": oof["sha256"],
+            "freeze_manifest": project_relative(oof["freeze_manifest"]),
+            "freeze_manifest_sha256": oof["freeze_manifest_sha256"],
+            "canonical_contract": {
+                "oof_sha256": oof["sha256"],
+                "freeze_sha256": oof["freeze_manifest_sha256"],
+            },
+            "semantic_reuse_attestation": attestation,
+        }
+    )
+    write_final_embedding_npz(
+        path=path,
+        oof=oof,
+        embeddings=embeddings,
+        fold_id=fold_id,
+        slice_count=slice_count,
+        payload=payload,
+    )
+    return attestation
 
 
 def main() -> None:
@@ -677,7 +793,26 @@ def main() -> None:
     print(f"only_folds={sorted(only_folds) if only_folds else 'all'}", flush=True)
     print(f"batch_size={args.batch_size} num_workers={args.num_workers}", flush=True)
     checkpoint_contracts = load_checkpoint_contracts(args.oof_run_manifest, args.checkpoint_kind)
-    if not only_folds and final_embedding_matches(args.out_embedding, oof, args.checkpoint_kind):
+    final_reuse_audit = inspect_final_embedding_reuse(
+        args.out_embedding,
+        oof,
+        args.checkpoint_kind,
+        checkpoint_contracts,
+    )
+    if not only_folds and final_reuse_audit.get("reusable"):
+        semantic_reuse_attestation = None
+        if not final_reuse_audit.get("exact_source_contract"):
+            semantic_reuse_attestation = refresh_final_embedding_contract(
+                path=args.out_embedding,
+                oof=oof,
+                checkpoint_kind=args.checkpoint_kind,
+                reuse_audit=final_reuse_audit,
+            )
+            print(
+                "Refreshed representation embedding OOF/freeze metadata after verified "
+                "semantic and checkpoint-contract reuse.",
+                flush=True,
+            )
         manifest_path = resolve(args.out_manifest)
         existing = {}
         if manifest_path.exists():
@@ -715,12 +850,21 @@ def main() -> None:
                     "information only; do not claim proven morphology-rhythm disentanglement."
                 ),
                 "reused_verified_final_embedding": True,
+                "semantic_reuse_attestation": semantic_reuse_attestation
+                or final_reuse_audit.get("existing_semantic_reuse_attestation")
+                or existing.get("semantic_reuse_attestation"),
             }
         )
         save_json(manifest_path, jsonable(existing))
         print(f"Reusing verified final representation embedding: {resolve(args.out_embedding)}", flush=True)
         print(f"Wrote manifest: {manifest_path}", flush=True)
         return
+    if final_reuse_audit.get("issues"):
+        print(
+            "Final representation embedding is not reusable: "
+            + "; ".join(str(issue) for issue in final_reuse_audit["issues"]),
+            flush=True,
+        )
     gen.validate_runtime_memory(args)
     validate_mamba_runtime_for_extraction()
 

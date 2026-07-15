@@ -75,6 +75,15 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertIn("sha256_file(oof_prediction_path)", summary_cell)
         self.assertNotIn("sha256_file(record_path)", summary_cell)
 
+    def test_notebook06_can_refresh_semantically_equivalent_embedding_on_cpu(self):
+        _, source = notebook_source("06_pooling_and_representation.ipynb")
+        for token in (
+            "inspect_final_embedding_reuse",
+            "Representation embedding semantic refresh audit",
+            "Refreshing representation provenance from the verified final embedding; GPU/Mamba is not needed.",
+        ):
+            self.assertIn(token, source)
+
     def test_notebook06_is_direct_run_and_contract_strict(self):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
         for token in (
