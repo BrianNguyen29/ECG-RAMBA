@@ -32,6 +32,7 @@ from scripts.revision.common import (  # noqa: E402
     save_json_atomic,
     sha256_file,
 )
+from scripts.revision.robustness_profile_audit import select_best_profile  # noqa: E402
 
 
 REQUIRED_ROBUSTNESS_STRESSES = {
@@ -798,6 +799,20 @@ def main() -> None:
         "oof_sha256": current_oof_sha256,
         "freeze_sha256": current_freeze_sha256,
     }
+    learned_robustness_audit = select_best_profile(
+        REVISION_DIR,
+        canonical_contract=canonical_contract,
+        runner_path=PROJECT_ROOT / "scripts" / "revision" / "21_robustness_multicomparator.py",
+        project_root=PROJECT_ROOT,
+    )
+    selected_robustness_paths = (
+        (learned_robustness_audit.get("selected") or {}).get("paths") or {}
+    )
+    for label, value in selected_robustness_paths.items():
+        optional_paths[f"learned_robustness_selected_{label}"] = Path(value)
+    selected_robustness_evidence_paths = [
+        rel(Path(value)) for value in selected_robustness_paths.values()
+    ]
 
     calibration = read_json(paths["calibration"], required=args.strict)
     pooling_rows = read_csv_rows(paths["pooling"], required=args.strict)
@@ -1254,7 +1269,8 @@ def main() -> None:
                 f"ResNet1D/CNN PR-AUC={fmt(resnet.get('pr_auc_macro'))}, F1={fmt(resnet.get('f1_macro'))}; "
                 f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
                 f"{transformer_key_numbers}"
-                f"{hybrid_key_numbers}; {external_comparator_audit['key_numbers']}"
+                f"{hybrid_key_numbers}; {external_comparator_audit['key_numbers']}; "
+                f"{learned_robustness_audit['key_numbers']}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
@@ -1263,7 +1279,8 @@ def main() -> None:
                 "reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json"
                 f"{transformer_evidence_paths}"
                 f"{hybrid_evidence_paths};reports/revision/metrics/external_comparator_paired_summary.json;"
-                "reports/revision/tables/table_external_comparator_paired.csv"
+                "reports/revision/tables/table_external_comparator_paired.csv;"
+                + ";".join(selected_robustness_evidence_paths)
             ),
             "safe_wording": (
                 "Do not claim superiority over all fair baselines. Report comparator-specific, "
@@ -1271,9 +1288,18 @@ def main() -> None:
                 "and Raw Mamba are stronger on discrimination/F1 metrics; narrow ECG-RAMBA "
                 "claims to supported calibration tradeoffs, architecture analysis, and "
                 "documented limitations. "
-                f"{external_comparator_audit['safe_wording']}"
+                f"{external_comparator_audit['safe_wording']} "
+                f"{learned_robustness_audit['safe_wording']}"
             ),
-            "blocker": "; ".join(item for item in [c01_blocker, external_comparator_audit["blocker"]] if item),
+            "blocker": "; ".join(
+                item
+                for item in [
+                    c01_blocker,
+                    external_comparator_audit["blocker"],
+                    learned_robustness_audit["blocker"],
+                ]
+                if item
+            ),
             "source_claim_status": c01_evidence_status,
         },
         {
@@ -1456,8 +1482,7 @@ def main() -> None:
             ),
             "robustness": (
                 "Use only metric-specific robustness claims supported by paired degradation CIs. "
-                "A learned-comparator ledger, when complete, remains stress-, metric-, and comparator-specific; "
-                "it does not support broad robustness superiority."
+                f"{learned_robustness_audit['safe_wording']}"
             ),
             "fewshot": (
                 "Legacy row-split score calibration is not claim-ready. Group-safe score calibration changes no "
@@ -1521,6 +1546,7 @@ def main() -> None:
         "true_fewshot_head_adaptation_summary": true_fewshot_summary,
         "external_learned_comparator_audit": external_comparator_audit,
         "robustness_summary": robustness_summary,
+        "learned_comparator_robustness_audit": learned_robustness_audit,
         "representation_summary": representation_summary,
         "task_status": {
             key: {
@@ -1568,6 +1594,14 @@ def main() -> None:
         "input_sha256": {
             name: sha256_file(path) for name, path in paths.items() if path.exists()
         },
+        "optional_input_sha256": {
+            name: sha256_file(path)
+            for name, path in optional_paths.items()
+            if path.exists() and path.stat().st_size > 0
+        },
+        "selected_learned_robustness_profile": learned_robustness_audit.get(
+            "selected_profile"
+        ),
         "final_ready_for_rebuttal": final_ready,
         "all_claims_supported": False,
     }
