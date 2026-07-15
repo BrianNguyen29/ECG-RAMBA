@@ -65,6 +65,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "core_final",
             "artifact_mirror.py publish --verify-existing size",
             "--refresh-existing-cache-dirs",
+            "oof_label_fold_contract_sha256",
+            "hrv_only_oof_reuse_attestation.json",
+            "semantic_contract_match",
         ):
             self.assertIn(token, source)
         summary_cell = next(cell for cell in cells if "Claim Evidence Summary requires" in cell)

@@ -103,8 +103,52 @@ class HRVDomainAnalysisTests(unittest.TestCase):
             np.testing.assert_array_equal(y_loaded, y)
             self.assertEqual(len(folds), 3)
             self.assertEqual(oof_info["oof_records_total"], 12)
+            self.assertEqual(len(oof_info["oof_label_fold_contract_sha256"]), 64)
             np.testing.assert_array_equal(X_loaded, X_hrv)
             self.assertFalse(hrv_info["raw_chapman_loaded"])
+
+            y_limited, _, limited_info = hrv_analysis.load_oof_labels_and_folds(oof_path, limit_records=6)
+            self.assertEqual(limited_info["oof_records_total"], 12)
+            self.assertEqual(limited_info["oof_records_used"], 6)
+            self.assertEqual(
+                limited_info["oof_label_fold_contract_sha256"],
+                hrv_analysis.oof_label_fold_contract_sha256(
+                    y_true=y[:6],
+                    fold_id=fold_id[:6],
+                    record_id=np.arange(6, dtype=np.int64),
+                    class_names=hrv_analysis.CLASSES,
+                ),
+            )
+            np.testing.assert_array_equal(y_limited, y[:6])
+
+    def test_oof_label_fold_contract_detects_fold_assignment_changes(self):
+        y = np.zeros((6, 27), dtype=np.float32)
+        y[::2, 0] = 1.0
+        record_id = np.arange(6, dtype=np.int64)
+        folds = np.asarray([1, 1, 2, 2, 3, 3], dtype=np.int16)
+        original = hrv_analysis.oof_label_fold_contract_sha256(
+            y_true=y,
+            fold_id=folds,
+            record_id=record_id,
+            class_names=hrv_analysis.CLASSES,
+        )
+        repeated = hrv_analysis.oof_label_fold_contract_sha256(
+            y_true=y.copy(),
+            fold_id=folds.astype(np.int64),
+            record_id=record_id.copy(),
+            class_names=list(hrv_analysis.CLASSES),
+        )
+        changed_folds = folds.copy()
+        changed_folds[[0, 2]] = changed_folds[[2, 0]]
+        changed = hrv_analysis.oof_label_fold_contract_sha256(
+            y_true=y,
+            fold_id=changed_folds,
+            record_id=record_id,
+            class_names=hrv_analysis.CLASSES,
+        )
+
+        self.assertEqual(original, repeated)
+        self.assertNotEqual(original, changed)
 
     def test_cached_hrv_loader_prefers_record_fingerprinted_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

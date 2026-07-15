@@ -16,6 +16,7 @@ inference task and are not executed here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,35 @@ PROTOCOL = "hrv36_logistic_regression_same_folds_threshold_0.5"
 DOMAIN_PROTOCOL = "hrv36_domain_logistic_regression_stratified_cv"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
+
+
+def oof_label_fold_contract_sha256(
+    *,
+    y_true: np.ndarray,
+    fold_id: np.ndarray,
+    record_id: np.ndarray,
+    class_names: Iterable[str],
+) -> str:
+    """Hash only the OOF fields that determine a fold-safe HRV baseline."""
+
+    digest = hashlib.sha256()
+
+    def update_array(name: str, value: np.ndarray, dtype: np.dtype) -> None:
+        array = np.ascontiguousarray(np.asarray(value, dtype=dtype))
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(str(array.dtype).encode("ascii") + b"\0")
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        digest.update(array.tobytes())
+
+    update_array("y_true", y_true, np.float32)
+    update_array("fold_id", fold_id, np.int16)
+    update_array("record_id", record_id, np.int64)
+    digest.update(b"class_names\0")
+    for name in class_names:
+        encoded = str(name).encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "little"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 def parse_args() -> argparse.Namespace:
@@ -430,18 +460,28 @@ def load_oof_labels_and_folds(oof_predictions: Path, limit_records: int) -> tupl
     if class_names != CLASSES:
         raise ValueError("OOF class_names differ from configs.config.CLASSES.")
 
+    oof_records_total = int(len(record_id))
     if limit_records > 0:
         y = y[:limit_records]
         fold_id = fold_id[:limit_records]
+        record_id = record_id[:limit_records]
+
+    semantic_contract_sha = oof_label_fold_contract_sha256(
+        y_true=y,
+        fold_id=fold_id,
+        record_id=record_id,
+        class_names=class_names,
+    )
 
     folds = folds_from_fold_id(fold_id)
     info = {
         "oof_predictions": str(oof_predictions),
         "oof_predictions_sha256": sha256_file(oof_predictions),
-        "oof_records_total": int(len(record_id)),
+        "oof_records_total": oof_records_total,
         "oof_records_used": int(len(y)),
         "fold_count": int(len(folds)),
         "fold_counts": {str(fold): int(np.sum(fold_id == fold)) for fold in sorted(np.unique(fold_id)) if int(fold) > 0},
+        "oof_label_fold_contract_sha256": semantic_contract_sha,
     }
     return y, folds, info
 
@@ -746,6 +786,9 @@ def write_outputs(
         config_hash=np.asarray(CONFIG_HASH),
         git_commit=np.asarray(_git_output(["rev-parse", "HEAD"]) or ""),
         manuscript_ready=np.asarray(True),
+        oof_label_fold_contract_sha256=np.asarray(
+            str(load_info.get("oof_label_fold_contract_sha256") or "")
+        ),
     )
 
     per_class_path = TABLE_DIR / "table_hrv_only_class_metrics.csv"
