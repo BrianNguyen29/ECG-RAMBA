@@ -54,7 +54,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                 compile(source, f"{notebook}:cell_{index}", "exec")
 
     def test_notebook05_selects_authenticated_robustness_profile(self):
-        _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
+        cells, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
         for token in (
             "robustness_profile_audit.py",
             "select_best_profile",
@@ -67,6 +67,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "--refresh-existing-cache-dirs",
         ):
             self.assertIn(token, source)
+        summary_cell = next(cell for cell in cells if "Claim Evidence Summary requires" in cell)
+        self.assertIn("oof_prediction_path = revision_root", summary_cell)
+        self.assertIn("sha256_file(oof_prediction_path)", summary_cell)
+        self.assertNotIn("sha256_file(record_path)", summary_cell)
 
     def test_notebook06_is_direct_run_and_contract_strict(self):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
