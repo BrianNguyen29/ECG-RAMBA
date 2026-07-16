@@ -136,6 +136,23 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook07_uses_stable_final_generator_capabilities(self):
+        _, source = notebook_source("07_results_freeze.ipynb")
+        generator_source = (
+            PROJECT_ROOT / "scripts" / "revision" / "13_final_evidence_matrix.py"
+        ).read_text(encoding="utf-8")
+        for token in (
+            "FINAL_EVIDENCE_SCHEMA_VERSION",
+            "FINAL_EVIDENCE_CAPABILITIES",
+            "group_safe_score_calibration_v2",
+            "true_fewshot_frozen_encoder_head_v2",
+            "representation_probe_v3",
+        ):
+            self.assertIn(token, source)
+            self.assertIn(token, generator_source)
+        self.assertNotIn("def summarize_fewshot", source)
+        self.assertNotIn("def combine_fewshot_summaries", source)
+
 
 if __name__ == "__main__":
     unittest.main()
