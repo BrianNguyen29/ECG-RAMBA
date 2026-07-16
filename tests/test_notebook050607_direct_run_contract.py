@@ -79,8 +79,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
         for token in (
             "inspect_final_embedding_reuse",
+            "validate_checkpoint_fold_contract",
             "Representation embedding semantic refresh audit",
             "Refreshing representation provenance from the verified final embedding; GPU/Mamba is not needed.",
+            "The extractor now uses the fold_id frozen in the canonical OOF artifact",
         ):
             self.assertIn(token, source)
 

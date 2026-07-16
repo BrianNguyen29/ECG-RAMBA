@@ -111,6 +111,66 @@ class RepresentationEmbeddingReuseTests(unittest.TestCase):
             self.assertFalse(audit["reusable"])
             self.assertIn("checkpoint_sha_contract_mismatch_or_incomplete", audit["issues"])
 
+    def test_fold_assignment_mismatch_blocks_reuse_with_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "embedding.npz"
+            old_oof, current_oof, checkpoint_contracts, payload, embeddings = self._fixture(root)
+            extract.write_final_embedding_npz(
+                path=path,
+                oof=old_oof,
+                embeddings=embeddings,
+                fold_id=old_oof["fold_id"],
+                slice_count=np.ones(len(old_oof["record_id"]), dtype=np.int16),
+                payload=payload,
+            )
+            current_oof["fold_id"] = np.roll(current_oof["fold_id"], 1)
+
+            audit = extract.inspect_final_embedding_reuse(
+                path, current_oof, "final_ema", checkpoint_contracts
+            )
+            self.assertFalse(audit["reusable"])
+            self.assertFalse(audit["semantic_field_match"]["fold_id"])
+            self.assertTrue(audit["semantic_field_match"]["y_true"])
+            self.assertIn("oof_fold_assignment_mismatch", audit["issues"])
+            self.assertEqual(audit["fold_assignment_mismatch_count"], len(old_oof["fold_id"]))
+
+    def test_folds_are_derived_from_frozen_oof_membership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_oof, _, _, _, _ = self._fixture(Path(tmp))
+            folds = extract.folds_from_frozen_oof(old_oof)
+            self.assertEqual([int(row["fold_num"]) for row in folds], [1, 2, 3, 4, 5])
+            for row in folds:
+                fold_num = int(row["fold_num"])
+                expected_val = np.flatnonzero(old_oof["fold_id"] == fold_num)
+                self.assertTrue(np.array_equal(row["va_idx"], expected_val))
+                self.assertTrue(np.all(old_oof["fold_id"][row["tr_idx"]] != fold_num))
+                self.assertEqual(len(row["tr_idx"]) + len(row["va_idx"]), len(old_oof["fold_id"]))
+
+    def test_checkpoint_folds_must_match_frozen_oof(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_oof, _, checkpoint_contracts, _, _ = self._fixture(root)
+            folds = extract.folds_from_frozen_oof(old_oof)
+            extract.joblib.dump(
+                [{"tr_idx": row["tr_idx"], "va_idx": row["va_idx"]} for row in folds],
+                root / "folds.pkl",
+            )
+            for fold, contract in checkpoint_contracts.items():
+                contract["path"] = str(root / f"fold{fold}_final_ema.pt")
+
+            split_contract = extract.validate_checkpoint_fold_contract(
+                old_oof, checkpoint_contracts
+            )
+            self.assertEqual(
+                split_contract["source"],
+                "frozen_oof_fold_id_verified_against_checkpoint_folds",
+            )
+            mismatched = dict(old_oof)
+            mismatched["fold_id"] = np.roll(old_oof["fold_id"], 1)
+            with self.assertRaisesRegex(RuntimeError, "mismatched_records"):
+                extract.validate_checkpoint_fold_contract(mismatched, checkpoint_contracts)
+
 
 if __name__ == "__main__":
     unittest.main()

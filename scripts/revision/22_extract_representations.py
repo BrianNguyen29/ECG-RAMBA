@@ -1,9 +1,10 @@
 """Extract frozen ECG-RAMBA branch embeddings for representation probes.
 
-This runner reuses the manuscript OOF data/fold/PCA/checkpoint contract from
-``01_generate_predictions.py`` and writes a record-level embedding artifact for
-``20_representation_probe.py``.  It is intentionally separate from the model
-class so the inference path used for reviewer metrics remains unchanged.
+This runner uses the fold assignment frozen in the manuscript OOF artifact and
+reuses the PCA/checkpoint contract from ``01_generate_predictions.py``. It
+writes a record-level embedding artifact for ``20_representation_probe.py``.
+It is intentionally separate from the model class so the inference path used
+for reviewer metrics remains unchanged.
 
 Outputs are cached per fold so Colab interruptions can be resumed without
 silently mixing checkpoint/config variants.
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import importlib
 import json
 import os
@@ -58,6 +60,100 @@ EMBEDDING_KEYS = [
     "context_embedding",
     "fused_embedding",
 ]
+
+
+def array_sha256(array: np.ndarray, dtype: np.dtype | type | None = None) -> str:
+    values = np.asarray(array, dtype=dtype)
+    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+
+
+def folds_from_frozen_oof(oof: dict[str, Any]) -> list[dict[str, np.ndarray | int | str]]:
+    """Build the exact evaluation folds recorded in the frozen OOF artifact."""
+    fold_id = np.asarray(oof["fold_id"], dtype=np.int16)
+    n_records = len(np.asarray(oof["record_id"]))
+    if fold_id.shape != (n_records,):
+        raise ValueError(f"Invalid frozen OOF fold_id shape: {fold_id.shape}")
+
+    expected_folds = list(range(1, int(CONFIG["n_folds"]) + 1))
+    observed_folds = sorted(int(value) for value in np.unique(fold_id))
+    if observed_folds != expected_folds:
+        raise ValueError(
+            "Frozen OOF fold_id does not contain the expected folds: "
+            f"observed={observed_folds} expected={expected_folds}"
+        )
+
+    folds: list[dict[str, np.ndarray | int | str]] = []
+    for fold_num in expected_folds:
+        va_idx = np.flatnonzero(fold_id == fold_num).astype(np.int64)
+        tr_idx = np.flatnonzero(fold_id != fold_num).astype(np.int64)
+        if len(va_idx) == 0 or len(tr_idx) + len(va_idx) != n_records:
+            raise ValueError(f"Frozen OOF fold {fold_num} has an invalid train/validation partition.")
+        folds.append(
+            {
+                "fold_num": fold_num,
+                "tr_idx": tr_idx,
+                "va_idx": va_idx,
+                "train_index_sha256": array_sha256(tr_idx, np.int64),
+                "validation_index_sha256": array_sha256(va_idx, np.int64),
+            }
+        )
+    return folds
+
+
+def validate_checkpoint_fold_contract(
+    oof: dict[str, Any], checkpoint_contracts: dict[int, dict[str, Any]]
+) -> dict[str, Any]:
+    """Verify that frozen OOF membership matches the checkpoints' persisted folds.pkl."""
+    checkpoint_paths = [
+        Path(str(row.get("path") or ""))
+        for _, row in sorted(checkpoint_contracts.items())
+        if str(row.get("path") or "")
+    ]
+    checkpoint_dirs = {path.parent for path in checkpoint_paths}
+    if len(checkpoint_paths) != int(CONFIG["n_folds"]) or len(checkpoint_dirs) != 1:
+        raise RuntimeError(
+            "Checkpoint fold provenance is incomplete or spans multiple model directories."
+        )
+
+    folds_path = next(iter(checkpoint_dirs)) / "folds.pkl"
+    if not folds_path.exists() or folds_path.stat().st_size == 0:
+        raise FileNotFoundError(
+            f"Persisted training folds are required beside the checkpoints: {folds_path}"
+        )
+    persisted_folds = joblib.load(folds_path)
+    if len(persisted_folds) != int(CONFIG["n_folds"]):
+        raise RuntimeError(
+            f"Persisted fold count mismatch: {len(persisted_folds)} != {CONFIG['n_folds']}"
+        )
+
+    n_records = len(np.asarray(oof["record_id"]))
+    persisted_fold_id = np.full(n_records, -1, dtype=np.int16)
+    for fold_num, fold in enumerate(persisted_folds, start=1):
+        va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
+        va_idx = va_idx[(va_idx >= 0) & (va_idx < n_records)]
+        if len(np.unique(va_idx)) != len(va_idx):
+            raise RuntimeError(f"Persisted fold {fold_num} contains duplicate validation indices.")
+        if np.any(persisted_fold_id[va_idx] != -1):
+            raise RuntimeError("Persisted folds assign at least one record to multiple validation folds.")
+        persisted_fold_id[va_idx] = fold_num
+    if np.any(persisted_fold_id < 0):
+        raise RuntimeError(
+            f"Persisted folds do not cover {int(np.sum(persisted_fold_id < 0))} OOF records."
+        )
+
+    current_fold_id = np.asarray(oof["fold_id"], dtype=np.int16)
+    if not np.array_equal(persisted_fold_id, current_fold_id):
+        mismatch_count = int(np.sum(persisted_fold_id != current_fold_id))
+        raise RuntimeError(
+            "Frozen OOF fold assignment differs from the folds persisted beside the checkpoints: "
+            f"mismatched_records={mismatch_count}."
+        )
+    return {
+        "source": "frozen_oof_fold_id_verified_against_checkpoint_folds",
+        "folds_path": str(folds_path),
+        "folds_file_sha256": sha256_file(folds_path),
+        "fold_assignment_sha256": array_sha256(current_fold_id, np.int16),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -666,15 +762,36 @@ def inspect_final_embedding_reuse(
             if str(data["checkpoint_kind"].item()) != checkpoint_kind:
                 audit["issues"].append("checkpoint_kind_mismatch")
 
-            semantic_match = bool(
-                np.array_equal(np.asarray(data["y_true"], dtype=np.float32), oof["y_true"])
-                and np.array_equal(np.asarray(data["record_id"]).astype(np.int64), oof["record_id"])
-                and np.array_equal(np.asarray(data["fold_id"]).astype(np.int16), oof["fold_id"])
-                and np.array_equal(np.asarray(data["class_names"]).astype(str), oof["class_names"])
-            )
+            embedded_fold_id = np.asarray(data["fold_id"], dtype=np.int16)
+            current_fold_id = np.asarray(oof["fold_id"], dtype=np.int16)
+            semantic_field_match = {
+                "y_true": bool(
+                    np.array_equal(np.asarray(data["y_true"], dtype=np.float32), oof["y_true"])
+                ),
+                "record_id": bool(
+                    np.array_equal(np.asarray(data["record_id"]).astype(np.int64), oof["record_id"])
+                ),
+                "fold_id": bool(np.array_equal(embedded_fold_id, current_fold_id)),
+                "class_names": bool(
+                    np.array_equal(np.asarray(data["class_names"]).astype(str), oof["class_names"])
+                ),
+            }
+            audit["semantic_field_match"] = semantic_field_match
+            semantic_match = all(semantic_field_match.values())
             audit["semantic_contract_match"] = semantic_match
             if not semantic_match:
                 audit["issues"].append("oof_semantic_contract_mismatch")
+            if not semantic_field_match["fold_id"]:
+                audit["issues"].append("oof_fold_assignment_mismatch")
+                audit["fold_assignment_mismatch_count"] = int(
+                    np.sum(embedded_fold_id != current_fold_id)
+                ) if embedded_fold_id.shape == current_fold_id.shape else None
+                audit["source_fold_assignment_sha256"] = array_sha256(
+                    embedded_fold_id, np.int16
+                )
+                audit["current_fold_assignment_sha256"] = array_sha256(
+                    current_fold_id, np.int16
+                )
 
             embedded_manifest = json.loads(str(data["embedding_manifest_json"].item()))
             audit["existing_semantic_reuse_attestation"] = embedded_manifest.get(
@@ -725,6 +842,7 @@ def refresh_final_embedding_contract(
     oof: dict[str, Any],
     checkpoint_kind: str,
     reuse_audit: dict[str, Any],
+    split_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = resolve(path)
     with np.load(path, allow_pickle=False) as data:
@@ -742,6 +860,7 @@ def refresh_final_embedding_contract(
         "semantic_contract_match": reuse_audit.get("semantic_contract_match") is True,
         "checkpoint_contract_match": reuse_audit.get("checkpoint_contract_match") is True,
         "semantic_fields": reuse_audit.get("semantic_fields", []),
+        "semantic_field_match": reuse_audit.get("semantic_field_match", {}),
     }
     payload.update(
         {
@@ -755,6 +874,11 @@ def refresh_final_embedding_contract(
             "canonical_contract": {
                 "oof_sha256": oof["sha256"],
                 "freeze_sha256": oof["freeze_manifest_sha256"],
+            },
+            "split_contract": split_contract
+            or {
+                "source": "frozen_oof_fold_id",
+                "fold_assignment_sha256": array_sha256(oof["fold_id"], np.int16),
             },
             "semantic_reuse_attestation": attestation,
         }
@@ -793,6 +917,8 @@ def main() -> None:
     print(f"only_folds={sorted(only_folds) if only_folds else 'all'}", flush=True)
     print(f"batch_size={args.batch_size} num_workers={args.num_workers}", flush=True)
     checkpoint_contracts = load_checkpoint_contracts(args.oof_run_manifest, args.checkpoint_kind)
+    checkpoint_split_contract = validate_checkpoint_fold_contract(oof, checkpoint_contracts)
+    print(f"checkpoint_split_contract={checkpoint_split_contract}", flush=True)
     final_reuse_audit = inspect_final_embedding_reuse(
         args.out_embedding,
         oof,
@@ -807,6 +933,7 @@ def main() -> None:
                 oof=oof,
                 checkpoint_kind=args.checkpoint_kind,
                 reuse_audit=final_reuse_audit,
+                split_contract=checkpoint_split_contract,
             )
             print(
                 "Refreshed representation embedding OOF/freeze metadata after verified "
@@ -835,6 +962,7 @@ def main() -> None:
                     "oof_sha256": oof["sha256"],
                     "freeze_sha256": oof["freeze_manifest_sha256"],
                 },
+                "split_contract": checkpoint_split_contract,
                 "n_records": int(len(oof["record_id"])),
                 "n_classes": int(oof["y_true"].shape[1]),
                 "covered_records": int(len(oof["record_id"])),
@@ -884,16 +1012,12 @@ def main() -> None:
         (n_records, CONFIG["hrv_dim"]), dtype=np.float32
     )
 
-    folds = gen.load_folds(y, subjects)
-    normalized_folds = []
-    for fold_num, fold in enumerate(folds, start=1):
-        tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
-        va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
-        if args.limit_records > 0:
-            tr_idx = tr_idx[tr_idx < n_records]
-            va_idx = va_idx[va_idx < n_records]
-        if len(va_idx):
-            normalized_folds.append({"fold_num": fold_num, "tr_idx": tr_idx, "va_idx": va_idx})
+    normalized_folds = folds_from_frozen_oof(oof)
+    print(
+        "Representation split source=frozen_oof_fold_id "
+        f"sha256={array_sha256(oof['fold_id'], np.int16)}",
+        flush=True,
+    )
 
     global_embeddings: dict[str, np.ndarray] | None = None
     global_fold_id = np.full(n_records, -1, dtype=np.int16)
@@ -903,8 +1027,8 @@ def main() -> None:
 
     for fold in normalized_folds:
         fold_idx = int(fold["fold_num"])
-        tr_idx = fold["tr_idx"]
-        va_idx = fold["va_idx"]
+        tr_idx = np.asarray(fold["tr_idx"], dtype=np.int64)
+        va_idx = np.asarray(fold["va_idx"], dtype=np.int64)
         checkpoint_file, checkpoint_sha = resolve_checkpoint_for_fold(
             fold_num=fold_idx,
             checkpoint_kind=args.checkpoint_kind,
@@ -991,6 +1115,8 @@ def main() -> None:
                 "fold": fold_idx,
                 "train_records": int(len(tr_idx)),
                 "validation_records": int(len(va_idx)),
+                "train_index_sha256": str(fold["train_index_sha256"]),
+                "validation_index_sha256": str(fold["validation_index_sha256"]),
                 "validation_slices": int(len(rids)),
                 "slice_count_min": int(fold_slice_count.min()),
                 "slice_count_max": int(fold_slice_count.max()),
@@ -1047,6 +1173,7 @@ def main() -> None:
             "freeze_sha256": oof["freeze_manifest_sha256"],
         },
         "dataset_record_order_fingerprint": dataset_record_fingerprint,
+        "split_contract": checkpoint_split_contract,
         "evaluation_config_hash": EVALUATION_CONFIG_HASH,
         "embedding_views": EMBEDDING_KEYS,
         "slice_embedding_aggregation": "arithmetic_mean_over_record_slices",
