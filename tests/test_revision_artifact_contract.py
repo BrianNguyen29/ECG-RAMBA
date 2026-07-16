@@ -448,6 +448,39 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 sha256_file(direct),
             )
 
+    def test_cache_directory_refresh_preserves_direct_representation_fold_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            relative = Path("predictions/folds/representation_fold1.npz")
+            local = revision / relative
+            canonical = mirror / relative
+            canonical.parent.mkdir(parents=True)
+            canonical.write_bytes(b"old-canonical-cache")
+
+            with patch.object(artifact_mirror, "REVISION_DIR", revision), patch.object(
+                artifact_mirror,
+                "ensure_revision_dirs",
+                return_value=None,
+            ):
+                artifact_mirror.publish(mirror, verify_existing="size")
+                local.parent.mkdir(parents=True)
+                local.write_bytes(b"stale-runtime-copy")
+                canonical.write_bytes(b"refreshed-direct-canonical-fold-cache")
+                manifest_path = artifact_mirror.publish(
+                    mirror,
+                    verify_existing="size",
+                    refresh_existing_cache_dirs=True,
+                )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = {row["relative_path"]: row for row in payload["artifacts"]}
+            self.assertEqual(canonical.read_bytes(), b"refreshed-direct-canonical-fold-cache")
+            self.assertEqual(payload["refreshed_existing_paths"], [relative.as_posix()])
+            self.assertEqual(payload["preserved_direct_canonical_paths"], [relative.as_posix()])
+            self.assertEqual(rows[relative.as_posix()]["sha256"], sha256_file(canonical))
+
     def test_publish_does_not_roll_canonical_mirror_back_from_stale_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

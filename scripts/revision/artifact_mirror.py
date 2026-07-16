@@ -62,9 +62,10 @@ def parse_args() -> argparse.Namespace:
         "--refresh-existing-cache-dirs",
         action="store_true",
         help=(
-            "Re-hash existing canonical files below directories whose name contains 'cache'. "
-            "Use after resumable runners write cache files directly to the mirror; non-cache "
-            "evidence and checkpoints retain the normal conflict checks."
+            "Re-hash existing canonical files below directories whose name contains 'cache' "
+            "or a known resumable fold-cache root. Use after resumable runners write cache "
+            "files directly to the mirror; non-cache evidence and checkpoints retain the "
+            "normal conflict checks."
         ),
     )
     subparsers.choices["restore"].add_argument(
@@ -135,8 +136,27 @@ def matches_refresh_prefix(relative: Path, prefixes: tuple[str, ...]) -> bool:
     )
 
 
+DIRECT_CANONICAL_CACHE_PREFIXES = (
+    "predictions/folds",
+    "predictions/external_comparator_folds",
+)
+
+
 def is_cache_artifact(relative: Path) -> bool:
-    return any("cache" in part.lower() for part in relative.parts[:-1])
+    named_cache_dir = any("cache" in part.lower() for part in relative.parts[:-1])
+    return named_cache_dir or matches_refresh_prefix(
+        relative, DIRECT_CANONICAL_CACHE_PREFIXES
+    )
+
+
+def can_refresh_existing(
+    relative: Path,
+    refresh_prefixes: tuple[str, ...],
+    refresh_existing_cache_dirs: bool,
+) -> bool:
+    return matches_refresh_prefix(relative, refresh_prefixes) or (
+        refresh_existing_cache_dirs and is_cache_artifact(relative)
+    )
 
 
 def publish(
@@ -168,8 +188,8 @@ def publish(
                     f"Existing mirror manifest references a missing file: {source}"
                 )
             actual_size = source.stat().st_size
-            refresh_allowed = matches_refresh_prefix(relative, refresh_prefixes) or (
-                refresh_existing_cache_dirs and is_cache_artifact(relative)
+            refresh_allowed = can_refresh_existing(
+                relative, refresh_prefixes, refresh_existing_cache_dirs
             )
             size_mismatch = row["size_bytes"] >= 0 and actual_size != row["size_bytes"]
             if size_mismatch and not refresh_allowed:
@@ -215,6 +235,7 @@ def publish(
     published_from_source = 0
     published_relative_paths: set[str] = set()
     skipped_stale_source_paths: list[str] = []
+    preserved_direct_canonical_paths: list[str] = []
     for source in sorted(REVISION_DIR.rglob("*")):
         if not source.is_file() or source.name == ".gitkeep":
             continue
@@ -245,6 +266,15 @@ def publish(
             continue
 
         if destination.exists() and destination_sha != source_sha:
+            refresh_allowed = can_refresh_existing(
+                relative, refresh_prefixes, refresh_existing_cache_dirs
+            )
+            if refresh_allowed:
+                # A refresh opt-in means this cache was written directly to the
+                # canonical mirror. Never roll it back from a stale runtime copy,
+                # even when Drive/local timestamp resolution is ambiguous.
+                preserved_direct_canonical_paths.append(relative.as_posix())
+                continue
             if source_conflict_policy == "fail":
                 raise RuntimeError(
                     f"Local/canonical publish conflict for {relative}; rerun with an explicit policy"
@@ -289,6 +319,8 @@ def publish(
         "refreshed_existing_paths": sorted(refreshed_existing_paths),
         "skipped_stale_source_count": len(skipped_stale_source_paths),
         "skipped_stale_source_paths": skipped_stale_source_paths,
+        "preserved_direct_canonical_count": len(preserved_direct_canonical_paths),
+        "preserved_direct_canonical_paths": sorted(preserved_direct_canonical_paths),
         "discovered_unmanifested_count": discovered_unmanifested,
         "artifacts": artifacts,
     }
