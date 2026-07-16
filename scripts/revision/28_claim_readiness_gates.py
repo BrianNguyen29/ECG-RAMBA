@@ -239,6 +239,49 @@ def manifest_output_issues(manifest_path: Path, required_outputs: list[Path]) ->
     return issues
 
 
+def manifest_artifact_issues(manifest_path: Path, required_outputs: list[Path]) -> list[str]:
+    payload = read_json_if_present(manifest_path)
+    if not payload or payload.get("_read_error"):
+        return []
+    rows = {
+        Path(str(row.get("path", ""))).name: row
+        for row in payload.get("artifacts", [])
+        if isinstance(row, dict) and row.get("path")
+    }
+    issues: list[str] = []
+    for expected in required_outputs:
+        actual = resolve(expected)
+        row = rows.get(actual.name)
+        if row is None:
+            issues.append(f"manifest.artifact_missing={actual.name}")
+            continue
+        if not actual.exists() or actual.stat().st_size == 0:
+            continue
+        if int(row.get("size_bytes", -1)) != actual.stat().st_size:
+            issues.append(f"manifest.artifact_size_mismatch={actual.name}")
+        if row.get("sha256") != sha256_file(actual):
+            issues.append(f"manifest.artifact_sha256_mismatch={actual.name}")
+    return issues
+
+
+def reviewer_closure_item_issues(path: Path, reviewer_item: str) -> list[str]:
+    payload = read_json_if_present(path)
+    if not payload or payload.get("_read_error"):
+        return []
+    matches = [row for row in payload.get("rows", []) if row.get("reviewer_item") == reviewer_item]
+    if len(matches) != 1:
+        return [f"closure.{reviewer_item}.row_count={len(matches)}"]
+    row = matches[0]
+    issues = []
+    if row.get("status") != "complete":
+        issues.append(f"closure.{reviewer_item}.status={row.get('status')}")
+    if row.get("manuscript_ready") is not True:
+        issues.append(f"closure.{reviewer_item}.manuscript_ready!=true")
+    for issue in row.get("issues") or []:
+        issues.append(f"closure.{reviewer_item}.issue={issue}")
+    return issues
+
+
 def read_csv_if_present(path: Path) -> list[dict[str, str]]:
     candidate = resolve(path)
     if not candidate.exists() or candidate.stat().st_size == 0:
@@ -543,6 +586,9 @@ def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
     canonical = canonical_contract()
+    closure_status_path = METRIC_DIR / "reviewer_gap_closure_status.json"
+    closure_table_path = TABLE_DIR / "table_reviewer_gap_closure_status.csv"
+    closure_manifest_path = MANIFEST_DIR / "reviewer_gap_closure_manifest.json"
     print("=" * 80, flush=True)
 
     method_identity_required = [
@@ -628,6 +674,110 @@ def main() -> None:
         ),
     )
 
+    morphology_learnability_required = [
+        METRIC_DIR / "morphology_learnability_summary.json",
+        Path("reports/revision/predictions/morphology_learnability_frozen_oof_predictions.npz"),
+        Path("reports/revision/predictions/morphology_learnability_partial_oof_predictions.npz"),
+        MANIFEST_DIR / "morphology_learnability_manifest.json",
+        METRIC_DIR / "paired_morphology_learnability_comparison.json",
+        TABLE_DIR / "table_paired_morphology_learnability.csv",
+        METRIC_DIR / "paired_morphology_learnability_bootstrap_samples.csv",
+        MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
+        TABLE_DIR / "table_morphology_learnability_compact.csv",
+        TABLE_DIR / "table_morphology_learnability_compact.tex",
+        closure_status_path,
+        closure_table_path,
+        closure_manifest_path,
+    ]
+    morphology_closure_outputs = morphology_learnability_required[8:12]
+    morphology_learnability_status, morphology_learnability_missing = complete_if_valid(
+        required=morphology_learnability_required,
+        complete_status="complete_controlled_kernel_learnability_sensitivity",
+        blocked_status="not_run_or_stale_controlled_kernel_learnability_sensitivity",
+        contract_issues=manifest_contract_issues(
+            MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
+            expected_status="complete",
+            expected_protocol="morphology_learnability_control_v1_same_folds_power_mean_q3_threshold_0.5",
+            canonical=canonical,
+            expected_fields={"n_boot": 1000, "bootstrap_unit": "Chapman record/subject"},
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
+            "40_paired_morphology_learnability.py",
+        )
+        + manifest_output_issues(
+            MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
+            morphology_learnability_required[4:7],
+        )
+        + reviewer_closure_item_issues(closure_status_path, "R1-C2")
+        + manifest_runner_issues(closure_manifest_path, "41_reviewer_gap_closure.py")
+        + manifest_artifact_issues(closure_manifest_path, morphology_closure_outputs),
+    )
+
+    external_ci_required = [
+        METRIC_DIR / "external_comparator_paired_summary.json",
+        TABLE_DIR / "table_external_comparator_paired.csv",
+        MANIFEST_DIR / "external_comparator_paired_manifest.json",
+        TABLE_DIR / "table_external_zero_target_ci_compact.csv",
+        TABLE_DIR / "table_external_zero_target_ci_compact.tex",
+        closure_status_path,
+        closure_table_path,
+        closure_manifest_path,
+    ]
+    external_ci_closure_outputs = external_ci_required[3:7]
+    external_ci_status, external_ci_missing = complete_if_valid(
+        required=external_ci_required,
+        complete_status="complete_group_paired_external_zero_target_ci",
+        blocked_status="not_run_or_stale_group_paired_external_zero_target_ci",
+        contract_issues=manifest_contract_issues(
+            MANIFEST_DIR / "external_comparator_paired_manifest.json",
+            expected_status="complete",
+            canonical=canonical,
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "external_comparator_paired_manifest.json",
+            "32_paired_external_comparators.py",
+        )
+        + reviewer_closure_item_issues(closure_status_path, "R1-C5")
+        + manifest_runner_issues(closure_manifest_path, "41_reviewer_gap_closure.py")
+        + manifest_artifact_issues(closure_manifest_path, external_ci_closure_outputs),
+    )
+
+    pooling_cross_dataset_required = [
+        METRIC_DIR / "pooling_sensitivity_across_datasets.csv",
+        TABLE_DIR / "table_pooling_sensitivity_across_datasets.csv",
+        METRIC_DIR / "pooling_q3_paired_bootstrap.json",
+        MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
+        TABLE_DIR / "table_pooling_cross_dataset_compact.csv",
+        TABLE_DIR / "table_pooling_cross_dataset_compact.tex",
+        closure_status_path,
+        closure_table_path,
+        closure_manifest_path,
+    ]
+    pooling_closure_outputs = pooling_cross_dataset_required[4:8]
+    pooling_cross_dataset_status, pooling_cross_dataset_missing = complete_if_valid(
+        required=pooling_cross_dataset_required,
+        complete_status="complete_group_bootstrap_pooling_cross_dataset_sensitivity",
+        blocked_status="not_run_or_stale_group_bootstrap_pooling_cross_dataset_sensitivity",
+        contract_issues=manifest_contract_issues(
+            MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
+            expected_status=True,
+            expected_protocol="external_pooling_sensitivity_v2_group_bootstrap",
+            expected_fields={
+                "datasets": ["ptbxl", "georgia", "cpsc2021"],
+                "n_boot": 1000,
+                "strict_group_bootstrap": True,
+            },
+        )
+        + manifest_runner_issues(
+            MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
+            "30_pooling_sensitivity_external.py",
+        )
+        + reviewer_closure_item_issues(closure_status_path, "R1-C6")
+        + manifest_runner_issues(closure_manifest_path, "41_reviewer_gap_closure.py")
+        + manifest_artifact_issues(closure_manifest_path, pooling_closure_outputs),
+    )
+
     robustness_required = [
         METRIC_DIR / "robustness_full_vs_resnet_comparison.json",
         METRIC_DIR / "robustness_full_vs_raw_mamba_comparison.json",
@@ -636,6 +786,11 @@ def main() -> None:
         METRIC_DIR / "robustness_multicomparator_summary.csv",
         TABLE_DIR / "table_robustness_multicomparator.csv",
         MANIFEST_DIR / "robustness_multicomparator_manifest.json",
+        TABLE_DIR / "table_robustness_six_stress_compact.csv",
+        TABLE_DIR / "table_robustness_six_stress_compact.tex",
+        closure_status_path,
+        closure_table_path,
+        closure_manifest_path,
     ]
     robustness_manifest = MANIFEST_DIR / "robustness_multicomparator_manifest.json"
     robustness_sidecars = {
@@ -654,6 +809,17 @@ def main() -> None:
             table_path=TABLE_DIR / "table_robustness_multicomparator.csv",
             sidecar_paths=robustness_sidecars,
             canonical=canonical,
+        )
+        + reviewer_closure_item_issues(closure_status_path, "R2-C3")
+        + manifest_runner_issues(closure_manifest_path, "41_reviewer_gap_closure.py")
+        + manifest_artifact_issues(
+            closure_manifest_path,
+            [
+                TABLE_DIR / "table_robustness_six_stress_compact.csv",
+                TABLE_DIR / "table_robustness_six_stress_compact.tex",
+                closure_status_path,
+                closure_table_path,
+            ],
         ),
     )
 
@@ -883,6 +1049,73 @@ def main() -> None:
             ),
         ),
         row(
+            claim_id="morphology_kernel_learnability_control",
+            claim_area="Controlled frozen-versus-partially-learnable morphology kernels",
+            status=morphology_learnability_status,
+            manuscript_ready=morphology_learnability_status.startswith("complete"),
+            evidence_status="controlled_reduced_bank_sensitivity",
+            required_artifacts=morphology_learnability_required,
+            missing_artifacts=morphology_learnability_missing,
+            safe_wording=(
+                "Report only endpoint-specific paired results from the reduced, identically initialized "
+                "frozen-versus-partially-learnable convolution-bank control. This separates kernel "
+                "learnability within that control, but does not establish a causal explanation for the full model."
+            ),
+            blocker=(
+                "The authenticated five-fold controlled learnability package or its paired bootstrap presentation is incomplete."
+                if morphology_learnability_missing
+                else ""
+            ),
+            next_action=(
+                "Run scripts/revision/39_morphology_learnability_control.py fold-wise on GPU, aggregate both variants, "
+                "then run scripts/revision/40_paired_morphology_learnability.py and the reviewer gap-closure gate."
+            ),
+        ),
+        row(
+            claim_id="external_zero_target_label_paired_ci",
+            claim_area="Dataset-specific zero-target-label paired uncertainty",
+            status=external_ci_status,
+            manuscript_ready=external_ci_status.startswith("complete"),
+            evidence_status="group_paired_dataset_specific",
+            required_artifacts=external_ci_required,
+            missing_artifacts=external_ci_missing,
+            safe_wording=(
+                "Report paired group-bootstrap confidence intervals separately for PTB-XL, Georgia, and CPSC2021, "
+                "by named comparator and metric. Do not pool mapped tasks or infer general zero-shot superiority."
+            ),
+            blocker=(
+                "The complete 3-dataset x 3-comparator x 5-metric paired CI grid or its compact reviewer table is missing/stale."
+                if external_ci_missing
+                else ""
+            ),
+            next_action=(
+                "Regenerate scripts/revision/32_paired_external_comparators.py with 1000 group-bootstrap replicates, "
+                "then run scripts/revision/41_reviewer_gap_closure.py."
+            ),
+        ),
+        row(
+            claim_id="pooling_q3_cross_dataset_sensitivity",
+            claim_area="Q=3 pooling sensitivity across mapped external datasets",
+            status=pooling_cross_dataset_status,
+            manuscript_ready=pooling_cross_dataset_status.startswith("complete"),
+            evidence_status="group_bootstrap_sensitivity_not_optimality",
+            required_artifacts=pooling_cross_dataset_required,
+            missing_artifacts=pooling_cross_dataset_missing,
+            safe_wording=(
+                "Describe Q=3 as the frozen aggregation operating point and show its sensitivity across each named dataset. "
+                "Do not claim Q=3 is universally optimal; keep CPSC2021 identified as an annotation-aligned mapped-window task."
+            ),
+            blocker=(
+                "The group-safe 3-dataset x 6-pooling-method sensitivity grid or paired Q=3 presentation is incomplete."
+                if pooling_cross_dataset_missing
+                else ""
+            ),
+            next_action=(
+                "Run scripts/revision/30_pooling_sensitivity_external.py for PTB-XL, Georgia, and CPSC2021 with "
+                "strict group bootstrap, then run scripts/revision/41_reviewer_gap_closure.py."
+            ),
+        ),
+        row(
             claim_id="fewshot_score_calibration_v1",
             claim_area="Existing row-split external score calibration",
             status="blocked_not_group_safe",
@@ -1031,17 +1264,22 @@ def main() -> None:
             required_artifacts=marked_manuscript_required,
             missing_artifacts=marked_missing,
             safe_wording=(
-                "Do not state that a marked manuscript has been supplied until latexdiff and LaTeX compilation "
-                "produce the verified marked PDF and its manifest."
+                "A verified marked/highlighted manuscript PDF and its provenance manifest are included in the "
+                "submission package."
+                if marked_status.startswith("complete")
+                else "Do not state that a marked manuscript has been supplied until latexdiff and LaTeX "
+                "compilation produce the verified marked PDF and its manifest."
             ),
             blocker=(
                 "The requested marked/highlighted manuscript PDF has not been built and verified."
-                if marked_missing
+                if not marked_status.startswith("complete")
                 else ""
             ),
             next_action=(
                 "Run scripts/revision/36_build_marked_manuscript.py in an environment with latexdiff and latexmk, "
                 "then retain its manifest with the submission package."
+                if not marked_status.startswith("complete")
+                else ""
             ),
         ),
         row(

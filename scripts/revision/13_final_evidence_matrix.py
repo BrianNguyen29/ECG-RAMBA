@@ -55,7 +55,7 @@ EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 5
+FINAL_EVIDENCE_SCHEMA_VERSION = 6
 FINAL_EVIDENCE_CAPABILITIES = (
     "claim_readiness_gates",
     "external_learned_comparator_audit",
@@ -64,6 +64,10 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "learned_comparator_robustness_audit",
     "representation_probe_v3",
     "reviewer_presentation_assets",
+    "reviewer_gap_closure_v1",
+    "morphology_kernel_learnability_control",
+    "external_zero_target_group_paired_ci",
+    "pooling_q3_cross_dataset_sensitivity",
     "transformer_paired",
     "true_fewshot_frozen_encoder_head_v2",
 )
@@ -721,6 +725,55 @@ def artifact(path: Path) -> dict[str, Any]:
     }
 
 
+def reviewer_gap_closure_contract_issues(
+    status: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    required_outputs: list[Path],
+) -> list[str]:
+    """Authenticate the four reviewer-item closure rows and compact outputs."""
+
+    issues: list[str] = []
+    expected_items = {"R1-C2", "R1-C5", "R1-C6", "R2-C3"}
+    rows = status.get("rows") if isinstance(status.get("rows"), list) else []
+    by_item = {
+        str(row.get("reviewer_item")): row
+        for row in rows
+        if isinstance(row, dict) and row.get("reviewer_item")
+    }
+    if status.get("status") is not True or set(by_item) != expected_items:
+        issues.append("reviewer gap closure status/grid is incomplete")
+    for reviewer_item in sorted(expected_items):
+        row = by_item.get(reviewer_item) or {}
+        if row.get("status") != "complete" or row.get("manuscript_ready") is not True:
+            issues.append(f"reviewer gap {reviewer_item} is not manuscript-ready")
+        if row.get("issues"):
+            issues.append(f"reviewer gap {reviewer_item} reports issues")
+
+    runner = PROJECT_ROOT / "scripts" / "revision" / "41_reviewer_gap_closure.py"
+    if manifest.get("status") != "complete":
+        issues.append(f"reviewer gap closure manifest status={manifest.get('status')!r}")
+    if not runner.exists() or manifest.get("runner_sha256") != sha256_file(runner):
+        issues.append("reviewer gap closure runner SHA mismatch")
+    artifact_rows = {
+        Path(str(row.get("path", ""))).name: row
+        for row in manifest.get("artifacts") or []
+        if isinstance(row, dict) and row.get("path")
+    }
+    for path in required_outputs:
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        row = artifact_rows.get(path.name)
+        if row is None:
+            issues.append(f"reviewer gap closure manifest missing {path.name}")
+            continue
+        if int(row.get("size_bytes", -1)) != path.stat().st_size:
+            issues.append(f"reviewer gap closure size mismatch for {path.name}")
+        if row.get("sha256") != sha256_file(path):
+            issues.append(f"reviewer gap closure SHA mismatch for {path.name}")
+    return issues
+
+
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
@@ -736,6 +789,17 @@ def main() -> None:
         "robustness": METRIC_DIR / "robustness_summary.csv",
         "paired_minirocket": METRIC_DIR / "paired_full_vs_minirocket_comparison.json",
         "paired_resnet": METRIC_DIR / "paired_full_vs_resnet_comparison.json",
+        "reviewer_gap_closure_status": METRIC_DIR / "reviewer_gap_closure_status.json",
+        "reviewer_gap_closure_table": TABLE_DIR / "table_reviewer_gap_closure_status.csv",
+        "reviewer_gap_closure_manifest": MANIFEST_DIR / "reviewer_gap_closure_manifest.json",
+        "external_zero_target_ci_compact": TABLE_DIR / "table_external_zero_target_ci_compact.csv",
+        "external_zero_target_ci_compact_tex": TABLE_DIR / "table_external_zero_target_ci_compact.tex",
+        "pooling_cross_dataset_compact": TABLE_DIR / "table_pooling_cross_dataset_compact.csv",
+        "pooling_cross_dataset_compact_tex": TABLE_DIR / "table_pooling_cross_dataset_compact.tex",
+        "morphology_learnability_compact": TABLE_DIR / "table_morphology_learnability_compact.csv",
+        "morphology_learnability_compact_tex": TABLE_DIR / "table_morphology_learnability_compact.tex",
+        "robustness_six_stress_compact": TABLE_DIR / "table_robustness_six_stress_compact.csv",
+        "robustness_six_stress_compact_tex": TABLE_DIR / "table_robustness_six_stress_compact.tex",
         "a0_status": REVISION_DIR / "a0_resolution_status.json",
         "claim_map": PROJECT_ROOT / "docs" / "revision_plan" / "claim_evidence_map.csv",
         "task_board": PROJECT_ROOT / "docs" / "revision_plan" / "task_board.csv",
@@ -797,6 +861,13 @@ def main() -> None:
         "robustness_full_vs_resnet": METRIC_DIR / "robustness_full_vs_resnet_comparison.json",
         "robustness_full_vs_raw_mamba": METRIC_DIR / "robustness_full_vs_raw_mamba_comparison.json",
         "robustness_full_vs_transformer": METRIC_DIR / "robustness_full_vs_transformer_comparison.json",
+        "morphology_learnability_summary": METRIC_DIR / "morphology_learnability_summary.json",
+        "paired_morphology_learnability": METRIC_DIR / "paired_morphology_learnability_comparison.json",
+        "paired_morphology_learnability_table": TABLE_DIR / "table_paired_morphology_learnability.csv",
+        "paired_morphology_learnability_manifest": MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
+        "pooling_sensitivity_across_datasets": METRIC_DIR / "pooling_sensitivity_across_datasets.csv",
+        "pooling_q3_paired_bootstrap": METRIC_DIR / "pooling_q3_paired_bootstrap.json",
+        "pooling_sensitivity_external_manifest": MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
@@ -842,6 +913,10 @@ def main() -> None:
     paired_hybrid_morphology = read_json(optional_paths["paired_hybrid_morphology"], required=False)
     hybrid_morphology_summary = read_json(optional_paths["hybrid_morphology_summary"], required=False)
     claim_readiness_gates = read_json(optional_paths["claim_readiness_gates"], required=False)
+    reviewer_gap_closure = read_json(paths["reviewer_gap_closure_status"], required=args.strict)
+    reviewer_gap_closure_manifest = read_json(
+        paths["reviewer_gap_closure_manifest"], required=args.strict
+    )
     external_gate_rows = read_csv_rows(
         optional_paths["external_protocol_gate_summary"],
         required=False,
@@ -995,6 +1070,24 @@ def main() -> None:
     task_board = read_csv_rows(paths["task_board"], required=False)
 
     contract_issues: list[str] = []
+    contract_issues.extend(
+        reviewer_gap_closure_contract_issues(
+            reviewer_gap_closure,
+            reviewer_gap_closure_manifest,
+            required_outputs=[
+                paths["reviewer_gap_closure_status"],
+                paths["reviewer_gap_closure_table"],
+                paths["external_zero_target_ci_compact"],
+                paths["external_zero_target_ci_compact_tex"],
+                paths["pooling_cross_dataset_compact"],
+                paths["pooling_cross_dataset_compact_tex"],
+                paths["morphology_learnability_compact"],
+                paths["morphology_learnability_compact_tex"],
+                paths["robustness_six_stress_compact"],
+                paths["robustness_six_stress_compact_tex"],
+            ],
+        )
+    )
     external_comparator_payload = read_json(
         optional_paths["external_comparator_summary"], required=False
     )
@@ -1273,6 +1366,15 @@ def main() -> None:
     fewshot_evidence_path_text = (
         ";" + ";".join(fewshot_evidence_paths) if fewshot_evidence_paths else ""
     )
+    reviewer_gap_by_item = {
+        str(item.get("reviewer_item")): item
+        for item in reviewer_gap_closure.get("rows") or []
+        if isinstance(item, dict) and item.get("reviewer_item")
+    }
+    reviewer_gap_status_text = ", ".join(
+        f"{item}={reviewer_gap_by_item.get(item, {}).get('status', 'missing')}"
+        for item in ("R1-C2", "R1-C5", "R1-C6", "R2-C3")
+    )
 
     matrix_rows = [
         {
@@ -1286,7 +1388,7 @@ def main() -> None:
                 f"Raw Mamba PR-AUC={fmt(raw_mamba.get('pr_auc_macro'))}, F1={fmt(raw_mamba.get('f1_macro'))}"
                 f"{transformer_key_numbers}"
                 f"{hybrid_key_numbers}; {external_comparator_audit['key_numbers']}; "
-                f"{learned_robustness_audit['key_numbers']}"
+                f"{learned_robustness_audit['key_numbers']}; reviewer closure: {reviewer_gap_status_text}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/baseline_summary.csv;"
@@ -1296,6 +1398,9 @@ def main() -> None:
                 f"{transformer_evidence_paths}"
                 f"{hybrid_evidence_paths};reports/revision/metrics/external_comparator_paired_summary.json;"
                 "reports/revision/tables/table_external_comparator_paired.csv;"
+                "reports/revision/tables/table_external_zero_target_ci_compact.csv;"
+                "reports/revision/tables/table_morphology_learnability_compact.csv;"
+                "reports/revision/tables/table_robustness_six_stress_compact.csv;"
                 + ";".join(selected_robustness_evidence_paths)
             ),
             "safe_wording": (
@@ -1305,7 +1410,8 @@ def main() -> None:
                 "claims to supported calibration tradeoffs, architecture analysis, and "
                 "documented limitations. "
                 f"{external_comparator_audit['safe_wording']} "
-                f"{learned_robustness_audit['safe_wording']}"
+                f"{learned_robustness_audit['safe_wording']} "
+                "The reduced morphology learnability control is a bounded mechanism sensitivity, not a causal explanation of the full model."
             ),
             "blocker": "; ".join(
                 item
@@ -1406,15 +1512,20 @@ def main() -> None:
             "evidence_status": "supported_as_tradeoff_not_optimality_claim",
             "key_numbers": (
                 f"Q=3 PR-AUC={fmt(q3.get('pr_auc_macro'))}, "
-                f"ROC-AUC={fmt(q3.get('roc_auc_macro'))}, F1={fmt(q3.get('f1_macro'))}"
+                f"ROC-AUC={fmt(q3.get('roc_auc_macro'))}, F1={fmt(q3.get('f1_macro'))}; "
+                f"cross-dataset gate={reviewer_gap_by_item.get('R1-C6', {}).get('status', 'missing')}"
             ),
             "evidence_paths": (
                 "reports/revision/metrics/pooling_sensitivity.csv;"
-                "reports/revision/metrics/pooling_decision_summary.json"
+                "reports/revision/metrics/pooling_decision_summary.json;"
+                "reports/revision/metrics/pooling_sensitivity_across_datasets.csv;"
+                "reports/revision/metrics/pooling_q3_paired_bootstrap.json;"
+                "reports/revision/tables/table_pooling_cross_dataset_compact.csv"
             ),
             "safe_wording": (
-                "Present Q=3 as the pre-specified/frozen operating point and a sensitivity-tested "
-                "tradeoff, not as globally optimal."
+                "Present Q=3 as the pre-specified/frozen operating point and show the group-bootstrap "
+                "sensitivity separately for Chapman, PTB-XL, Georgia, and the CPSC2021 mapped-window task. "
+                "Treat it as a tested tradeoff, not a universally optimal pooling rule."
             ),
             "blocker": "",
             "source_claim_status": claim_by_id.get("C05", {}).get("status", ""),
@@ -1545,10 +1656,26 @@ def main() -> None:
                 "Use scripts/revision/28_claim_readiness_gates.py as a blocker ledger for optional or "
                 "not-supported claims; blocked rows must not be converted into positive manuscript claims."
             ),
+            "reviewer_gap_closure": (
+                "Use reviewer_gap_closure_status.json and its authenticated compact tables for R1-C2, R1-C5, "
+                "R1-C6, and R2-C3. A reviewer item is usable only when its manuscript_ready field is true."
+            ),
+            "morphology_learnability": (
+                "The controlled reduced-bank frozen-versus-partially-learnable comparison isolates kernel "
+                "learnability only within that matched sensitivity experiment; it is not causal proof for ECG-RAMBA."
+            ),
+            "external_zero_target_ci": (
+                "Report group-paired bootstrap CIs separately by dataset, comparator, and metric. Do not pool "
+                "PTB-XL, Georgia, and CPSC2021 or claim general zero-shot superiority."
+            ),
+            "pooling_cross_dataset": (
+                "Q=3 is the frozen operating point with cross-dataset sensitivity evidence, not a universally optimal rule."
+            ),
         },
         "inputs": {name: artifact(path) for name, path in paths.items()},
         "optional_inputs": {name: artifact(path) for name, path in optional_paths.items()},
         "claim_readiness_gates": claim_readiness_gates if isinstance(claim_readiness_gates, dict) else {},
+        "reviewer_gap_closure": reviewer_gap_closure if isinstance(reviewer_gap_closure, dict) else {},
         "external_gate_summary": {
             "expected_datasets": list(EXPECTED_EXTERNAL_DATASETS),
             "status": external_gate_status,

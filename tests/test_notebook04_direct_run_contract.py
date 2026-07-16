@@ -118,6 +118,38 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.source)
 
+    def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
+        for token in (
+            "39_morphology_learnability_control.py",
+            "40_paired_morphology_learnability.py",
+            "MORPHOLOGY_LEARNABILITY_FOLD_CACHE_DIR",
+            "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR",
+            "matched_initialization_sha256_by_fold",
+            "morphology_learnability_{variant}_fold{fold}_predictions.npz",
+            "fold{fold}_morphology_learnability_{variant}_final.pt",
+            "paired_morphology_learnability_bootstrap_samples.csv",
+            "--n-boot 1000",
+        ):
+            self.assertIn(token, self.source)
+
+        setup_cell = next(
+            cell for cell in self.code_cells if "DIRECT_RUN_SOURCE_REQUIREMENTS_04" in cell
+        )
+        self.assertIn("scripts/revision/39_morphology_learnability_control.py", setup_cell)
+        self.assertIn("scripts/revision/40_paired_morphology_learnability.py", setup_cell)
+
+        summary_cell = next(
+            cell for cell in self.code_cells if "reviewer_required_baseline_outputs" in cell
+        )
+        for token in (
+            "morphology_learnability_summary.json",
+            "morphology_learnability_frozen_oof_predictions.npz",
+            "morphology_learnability_partial_oof_predictions.npz",
+            "paired_morphology_learnability_comparison.json",
+            "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR",
+        ):
+            self.assertIn(token, summary_cell)
+
 
 if __name__ == "__main__":
     unittest.main()

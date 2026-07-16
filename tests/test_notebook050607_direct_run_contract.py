@@ -1,3 +1,4 @@
+import ast
 import json
 import unittest
 from pathlib import Path
@@ -70,6 +71,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "semantic_contract_match",
         ):
             self.assertIn(token, source)
+        self.assertIn("'canonical_resume'", source)
+        self.assertIn("Canonical six-stress robustness ledger is incomplete", source)
+        self.assertIn("ROBUSTNESS_MULTI_STRICT = ROBUSTNESS_MULTI_RUN_PROFILE", source)
         summary_cell = next(cell for cell in cells if "Claim Evidence Summary requires" in cell)
         self.assertIn("oof_prediction_path = revision_root", summary_cell)
         self.assertIn("sha256_file(oof_prediction_path)", summary_cell)
@@ -102,6 +106,13 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "Repairing stale direct-cache manifest rows before Notebook 06 restore",
             "representation_cache_manifest_repair.log",
             "--refresh-existing-prefix predictions/folds",
+        ):
+            self.assertIn(token, source)
+        for token in (
+            "ptbxl,georgia,cpsc2021",
+            "external_pooling_manifest.get('datasets') != ['ptbxl', 'georgia', 'cpsc2021']",
+            "external_pooling_manifest.get('strict_group_bootstrap') is not True",
+            "pooling_q3_paired_bootstrap.json",
         ):
             self.assertIn(token, source)
 
@@ -148,11 +159,38 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "true_fewshot_frozen_encoder_head_v2",
             "representation_probe_v3",
             "reviewer_presentation_assets",
+            "reviewer_gap_closure_v1",
+            "morphology_kernel_learnability_control",
+            "external_zero_target_group_paired_ci",
+            "pooling_q3_cross_dataset_sensitivity",
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
+
+    def test_final_generator_closure_helper_does_not_truncate_main(self):
+        generator_path = PROJECT_ROOT / "scripts" / "revision" / "13_final_evidence_matrix.py"
+        tree = ast.parse(generator_path.read_text(encoding="utf-8"))
+        functions = {
+            node.name: node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        self.assertIn("reviewer_gap_closure_contract_issues", functions)
+        main_node = functions["main"]
+        self.assertFalse(any(isinstance(node, ast.FunctionDef) for node in main_node.body))
+        assigned_names = {
+            target.id
+            for node in ast.walk(main_node)
+            if isinstance(node, (ast.Assign, ast.AnnAssign))
+            for target in (
+                node.targets if isinstance(node, ast.Assign) else [node.target]
+            )
+            if isinstance(target, ast.Name)
+        }
+        self.assertIn("missing", assigned_names)
+        self.assertIn("matrix_rows", assigned_names)
 
     def test_notebook07_refreshes_calibration_and_builds_reviewer_assets(self):
         _, source = notebook_source("07_results_freeze.ipynb")
@@ -163,6 +201,22 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "29_reviewer_presentation_assets.py --strict",
             "final_evidence_calibration_contract_refresh.log",
             "final_evidence_calibration_refresh_mirror_publish.log",
+        ):
+            self.assertIn(token, source)
+
+    def test_notebook07_closes_four_partial_reviewer_items_before_final_freeze(self):
+        _, source = notebook_source("07_results_freeze.ipynb")
+        for token in (
+            "41_reviewer_gap_closure.py --strict",
+            "reviewer_gap_closure_mirror_publish.log",
+            "R1-C2",
+            "R1-C5",
+            "R1-C6",
+            "R2-C3",
+            "table_external_zero_target_ci_compact.csv",
+            "table_pooling_cross_dataset_compact.csv",
+            "table_morphology_learnability_compact.csv",
+            "table_robustness_six_stress_compact.csv",
         ):
             self.assertIn(token, source)
 

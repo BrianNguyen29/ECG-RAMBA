@@ -111,11 +111,11 @@ class PipelineStorageAuditTest(unittest.TestCase):
             head_cache.write_bytes(b"prediction")
 
             rows = {row.stage: row for row in MODULE.audit_stages(root, manifest_rows={})}
-            self.assertEqual(rows["external_ptbxl_test_representation_fold_cache"].expected_count, 15)
+            self.assertEqual(rows["external_ptbxl_test_representation_fold_cache"].expected_count, 20)
             self.assertEqual(rows["external_ptbxl_test_representation_fold_cache"].found_count, 1)
-            self.assertEqual(rows["true_fewshot_prediction_cache"].expected_count, 60)
+            self.assertEqual(rows["true_fewshot_prediction_cache"].expected_count, 80)
             self.assertEqual(rows["true_fewshot_prediction_cache"].found_count, 1)
-            self.assertEqual(rows["true_fewshot_metric_cache"].expected_count, 500)
+            self.assertEqual(rows["true_fewshot_metric_cache"].expected_count, 700)
 
     def test_full_model_checkpoint_contract_uses_oof_manifest_sha(self):
         with tempfile.TemporaryDirectory() as tmp:

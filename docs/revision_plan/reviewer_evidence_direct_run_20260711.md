@@ -85,9 +85,12 @@ Colab bootstrap is expensive.
   fine-tuning. `table_true_fewshot_head_ptbxl_primary.csv` uses one shared
   patient-group bootstrap grid across all five adaptation seeds and matched
   models, so the reported primary and paired CIs are directly comparable.
-- The frozen-transform MLP is a head-capacity sensitivity control. It does not
-  make random-convolution kernels learnable or prove determinism versus
-  regularization.
+- The frozen-transform MLP remains a head-capacity sensitivity control. The
+  separate controlled morphology-learnability experiment compares an
+  identically initialized reduced random-convolution bank with 0% versus 25%
+  trainable kernel channels. It isolates kernel learnability within that
+  reduced control, but it is not the evaluated 10,000-kernel branch and does
+  not prove a causal mechanism for Full ECG-RAMBA.
 - Representation UMAP/probe/CKA is an audit. It cannot be phrased as proven
   morphology-rhythm disentanglement.
 
@@ -97,7 +100,7 @@ Colab bootstrap is expensive.
 | --- | --- | --- |
 | Notebook 02 canonical OOF or missing external Full-model prediction | A100 High-RAM preferred | Reuses frozen OOF/external artifacts when manifest checks pass; otherwise runs inference. |
 | Notebook 03 calibration and presentation assets | CPU | Reuses matching CI/table/figure outputs. Presentation assets defer until current paired artifacts exist. |
-| Notebook 04 Raw Mamba, Transformer, frozen-transform MLP | A100 High-RAM | Trains only missing or stale folds; checkpoints and fold prediction caches are mirrored after each fold. |
+| Notebook 04 Raw Mamba, Transformer, frozen-transform MLP, controlled kernel-learnability bank | A100 High-RAM | Trains only missing or stale folds; checkpoints and fold prediction caches are mirrored after each fold. |
 | Notebook 04 paired comparisons and ledger | CPU | Bootstrap is CPU-bound; no model inference. |
 | Notebook 05 comparator stress prediction | A100 High-RAM | Generates or reuses stress prediction files per comparator, stress, and fold. |
 | Notebook 05 multi-comparator bootstrap ledger | CPU | Reuses metric cache entries keyed by prediction provenance. |
@@ -119,9 +122,11 @@ matrix, copy, and publication cells can run on CPU.
    print `Deferred` at this point; that is expected until Notebook 04 paired
    artifacts are current.
 4. Run Notebook 04. Leave the heavy runner controls as `auto`. For any missing
-   Raw Mamba, Transformer, or frozen-transform MLP folds, the notebook runs
-   one fold at a time and publishes the Drive mirror immediately. Then run the
-   paired-comparison cells and the completion ledger.
+   Raw Mamba, Transformer, frozen-transform MLP, or controlled
+   frozen-versus-partially-learnable morphology folds, the notebook runs one
+   fold at a time and publishes the Drive mirror immediately. Then run every
+   paired-comparison cell, including the controlled-kernel paired bootstrap,
+   and the completion ledger.
 5. Return to the new end-of-Notebook-02 cells. Their first pass after Notebook
    04 produces or verifies zero-target-label PTB-XL/Georgia ResNet1D/CNN and
    Raw Mamba outputs. A Transformer is added only if its in-domain OOF and
@@ -132,11 +137,14 @@ matrix, copy, and publication cells can run on CPU.
 6. Rerun the reviewer-presentation cell in Notebook 03. It creates the
    reliability figure, compact calibration/paired-CI tables, Q=3 sensitivity
    table, fold-specific PCA variance table, and training-configuration table.
-7. Run Notebook 05. Start with its reviewer-minimal stress profile if a full
-   six-stress/five-metric multi-comparator bootstrap would exceed the runtime
-   budget. Treat a reviewer-minimal profile as named screening evidence; do not
-   silently substitute it for the canonical six-stress ledger.
-8. Run Notebook 06. External pooling keeps PTB-XL and Georgia separate. Run
+7. Run Notebook 05 with `ROBUSTNESS_MULTI_RUN_PROFILE='canonical_resume'`.
+   The six stresses are processed separately and publish after each completed
+   stage; the shared metric cache resumes interrupted 1,000-bootstrap work.
+   Notebook 07 rejects reviewer-minimal screening output as final R2-C3
+   evidence.
+8. Run Notebook 06. External pooling keeps PTB-XL, Georgia, and CPSC2021
+   separate and requires six methods plus 1,000 group-bootstrap replicates.
+   Run
    representation extraction only if missing; it needs the same Mamba runtime
    as Full ECG-RAMBA. The v3 probe runs afterwards and produces the audit
    figure plus fold-level probe table.
@@ -165,12 +173,12 @@ Use the checked-in defaults unless this table explicitly says otherwise:
 | 01 | All sections | CPU. | None. This is a protocol audit, not model training. |
 | 02 first pass | Setup through **External Protocol Gate**, then **PTB-XL Fold 9 Adaptation-Pool Export** | A100 High-RAM when an OOF/external export is missing. Keep OOF/external force flags false and reuse enabled. | The learned-comparator, representation, and true-head sections may defer before Notebook 04; this is expected. |
 | 03 first pass | Setup through calibration CI and reviewer tables | CPU High-RAM. | Presentation assets may defer until Notebook 04 paired tables exist. |
-| 04 | All sections | A100 High-RAM for the five heavy baseline sections; CPU is enough from **Fair Baseline Completion Matrix** onward. Keep runner mode `auto`, force-rerun false, checkpoint saving/reuse true. | Skip Notebook 02a unless the frozen Full final-EMA checkpoint contract itself is invalid and a paper-level retrain was explicitly chosen. |
+| 04 | All sections | A100 High-RAM through **Controlled Frozen-vs-Partially-Learnable Morphology Bank**; CPU is enough for paired comparisons and ledgers. Keep runner mode `auto`, force-rerun false, checkpoint saving/reuse true. | Skip Notebook 02a unless the frozen Full final-EMA checkpoint contract itself is invalid and a paper-level retrain was explicitly chosen. |
 | 02 second pass | **External Learned-Comparator Zero-Target-Label Inference** through **True Few-Shot Frozen-Encoder Head Adaptation**, then inventory/mirror | A100 for external comparator inference and source-bound representation extraction. CPU High-RAM for paired bootstrap, group-safe score calibration, and linear heads. Keep `TRUE_FEWSHOT_PRIMARY_FRACTION=0.10`, seeds 42--46, fractions 0/1/5/10%, reuse true. | Old representation protocol-v1 caches are intentionally rejected once; protocol-v2 fold caches resume thereafter. |
 | 03 second pass | **Build Reviewer Presentation Assets**, then mirror | CPU. | None after paired artifacts are current. |
-| 05 GPU pass | Setup through **Comparator Stress Prediction Generation** | A100 High-RAM, batch 512; lower to 256 only on OOM. Default reviewer-minimal stresses are `snr5db,precordial_dropout`. Each stress is published immediately. | Do not rerun completed stress files; the exact checkpoint/prediction contract is checked before reuse. |
-| 05 CPU pass | **Multi-Comparator Robustness Ledger** through mirror/output | CPU High-RAM. Default `reviewer_minimal` is screening (`n_boot=200`) only. Use `single_stress_final` repeatedly or `core_final` for claim-ready `n_boot=1000` rows. | Do not present reviewer-minimal output as the canonical six-stress ledger. |
-| 06 | All sections | CPU for pooling/probe; A100 plus Mamba only if representation embeddings are missing/stale. | Existing compatible embeddings/probe artifacts are reused. |
+| 05 GPU pass | Setup through **Comparator Stress Prediction Generation** | A100 High-RAM, batch 512; lower to 256 only on OOM. Canonical mode requires all six stresses for ResNet, Raw Mamba, and Transformer. Each stress is published immediately. | Do not rerun completed stress files; the exact checkpoint/prediction contract is checked before reuse. |
+| 05 CPU pass | **Multi-Comparator Robustness Ledger** through mirror/output | CPU High-RAM. Keep `canonical_resume`, `n_boot=1000`, five metrics, and eight bootstrap workers unless RAM pressure requires fewer workers. | Do not present reviewer-minimal output as the canonical six-stress ledger. |
+| 06 | All sections | CPU for pooling/probe; A100 plus Mamba only if representation embeddings are missing/stale. | Existing compatible embeddings/probe artifacts are reused; final pooling requires PTB-XL, Georgia, and CPSC2021. |
 | 07 | All sections | CPU High-RAM. | Run only after the preceding mirror publishes. Any strict failure means the source-of-truth tables must not be used yet. |
 
 For Notebook 02, the direct-run heavy controls should remain:
@@ -186,16 +194,12 @@ TRUE_FEWSHOT_PRIMARY_FRACTION = 0.10
 TRUE_FEWSHOT_N_BOOT = 1000
 ```
 
-For Notebook 05, select the profile before its comparator cells, or set the
-equivalent environment variable before running the section:
+For Notebook 05 final reviewer evidence, keep:
 
 ```python
-# Fast reviewer screening, not final claim evidence.
-ROBUSTNESS_MULTI_RUN_PROFILE = 'reviewer_minimal'
-
-# Claim-ready one-stress pass; rerun for each required stress while reusing cache.
-ROBUSTNESS_MULTI_RUN_PROFILE = 'single_stress_final'
-ROBUSTNESS_MULTI_SINGLE_STRESS = 'snr5db'
+ROBUSTNESS_MULTI_RUN_PROFILE = 'canonical_resume'
+ROBUSTNESS_MULTI_N_BOOT = 1000
+ROBUSTNESS_MULTI_BOOTSTRAP_JOBS = 8
 ```
 
 The recommended disconnect boundary is immediately after a cell prints a
@@ -263,13 +267,20 @@ checksums.
 | Reviewer item | Primary artifacts |
 | --- | --- |
 | R1-C1/R1-C5 reliability and paired CI presentation | `figure_calibration_audit.png`, `table_calibration_ci_compact.csv`, `table_paired_baseline_ci_compact.csv`, `reviewer_completion_input_contract.json` |
-| R1-C2 head-capacity sensitivity | `hybrid_morphology_baseline_summary.json`, paired Hybrid comparison, five checkpoint files |
+| R1-C2 determinism/regularization sensitivity | Existing Hybrid MLP package plus `morphology_learnability_summary.json`, frozen/partial OOF predictions, ten controlled checkpoints, `table_paired_morphology_learnability.csv`, and its paired manifest |
 | R1-C4 Transformer comparator | `transformer_ecg_baseline_summary.json`, paired Transformer comparison, five checkpoint files |
-| R1-C6 pooling sensitivity | `pooling_sensitivity.csv`, `pooling_sensitivity_external.csv`, Q=3 paired bootstrap output |
+| R1-C5 external zero-target-label uncertainty | Exact 3-dataset x 3-comparator x 5-metric group-paired grid, `table_external_zero_target_ci_compact.csv`, and authenticated manifest |
+| R1-C6 pooling sensitivity | Chapman sensitivity plus exact PTB-XL/Georgia/CPSC2021 x six-method table, 75 Q=3 paired group-bootstrap items, and `table_pooling_cross_dataset_compact.csv` |
 | R1-C7 PCA/config appendix | `table_fold_pca_provenance.csv`, `table_training_configuration.csv`, morphology transform contract |
 | R2-C2 representation audit | v3 `representation_probe_manifest.json`, fold probe table, CKA table, audit figure |
+| R2-C3 robustness | Canonical six-stress x four-comparator x five-metric paired-degradation ledger, 1,000 valid bootstrap replicates per row, and `table_robustness_six_stress_compact.csv` |
 | R2-C4 adaptation | group-safe score-calibration manifest and true frozen-encoder linear-head manifest, both PTB-XL fold 9/10 only |
 | Editorial marked manuscript | `marked_manuscript_manifest.json` with `editorial_ready=true` and a nonempty marked PDF |
+
+Notebook 07 runs `41_reviewer_gap_closure.py --strict`. All four rows
+(`R1-C2`, `R1-C5`, `R1-C6`, and `R2-C3`) must be `complete` and
+`manuscript_ready=true` before the compact tables are promoted into the final
+evidence package.
 
 ## Final Safe Wording Gate
 

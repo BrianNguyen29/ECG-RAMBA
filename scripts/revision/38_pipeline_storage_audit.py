@@ -80,6 +80,7 @@ EXTERNAL_REPRESENTATION_MODELS = (
     ("full", "ecg_ramba_full"),
     ("resnet", "resnet1d_cnn"),
     ("raw_mamba", "raw_mamba"),
+    ("transformer", "transformer_ecg"),
 )
 FEWSHOT_SEEDS = (42, 43, 44, 45, 46)
 FEWSHOT_FRACTION_TAGS = ("0", "0p01", "0p05", "0p1")
@@ -130,7 +131,7 @@ def true_fewshot_metric_slots() -> tuple[tuple[str, str], ...]:
             "metrics/true_fewshot_head_metric_cache/ptbxl/"
             f"full_vs_{model}_seed{seed}_frac{fraction}_{metric}_*.json",
         )
-        for model in ("resnet", "raw_mamba")
+        for model in ("resnet", "raw_mamba", "transformer")
         for seed in FEWSHOT_SEEDS
         for fraction in FEWSHOT_FRACTION_TAGS
         for metric in FEWSHOT_METRICS
@@ -183,6 +184,19 @@ STAGES = (
         True,
     ),
     (
+        "morphology_learnability_fold_cache",
+        "predictions/folds/morphology_learnability_{variant}_fold{fold}_predictions.npz",
+        tuple(
+            (
+                f"{variant}_fold{fold}",
+                f"predictions/folds/morphology_learnability_{variant}_fold{fold}_predictions.npz",
+            )
+            for variant in ("frozen", "partial")
+            for fold in range(1, 6)
+        ),
+        True,
+    ),
+    (
         "representation_fold_cache",
         "predictions/folds/representation_final_ema_fold{fold}_*.npz",
         fold_slots("predictions/folds/representation_final_ema_fold{fold}_*.npz"),
@@ -190,13 +204,13 @@ STAGES = (
     ),
     (
         "external_ptbxl_test_representation_fold_cache",
-        "PTB-XL fold-10 source-bound record representations (3 models x 5 folds)",
+        "PTB-XL fold-10 source-bound record representations (4 models x 5 folds)",
         external_representation_slots(""),
         True,
     ),
     (
         "external_ptbxl_fold9_representation_fold_cache",
-        "PTB-XL fold-9 source-bound record representations (3 models x 5 folds)",
+        "PTB-XL fold-9 source-bound record representations (4 models x 5 folds)",
         external_representation_slots("fold9"),
         True,
     ),
@@ -214,13 +228,13 @@ STAGES = (
     ),
     (
         "true_fewshot_prediction_cache",
-        "PTB-XL true-head prediction cache (3 models x 5 seeds x 4 budgets)",
+        "PTB-XL true-head prediction cache (4 models x 5 seeds x 4 budgets)",
         true_fewshot_prediction_slots("npz"),
         True,
     ),
     (
         "true_fewshot_coefficient_cache",
-        "PTB-XL true-head coefficient sidecars (3 models x 5 seeds x 4 budgets)",
+        "PTB-XL true-head coefficient sidecars (4 models x 5 seeds x 4 budgets)",
         true_fewshot_prediction_slots("coefficients.json"),
         True,
     ),
@@ -252,6 +266,20 @@ STAGES = (
         "hybrid_checkpoints",
         "experimental/hybrid_morphology_checkpoints/fold{fold}_hybrid_morphology_final.pt",
         fold_slots("experimental/hybrid_morphology_checkpoints/fold{fold}_hybrid_morphology_final.pt"),
+        True,
+    ),
+    (
+        "morphology_learnability_checkpoints",
+        "experimental/morphology_learnability_checkpoints/{variant}/fold{fold}_morphology_learnability_{variant}_final.pt",
+        tuple(
+            (
+                f"{variant}_fold{fold}",
+                "experimental/morphology_learnability_checkpoints/"
+                f"{variant}/fold{fold}_morphology_learnability_{variant}_final.pt",
+            )
+            for variant in ("frozen", "partial")
+            for fold in range(1, 6)
+        ),
         True,
     ),
     ("full_stress_predictions", "six frozen perturbations", stress_slots("full"), True),
