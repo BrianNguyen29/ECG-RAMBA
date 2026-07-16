@@ -102,6 +102,23 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook06_finds_current_notebook02_mamba_installer(self):
+        payload = notebook_payload("02_predictions_and_external_eval.ipynb")
+        required_markers = (
+            "INSTALL_MODEL_DEPS",
+            "MODEL_DEPS_SHOULD_RUN",
+            "AUTO_PIN_TORCH_FOR_MAMBA",
+            "Mamba wheel environment",
+        )
+        candidates = [
+            "".join(cell.get("source", []))
+            for cell in payload["cells"]
+            if cell.get("cell_type") == "code"
+            and all(marker in "".join(cell.get("source", [])) for marker in required_markers)
+        ]
+        self.assertEqual(len(candidates), 1)
+        self.assertIn("INSTALL_MODEL_DEPS = 'auto'", candidates[0])
+
     def test_notebook07_uses_targeted_restore_and_exports_profiles(self):
         _, source = notebook_source("07_results_freeze.ipynb")
         for token in (
