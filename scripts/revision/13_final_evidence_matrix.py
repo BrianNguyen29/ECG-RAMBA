@@ -55,7 +55,7 @@ EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 4
+FINAL_EVIDENCE_SCHEMA_VERSION = 5
 FINAL_EVIDENCE_CAPABILITIES = (
     "claim_readiness_gates",
     "external_learned_comparator_audit",
@@ -63,6 +63,7 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "hybrid_morphology_paired",
     "learned_comparator_robustness_audit",
     "representation_probe_v3",
+    "reviewer_presentation_assets",
     "transformer_paired",
     "true_fewshot_frozen_encoder_head_v2",
 )

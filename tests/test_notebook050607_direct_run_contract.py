@@ -147,11 +147,29 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "group_safe_score_calibration_v2",
             "true_fewshot_frozen_encoder_head_v2",
             "representation_probe_v3",
+            "reviewer_presentation_assets",
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
+
+    def test_notebook07_refreshes_calibration_and_builds_reviewer_assets(self):
+        _, source = notebook_source("07_results_freeze.ipynb")
+        for token in (
+            "bootstrap.unit=",
+            "one_chapman_record_per_subject",
+            "04_calibration_ci.py",
+            "29_reviewer_presentation_assets.py --strict",
+            "final_evidence_calibration_contract_refresh.log",
+            "final_evidence_calibration_refresh_mirror_publish.log",
+        ):
+            self.assertIn(token, source)
+
+    def test_notebook03_rejects_legacy_calibration_bootstrap_metadata(self):
+        _, source = notebook_source("03_calibration_and_ci.ipynb")
+        self.assertIn("bootstrap_unit_missing_or_mismatched", source)
+        self.assertIn("bootstrap_independence_contract_missing_or_mismatched", source)
 
 
 if __name__ == "__main__":
