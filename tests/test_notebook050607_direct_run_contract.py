@@ -99,6 +99,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "_probe_is_v3_ready()",
             "representation_probe_fold_safe_v3_projection_and_fold_audit",
             "--refresh-existing-cache-dirs",
+            "Repairing stale direct-cache manifest rows before Notebook 06 restore",
+            "representation_cache_manifest_repair.log",
+            "--refresh-existing-prefix predictions/folds",
         ):
             self.assertIn(token, source)
 
