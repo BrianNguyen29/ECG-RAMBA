@@ -118,8 +118,8 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Thread workers for bootstrap replicate evaluation. RNG indices are still "
-            "generated serially, so changing this value does not change sampled records."
+            "Thread workers for bootstrap replicate evaluation. Seeded record draws are "
+            "generated serially and cached, so changing this value does not change sampled records."
         ),
     )
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False)

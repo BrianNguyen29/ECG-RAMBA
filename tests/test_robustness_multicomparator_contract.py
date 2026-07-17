@@ -212,6 +212,83 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
         for observed_counts, expected_counts in zip(observed, expected):
             np.testing.assert_array_equal(observed_counts, expected_counts)
 
+    def test_fast_engine_matches_bin_edges_and_degenerate_labels(self):
+        n_records = 180
+        y_true = np.column_stack(
+            [
+                np.zeros(n_records),
+                np.ones(n_records),
+                np.arange(n_records) % 2,
+                (np.arange(n_records) % 3) == 0,
+            ]
+        ).astype(np.float32)
+        bin_edges = np.linspace(0.0, 1.0, 16, dtype=np.float32)
+        y_prob = np.column_stack(
+            [np.roll(np.resize(bin_edges, n_records), shift) for shift in range(y_true.shape[1])]
+        ).astype(np.float32)
+        data = {"y_true": y_true, "y_prob": y_prob}
+        rng = np.random.default_rng(91)
+        indices = rng.integers(0, n_records, size=n_records)
+        counts = np.bincount(indices, minlength=n_records)
+
+        for spec in ROBUSTNESS.metric_specs(threshold=0.5, n_bins=15):
+            expected = ROBUSTNESS.metric_value(spec, data, indices)
+            observed = ROBUSTNESS.weighted_resample_metric(spec, data, counts)
+            tolerance = 1e-7 if spec["name"] in {"brier_macro", "ece_macro"} else 1e-12
+            self.assertAlmostEqual(expected, observed, delta=tolerance, msg=spec["name"])
+
+    def test_fast_paired_intervals_match_legacy_record_resampling(self):
+        rng = np.random.default_rng(121)
+        y_true = rng.integers(0, 2, size=(80, 4)).astype(np.float32)
+
+        def data(offset: float):
+            y_prob = np.clip(
+                0.1 + 0.7 * y_true + offset + rng.normal(0.0, 0.15, y_true.shape),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            return {"y_true": y_true, "y_prob": y_prob}
+
+        datasets = (data(0.0), data(-0.04), data(0.02), data(-0.01))
+        n_boot, seed = 25, 72
+        for spec in ROBUSTNESS.metric_specs(threshold=0.5, n_bins=15):
+            observed = ROBUSTNESS.paired_bootstrap(spec, *datasets, n_boot, seed, n_jobs=3)
+            legacy_rng = np.random.default_rng(seed)
+            degradation_values = []
+            stressed_values = []
+            for _ in range(n_boot):
+                indices = legacy_rng.integers(0, len(y_true), size=len(y_true))
+                fc, fs, cc, cs = (
+                    ROBUSTNESS.metric_value(spec, dataset, indices) for dataset in datasets
+                )
+                full_degradation = ROBUSTNESS.benefit(fs, spec["direction"]) - ROBUSTNESS.benefit(
+                    fc,
+                    spec["direction"],
+                )
+                comparator_degradation = ROBUSTNESS.benefit(
+                    cs,
+                    spec["direction"],
+                ) - ROBUSTNESS.benefit(cc, spec["direction"])
+                degradation_values.append(full_degradation - comparator_degradation)
+                stressed_values.append(
+                    ROBUSTNESS.benefit(fs, spec["direction"])
+                    - ROBUSTNESS.benefit(cs, spec["direction"])
+                )
+
+            degradation_ci = np.quantile(degradation_values, [0.025, 0.975])
+            stressed_ci = np.quantile(stressed_values, [0.025, 0.975])
+            tolerance = 1e-7 if spec["name"] in {"brier_macro", "ece_macro"} else 1e-12
+            self.assertAlmostEqual(
+                observed["degradation_adv_mean"],
+                float(np.mean(degradation_values)),
+                delta=tolerance,
+                msg=spec["name"],
+            )
+            self.assertAlmostEqual(observed["degradation_adv_ci_low"], degradation_ci[0], delta=tolerance)
+            self.assertAlmostEqual(observed["degradation_adv_ci_high"], degradation_ci[1], delta=tolerance)
+            self.assertAlmostEqual(observed["stressed_adv_ci_low"], stressed_ci[0], delta=tolerance)
+            self.assertAlmostEqual(observed["stressed_adv_ci_high"], stressed_ci[1], delta=tolerance)
+
     def test_canonical_readiness_rejects_screening_profile(self):
         with tempfile.TemporaryDirectory(dir=READINESS.PROJECT_ROOT) as tmp:
             root = Path(tmp)
