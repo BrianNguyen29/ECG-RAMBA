@@ -87,6 +87,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "Authenticated comparator/stress artifacts:",
             "Missing/stale comparator stress pairs:",
             "Only affected stress groups will run",
+            "raw_mamba_needs_inference",
             "--refresh-existing-prefix predictions/robustness_",
             "All requested comparator stress artifacts passed provenance validation",
         ):
