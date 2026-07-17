@@ -226,9 +226,9 @@ def compare(
         improvement = raw_difference if spec.higher_is_better else -raw_difference
         print(f"{comparison}: paired bootstrap {spec.name} start", flush=True)
         ci, metric_samples = helpers.paired_bootstrap_difference(
-            y_true,
-            first_prob,
-            second_prob,
+            y_true=y_true,
+            full_prob=first_prob,
+            comparator_prob=second_prob,
             spec=spec,
             n_boot=args.n_boot,
             seed=args.seed + metric_index * 1009,
