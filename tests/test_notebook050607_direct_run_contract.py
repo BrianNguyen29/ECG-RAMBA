@@ -254,6 +254,12 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook07_closes_four_partial_reviewer_items_before_final_freeze(self):
         _, source = notebook_source("07_results_freeze.ipynb")
         for token in (
+            "30_pooling_sensitivity_external.py",
+            "--dataset ptbxl --dataset georgia --dataset cpsc2021",
+            "--strict-group-bootstrap",
+            "reviewer_gap_pooling_refresh.log",
+            "reviewer_gap_pooling_refresh_mirror_publish.log",
+            "experimental/external/cpsc2021/cpsc2021_full_slice_predictions.npz",
             "41_reviewer_gap_closure.py --strict",
             "reviewer_gap_closure_mirror_publish.log",
             "R1-C2",
@@ -266,6 +272,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "table_robustness_six_stress_compact.csv",
         ):
             self.assertIn(token, source)
+        self.assertLess(
+            source.index("30_pooling_sensitivity_external.py"),
+            source.index("41_reviewer_gap_closure.py --strict"),
+        )
 
     def test_notebook03_rejects_legacy_calibration_bootstrap_metadata(self):
         _, source = notebook_source("03_calibration_and_ci.ipynb")
