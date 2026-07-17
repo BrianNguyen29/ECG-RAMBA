@@ -13,9 +13,29 @@ from scripts.revision.common import sha256_file
 
 ROBUSTNESS = importlib.import_module("scripts.revision.21_robustness_multicomparator")
 READINESS = importlib.import_module("scripts.revision.28_claim_readiness_gates")
+FINAL_EVIDENCE = importlib.import_module("scripts.revision.13_final_evidence_matrix")
 
 
 class RobustnessMulticomparatorContractTests(unittest.TestCase):
+    def test_legacy_minirocket_interpretations_are_normalized_to_nominal_ci_wording(self):
+        row = {
+            "stress_test": "snr5db",
+            "metric": "pr_auc_macro",
+            "degradation_interpretation": "full_significantly_less_degraded",
+            "stressed_performance_interpretation": "minirocket_significantly_better_under_stress",
+        }
+        normalized = FINAL_EVIDENCE.robustness_claim_rows([row])[0]
+        self.assertEqual(
+            normalized["degradation_interpretation"],
+            "full_nominal_95ci_less_degraded",
+        )
+        self.assertEqual(
+            normalized["stressed_performance_interpretation"],
+            "minirocket_nominal_95ci_better_under_stress",
+        )
+        self.assertNotIn("significant", normalized["safe_wording_degradation"].lower())
+        self.assertNotIn("superiority", normalized["safe_wording_stressed_performance"].lower())
+
     def test_minirocket_uses_matching_robustness_clean_reference(self):
         self.assertEqual(
             ROBUSTNESS.COMPARATORS["minirocket"]["clean"],

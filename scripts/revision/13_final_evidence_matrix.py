@@ -226,19 +226,52 @@ def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
         degradation = str(row.get("degradation_interpretation", ""))
         stressed = str(row.get("stressed_performance_interpretation", ""))
         metric = str(row.get("metric", ""))
-        if degradation == "full_significantly_less_degraded":
-            degradation_wording = "Full ECG-RAMBA degrades less for this stress/metric."
-        elif degradation == "minirocket_significantly_less_degraded":
-            degradation_wording = "The fixed-transform-only comparator degrades less for this stress/metric."
+        if degradation in {"full_nominal_95ci_less_degraded", "full_significantly_less_degraded"}:
+            normalized_degradation = "full_nominal_95ci_less_degraded"
+            degradation_wording = (
+                "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
+                "favors Full ECG-RAMBA for the clean-to-stress change."
+            )
+        elif degradation in {
+            "minirocket_nominal_95ci_less_degraded",
+            "minirocket_significantly_less_degraded",
+        }:
+            normalized_degradation = "minirocket_nominal_95ci_less_degraded"
+            degradation_wording = (
+                "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
+                "favors the fixed-transform-only comparator for the clean-to-stress change."
+            )
         else:
-            degradation_wording = "No paired degradation advantage should be claimed."
+            normalized_degradation = "nominal_95ci_inconclusive_degradation_difference"
+            degradation_wording = (
+                "The nominal unadjusted paired 95% record-bootstrap CI is inconclusive for the "
+                "clean-to-stress change difference."
+            )
 
-        if stressed == "full_significantly_better_under_stress":
-            stressed_wording = "Full ECG-RAMBA is better under the stressed operating point."
-        elif stressed == "minirocket_significantly_better_under_stress":
-            stressed_wording = "The fixed-transform-only comparator is better under the stressed operating point."
+        if stressed in {
+            "full_nominal_95ci_better_under_stress",
+            "full_significantly_better_under_stress",
+        }:
+            normalized_stressed = "full_nominal_95ci_better_under_stress"
+            stressed_wording = (
+                "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
+                "favors Full ECG-RAMBA at the stressed operating point."
+            )
+        elif stressed in {
+            "minirocket_nominal_95ci_better_under_stress",
+            "minirocket_significantly_better_under_stress",
+        }:
+            normalized_stressed = "minirocket_nominal_95ci_better_under_stress"
+            stressed_wording = (
+                "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
+                "favors the fixed-transform-only comparator at the stressed operating point."
+            )
         else:
-            stressed_wording = "No stressed-performance superiority should be claimed."
+            normalized_stressed = "nominal_95ci_inconclusive_stressed_difference"
+            stressed_wording = (
+                "The nominal unadjusted paired 95% record-bootstrap CI is inconclusive at the "
+                "stressed operating point."
+            )
 
         claim_rows.append(
             {
@@ -261,8 +294,12 @@ def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 ),
                 "stressed_ci_low": row.get("stressed_advantage_ci_low", ""),
                 "stressed_ci_high": row.get("stressed_advantage_ci_high", ""),
-                "degradation_interpretation": degradation,
-                "stressed_performance_interpretation": stressed,
+                "degradation_interpretation": normalized_degradation,
+                "stressed_performance_interpretation": normalized_stressed,
+                "ci_scope": "nominal_95_percentile_paired_record_bootstrap_unadjusted",
+                "training_variability_scope": (
+                    "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+                ),
                 "safe_wording_degradation": degradation_wording,
                 "safe_wording_stressed_performance": stressed_wording,
             }
@@ -274,24 +311,29 @@ def summarize_robustness(rows: list[dict[str, str]]) -> dict[str, Any]:
     full_less_degraded = [
         row
         for row in rows
-        if row.get("degradation_interpretation") == "full_significantly_less_degraded"
+        if row.get("degradation_interpretation")
+        in {"full_nominal_95ci_less_degraded", "full_significantly_less_degraded"}
     ]
     mini_less_degraded = [
         row
         for row in rows
-        if row.get("degradation_interpretation") == "minirocket_significantly_less_degraded"
+        if row.get("degradation_interpretation")
+        in {"minirocket_nominal_95ci_less_degraded", "minirocket_significantly_less_degraded"}
     ]
     full_better_stress = [
         row
         for row in rows
         if row.get("stressed_performance_interpretation")
-        == "full_significantly_better_under_stress"
+        in {"full_nominal_95ci_better_under_stress", "full_significantly_better_under_stress"}
     ]
     mini_better_stress = [
         row
         for row in rows
         if row.get("stressed_performance_interpretation")
-        == "minirocket_significantly_better_under_stress"
+        in {
+            "minirocket_nominal_95ci_better_under_stress",
+            "minirocket_significantly_better_under_stress",
+        }
     ]
     return {
         "n_rows": len(rows),

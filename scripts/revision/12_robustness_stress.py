@@ -71,6 +71,9 @@ from src.provenance import record_order_fingerprint  # noqa: E402
 
 
 PROTOCOL = "robustness_full_vs_minirocket_perturbation_v1"
+CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+PERTURBATION_REALIZATION_SCOPE = "single_fixed_seed_conditional_stress_audit"
 MINIROCKET_HEAD_PROTOCOL = "minirocket_clean_heads_for_robustness_v1"
 EXPECTED_MINIROCKET_PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 DEFAULT_STRESS_TESTS = [
@@ -1344,12 +1347,19 @@ def paired_bootstrap_robustness(
     }, samples
 
 
-def interpretation(ci_low: float, ci_high: float, *, positive_label: str, negative_label: str) -> str:
+def interpretation(
+    ci_low: float,
+    ci_high: float,
+    *,
+    positive_label: str,
+    negative_label: str,
+    inconclusive_label: str,
+) -> str:
     if ci_low > 0.0:
         return positive_label
     if ci_high < 0.0:
         return negative_label
-    return "inconclusive"
+    return inconclusive_label
 
 
 def main() -> None:
@@ -1789,17 +1799,22 @@ def main() -> None:
                 "p_value_degradation_two_sided": ci["p_value_degradation_two_sided"],
                 "p_value_stressed_two_sided": ci["p_value_stressed_two_sided"],
                 "n_boot_valid": ci["n_boot_valid"],
+                "ci_scope": CI_SCOPE,
+                "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+                "perturbation_realization_scope": PERTURBATION_REALIZATION_SCOPE,
                 "degradation_interpretation": interpretation(
                     ci["degradation_advantage_ci_low"],
                     ci["degradation_advantage_ci_high"],
-                    positive_label="full_significantly_less_degraded",
-                    negative_label="minirocket_significantly_less_degraded",
+                    positive_label="full_nominal_95ci_less_degraded",
+                    negative_label="minirocket_nominal_95ci_less_degraded",
+                    inconclusive_label="nominal_95ci_inconclusive_degradation_difference",
                 ),
                 "stressed_performance_interpretation": interpretation(
                     ci["stressed_advantage_ci_low"],
                     ci["stressed_advantage_ci_high"],
-                    positive_label="full_significantly_better_under_stress",
-                    negative_label="minirocket_significantly_better_under_stress",
+                    positive_label="full_nominal_95ci_better_under_stress",
+                    negative_label="minirocket_nominal_95ci_better_under_stress",
+                    inconclusive_label="nominal_95ci_inconclusive_stressed_difference",
                 ),
             }
             rows.append(row)

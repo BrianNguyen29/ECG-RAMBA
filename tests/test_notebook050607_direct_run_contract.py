@@ -74,6 +74,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "ece_context",
             "bootstrap_record_counts",
             "nominal_95_percentile_paired_record_bootstrap_unadjusted",
+            "full_nominal_95ci_less_degraded",
+            "nominal_95ci_inconclusive_stressed_difference",
             "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap",
             "METRIC_CACHE_SCHEMA_VERSION = 2",
             "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero",
