@@ -160,6 +160,58 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(len(shared[("stress", "metric", 123)]), 25)
 
+    def test_fast_weighted_engine_matches_explicit_record_resampling(self):
+        rng = np.random.default_rng(20260717)
+        y_true = rng.integers(0, 2, size=(240, 5)).astype(np.float32)
+        # Quantization deliberately creates score ties, exercising the cached
+        # threshold boundaries used by the exact PR/ROC implementation.
+        y_prob = np.round(rng.uniform(0.0, 1.0, size=y_true.shape), 2).astype(np.float32)
+        data = {"y_true": y_true, "y_prob": y_prob}
+        specs = ROBUSTNESS.metric_specs(threshold=0.5, n_bins=15)
+
+        for _ in range(20):
+            indices = rng.integers(0, len(y_true), size=len(y_true))
+            counts = np.bincount(indices, minlength=len(y_true)).astype(np.float64)
+            for spec in specs:
+                expected = ROBUSTNESS.metric_value(spec, data, indices)
+                observed = ROBUSTNESS.weighted_resample_metric(spec, data, counts)
+                tolerance = 1e-7 if spec["name"] in {"brier_macro", "ece_macro"} else 1e-12
+                self.assertAlmostEqual(expected, observed, delta=tolerance, msg=spec["name"])
+
+    def test_fast_standard_metric_bootstrap_is_thread_deterministic(self):
+        rng = np.random.default_rng(42)
+        y_true = rng.integers(0, 2, size=(120, 3)).astype(np.float32)
+
+        def data(offset: float):
+            probability = np.clip(
+                0.15 + 0.65 * y_true + offset + rng.normal(0.0, 0.08, size=y_true.shape),
+                0.0,
+                1.0,
+            ).astype(np.float32)
+            return {"y_true": y_true, "y_prob": probability}
+
+        datasets = (data(0.00), data(-0.02), data(0.01), data(-0.01))
+        for spec in ROBUSTNESS.metric_specs(threshold=0.5, n_bins=15):
+            sequential = ROBUSTNESS.paired_bootstrap(spec, *datasets, 30, 123, n_jobs=1)
+            threaded = ROBUSTNESS.paired_bootstrap(spec, *datasets, 30, 123, n_jobs=4)
+            self.assertEqual(sequential, threaded, spec["name"])
+            self.assertEqual(sequential["bootstrap_engine"], ROBUSTNESS.BOOTSTRAP_ENGINE)
+
+    def test_seeded_record_count_cache_matches_explicit_bootstrap_draws(self):
+        n_records, n_boot, seed = 123, 7, 20260717
+        observed = ROBUSTNESS.bootstrap_record_counts(n_records, n_boot, seed)
+        expected_rng = np.random.default_rng(seed)
+        expected = tuple(
+            np.bincount(
+                expected_rng.integers(0, n_records, size=n_records),
+                minlength=n_records,
+            )
+            for _ in range(n_boot)
+        )
+        self.assertIs(observed, ROBUSTNESS.bootstrap_record_counts(n_records, n_boot, seed))
+        for observed_counts, expected_counts in zip(observed, expected):
+            np.testing.assert_array_equal(observed_counts, expected_counts)
+
     def test_canonical_readiness_rejects_screening_profile(self):
         with tempfile.TemporaryDirectory(dir=READINESS.PROJECT_ROOT) as tmp:
             root = Path(tmp)

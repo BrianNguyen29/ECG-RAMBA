@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
+from scipy import sparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -45,6 +46,7 @@ from scripts.revision.common import (  # noqa: E402
 
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
+BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
 DEFAULT_STRESSES = (
     "snr20db",
     "snr10db",
@@ -484,6 +486,7 @@ def metric_specs(threshold: float, n_bins: int) -> list[dict[str, Any]]:
         {
             "name": "f1_macro",
             "direction": "higher",
+            "threshold": float(threshold),
             "fn": lambda y, p: multilabel_metrics(y, p, threshold=threshold)["f1_macro"],
         },
         {
@@ -494,6 +497,7 @@ def metric_specs(threshold: float, n_bins: int) -> list[dict[str, Any]]:
         {
             "name": "ece_macro",
             "direction": "lower",
+            "n_bins": int(n_bins),
             "fn": lambda y, p: calibration_summary(y, p, n_bins=n_bins)["ece_macro"],
         },
     ]
@@ -521,6 +525,189 @@ def metric_value(spec: dict[str, Any], data: dict[str, Any], idx: np.ndarray | N
     return value
 
 
+_RANK_CONTEXT_CACHE: dict[str, list[dict[str, np.ndarray]]] = {}
+_ECE_CONTEXT_CACHE: dict[str, dict[str, Any]] = {}
+_RESAMPLE_COUNT_CACHE: dict[tuple[int, int, int], tuple[np.ndarray, ...]] = {}
+
+
+def rank_context(data: dict[str, Any]) -> list[dict[str, np.ndarray]]:
+    """Cache score order/tie boundaries once for exact weighted PR/ROC bootstrap."""
+
+    source_sha = str(data.get("sha256") or "")
+    cached = _RANK_CONTEXT_CACHE.get(source_sha) if source_sha else data.get("_rank_context")
+    if cached is not None:
+        return cached
+
+    y_true = np.asarray(data["y_true"])
+    y_prob = np.asarray(data["y_prob"])
+    contexts: list[dict[str, np.ndarray]] = []
+    for class_idx in range(y_true.shape[1]):
+        # Match sklearn's stable descending score order and collapse equal-score ties.
+        order = np.argsort(y_prob[:, class_idx], kind="mergesort")[::-1]
+        sorted_prob = y_prob[order, class_idx]
+        boundaries = np.r_[np.where(np.diff(sorted_prob))[0], len(order) - 1]
+        contexts.append(
+            {
+                "order": order.astype(np.int32, copy=False),
+                "boundaries": boundaries.astype(np.int32, copy=False),
+                "y_sorted": y_true[order, class_idx].astype(np.uint8, copy=False),
+            }
+        )
+    if source_sha:
+        _RANK_CONTEXT_CACHE[source_sha] = contexts
+    else:
+        data["_rank_context"] = contexts
+    return contexts
+
+
+def weighted_rank_metric(
+    contexts: list[dict[str, np.ndarray]],
+    counts: np.ndarray,
+    *,
+    metric: str,
+) -> float:
+    """Compute macro AP/AUC for an integer-weighted record resample without re-sorting."""
+
+    scores: list[float] = []
+    for context in contexts:
+        weights = counts[context["order"]]
+        positives = weights * context["y_sorted"]
+        negatives = weights - positives
+        tp = np.cumsum(positives, dtype=np.float64)[context["boundaries"]]
+        fp = np.cumsum(negatives, dtype=np.float64)[context["boundaries"]]
+        total_positive = float(tp[-1])
+        total_negative = float(fp[-1])
+        if total_positive <= 0.0 or total_negative <= 0.0:
+            continue
+        if metric == "roc_auc_macro":
+            tpr = tp / total_positive
+            fpr = fp / total_negative
+            tpr = np.r_[0.0, tpr]
+            fpr = np.r_[0.0, fpr]
+            scores.append(float(np.sum(np.diff(fpr) * (tpr[:-1] + tpr[1:]) * 0.5)))
+        elif metric == "pr_auc_macro":
+            precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) > 0)
+            recall = tp / total_positive
+            scores.append(float(np.sum(np.diff(np.r_[0.0, recall]) * precision)))
+        else:
+            raise ValueError(f"Unsupported weighted rank metric: {metric}")
+    return float(np.mean(scores)) if scores else math.nan
+
+
+def ece_context(data: dict[str, Any], n_bins: int) -> dict[str, Any]:
+    """Cache a sparse record-to-class-bin residual matrix for exact ECE."""
+
+    source_sha = str(data.get("sha256") or "")
+    cache_key = f"{source_sha}:bins={n_bins}" if source_sha else ""
+    memory_cache = data.setdefault("_ece_contexts", {}) if not source_sha else None
+    cached = _ECE_CONTEXT_CACHE.get(cache_key) if source_sha else memory_cache.get(n_bins)
+    if cached is not None:
+        return cached
+
+    y_true = np.asarray(data["y_true"], dtype=np.float64)
+    y_prob = np.asarray(data["y_prob"], dtype=np.float64)
+    n_records, n_classes = y_true.shape
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_index = np.searchsorted(bins, y_prob, side="right") - 1
+    bin_index = np.clip(bin_index, 0, n_bins - 1)
+    row_index = (np.arange(n_classes)[:, None] * n_bins + bin_index.T).ravel()
+    column_index = np.broadcast_to(np.arange(n_records), (n_classes, n_records)).ravel()
+    residual = (y_true - y_prob).T.ravel()
+    matrix = sparse.csr_matrix(
+        (residual, (row_index, column_index)),
+        shape=(n_classes * n_bins, n_records),
+    )
+    cached = {"matrix": matrix, "n_classes": n_classes, "n_bins": n_bins}
+    if source_sha:
+        _ECE_CONTEXT_CACHE[cache_key] = cached
+    else:
+        memory_cache[n_bins] = cached
+    return cached
+
+
+def bootstrap_record_counts(n_records: int, n_boot: int, seed: int) -> tuple[np.ndarray, ...]:
+    """Reuse the exact seeded record-resample counts across paired comparators."""
+
+    cache_key = (int(n_records), int(n_boot), int(seed))
+    cached = _RESAMPLE_COUNT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    rng = np.random.default_rng(seed)
+    count_dtype = np.uint16 if n_records <= np.iinfo(np.uint16).max else np.uint32
+    counts = tuple(
+        np.bincount(
+            rng.integers(0, n_records, size=n_records),
+            minlength=n_records,
+        ).astype(count_dtype, copy=False)
+        for _ in range(n_boot)
+    )
+    _RESAMPLE_COUNT_CACHE[cache_key] = counts
+    return counts
+
+
+def weighted_resample_metric(
+    spec: dict[str, Any],
+    data: dict[str, Any],
+    counts: np.ndarray,
+    *,
+    rank_cache: list[dict[str, np.ndarray]] | None = None,
+    ece_cache: dict[str, Any] | None = None,
+) -> float:
+    """Exact metric for the same integer record resample represented by counts."""
+
+    metric = str(spec["name"])
+    if metric in {"pr_auc_macro", "roc_auc_macro"}:
+        return weighted_rank_metric(
+            rank_cache if rank_cache is not None else rank_context(data),
+            counts,
+            metric=metric,
+        )
+
+    y_true_raw = np.asarray(data["y_true"])
+    y_prob_raw = np.asarray(data["y_prob"])
+    y_true = y_true_raw.astype(np.float64, copy=False)
+    y_prob = y_prob_raw.astype(np.float64, copy=False)
+    weights = np.asarray(counts, dtype=np.float64)
+    total_weight = float(np.sum(weights))
+    if total_weight <= 0.0:
+        return math.nan
+
+    if metric == "f1_macro":
+        predicted = y_prob >= float(spec["threshold"])
+        positive = y_true == 1.0
+        expanded = weights[:, None]
+        tp = np.sum(expanded * (positive & predicted), axis=0, dtype=np.float64)
+        fp = np.sum(expanded * (~positive & predicted), axis=0, dtype=np.float64)
+        fn = np.sum(expanded * (positive & ~predicted), axis=0, dtype=np.float64)
+        denominator = 2.0 * tp + fp + fn
+        per_class = np.divide(2.0 * tp, denominator, out=np.zeros_like(tp), where=denominator > 0)
+        return float(np.mean(per_class))
+
+    positive_weight = weights @ y_true
+    valid_classes = (positive_weight > 0.0) & (positive_weight < total_weight)
+    if not np.any(valid_classes):
+        return math.nan
+
+    if metric == "brier_macro":
+        # Preserve the original prediction dtype for parity with sklearn's
+        # brier_score_loss on the explicitly repeated bootstrap sample.
+        squared_error = np.square(y_true_raw - y_prob_raw)
+        per_class = (weights @ squared_error) / total_weight
+        return float(np.mean(per_class[valid_classes]))
+
+    if metric == "ece_macro":
+        n_bins = int(spec["n_bins"])
+        context = ece_cache if ece_cache is not None else ece_context(data, n_bins)
+        weighted_residual = np.asarray(context["matrix"] @ weights).reshape(
+            int(context["n_classes"]),
+            n_bins,
+        )
+        per_class = np.sum(np.abs(weighted_residual), axis=1) / total_weight
+        return float(np.mean(per_class[valid_classes]))
+
+    raise ValueError(f"Unsupported weighted resample metric: {metric}")
+
+
 def paired_bootstrap(
     spec: dict[str, Any],
     full_clean: dict[str, Any],
@@ -533,7 +720,6 @@ def paired_bootstrap(
     shared_full_cache: dict[tuple[Any, ...], list[tuple[float, float]]] | None = None,
     shared_full_cache_key: tuple[Any, ...] | None = None,
 ) -> dict[str, Any]:
-    rng = np.random.default_rng(seed)
     n = len(full_clean["y_true"])
     values = []
     stressed_values = []
@@ -546,15 +732,81 @@ def paired_bootstrap(
     if cached_full_values is not None and len(cached_full_values) != n_boot:
         raise RuntimeError("Shared Full bootstrap cache length does not match n_boot")
 
-    def evaluate(item: tuple[int, np.ndarray]) -> tuple[tuple[float, float], tuple[float, float] | None]:
-        ordinal, idx = item
+    optimized_metric = str(spec.get("name")) in {
+        "pr_auc_macro",
+        "roc_auc_macro",
+        "f1_macro",
+        "brier_macro",
+        "ece_macro",
+    }
+    cached_record_counts = bootstrap_record_counts(n, n_boot, seed) if optimized_metric else None
+    rng = np.random.default_rng(seed) if not optimized_metric else None
+    rank_caches = (
+        {
+            "full_clean": rank_context(full_clean),
+            "full_stress": rank_context(full_stress),
+            "comp_clean": rank_context(comp_clean),
+            "comp_stress": rank_context(comp_stress),
+        }
+        if str(spec.get("name")) in {"pr_auc_macro", "roc_auc_macro"}
+        else {}
+    )
+    ece_caches = (
+        {
+            "full_clean": ece_context(full_clean, int(spec["n_bins"])),
+            "full_stress": ece_context(full_stress, int(spec["n_bins"])),
+            "comp_clean": ece_context(comp_clean, int(spec["n_bins"])),
+            "comp_stress": ece_context(comp_stress, int(spec["n_bins"])),
+        }
+        if str(spec.get("name")) == "ece_macro"
+        else {}
+    )
+
+    def evaluate(
+        item: tuple[int, np.ndarray | None, np.ndarray],
+    ) -> tuple[tuple[float, float], tuple[float, float] | None]:
+        ordinal, idx, counts = item
         if cached_full_values is None:
-            fc = metric_value(spec, full_clean, idx)
-            fs = metric_value(spec, full_stress, idx)
+            if optimized_metric:
+                fc = weighted_resample_metric(
+                    spec,
+                    full_clean,
+                    counts,
+                    rank_cache=rank_caches.get("full_clean"),
+                    ece_cache=ece_caches.get("full_clean"),
+                )
+                fs = weighted_resample_metric(
+                    spec,
+                    full_stress,
+                    counts,
+                    rank_cache=rank_caches.get("full_stress"),
+                    ece_cache=ece_caches.get("full_stress"),
+                )
+            else:
+                assert idx is not None
+                fc = metric_value(spec, full_clean, idx)
+                fs = metric_value(spec, full_stress, idx)
         else:
             fc, fs = cached_full_values[ordinal]
-        cc = metric_value(spec, comp_clean, idx)
-        cs = metric_value(spec, comp_stress, idx)
+        if optimized_metric:
+            cc = weighted_resample_metric(
+                spec,
+                comp_clean,
+                counts,
+                rank_cache=rank_caches.get("comp_clean"),
+                ece_cache=ece_caches.get("comp_clean"),
+            )
+            cs = weighted_resample_metric(
+                spec,
+                comp_stress,
+                counts,
+                rank_cache=rank_caches.get("comp_stress"),
+                ece_cache=ece_caches.get("comp_stress"),
+            )
+        else:
+            assert idx is not None
+            cc = metric_value(spec, comp_clean, idx)
+            cs = metric_value(spec, comp_stress, idx)
         full_pair = (float(fc), float(fs))
         if not all(np.isfinite([fc, fs, cc, cs])):
             return full_pair, None
@@ -580,8 +832,19 @@ def paired_bootstrap(
             # Generate indices in the caller thread and in the same order as
             # the historical sequential implementation. Executor.map returns
             # results in input order, preserving deterministic quantiles.
-            indices = [rng.integers(0, n, size=n) for _ in range(count)]
-            indexed = list(enumerate(indices, start=ordinal))
+            if optimized_metric:
+                assert cached_record_counts is not None
+                indexed = [
+                    (sample_ordinal, None, cached_record_counts[sample_ordinal])
+                    for sample_ordinal in range(ordinal, ordinal + count)
+                ]
+            else:
+                assert rng is not None
+                indices = [rng.integers(0, n, size=n) for _ in range(count)]
+                indexed = [
+                    (sample_ordinal, idx, np.bincount(idx, minlength=n).astype(np.float64, copy=False))
+                    for sample_ordinal, idx in enumerate(indices, start=ordinal)
+                ]
             ordinal += count
             results = (
                 executor_context.map(evaluate, indexed)
@@ -613,6 +876,7 @@ def paired_bootstrap(
     slo, shi = np.quantile(stressed_values, [0.025, 0.975])
     return {
         "n_boot_valid": int(len(values)),
+        "bootstrap_engine": BOOTSTRAP_ENGINE if optimized_metric else "record_index_resample_v1",
         "degradation_adv_mean": float(np.mean(values)),
         "degradation_adv_ci_low": float(lo),
         "degradation_adv_ci_high": float(hi),
@@ -669,6 +933,7 @@ def main() -> None:
     if args.bootstrap_jobs < 1:
         raise ValueError("--bootstrap-jobs must be at least 1")
     print(f"bootstrap_jobs={args.bootstrap_jobs}", flush=True)
+    print(f"bootstrap_engine={BOOTSTRAP_ENGINE}", flush=True)
     print(f"metric_cache_dir={resolve(args.metric_cache_dir)} reuse={args.reuse_metric_cache}", flush=True)
 
     clean: dict[str, dict[str, Any]] = {}
@@ -753,6 +1018,7 @@ def main() -> None:
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
         "bootstrap_jobs": args.bootstrap_jobs,
+        "bootstrap_engine": BOOTSTRAP_ENGINE,
         "metrics": requested_metrics,
         "metric_cache_dir": project_relative(args.metric_cache_dir),
         "output_profile": output_profile_name(args.out_pairwise),
@@ -880,10 +1146,12 @@ def main() -> None:
                         "stressed_adv_ci_low": boot.get("stressed_adv_ci_low"),
                         "stressed_adv_ci_high": boot.get("stressed_adv_ci_high"),
                         "n_boot_valid": boot.get("n_boot_valid"),
+                        "bootstrap_engine": boot.get("bootstrap_engine"),
                         "interpretation": interp,
                     }
                     write_metric_cache(cache_path, metadata, row)
                     print(f"{stress} {comp} {spec['name']}: bootstrap done", flush=True)
+                row.setdefault("bootstrap_engine", "record_index_resample_v1_cached_exact")
                 interp = row_interpretation(row)
                 rows.append(row)
                 pairwise["items"][f"{stress}/{comp}/{spec['name']}"] = row
@@ -913,6 +1181,7 @@ def main() -> None:
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
         "bootstrap_jobs": args.bootstrap_jobs,
+        "bootstrap_engine": BOOTSTRAP_ENGINE,
         "metrics": requested_metrics,
         "output_profile": output_profile_name(args.out_pairwise),
         "completed_rows": len(completed),
@@ -958,6 +1227,7 @@ def main() -> None:
             "n_bins": args.n_bins,
             "n_boot": args.n_boot,
             "bootstrap_jobs": args.bootstrap_jobs,
+            "bootstrap_engine": BOOTSTRAP_ENGINE,
             "output_profile": output_profile_name(args.out_pairwise),
             "expected_rows": expected_rows,
             "completed_rows": len(comp_rows) - len(comp_blocked),

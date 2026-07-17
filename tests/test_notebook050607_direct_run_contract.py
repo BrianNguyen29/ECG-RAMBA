@@ -69,6 +69,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "oof_label_fold_contract_sha256",
             "hrv_only_oof_reuse_attestation.json",
             "semantic_contract_match",
+            "BOOTSTRAP_ENGINE",
+            "weighted_resample_metric",
+            "ROBUSTNESS_MULTI_DEFAULT_BOOTSTRAP_JOBS",
+            "ROBUSTNESS_MULTI_INNER_THREADS",
+            "total paired metric jobs",
         ):
             self.assertIn(token, source)
         self.assertIn("'canonical_resume'", source)
