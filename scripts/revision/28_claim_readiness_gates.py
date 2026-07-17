@@ -824,7 +824,7 @@ def main() -> None:
     )
 
     pooling_cross_dataset_required = [
-        METRIC_DIR / "pooling_sensitivity_across_datasets.csv",
+        METRIC_DIR / "pooling_sensitivity_external.csv",
         TABLE_DIR / "table_pooling_sensitivity_across_datasets.csv",
         METRIC_DIR / "pooling_q3_paired_bootstrap.json",
         MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",

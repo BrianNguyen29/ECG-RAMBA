@@ -213,6 +213,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
+        self.assertIn("required_generator_schema = 7", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 7", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 
@@ -276,6 +278,22 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             source.index("30_pooling_sensitivity_external.py"),
             source.index("41_reviewer_gap_closure.py --strict"),
         )
+
+    def test_external_pooling_summary_uses_one_canonical_filename(self):
+        producer = (
+            PROJECT_ROOT / "scripts" / "revision" / "30_pooling_sensitivity_external.py"
+        ).read_text(encoding="utf-8")
+        final_generator = (
+            PROJECT_ROOT / "scripts" / "revision" / "13_final_evidence_matrix.py"
+        ).read_text(encoding="utf-8")
+        readiness_gate = (
+            PROJECT_ROOT / "scripts" / "revision" / "28_claim_readiness_gates.py"
+        ).read_text(encoding="utf-8")
+        for source in (producer, final_generator, readiness_gate):
+            self.assertIn("pooling_sensitivity_external.csv", source)
+        stale_metric = 'METRIC_DIR / "pooling_sensitivity_across_datasets.csv"'
+        self.assertNotIn(stale_metric, final_generator)
+        self.assertNotIn(stale_metric, readiness_gate)
 
     def test_notebook03_rejects_legacy_calibration_bootstrap_metadata(self):
         _, source = notebook_source("03_calibration_and_ci.ipynb")

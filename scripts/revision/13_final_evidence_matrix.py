@@ -55,7 +55,7 @@ EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 6
+FINAL_EVIDENCE_SCHEMA_VERSION = 7
 FINAL_EVIDENCE_CAPABILITIES = (
     "claim_readiness_gates",
     "external_learned_comparator_audit",
@@ -907,7 +907,7 @@ def main() -> None:
         "paired_morphology_learnability": METRIC_DIR / "paired_morphology_learnability_comparison.json",
         "paired_morphology_learnability_table": TABLE_DIR / "table_paired_morphology_learnability.csv",
         "paired_morphology_learnability_manifest": MANIFEST_DIR / "paired_morphology_learnability_manifest.json",
-        "pooling_sensitivity_across_datasets": METRIC_DIR / "pooling_sensitivity_across_datasets.csv",
+        "pooling_sensitivity_external": METRIC_DIR / "pooling_sensitivity_external.csv",
         "pooling_q3_paired_bootstrap": METRIC_DIR / "pooling_q3_paired_bootstrap.json",
         "pooling_sensitivity_external_manifest": MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
     }
@@ -1560,7 +1560,7 @@ def main() -> None:
             "evidence_paths": (
                 "reports/revision/metrics/pooling_sensitivity.csv;"
                 "reports/revision/metrics/pooling_decision_summary.json;"
-                "reports/revision/metrics/pooling_sensitivity_across_datasets.csv;"
+                "reports/revision/metrics/pooling_sensitivity_external.csv;"
                 "reports/revision/metrics/pooling_q3_paired_bootstrap.json;"
                 "reports/revision/tables/table_pooling_cross_dataset_compact.csv"
             ),
