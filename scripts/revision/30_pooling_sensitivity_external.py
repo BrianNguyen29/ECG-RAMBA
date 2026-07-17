@@ -348,7 +348,10 @@ def main() -> None:
             "strict_group_bootstrap": bool(args.strict_group_bootstrap),
             "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
             "frozen_reference": "power_mean_q3",
-            "safe_wording": "Q=3 is a frozen operating point, not a universally optimal pooling exponent.",
+            "safe_wording": (
+                "Q=3 is a frozen operating point, not a universally optimal pooling exponent. "
+                "PTB-XL resampling uses patient IDs, CPSC2021 uses source ECG records, and Georgia uses record IDs under an explicit independence assumption because patient identifiers are unavailable."
+            ),
             "inputs": inputs,
             "outputs": [
                 {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}

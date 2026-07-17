@@ -195,9 +195,18 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                             "metric": metric,
                             "status": "complete",
                             "n_boot_valid": 1000,
+                            "clean_full": 0.5,
+                            "stress_full": 0.4,
+                            "degradation_full_benefit": -0.1,
+                            "clean_comparator": 0.45,
+                            "stress_comparator": 0.34,
+                            "degradation_comparator_benefit": -0.11,
                             "degradation_advantage_full": 0.01,
+                            "stressed_advantage_full": 0.06,
                             "degradation_adv_ci_low": -0.01,
                             "degradation_adv_ci_high": 0.02,
+                            "stressed_adv_ci_low": 0.02,
+                            "stressed_adv_ci_high": 0.10,
                             "interpretation": "no_significant_degradation_difference",
                         }
                     )
@@ -232,6 +241,13 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
             self.assertTrue(status["manuscript_ready"])
             self.assertTrue(compact)
 
+        external_status, external_compact = self.module.validate_external(self.args)
+        self.assertIn("record-level resampling", external_status["safe_wording"])
+        self.assertTrue(all("Holm-adjusted conclusion" in row for row in external_compact))
+        robustness_status, robustness_compact = self.module.validate_robustness(self.args)
+        self.assertIn("pointwise", robustness_status["safe_wording"])
+        self.assertTrue(all("Pointwise CI overlaps zero" in row for row in robustness_compact))
+
     def test_short_pooling_bootstrap_is_rejected(self):
         payload = json.loads(self.args.pooling_bootstrap.read_text(encoding="utf-8"))
         first = next(iter(payload["items"].values()))
@@ -243,6 +259,34 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         status, _ = self.module.validate_pooling(self.args)
         self.assertEqual(status["status"], "incomplete")
         self.assertTrue(any("short" in issue for issue in status["issues"]))
+
+    def test_holm_adjustment_controls_reviewer_facing_morphology_conclusion(self):
+        with self.args.morphology_table.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["holm_p_value_two_sided"] = "0.5"
+        rows[0]["interpretation"] = "full_significantly_better"
+        write_csv(self.args.morphology_table, rows)
+        manifest = json.loads(self.args.morphology_manifest.read_text(encoding="utf-8"))
+        manifest["outputs"][0] = self.output_row(self.args.morphology_table)
+        write_json(self.args.morphology_manifest, manifest)
+
+        status, compact = self.module.validate_morphology(self.args)
+        self.assertEqual(status["status"], "complete", status["issues"])
+        first = next(row for row in compact if row["Comparison"] == "partial_vs_frozen")
+        self.assertEqual(first["Holm-adjusted conclusion"], "No Holm-adjusted difference")
+
+    def test_nonfinite_robustness_interval_is_rejected(self):
+        with self.args.robustness_table.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["degradation_adv_ci_low"] = "nan"
+        write_csv(self.args.robustness_table, rows)
+        manifest = json.loads(self.args.robustness_manifest.read_text(encoding="utf-8"))
+        manifest["artifact_sha256"]["table"] = self.module.sha256_file(self.args.robustness_table)
+        write_json(self.args.robustness_manifest, manifest)
+
+        status, _ = self.module.validate_robustness(self.args)
+        self.assertEqual(status["status"], "incomplete")
+        self.assertTrue(any("Non-finite" in issue for issue in status["issues"]))
 
 
 if __name__ == "__main__":

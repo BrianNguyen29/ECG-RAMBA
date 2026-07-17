@@ -223,6 +223,31 @@ def fmt(value: Any, digits: int = 4) -> str:
     return f"{float(value):.{digits}f}"
 
 
+def holm_adjusted_conclusion(
+    row: dict[str, Any],
+    *,
+    first_label: str,
+    second_label: str,
+    low_key: str = "improvement_ci_low",
+    high_key: str = "improvement_ci_high",
+    p_key: str = "holm_p_value_two_sided",
+) -> str:
+    """Return a conservative family-wise conclusion for reviewer-facing tables."""
+
+    low = float_value(row, low_key)
+    high = float_value(row, high_key)
+    adjusted_p = float_value(row, p_key)
+    if not 0.0 <= adjusted_p <= 1.0:
+        raise ValueError(f"Invalid Holm-adjusted p-value: {row}")
+    if adjusted_p >= 0.05 or low <= 0.0 <= high:
+        return "No Holm-adjusted difference"
+    if low > 0.0:
+        return f"Holm-adjusted evidence favors {first_label}"
+    if high < 0.0:
+        return f"Holm-adjusted evidence favors {second_label}"
+    return "No Holm-adjusted difference"
+
+
 def latex_escape(value: Any) -> str:
     text = str(value)
     replacements = {
@@ -279,7 +304,7 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
             issues.append("external paired CI has fewer than 1000 valid bootstrap replicates")
             break
         if int_value(row, "n_groups") < 2 or not row.get("group_unit"):
-            issues.append("external paired CI lacks patient/source group bootstrap provenance")
+            issues.append("external paired CI lacks declared resampling-unit provenance")
             break
         for key in (
             "full_value",
@@ -297,6 +322,11 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
     for row in rows:
         if row["metric"] not in {"pr_auc_macro", "f1_macro"}:
             continue
+        adjusted = holm_adjusted_conclusion(
+            row,
+            first_label="Full",
+            second_label=row["comparator_label"],
+        )
         compact.append(
             {
                 "Dataset": row["dataset"],
@@ -305,11 +335,11 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
                 "Full": fmt(row["full_value"]),
                 "Comparator value": fmt(row["comparator_value"]),
                 "Delta Full-comparator": fmt(row["improvement_full_over_comparator"]),
-                "95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
+                "Pointwise 95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
                 "Holm p": fmt(row["holm_p_value_two_sided"]),
                 "Groups": int_value(row, "n_groups"),
-                "Group unit": row["group_unit"],
-                "Interpretation": row["interpretation"],
+                "Resampling unit": row["group_unit"],
+                "Holm-adjusted conclusion": adjusted,
             }
         )
     return {
@@ -319,7 +349,8 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
         "issues": issues,
         "evidence": [str(resolve(args.external_table)), str(resolve(args.external_manifest))],
         "safe_wording": (
-            "Report zero-target-label paired effects separately by dataset, comparator, and metric with group-bootstrap CIs; do not pool tasks."
+            "Report zero-target-label paired effects separately by dataset, comparator, and metric with pointwise CIs and Holm-adjusted conclusions; do not pool tasks. "
+            "PTB-XL uses patient IDs, CPSC2021 uses source-record groups, and Georgia uses record-level resampling under an explicit independence assumption because patient IDs are unavailable."
         ),
     }, compact
 
@@ -431,6 +462,20 @@ def validate_morphology(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             if int_value(row, "n_boot_valid") < 1000:
                 issues.append("controlled morphology comparison has fewer than 1000 bootstrap replicates")
                 break
+            for key in (
+                "first_value",
+                "second_value",
+                "improvement_first_over_second",
+                "improvement_ci_low",
+                "improvement_ci_high",
+                "holm_p_value_two_sided",
+            ):
+                float_value(row, key)
+            adjusted = holm_adjusted_conclusion(
+                row,
+                first_label=row.get("first_label") or "first model",
+                second_label=row.get("second_label") or "second model",
+            )
             compact.append(
                 {
                     "Comparison": row["comparison"],
@@ -438,9 +483,9 @@ def validate_morphology(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                     "First": fmt(row["first_value"]),
                     "Second": fmt(row["second_value"]),
                     "Oriented delta": fmt(row["improvement_first_over_second"]),
-                    "95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
+                    "Pointwise 95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
                     "Holm p": fmt(row["holm_p_value_two_sided"]),
-                    "Interpretation": row["interpretation"],
+                    "Holm-adjusted conclusion": adjusted,
                 }
             )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
@@ -487,6 +532,28 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             if int_value(row, "n_boot_valid") < 1000 or row.get("status") != "complete":
                 issues.append("canonical robustness table contains incomplete/bootstrap-short rows")
                 break
+            for key in (
+                "clean_full",
+                "stress_full",
+                "degradation_full_benefit",
+                "clean_comparator",
+                "stress_comparator",
+                "degradation_comparator_benefit",
+                "degradation_advantage_full",
+                "stressed_advantage_full",
+                "degradation_adv_ci_low",
+                "degradation_adv_ci_high",
+                "stressed_adv_ci_low",
+                "stressed_adv_ci_high",
+            ):
+                float_value(row, key)
+            if row.get("interpretation") not in {
+                "full_significantly_less_degraded",
+                "comparator_significantly_less_degraded",
+                "no_significant_degradation_difference",
+            }:
+                issues.append("canonical robustness table contains an unknown pointwise-CI interpretation")
+                break
 
         grouped: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
         for row in rows:
@@ -507,9 +574,9 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                         "F1 95% CI": f"[{fmt(f1['degradation_adv_ci_low'])}, {fmt(f1['degradation_adv_ci_high'])}]",
                         "PR-AUC degradation advantage": fmt(pr["degradation_advantage_full"]),
                         "PR-AUC 95% CI": f"[{fmt(pr['degradation_adv_ci_low'])}, {fmt(pr['degradation_adv_ci_high'])}]",
-                        "Full less degraded": counts["full_significantly_less_degraded"],
-                        "Comparator less degraded": counts["comparator_significantly_less_degraded"],
-                        "Inconclusive": counts["no_significant_degradation_difference"],
+                        "Pointwise CI favors Full": counts["full_significantly_less_degraded"],
+                        "Pointwise CI favors comparator": counts["comparator_significantly_less_degraded"],
+                        "Pointwise CI overlaps zero": counts["no_significant_degradation_difference"],
                     }
                 )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
@@ -520,7 +587,9 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
         "manuscript_ready": not issues,
         "issues": issues,
         "evidence": [str(resolve(args.robustness_table)), str(resolve(args.robustness_manifest))],
-        "safe_wording": "Report robustness only by named stress, metric, and comparator; do not claim general robustness superiority.",
+        "safe_wording": (
+            "Report robustness only by named stress, metric, and comparator. The 95% intervals are pointwise and are not multiplicity-adjusted across the 120 stress/comparator/metric rows; do not claim general robustness superiority."
+        ),
     }, compact
 
 

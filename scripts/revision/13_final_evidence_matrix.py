@@ -1609,7 +1609,8 @@ def main() -> None:
             ),
             "robustness": (
                 "Use only metric-specific robustness claims supported by paired degradation CIs. "
-                f"{learned_robustness_audit['safe_wording']}"
+                f"{learned_robustness_audit['safe_wording']} "
+                "Treat the multi-comparator 95% intervals as pointwise; they are not multiplicity-adjusted across the full stress/comparator/metric grid."
             ),
             "fewshot": (
                 "Legacy row-split score calibration is not claim-ready. Group-safe score calibration changes no "
@@ -1665,8 +1666,9 @@ def main() -> None:
                 "learnability only within that matched sensitivity experiment; it is not causal proof for ECG-RAMBA."
             ),
             "external_zero_target_ci": (
-                "Report group-paired bootstrap CIs separately by dataset, comparator, and metric. Do not pool "
-                "PTB-XL, Georgia, and CPSC2021 or claim general zero-shot superiority."
+                "Report paired bootstrap CIs separately by dataset, comparator, and metric, with Holm-adjusted conclusions for each dataset family. "
+                "PTB-XL uses patient IDs, CPSC2021 uses source-record groups, and Georgia uses record-level resampling under an explicit independence assumption because patient IDs are unavailable. "
+                "Do not pool PTB-XL, Georgia, and CPSC2021 or claim general zero-shot superiority."
             ),
             "pooling_cross_dataset": (
                 "Q=3 is the frozen operating point with cross-dataset sensitivity evidence, not a universally optimal rule."
