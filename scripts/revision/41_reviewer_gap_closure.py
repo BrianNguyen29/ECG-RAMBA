@@ -47,6 +47,20 @@ STRESSES = (
     "resample_250hz",
 )
 METRICS = ("pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro")
+ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+ROBUSTNESS_BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
+    "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+)
+ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION = 2
+ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY = (
+    "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
+)
+ROBUSTNESS_INTERPRETATIONS = {
+    "full_nominal_95ci_more_favorable_change",
+    "comparator_nominal_95ci_more_favorable_change",
+    "nominal_95ci_inconclusive_change_difference",
+}
 POOLING_METHODS = (
     "mean",
     "power_mean_q2",
@@ -528,6 +542,40 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             issues.append("canonical robustness pairwise SHA is not authenticated by its manifest")
         if not runner_hash_matches(manifest, "21_robustness_multicomparator.py"):
             issues.append("canonical robustness runner SHA does not match the current implementation")
+        for label, payload in (("pairwise", pairwise), ("manifest", manifest)):
+            if payload.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
+                issues.append(f"{label} robustness CI scope is stale or missing")
+            if payload.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
+                issues.append(f"{label} robustness bootstrap unit is stale or missing")
+            if payload.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE:
+                issues.append(f"{label} robustness training-variability scope is stale or missing")
+            if int_value(payload, "metric_cache_schema_version") != ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION:
+                issues.append(f"{label} robustness metric-cache schema is stale or missing")
+            if payload.get("macro_class_support_policy") != ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY:
+                issues.append(f"{label} robustness macro class-support policy is stale or missing")
+            independence = payload.get("bootstrap_independence_contract") or {}
+            if (
+                independence.get("unit") != ROBUSTNESS_BOOTSTRAP_UNIT
+                or independence.get("independence_contract") != "one_chapman_record_per_subject"
+                or independence.get("training_variability_scope")
+                != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE
+            ):
+                issues.append(f"{label} robustness bootstrap independence contract is invalid")
+            source_value = independence.get("source")
+            source_path = resolve(Path(source_value)) if source_value else None
+            if source_path is None or not source_path.exists() or source_path.stat().st_size == 0:
+                issues.append(f"{label} robustness bootstrap contract source is missing")
+            elif independence.get("source_sha256") != sha256_file(source_path):
+                issues.append(f"{label} robustness bootstrap contract source SHA is invalid")
+            if set((payload.get("stress_contracts") or {}).keys()) != set(STRESSES):
+                issues.append(f"{label} robustness stress contracts are incomplete")
+        expected_artifact_rows = (1 + len(ROBUSTNESS_COMPARATORS)) * (1 + len(STRESSES))
+        artifact_status = manifest.get("artifact_status") or []
+        if (
+            len(artifact_status) != expected_artifact_rows
+            or any(row.get("status") != "ready" for row in artifact_status)
+        ):
+            issues.append("canonical robustness prediction provenance grid is incomplete or invalid")
         for row in rows:
             if int_value(row, "n_boot_valid") < 1000 or row.get("status") != "complete":
                 issues.append("canonical robustness table contains incomplete/bootstrap-short rows")
@@ -547,11 +595,19 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                 "stressed_adv_ci_high",
             ):
                 float_value(row, key)
-            if row.get("interpretation") not in {
-                "full_significantly_less_degraded",
-                "comparator_significantly_less_degraded",
-                "no_significant_degradation_difference",
-            }:
+            if row.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
+                issues.append("canonical robustness table contains a stale CI scope")
+                break
+            if row.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
+                issues.append("canonical robustness table contains a stale bootstrap unit")
+                break
+            if row.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE:
+                issues.append("canonical robustness table contains a stale training-variability scope")
+                break
+            if row.get("macro_class_support_policy") != ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY:
+                issues.append("canonical robustness table contains a stale macro class-support policy")
+                break
+            if row.get("interpretation") not in ROBUSTNESS_INTERPRETATIONS:
                 issues.append("canonical robustness table contains an unknown pointwise-CI interpretation")
                 break
 
@@ -574,9 +630,15 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                         "F1 95% CI": f"[{fmt(f1['degradation_adv_ci_low'])}, {fmt(f1['degradation_adv_ci_high'])}]",
                         "PR-AUC degradation advantage": fmt(pr["degradation_advantage_full"]),
                         "PR-AUC 95% CI": f"[{fmt(pr['degradation_adv_ci_low'])}, {fmt(pr['degradation_adv_ci_high'])}]",
-                        "Pointwise CI favors Full": counts["full_significantly_less_degraded"],
-                        "Pointwise CI favors comparator": counts["comparator_significantly_less_degraded"],
-                        "Pointwise CI overlaps zero": counts["no_significant_degradation_difference"],
+                        "Nominal pointwise CI favors Full": counts[
+                            "full_nominal_95ci_more_favorable_change"
+                        ],
+                        "Nominal pointwise CI favors comparator": counts[
+                            "comparator_nominal_95ci_more_favorable_change"
+                        ],
+                        "Nominal pointwise CI overlaps zero": counts[
+                            "nominal_95ci_inconclusive_change_difference"
+                        ],
                     }
                 )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:

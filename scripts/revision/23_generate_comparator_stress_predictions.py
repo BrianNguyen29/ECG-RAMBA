@@ -218,13 +218,16 @@ def validate_existing(
     *,
     comparator: str,
     stress: str,
+    stress_spec: dict[str, Any],
     freeze_contract: dict[str, Any],
     checkpoint_hashes: list[str],
+    raw_cache_sha256: str | None = None,
 ) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
     try:
         with np.load(path, allow_pickle=False) as data:
+            stress_metadata = json.loads(str(scalar(data, "stress_metadata_json", "")) or "{}")
             return (
                 "y_true" in data.files
                 and "y_prob" in data.files
@@ -240,6 +243,9 @@ def validate_existing(
                 and str(scalar(data, "protocol")) == PROTOCOL
                 and str(scalar(data, "comparator")) == comparator
                 and str(scalar(data, "stress_test")) == stress
+                and isinstance(stress_metadata.get("spec"), dict)
+                and json.dumps(stress_metadata["spec"], sort_keys=True)
+                == json.dumps(stress_spec, sort_keys=True)
                 and str(scalar(data, "aggregation_implementation")) == POWER_MEAN_IMPLEMENTATION
                 and float(scalar(data, "power_mean_q", -1.0)) == float(CONFIG["power_mean_q"])
                 and str(scalar(data, "oof_predictions_sha256"))
@@ -249,6 +255,10 @@ def validate_existing(
                 and np.array_equal(
                     np.asarray(data["checkpoint_sha256"]).astype(str),
                     np.asarray(checkpoint_hashes).astype(str),
+                )
+                and (
+                    raw_cache_sha256 is None
+                    or str(scalar(data, "raw_cache_sha256")) == raw_cache_sha256
                 )
             )
     except Exception:
@@ -493,6 +503,7 @@ def main() -> None:
                     class_names,
                     comparator=comparator,
                     stress=stress,
+                    stress_spec=spec,
                     freeze_contract=freeze_contract,
                     checkpoint_hashes=contract["sha256"],
                 ):
@@ -552,8 +563,10 @@ def main() -> None:
                 class_names,
                 comparator=comparator,
                 stress=stress,
+                stress_spec=spec,
                 freeze_contract=freeze_contract,
                 checkpoint_hashes=contract["sha256"],
+                raw_cache_sha256=str(raw_cache_info.get("raw_cache_sha256") or ""),
             ):
                 print(f"Reusing existing {comparator}/{stress}: {out}", flush=True)
                 artifacts.append({"comparator": comparator, "stress": stress, "path": project_relative(out), "sha256": sha256_file(out), "reused": True})

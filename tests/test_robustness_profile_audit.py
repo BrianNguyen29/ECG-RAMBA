@@ -6,7 +6,12 @@ from pathlib import Path
 
 from scripts.revision.common import sha256_file
 from scripts.revision.robustness_profile_audit import (
+    BOOTSTRAP_UNIT,
+    CI_SCOPE,
+    MACRO_CLASS_SUPPORT_POLICY,
+    METRIC_CACHE_SCHEMA_VERSION,
     PROTOCOL,
+    TRAINING_VARIABILITY_SCOPE,
     profile_paths,
     select_best_profile,
     validate_profile,
@@ -33,6 +38,25 @@ class RobustnessProfileAuditTests(unittest.TestCase):
         for path in paths.values():
             path.parent.mkdir(parents=True, exist_ok=True)
         comparators = ["full", "minirocket", "resnet", "raw_mamba", "transformer"]
+        bootstrap_source = revision_root / "metrics" / "calibration_bootstrap_contract.json"
+        bootstrap_source.write_text(
+            json.dumps(
+                {
+                    "bootstrap": {
+                        "unit": "chapman_record_subject",
+                        "independence_contract": "one_chapman_record_per_subject",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        bootstrap_contract = {
+            "unit": BOOTSTRAP_UNIT,
+            "independence_contract": "one_chapman_record_per_subject",
+            "source": bootstrap_source.relative_to(PROJECT_ROOT).as_posix(),
+            "source_sha256": sha256_file(bootstrap_source),
+            "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+        }
         rows = [
             {
                 "stress": stress,
@@ -42,11 +66,15 @@ class RobustnessProfileAuditTests(unittest.TestCase):
                 "output_profile": profile,
                 "n_boot": n_boot,
                 "n_boot_valid": n_boot if n_boot_valid is None else n_boot_valid,
+                "bootstrap_unit": BOOTSTRAP_UNIT,
+                "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+                "ci_scope": CI_SCOPE,
+                "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
                 "degradation_adv_ci_low": -0.01,
                 "degradation_adv_ci_high": 0.01,
                 "stressed_adv_ci_low": -0.02,
                 "stressed_adv_ci_high": 0.02,
-                "interpretation": "inconclusive_degradation_difference",
+                "interpretation": "nominal_95ci_inconclusive_change_difference",
             }
             for stress in stresses
             for comparator in comparators[1:]
@@ -69,8 +97,20 @@ class RobustnessProfileAuditTests(unittest.TestCase):
             "stress_tests": stresses,
             "metrics": metrics,
             "n_boot": n_boot,
+            "bootstrap_unit": BOOTSTRAP_UNIT,
+            "bootstrap_independence_contract": bootstrap_contract,
+            "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+            "ci_scope": CI_SCOPE,
+            "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+            "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
+            "stress_contracts": {stress: {"spec": {"name": stress}} for stress in stresses},
             "completed_rows": len(rows),
             "blocked_rows": 0,
+            "artifact_status": [
+                {"comparator": comparator, "kind": kind, "status": "ready"}
+                for comparator in comparators
+                for kind in ("clean", *(f"stress:{stress}" for stress in stresses))
+            ],
             "items": {
                 f"{row['stress']}/{row['comparator']}/{row['metric']}": row
                 for row in rows
@@ -94,6 +134,12 @@ class RobustnessProfileAuditTests(unittest.TestCase):
                         "output_profile": profile,
                         "canonical_contract": canonical,
                         "runner_sha256": runner_sha,
+                        "bootstrap_unit": BOOTSTRAP_UNIT,
+                        "bootstrap_independence_contract": bootstrap_contract,
+                        "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+                        "ci_scope": CI_SCOPE,
+                        "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+                        "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
                         "source_pairwise_sha256": pairwise_sha,
                         "rows": comparator_rows,
                     }
@@ -207,6 +253,37 @@ class RobustnessProfileAuditTests(unittest.TestCase):
             self.assertTrue(
                 any(issue.startswith("summary_invalid_bootstrap_count") for issue in result["issues"])
             )
+
+    def test_invalid_artifact_provenance_rejects_profile(self):
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT) as tmp:
+            revision_root = Path(tmp) / "reports" / "revision"
+            canonical = {"oof_sha256": "oof", "freeze_sha256": "freeze"}
+            paths = self._write_profile(
+                revision_root,
+                "core_final",
+                canonical=canonical,
+                n_boot=1000,
+                stresses=["snr5db"],
+                metrics=["pr_auc_macro"],
+            )
+            manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+            manifest["artifact_status"] = [
+                {
+                    "comparator": "transformer",
+                    "kind": "stress:snr5db",
+                    "status": "missing_or_invalid:checkpoint mismatch",
+                }
+            ]
+            paths["manifest"].write_text(json.dumps(manifest), encoding="utf-8")
+            result = validate_profile(
+                revision_root,
+                "core_final",
+                canonical_contract=canonical,
+                runner_path=RUNNER,
+                project_root=PROJECT_ROOT,
+            )
+            self.assertFalse(result["valid"])
+            self.assertIn("manifest_has_invalid_artifacts:1", result["issues"])
 
 
 if __name__ == "__main__":

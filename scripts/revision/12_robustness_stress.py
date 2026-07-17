@@ -1078,6 +1078,7 @@ def load_existing_prediction(
     y: np.ndarray,
     fold_id: np.ndarray,
     expected_stress: str,
+    expected_stress_spec: dict,
     expected_model_label: str,
     expected_contract_hash: str | None,
     expected_checkpoint_sha_by_fold: dict[int, str] | None = None,
@@ -1096,6 +1097,11 @@ def load_existing_prediction(
             cached_fold = np.asarray(data["fold_id"], dtype=np.int16)
             cached_protocol = str(np.asarray(data["protocol"]).item()) if "protocol" in data.files else ""
             cached_stress = str(np.asarray(data["stress_name"]).item()) if "stress_name" in data.files else ""
+            cached_stress_spec = (
+                json.loads(str(np.asarray(data["stress_json"]).item()))
+                if "stress_json" in data.files
+                else None
+            )
             cached_model = str(np.asarray(data["model_label"]).item()) if "model_label" in data.files else ""
             metadata = (
                 json.loads(str(np.asarray(data["metadata_json"]).item()))
@@ -1143,6 +1149,9 @@ def load_existing_prediction(
         and np.array_equal(cached_fold, fold_id)
         and cached_protocol == PROTOCOL
         and cached_stress == expected_stress
+        and isinstance(cached_stress_spec, dict)
+        and json.dumps(cached_stress_spec, sort_keys=True)
+        == json.dumps(expected_stress_spec, sort_keys=True)
         and cached_model == expected_model_label
         and contract_matches
     ):
@@ -1405,6 +1414,7 @@ def main() -> None:
                 y=y,
                 fold_id=fold_id,
                 expected_stress=stress_name,
+                expected_stress_spec=stress,
                 expected_model_label="Full ECG-RAMBA",
                 expected_contract_hash=full_prediction_contract_hash,
                 expected_checkpoint_sha_by_fold=expected_checkpoint_sha_by_fold,
@@ -1414,6 +1424,7 @@ def main() -> None:
                 y=y,
                 fold_id=fold_id,
                 expected_stress=stress_name,
+                expected_stress_spec=stress,
                 expected_model_label="MiniRocket-only",
                 expected_contract_hash=mini_prediction_contract_hash,
                 expected_minirocket_params_hash=(
@@ -1552,6 +1563,7 @@ def main() -> None:
                 y=y,
                 fold_id=fold_id,
                 expected_stress=stress_name,
+                expected_stress_spec=stress,
                 expected_model_label="Full ECG-RAMBA",
                 expected_contract_hash=full_prediction_contract_hash,
                 expected_checkpoint_sha_by_fold=expected_checkpoint_sha_by_fold,
@@ -1561,6 +1573,7 @@ def main() -> None:
                 y=y,
                 fold_id=fold_id,
                 expected_stress=stress_name,
+                expected_stress_spec=stress,
                 expected_model_label="MiniRocket-only",
                 expected_contract_hash=mini_prediction_contract_hash,
                 expected_minirocket_params_hash=(

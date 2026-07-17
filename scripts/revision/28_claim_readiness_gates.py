@@ -35,6 +35,20 @@ from scripts.revision.common import (  # noqa: E402
 
 
 ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v1"
+ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+ROBUSTNESS_BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
+    "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+)
+ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION = 2
+ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY = (
+    "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
+)
+ROBUSTNESS_INTERPRETATIONS = {
+    "full_nominal_95ci_more_favorable_change",
+    "comparator_nominal_95ci_more_favorable_change",
+    "nominal_95ci_inconclusive_change_difference",
+}
 FEWSHOT_SEEDS = (42, 43, 44, 45, 46)
 ROBUSTNESS_STRESSES = [
     "snr20db",
@@ -417,6 +431,34 @@ def robustness_contract_issues(
             issues.append(f"{label}.canonical_contract_mismatch")
         if runner_sha is None or payload.get("runner_sha256") != runner_sha:
             issues.append(f"{label}.runner_sha256_mismatch")
+        if payload.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
+            issues.append(f"{label}.ci_scope={payload.get('ci_scope')!r}")
+        if payload.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
+            issues.append(f"{label}.bootstrap_unit={payload.get('bootstrap_unit')!r}")
+        if payload.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE:
+            issues.append(
+                f"{label}.training_variability_scope={payload.get('training_variability_scope')!r}"
+            )
+        if int_or_zero(payload.get("metric_cache_schema_version")) != ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION:
+            issues.append(f"{label}.metric_cache_schema_version_invalid")
+        if payload.get("macro_class_support_policy") != ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY:
+            issues.append(f"{label}.macro_class_support_policy_invalid")
+        independence = payload.get("bootstrap_independence_contract") or {}
+        if (
+            independence.get("unit") != ROBUSTNESS_BOOTSTRAP_UNIT
+            or independence.get("independence_contract") != "one_chapman_record_per_subject"
+            or independence.get("training_variability_scope")
+            != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE
+        ):
+            issues.append(f"{label}.bootstrap_independence_contract_invalid")
+        source_value = independence.get("source")
+        source_path = resolve(Path(source_value)) if source_value else None
+        if source_path is None or not source_path.exists() or source_path.stat().st_size == 0:
+            issues.append(f"{label}.bootstrap_contract_source_missing")
+        elif independence.get("source_sha256") != sha256_file(source_path):
+            issues.append(f"{label}.bootstrap_contract_source_sha256_mismatch")
+        if set((payload.get("stress_contracts") or {}).keys()) != set(ROBUSTNESS_STRESSES):
+            issues.append(f"{label}.stress_contracts_incomplete")
         if list(payload.get("comparators") or []) != ROBUSTNESS_COMPARATORS:
             issues.append(f"{label}.comparators_incomplete")
         if list(payload.get("stress_tests") or []) != ROBUSTNESS_STRESSES:
@@ -429,6 +471,14 @@ def robustness_contract_issues(
             issues.append(f"{label}.blocked_rows={payload.get('blocked_rows')!r}")
         if int_or_zero(payload.get("completed_rows")) != expected_rows:
             issues.append(f"{label}.completed_rows={payload.get('completed_rows')!r}")
+        invalid_artifacts = [
+            row for row in payload.get("artifact_status") or [] if row.get("status") != "ready"
+        ]
+        expected_artifact_rows = len(ROBUSTNESS_COMPARATORS) * (1 + len(ROBUSTNESS_STRESSES))
+        if len(payload.get("artifact_status") or []) != expected_artifact_rows:
+            issues.append(f"{label}.artifact_provenance_grid_incomplete")
+        if invalid_artifacts:
+            issues.append(f"{label}.invalid_artifacts={len(invalid_artifacts)}")
 
     if pairwise and len(pairwise.get("items") or {}) != expected_rows:
         issues.append(f"pairwise.items_count={len(pairwise.get('items') or {})}")
@@ -452,6 +502,20 @@ def robustness_contract_issues(
             issues.append(f"{label}:canonical_contract_mismatch")
         if runner_sha is None or payload.get("runner_sha256") != runner_sha:
             issues.append(f"{label}:runner_sha256_mismatch")
+        if payload.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
+            issues.append(f"{label}:ci_scope_mismatch")
+        if payload.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
+            issues.append(f"{label}:bootstrap_unit_mismatch")
+        if payload.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE:
+            issues.append(f"{label}:training_variability_scope_mismatch")
+        if int_or_zero(payload.get("metric_cache_schema_version")) != ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION:
+            issues.append(f"{label}:metric_cache_schema_version_mismatch")
+        if payload.get("macro_class_support_policy") != ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY:
+            issues.append(f"{label}:macro_class_support_policy_mismatch")
+        if payload.get("bootstrap_independence_contract") != manifest.get(
+            "bootstrap_independence_contract"
+        ):
+            issues.append(f"{label}:bootstrap_independence_contract_mismatch")
         if payload.get("source_pairwise") != expected_pairwise_rel:
             issues.append(f"{label}:source_pairwise_mismatch")
         if payload.get("source_pairwise_sha256") != pairwise_sha:
@@ -488,6 +552,22 @@ def robustness_contract_issues(
             issues.append(f"{label}.contains_noncanonical_rows")
         if any(int_or_zero(row.get("n_boot")) != ROBUSTNESS_N_BOOT for row in rows):
             issues.append(f"{label}.n_boot_mismatch")
+        if any(row.get("ci_scope") != ROBUSTNESS_CI_SCOPE for row in rows):
+            issues.append(f"{label}.ci_scope_mismatch")
+        if any(row.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT for row in rows):
+            issues.append(f"{label}.bootstrap_unit_mismatch")
+        if any(
+            row.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE
+            for row in rows
+        ):
+            issues.append(f"{label}.training_variability_scope_mismatch")
+        if any(
+            row.get("macro_class_support_policy") != ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY
+            for row in rows
+        ):
+            issues.append(f"{label}.macro_class_support_policy_mismatch")
+        if any(row.get("interpretation") not in ROBUSTNESS_INTERPRETATIONS for row in rows):
+            issues.append(f"{label}.interpretation_not_claim_safe")
 
     artifact_sha = manifest.get("artifact_sha256") if isinstance(manifest, dict) else {}
     expected_hashes = {

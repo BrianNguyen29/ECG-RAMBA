@@ -27,6 +27,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     "clean_prediction_sha256": "clean-a",
                 }
             }
+            stress_spec = ROBUSTNESS.stress_specs(["snr20db"], 42)[0]
             np.savez_compressed(
                 path,
                 y_true=y,
@@ -34,6 +35,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 fold_id=fold_id,
                 protocol=np.asarray(ROBUSTNESS.PROTOCOL),
                 stress_name=np.asarray("snr20db"),
+                stress_json=np.asarray(json.dumps(stress_spec, sort_keys=True)),
                 model_label=np.asarray("MiniRocket-only"),
                 metadata_json=np.asarray(json.dumps(metadata)),
             )
@@ -43,6 +45,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 y=y,
                 fold_id=fold_id,
                 expected_stress="snr20db",
+                expected_stress_spec=stress_spec,
                 expected_model_label="MiniRocket-only",
                 expected_contract_hash=None,
                 expected_minirocket_params_hash="params-a",
@@ -55,6 +58,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 y=y,
                 fold_id=fold_id,
                 expected_stress="snr20db",
+                expected_stress_spec=stress_spec,
                 expected_model_label="MiniRocket-only",
                 expected_contract_hash=None,
                 expected_minirocket_params_hash="params-a",
@@ -73,6 +77,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 y=y,
                 fold_id=fold_id,
                 expected_stress="snr20db",
+                expected_stress_spec=ROBUSTNESS.stress_specs(["snr20db"], 42)[0],
                 expected_model_label="Full ECG-RAMBA",
                 expected_contract_hash="contract",
                 expected_checkpoint_sha_by_fold={1: "a", 2: "b"},
@@ -92,6 +97,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 "oof_predictions_sha256": "oof",
                 "freeze_manifest_sha256": "freeze",
             }
+            stress_spec = COMPARATOR_STRESS.robust_helpers.stress_specs(["snr20db"], 42)[0]
             np.savez_compressed(
                 path,
                 y_true=y,
@@ -102,6 +108,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 protocol=np.asarray(COMPARATOR_STRESS.PROTOCOL),
                 comparator=np.asarray("resnet"),
                 stress_test=np.asarray("snr20db"),
+                stress_metadata_json=np.asarray(json.dumps({"spec": stress_spec}, sort_keys=True)),
                 aggregation_implementation=np.asarray(
                     COMPARATOR_STRESS.POWER_MEAN_IMPLEMENTATION
                 ),
@@ -109,6 +116,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 oof_predictions_sha256=np.asarray("oof"),
                 freeze_manifest_sha256=np.asarray("freeze"),
                 checkpoint_sha256=np.asarray(hashes),
+                raw_cache_sha256=np.asarray("raw-cache"),
             )
             self.assertTrue(
                 COMPARATOR_STRESS.validate_existing(
@@ -119,8 +127,40 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     class_names,
                     comparator="resnet",
                     stress="snr20db",
+                    stress_spec=stress_spec,
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
+                    raw_cache_sha256="raw-cache",
+                )
+            )
+            self.assertFalse(
+                COMPARATOR_STRESS.validate_existing(
+                    path,
+                    y,
+                    fold_id,
+                    record_id,
+                    class_names,
+                    comparator="resnet",
+                    stress="snr20db",
+                    stress_spec={**stress_spec, "seed": 999},
+                    freeze_contract=freeze,
+                    checkpoint_hashes=hashes,
+                    raw_cache_sha256="raw-cache",
+                )
+            )
+            self.assertFalse(
+                COMPARATOR_STRESS.validate_existing(
+                    path,
+                    y,
+                    fold_id,
+                    record_id,
+                    class_names,
+                    comparator="resnet",
+                    stress="snr20db",
+                    stress_spec=stress_spec,
+                    freeze_contract=freeze,
+                    checkpoint_hashes=hashes,
+                    raw_cache_sha256="different-raw-cache",
                 )
             )
             self.assertFalse(
@@ -132,6 +172,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     class_names,
                     comparator="resnet",
                     stress="snr20db",
+                    stress_spec=stress_spec,
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
                 )

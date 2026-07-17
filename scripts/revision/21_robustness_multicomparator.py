@@ -47,6 +47,28 @@ from scripts.revision.common import (  # noqa: E402
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
 BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
+METRIC_CACHE_SCHEMA_VERSION = 2
+CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+MACRO_CLASS_SUPPORT_POLICY = (
+    "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
+)
+STRESS_INPUT_SPACE = "bandpass_filtered_per_lead_z_normalized_model_input"
+CHAPMAN_LEAD_ORDER = (
+    "I",
+    "II",
+    "III",
+    "aVR",
+    "aVL",
+    "aVF",
+    "V1",
+    "V2",
+    "V3",
+    "V4",
+    "V5",
+    "V6",
+)
 DEFAULT_STRESSES = (
     "snr20db",
     "snr10db",
@@ -94,6 +116,7 @@ COMPARATORS = {
 OOF_RUN_MANIFEST = MANIFEST_DIR / "oof_final_ema_prediction_run_manifest.json"
 OOF_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 MINIROCKET_HEADS_MANIFEST = MANIFEST_DIR / "robustness_minirocket_heads_manifest.json"
+CALIBRATION_CI = METRIC_DIR / "calibration_ci_oof_final_ema_predictions.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -173,6 +196,66 @@ def parse_list(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def expected_stress_spec(name: str, seed: int) -> dict[str, Any]:
+    """Return the exact perturbation contract used by scripts 12 and 23."""
+
+    if name == "snr20db":
+        return {"name": name, "kind": "additive_noise", "snr_db": 20.0, "seed": seed + 2001}
+    if name == "snr10db":
+        return {"name": name, "kind": "additive_noise", "snr_db": 10.0, "seed": seed + 2011}
+    if name == "snr5db":
+        return {"name": name, "kind": "additive_noise", "snr_db": 5.0, "seed": seed + 2021}
+    if name == "random_3_lead_dropout":
+        return {"name": name, "kind": "random_lead_dropout", "n_drop": 3, "seed": seed + 3001}
+    if name == "precordial_dropout":
+        return {
+            "name": name,
+            "kind": "fixed_lead_dropout",
+            "lead_indices": list(range(6, 12)),
+            "seed": seed,
+        }
+    if name == "resample_250hz":
+        return {
+            "name": name,
+            "kind": "resample_down_up",
+            "source_hz": 500,
+            "target_hz": 250,
+            "seed": seed,
+        }
+    raise ValueError(f"Unknown stress test: {name}")
+
+
+def stress_contract_description(spec: dict[str, Any]) -> dict[str, Any]:
+    description: dict[str, Any] = {
+        "spec": spec,
+        "input_space": STRESS_INPUT_SPACE,
+        "same_realization_across_models": True,
+        "realization_scope": "single_fixed_seed_conditional_stress_audit",
+    }
+    if spec["kind"] in {"random_lead_dropout", "fixed_lead_dropout"}:
+        description["lead_order"] = list(CHAPMAN_LEAD_ORDER)
+    if spec["kind"] == "additive_noise":
+        description["implementation"] = (
+            "iid_gaussian_noise_scaled_per_record_from_global_mean_square_across_leads_and_time"
+        )
+        description["snr_definition"] = "signal_power_over_noise_power_in_model_input_space"
+        description["amplitude_clipping"] = False
+    elif spec["kind"] == "random_lead_dropout":
+        description["implementation"] = (
+            "per_record_uniform_without_replacement_three_of_twelve_leads_zero_filled"
+        )
+    elif spec["kind"] == "fixed_lead_dropout":
+        description["implementation"] = "fixed_v1_to_v6_zero_filled"
+    if spec["kind"] == "resample_down_up":
+        description["implementation"] = (
+            "scipy_resample_poly_500_to_250_then_250_to_500_default_antialias_fir_trim_or_zero_pad"
+        )
+        description["interpretation"] = (
+            "anti_aliased_500_to_250_to_500_hz_bandwidth_perturbation_not_native_250hz_deployment"
+        )
+    return description
+
+
 def cache_slug(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
 
@@ -221,6 +304,9 @@ def cache_metadata(
         "n_bins": int(args.n_bins),
         "n_boot": int(args.n_boot),
         "seed": int(seed),
+        "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+        "bootstrap_engine_contract": BOOTSTRAP_ENGINE,
+        "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
         "full_clean_sha256": full_clean["sha256"],
         "full_stress_sha256": full_stress["sha256"],
         "comp_clean_sha256": comp_clean["sha256"],
@@ -237,10 +323,39 @@ def read_metric_cache(path: Path, metadata: dict[str, Any]) -> dict[str, Any] | 
     except Exception as exc:
         print(f"WARNING: could not read metric cache {path}: {exc}", flush=True)
         return None
-    if payload.get("metadata") != metadata:
-        return None
     row = payload.get("row")
-    return row if isinstance(row, dict) else None
+    if not isinstance(row, dict):
+        return None
+    observed_metadata = payload.get("metadata")
+    if observed_metadata == metadata:
+        return row
+
+    # The original cache schema omitted explicit engine/support-policy fields.
+    # Accept it only when every numerical input field matches and the stored
+    # row identifies an engine covered by exact regression-parity tests.
+    compatibility_fields = {
+        "metric_cache_schema_version",
+        "bootstrap_engine_contract",
+        "macro_class_support_policy",
+    }
+    legacy_expected = {
+        key: value for key, value in metadata.items() if key not in compatibility_fields
+    }
+    allowed_legacy_engines = {
+        BOOTSTRAP_ENGINE,
+        "record_index_resample_v1",
+        "record_index_resample_v1_cached_exact",
+    }
+    if (
+        observed_metadata == legacy_expected
+        and str(row.get("bootstrap_engine") or "") in allowed_legacy_engines
+    ):
+        row = dict(row)
+        row["metric_cache_compatibility_attestation"] = (
+            "legacy_schema_exact_regression_parity_verified"
+        )
+        return row
+    return None
 
 
 def write_metric_cache(path: Path, metadata: dict[str, Any], row: dict[str, Any]) -> None:
@@ -406,12 +521,74 @@ def load_canonical_contract(clean_sha256: str) -> dict[str, str]:
     }
 
 
+def load_bootstrap_independence_contract(canonical_contract: dict[str, str]) -> dict[str, Any]:
+    """Authenticate the subject-level interpretation of a record bootstrap."""
+
+    path = resolve(CALIBRATION_CI)
+    if not path.exists() or path.stat().st_size == 0:
+        raise FileNotFoundError(
+            "Missing calibration/bootstrap contract required for subject-level robustness CIs: "
+            f"{path}"
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    bootstrap = payload.get("bootstrap") or {}
+    if bootstrap.get("unit") != "chapman_record_subject":
+        raise RuntimeError("Calibration contract does not declare Chapman record-subject bootstrap units")
+    if bootstrap.get("independence_contract") != "one_chapman_record_per_subject":
+        raise RuntimeError("Calibration contract does not declare one Chapman record per subject")
+    if payload.get("predictions_sha256") != canonical_contract["oof_sha256"]:
+        raise RuntimeError("Calibration bootstrap contract references a different canonical OOF artifact")
+    if payload.get("freeze_manifest_sha256") != canonical_contract["freeze_sha256"]:
+        raise RuntimeError("Calibration bootstrap contract references a different OOF freeze manifest")
+    return {
+        "unit": BOOTSTRAP_UNIT,
+        "independence_contract": "one_chapman_record_per_subject",
+        "source": project_relative(path),
+        "source_sha256": sha256_file(path),
+        "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+    }
+
+
+def load_validated_clean_artifact(comparator: str, path: Path) -> dict[str, Any]:
+    """Validate a clean artifact completely before exposing it to aggregation."""
+
+    candidate = load_npz(path)
+    checkpoint_sha = load_clean_checkpoint_contract(comparator, candidate)
+    if checkpoint_sha:
+        candidate["checkpoint_sha256"] = np.asarray(checkpoint_sha)
+    return candidate
+
+
+def artifact_stress_spec(comparator: str, stress_data: dict[str, Any]) -> dict[str, Any]:
+    if comparator in {"full", "minirocket"}:
+        raw = str(scalar(stress_data, "stress_json", ""))
+        if not raw:
+            raise RuntimeError(f"{comparator} stress artifact lacks stress_json")
+        payload = json.loads(raw)
+    else:
+        raw = str(scalar(stress_data, "stress_metadata_json", ""))
+        if not raw:
+            raise RuntimeError(f"{comparator} stress artifact lacks stress_metadata_json")
+        payload = (json.loads(raw) or {}).get("spec")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{comparator} stress specification is malformed")
+    return payload
+
+
 def validate_stress_provenance(
     comparator: str,
     stress: str,
     clean: dict[str, Any],
     stress_data: dict[str, Any],
+    expected_spec: dict[str, Any],
 ) -> None:
+    observed_spec = artifact_stress_spec(comparator, stress_data)
+    if json.dumps(observed_spec, sort_keys=True) != json.dumps(expected_spec, sort_keys=True):
+        raise RuntimeError(
+            f"{comparator}/{stress} perturbation specification mismatch: "
+            f"{observed_spec!r} != {expected_spec!r}"
+        )
+
     if comparator == "full":
         expected = np.asarray(clean.get("checkpoint_sha256", [])).astype(str)
         metadata = json.loads(str(scalar(stress_data, "metadata_json", "{}")))
@@ -445,6 +622,22 @@ def validate_stress_provenance(
             raise RuntimeError(f"{comparator}/{stress} comparator tag mismatch")
         if str(scalar(stress_data, "stress_test")) != stress:
             raise RuntimeError(f"{comparator}/{stress} stress tag mismatch")
+        for field in (
+            "raw_cache_sha256",
+            "oof_predictions_sha256",
+            "freeze_manifest_sha256",
+            "aggregation_implementation",
+            "power_mean_q",
+        ):
+            expected_value = str(scalar(clean, field, ""))
+            actual_value = str(scalar(stress_data, field, ""))
+            if not expected_value or actual_value != expected_value:
+                raise RuntimeError(
+                    f"{comparator}/{stress} {field} differs from its clean baseline contract"
+                )
+        slice_count = np.asarray(stress_data.get("slice_count", []), dtype=np.int64)
+        if slice_count.shape != (len(stress_data["y_true"]),) or np.any(slice_count <= 0):
+            raise RuntimeError(f"{comparator}/{stress} has incomplete record slice coverage")
         return
 
     if str(scalar(stress_data, "protocol")) != "robustness_full_vs_minirocket_perturbation_v1":
@@ -469,6 +662,22 @@ def validate_stress_provenance(
             )
         if cached_manifest.get("clean_prediction_sha256") != clean.get("sha256"):
             raise RuntimeError(f"minirocket/{stress} references a different clean robustness prediction")
+
+
+def load_validated_stress_artifact(
+    comparator: str,
+    stress: str,
+    path: Path,
+    clean: dict[str, Any],
+    full_clean: dict[str, Any],
+    expected_spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate a stress artifact completely before exposing it to aggregation."""
+
+    candidate = load_npz(path)
+    validate_same_contract(full_clean, candidate, f"{comparator}/{stress}")
+    validate_stress_provenance(comparator, stress, clean, candidate, expected_spec)
+    return candidate
 
 
 def metric_specs(threshold: float, n_bins: int) -> list[dict[str, Any]]:
@@ -890,16 +1099,13 @@ def interpretation(ci_low: float, ci_high: float) -> str:
     if not np.isfinite(ci_low) or not np.isfinite(ci_high):
         return "insufficient_bootstrap"
     if ci_low > 0:
-        return "full_significantly_less_degraded"
+        return "full_nominal_95ci_more_favorable_change"
     if ci_high < 0:
-        return "comparator_significantly_less_degraded"
-    return "no_significant_degradation_difference"
+        return "comparator_nominal_95ci_more_favorable_change"
+    return "nominal_95ci_inconclusive_change_difference"
 
 
 def row_interpretation(row: dict[str, Any]) -> str:
-    cached = str(row.get("interpretation") or "").strip()
-    if cached:
-        return cached
     return interpretation(
         float(row.get("degradation_adv_ci_low", math.nan)),
         float(row.get("degradation_adv_ci_high", math.nan)),
@@ -941,13 +1147,8 @@ def main() -> None:
     for comp in comparators:
         path = PREDICTION_DIR / COMPARATORS[comp]["clean"]
         try:
-            clean[comp] = load_npz(path)
-            checkpoint_sha = load_clean_checkpoint_contract(
-                comp,
-                clean[comp],
-            )
-            if checkpoint_sha:
-                clean[comp]["checkpoint_sha256"] = np.asarray(checkpoint_sha)
+            candidate_clean = load_validated_clean_artifact(comp, path)
+            clean[comp] = candidate_clean
             artifact_status.append(
                 {
                     "comparator": comp,
@@ -990,6 +1191,7 @@ def main() -> None:
 
     full_clean = clean["full"]
     canonical_contract = load_canonical_contract(full_clean["sha256"])
+    bootstrap_independence_contract = load_bootstrap_independence_contract(canonical_contract)
     for comp, data in list(clean.items()):
         if comp == "full":
             continue
@@ -1009,6 +1211,9 @@ def main() -> None:
             del clean[comp]
 
     specs = filter_metric_specs(metric_specs(args.threshold, args.n_bins), requested_metrics)
+    expected_stress_specs = {
+        stress: expected_stress_spec(stress, int(args.seed)) for stress in stresses
+    }
     rows: list[dict[str, Any]] = []
     pairwise: dict[str, Any] = {
         "status": "complete_with_possible_missing_comparators",
@@ -1019,11 +1224,24 @@ def main() -> None:
         "n_boot": args.n_boot,
         "bootstrap_jobs": args.bootstrap_jobs,
         "bootstrap_engine": BOOTSTRAP_ENGINE,
+        "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+        "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
+        "bootstrap_unit": BOOTSTRAP_UNIT,
+        "bootstrap_independence_contract": bootstrap_independence_contract,
+        "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+        "ci_scope": CI_SCOPE,
+        "endpoint_definition": (
+            "difference_in_signed_clean_to_stress_benefit_change_full_minus_comparator"
+        ),
         "metrics": requested_metrics,
         "metric_cache_dir": project_relative(args.metric_cache_dir),
         "output_profile": output_profile_name(args.out_pairwise),
         "comparators": comparators,
         "stress_tests": stresses,
+        "stress_contracts": {
+            name: stress_contract_description(spec)
+            for name, spec in expected_stress_specs.items()
+        },
         "canonical_contract": canonical_contract,
         "runner_sha256": sha256_file(Path(__file__)),
         "items": {},
@@ -1037,9 +1255,15 @@ def main() -> None:
                 continue
             stress_path = PREDICTION_DIR / COMPARATORS[comp]["stress"].format(stress=stress)
             try:
-                stress_data[comp] = load_npz(stress_path)
-                validate_same_contract(full_clean, stress_data[comp], f"{comp}/{stress}")
-                validate_stress_provenance(comp, stress, clean[comp], stress_data[comp])
+                candidate_stress = load_validated_stress_artifact(
+                    comp,
+                    stress,
+                    stress_path,
+                    clean[comp],
+                    full_clean,
+                    expected_stress_specs[stress],
+                )
+                stress_data[comp] = candidate_stress
                 artifact_status.append(
                     {
                         "comparator": comp,
@@ -1051,13 +1275,14 @@ def main() -> None:
                     }
                 )
             except Exception as exc:
+                invalid_exists = stress_path.exists() and stress_path.stat().st_size > 0
                 artifact_status.append(
                     {
                         "comparator": comp,
                         "kind": f"stress:{stress}",
                         "path": project_relative(stress_path),
-                        "exists": False,
-                        "sha256": "",
+                        "exists": invalid_exists,
+                        "sha256": sha256_file(stress_path) if invalid_exists else "",
                         "status": f"missing_or_invalid:{exc}",
                     }
                 )
@@ -1074,6 +1299,11 @@ def main() -> None:
                     "threshold": args.threshold,
                     "n_bins": args.n_bins,
                     "n_boot": args.n_boot,
+                    "bootstrap_unit": BOOTSTRAP_UNIT,
+                    "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+                    "ci_scope": CI_SCOPE,
+                    "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
+                    "perturbation_realization_scope": "single_fixed_seed_conditional_stress_audit",
                 }
                 if comp not in clean:
                     rows.append({**base_row, "status": "blocked_missing_clean_comparator"})
@@ -1153,6 +1383,24 @@ def main() -> None:
                     print(f"{stress} {comp} {spec['name']}: bootstrap done", flush=True)
                 row.setdefault("bootstrap_engine", "record_index_resample_v1_cached_exact")
                 interp = row_interpretation(row)
+                previous_interpretation = str(row.get("interpretation") or "").strip()
+                if previous_interpretation and previous_interpretation != interp:
+                    row["legacy_interpretation"] = previous_interpretation
+                row.update(
+                    {
+                        **base_row,
+                        "status": "complete",
+                        "clean_full": fc,
+                        "stress_full": fs,
+                        "degradation_full_benefit": full_deg,
+                        "clean_comparator": cc,
+                        "stress_comparator": cs,
+                        "degradation_comparator_benefit": comp_deg,
+                        "degradation_advantage_full": deg_adv,
+                        "stressed_advantage_full": stressed_adv,
+                        "interpretation": interp,
+                    }
+                )
                 rows.append(row)
                 pairwise["items"][f"{stress}/{comp}/{spec['name']}"] = row
                 print(
@@ -1168,8 +1416,10 @@ def main() -> None:
     pairwise["status"] = "complete_with_blockers" if blocked else "complete"
     pairwise["artifact_status"] = artifact_status
     pairwise["safe_wording"] = (
-        "Use only metric-specific and comparator-specific robustness statements. "
-        "Missing stress artifacts keep broad robustness superiority blocked."
+        "Use only named stress-, metric-, and comparator-specific signed change differences. "
+        "The paired 95% percentile CIs are nominal and unadjusted across the full comparison family; "
+        "stochastic stresses use one fixed seeded realization, and trained folds/checkpoints are held fixed. "
+        "Do not claim broad robustness superiority or training-run uncertainty."
     )
     manifest = {
         "status": "complete_with_blockers" if blocked else "complete",
@@ -1182,7 +1432,20 @@ def main() -> None:
         "n_boot": args.n_boot,
         "bootstrap_jobs": args.bootstrap_jobs,
         "bootstrap_engine": BOOTSTRAP_ENGINE,
+        "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+        "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
+        "bootstrap_unit": BOOTSTRAP_UNIT,
+        "bootstrap_independence_contract": bootstrap_independence_contract,
+        "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+        "ci_scope": CI_SCOPE,
+        "endpoint_definition": (
+            "difference_in_signed_clean_to_stress_benefit_change_full_minus_comparator"
+        ),
         "metrics": requested_metrics,
+        "stress_contracts": {
+            name: stress_contract_description(spec)
+            for name, spec in expected_stress_specs.items()
+        },
         "output_profile": output_profile_name(args.out_pairwise),
         "completed_rows": len(completed),
         "blocked_rows": len(blocked),
@@ -1228,6 +1491,15 @@ def main() -> None:
             "n_boot": args.n_boot,
             "bootstrap_jobs": args.bootstrap_jobs,
             "bootstrap_engine": BOOTSTRAP_ENGINE,
+            "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+            "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
+            "bootstrap_unit": BOOTSTRAP_UNIT,
+            "bootstrap_independence_contract": bootstrap_independence_contract,
+            "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
+            "ci_scope": CI_SCOPE,
+            "endpoint_definition": (
+                "difference_in_signed_clean_to_stress_benefit_change_full_minus_comparator"
+            ),
             "output_profile": output_profile_name(args.out_pairwise),
             "expected_rows": expected_rows,
             "completed_rows": len(comp_rows) - len(comp_blocked),
@@ -1238,7 +1510,8 @@ def main() -> None:
             "canonical_contract": canonical_contract,
             "runner_sha256": sha256_file(Path(__file__)),
             "safe_wording": (
-                "Use only stress-, metric-, and comparator-specific paired degradation CIs."
+                "Use only this named stress/metric/comparator signed change difference with its "
+                "nominal unadjusted paired 95% record-bootstrap CI, conditional on the fixed trained folds."
             ),
         }
         save_json(sidecar_path, sidecar)

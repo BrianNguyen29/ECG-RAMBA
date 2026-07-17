@@ -19,6 +19,18 @@ from scripts.revision.common import sha256_file
 
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
+CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+METRIC_CACHE_SCHEMA_VERSION = 2
+MACRO_CLASS_SUPPORT_POLICY = (
+    "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
+)
+ALLOWED_INTERPRETATIONS = {
+    "full_nominal_95ci_more_favorable_change",
+    "comparator_nominal_95ci_more_favorable_change",
+    "nominal_95ci_inconclusive_change_difference",
+}
 CANONICAL_STRESSES = {
     "snr20db",
     "snr10db",
@@ -111,8 +123,9 @@ def _classification(
             "metric_specific_ci_ready": True,
             "canonical_gate_ready": True,
             "safe_wording": (
-                "Use only stress-, metric-, and comparator-specific paired degradation CIs. "
-                "Completion of the full ledger does not establish broad robustness superiority."
+                "Use only named stress-, metric-, and comparator-specific signed change differences. "
+                "CIs are nominal and unadjusted across the comparison family; completion does not "
+                "establish broad robustness superiority."
             ),
         }
     if metric_specific_ci_ready:
@@ -122,8 +135,8 @@ def _classification(
             "metric_specific_ci_ready": True,
             "canonical_gate_ready": False,
             "safe_wording": (
-                "Use only the named stress-, metric-, and comparator-specific paired degradation CIs. "
-                "The subset does not represent the predefined full robustness ledger."
+                "Use only the named stress-, metric-, and comparator-specific signed change differences "
+                "with nominal unadjusted CIs. The subset does not represent the predefined full ledger."
             ),
         }
     return {
@@ -192,6 +205,38 @@ def validate_profile(
             issues.append(f"{label}.canonical_contract_mismatch")
         if payload.get("runner_sha256") != expected_runner_sha:
             issues.append(f"{label}.runner_sha256_mismatch")
+        if payload.get("ci_scope") != CI_SCOPE:
+            issues.append(f"{label}.ci_scope={payload.get('ci_scope')!r}")
+        if payload.get("bootstrap_unit") != BOOTSTRAP_UNIT:
+            issues.append(f"{label}.bootstrap_unit={payload.get('bootstrap_unit')!r}")
+        if payload.get("training_variability_scope") != TRAINING_VARIABILITY_SCOPE:
+            issues.append(
+                f"{label}.training_variability_scope={payload.get('training_variability_scope')!r}"
+            )
+        if int(payload.get("metric_cache_schema_version", 0)) != METRIC_CACHE_SCHEMA_VERSION:
+            issues.append(f"{label}.metric_cache_schema_version_invalid")
+        if payload.get("macro_class_support_policy") != MACRO_CLASS_SUPPORT_POLICY:
+            issues.append(f"{label}.macro_class_support_policy_invalid")
+        independence = payload.get("bootstrap_independence_contract") or {}
+        if (
+            independence.get("unit") != BOOTSTRAP_UNIT
+            or independence.get("independence_contract") != "one_chapman_record_per_subject"
+            or independence.get("training_variability_scope") != TRAINING_VARIABILITY_SCOPE
+        ):
+            issues.append(f"{label}.bootstrap_independence_contract_invalid")
+        source_value = independence.get("source")
+        if source_value:
+            source_path = _project_path(project_root, source_value)
+            if not source_path.exists() or source_path.stat().st_size == 0:
+                issues.append(f"{label}.bootstrap_contract_source_missing")
+            elif independence.get("source_sha256") != sha256_file(source_path):
+                issues.append(f"{label}.bootstrap_contract_source_sha256_mismatch")
+        else:
+            issues.append(f"{label}.bootstrap_contract_source_missing")
+        if set((payload.get("stress_contracts") or {}).keys()) != set(
+            payload.get("stress_tests") or []
+        ):
+            issues.append(f"{label}.stress_contracts_incomplete")
 
     stresses = {str(item) for item in manifest.get("stress_tests") or []}
     metrics = {str(item) for item in manifest.get("metrics") or []}
@@ -243,6 +288,27 @@ def validate_profile(
         issues.append("summary_output_profile_mismatch")
     if any(_as_int(row.get("n_boot")) != n_boot for row in rows):
         issues.append("summary_n_boot_mismatch")
+    if any(str(row.get("ci_scope")) != CI_SCOPE for row in rows):
+        issues.append("summary_ci_scope_mismatch")
+    if any(str(row.get("bootstrap_unit")) != BOOTSTRAP_UNIT for row in rows):
+        issues.append("summary_bootstrap_unit_mismatch")
+    if any(
+        str(row.get("training_variability_scope")) != TRAINING_VARIABILITY_SCOPE
+        for row in rows
+    ):
+        issues.append("summary_training_variability_scope_mismatch")
+    if any(str(row.get("macro_class_support_policy")) != MACRO_CLASS_SUPPORT_POLICY for row in rows):
+        issues.append("summary_macro_class_support_policy_mismatch")
+    if any(str(row.get("interpretation")) not in ALLOWED_INTERPRETATIONS for row in rows):
+        issues.append("summary_interpretation_not_claim_safe")
+    invalid_artifacts = [
+        row for row in manifest.get("artifact_status") or [] if row.get("status") != "ready"
+    ]
+    expected_artifact_rows = len(comparators) * (1 + len(stresses))
+    if len(manifest.get("artifact_status") or []) != expected_artifact_rows:
+        issues.append("manifest_artifact_provenance_grid_incomplete")
+    if invalid_artifacts:
+        issues.append(f"manifest_has_invalid_artifacts:{len(invalid_artifacts)}")
     minimum_valid_bootstraps = max(1, math.ceil(0.95 * n_boot))
     ci_fields = (
         "degradation_adv_ci_low",
@@ -318,6 +384,20 @@ def validate_profile(
             issues.append(f"sidecar_profile_mismatch:{comparator}")
         if sidecar.get("runner_sha256") != expected_runner_sha:
             issues.append(f"sidecar_runner_sha256_mismatch:{comparator}")
+        if sidecar.get("ci_scope") != CI_SCOPE:
+            issues.append(f"sidecar_ci_scope_mismatch:{comparator}")
+        if sidecar.get("bootstrap_unit") != BOOTSTRAP_UNIT:
+            issues.append(f"sidecar_bootstrap_unit_mismatch:{comparator}")
+        if sidecar.get("training_variability_scope") != TRAINING_VARIABILITY_SCOPE:
+            issues.append(f"sidecar_training_variability_scope_mismatch:{comparator}")
+        if int(sidecar.get("metric_cache_schema_version", 0)) != METRIC_CACHE_SCHEMA_VERSION:
+            issues.append(f"sidecar_metric_cache_schema_version_mismatch:{comparator}")
+        if sidecar.get("macro_class_support_policy") != MACRO_CLASS_SUPPORT_POLICY:
+            issues.append(f"sidecar_macro_class_support_policy_mismatch:{comparator}")
+        if sidecar.get("bootstrap_independence_contract") != manifest.get(
+            "bootstrap_independence_contract"
+        ):
+            issues.append(f"sidecar_bootstrap_independence_contract_mismatch:{comparator}")
         if sidecar.get("source_pairwise_sha256") != sha256_file(paths["pairwise"]):
             issues.append(f"sidecar_pairwise_sha256_mismatch:{comparator}")
         sidecar_rows = sidecar.get("rows") or []

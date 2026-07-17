@@ -55,6 +55,8 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
             robustness_pairwise=root / "robustness_pairwise.json",
             robustness_manifest=root / "robustness_manifest.json",
         )
+        self.robustness_bootstrap_contract = root / "calibration_ci.json"
+        write_json(self.robustness_bootstrap_contract, {"status": "complete"})
         self._write_external()
         self._write_pooling()
         self._write_morphology()
@@ -183,6 +185,21 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         )
 
     def _write_robustness(self):
+        independence = {
+            "unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
+            "independence_contract": "one_chapman_record_per_subject",
+            "source": str(self.robustness_bootstrap_contract),
+            "source_sha256": self.module.sha256_file(self.robustness_bootstrap_contract),
+            "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
+        }
+        stress_contracts = {stress: {"spec": {"name": stress}} for stress in self.module.STRESSES}
+        artifact_status = []
+        for comparator in ("full", *self.module.ROBUSTNESS_COMPARATORS):
+            artifact_status.append({"comparator": comparator, "kind": "clean", "status": "ready"})
+            for stress in self.module.STRESSES:
+                artifact_status.append(
+                    {"comparator": comparator, "kind": f"stress:{stress}", "status": "ready"}
+                )
         rows = []
         for stress in self.module.STRESSES:
             for comparator in self.module.ROBUSTNESS_COMPARATORS:
@@ -207,13 +224,31 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                             "degradation_adv_ci_high": 0.02,
                             "stressed_adv_ci_low": 0.02,
                             "stressed_adv_ci_high": 0.10,
-                            "interpretation": "no_significant_degradation_difference",
+                            "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                            "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
+                            "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
+                            "macro_class_support_policy": (
+                                self.module.ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY
+                            ),
+                            "interpretation": "nominal_95ci_inconclusive_change_difference",
                         }
                     )
         write_csv(self.args.robustness_table, rows)
         write_json(
             self.args.robustness_pairwise,
-            {"status": "complete", "n_boot": 1000, "output_profile": "canonical"},
+            {
+                "status": "complete",
+                "n_boot": 1000,
+                "output_profile": "canonical",
+                "runner_sha256": self.runner_sha("21_robustness_multicomparator.py"),
+                "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
+                "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
+                "metric_cache_schema_version": self.module.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
+                "macro_class_support_policy": self.module.ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY,
+                "bootstrap_independence_contract": independence,
+                "stress_contracts": stress_contracts,
+            },
         )
         write_json(
             self.args.robustness_manifest,
@@ -222,6 +257,14 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                 "n_boot": 1000,
                 "output_profile": "canonical",
                 "runner_sha256": self.runner_sha("21_robustness_multicomparator.py"),
+                "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
+                "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
+                "metric_cache_schema_version": self.module.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
+                "macro_class_support_policy": self.module.ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY,
+                "bootstrap_independence_contract": independence,
+                "stress_contracts": stress_contracts,
+                "artifact_status": artifact_status,
                 "artifact_sha256": {
                     "table": self.module.sha256_file(self.args.robustness_table),
                     "pairwise": self.module.sha256_file(self.args.robustness_pairwise),
@@ -246,7 +289,7 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         self.assertTrue(all("Holm-adjusted conclusion" in row for row in external_compact))
         robustness_status, robustness_compact = self.module.validate_robustness(self.args)
         self.assertIn("pointwise", robustness_status["safe_wording"])
-        self.assertTrue(all("Pointwise CI overlaps zero" in row for row in robustness_compact))
+        self.assertTrue(all("Nominal pointwise CI overlaps zero" in row for row in robustness_compact))
 
     def test_short_pooling_bootstrap_is_rejected(self):
         payload = json.loads(self.args.pooling_bootstrap.read_text(encoding="utf-8"))
