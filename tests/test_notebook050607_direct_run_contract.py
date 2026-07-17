@@ -79,6 +79,33 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertIn("sha256_file(oof_prediction_path)", summary_cell)
         self.assertNotIn("sha256_file(record_path)", summary_cell)
 
+    def test_notebook05_validates_stress_provenance_before_gpu_reuse(self):
+        _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
+        for token in (
+            "comparator_stress_manifest_preflight.log",
+            "--finalize-manifest-only",
+            "Authenticated comparator/stress artifacts:",
+            "Missing/stale comparator stress pairs:",
+            "Only affected stress groups will run",
+            "--refresh-existing-prefix predictions/robustness_",
+            "All requested comparator stress artifacts passed provenance validation",
+        ):
+            self.assertIn(token, source)
+        self.assertNotIn(
+            "All requested comparator stress prediction artifacts are present; skipping GPU inference.",
+            source,
+        )
+
+    def test_notebook05_finds_current_notebook02_mamba_installer(self):
+        _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
+        for token in (
+            "MODEL_DEPS_SHOULD_RUN",
+            "candidate_count={len(installer_candidates)}",
+            "Mamba wheel environment",
+        ):
+            self.assertIn(token, source)
+        self.assertNotIn("'INSTALL_MODEL_DEPS = True' in source", source)
+
     def test_notebook06_can_refresh_semantically_equivalent_embedding_on_cpu(self):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
         for token in (
