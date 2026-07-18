@@ -36,6 +36,47 @@ from configs.config import CONFIG, PATHS, SEQ_LEN, FS
 from src.provenance import record_order_fingerprint
 
 
+HRV36_SCHEMA_VERSION = 2
+HRV36_CHECKPOINT_SEMANTICS = "checkpoint_compatible_amplitude_slots_zero"
+HRV36_ACTIVE_RR_SLICE = slice(0, 5)
+HRV36_RESERVED_SLICE = slice(5, 25)
+HRV36_AMPLITUDE_SLICE = slice(25, 30)
+HRV36_GLOBAL_SLICE = slice(30, 36)
+
+
+def checkpoint_compatible_hrv36_contract() -> dict:
+    return {
+        "schema_version": HRV36_SCHEMA_VERSION,
+        "semantics": HRV36_CHECKPOINT_SEMANTICS,
+        "active_rr_slots": "0:5",
+        "reserved_zero_slots": "5:25",
+        "amplitude_zero_slots": "25:30",
+        "global_stat_slots": "30:36",
+        "full_hrv_claim_supported": False,
+    }
+
+
+def validate_checkpoint_compatible_hrv36(
+    features: np.ndarray,
+    *,
+    context: str = "HRV36",
+) -> None:
+    """Validate the exact rhythm-feature semantics used by current checkpoints."""
+    values = np.asarray(features)
+    if values.ndim not in {1, 2} or values.shape[-1] != int(CONFIG["hrv_dim"]):
+        raise ValueError(
+            f"{context} has shape={values.shape}; expected (..., {CONFIG['hrv_dim']})"
+        )
+    if not np.isfinite(values).all():
+        raise ValueError(f"{context} contains non-finite values")
+    if np.any(values[..., HRV36_RESERVED_SLICE] != 0):
+        raise ValueError(f"{context} reserved slots 5:25 must be zero")
+    if np.any(values[..., HRV36_AMPLITUDE_SLICE] != 0):
+        raise ValueError(
+            f"{context} amplitude slots 25:30 must be zero for the current checkpoint contract"
+        )
+
+
 # ============================================================
 # MINI-ROCKET (DETERMINISTIC, CPU-ONLY, PAPER-SAFE)
 # ============================================================
@@ -333,12 +374,29 @@ def generate_hrv_cache(
     X: np.ndarray,
     X_raw_amp: np.ndarray,
     record_ids: np.ndarray | None = None,
+    *,
+    semantics: str = HRV36_CHECKPOINT_SEMANTICS,
 ) -> np.ndarray:
     """
-    HRV + amplitude + global record stats.
+    Generate the checkpoint-compatible 36-dimensional rhythm-statistic input.
 
-    Fixed dimensionality = 36
+    Current checkpoints received five RR summaries, twenty reserved zeros, five
+    zero amplitude slots, and six global signal statistics. ``X_raw_amp`` is
+    retained only for input-length compatibility: the original Chapman pipeline
+    passed its precomputed five-dimensional vectors into a waveform amplitude
+    extractor, which left slots 25:30 at zero. A corrected/full HRV schema must
+    use a new cache namespace and a complete five-fold retraining protocol.
     """
+
+    if semantics != HRV36_CHECKPOINT_SEMANTICS:
+        raise ValueError(
+            "Unsupported HRV36 semantics for current checkpoints: "
+            f"{semantics!r}; expected {HRV36_CHECKPOINT_SEMANTICS!r}"
+        )
+    if len(X_raw_amp) != len(X):
+        raise ValueError(
+            f"X_raw_amp length {len(X_raw_amp)} does not match ECG length {len(X)}"
+        )
 
     record_fingerprint = (
         record_order_fingerprint(record_ids)
@@ -361,32 +419,59 @@ def generate_hrv_cache(
                 if "record_order_fingerprint" in payload.files
                 else None
             )
+            cached_semantics = (
+                str(payload["hrv_semantics"].item())
+                if "hrv_semantics" in payload.files
+                else None
+            )
         expected_shape = (len(X), int(CONFIG["hrv_dim"]))
         fingerprint_matches = (
             record_fingerprint is None
             or cached_record_fingerprint == record_fingerprint
         )
+        semantics_match = cached_semantics in {None, semantics}
+        feature_contract_valid = True
+        try:
+            validate_checkpoint_compatible_hrv36(cached, context=str(cache_path))
+        except ValueError:
+            feature_contract_valid = False
         if (
             cached.shape == expected_shape
             and np.isfinite(cached).all()
             and fingerprint_matches
+            and semantics_match
+            and feature_contract_valid
         ):
-            print(f"✅ Loaded HRV36 cache: {cached.shape}")
+            provenance = "legacy-value-verified" if cached_semantics is None else "metadata-verified"
+            print(
+                f"✅ Loaded HRV36 cache: {cached.shape} | semantics={semantics} | {provenance}"
+            )
             return cached.astype(np.float32)
         print(
             "⚠️ HRV36 cache contract mismatch "
             f"(found={cached.shape}, expected={expected_shape}, "
             f"finite={bool(np.isfinite(cached).all())}, "
-            f"record_fingerprint_match={fingerprint_matches}) → regenerating"
+            f"record_fingerprint_match={fingerprint_matches}, "
+            f"semantics_match={semantics_match}, "
+            f"feature_contract_valid={feature_contract_valid}) → regenerating"
         )
 
-    print("💓 Extracting HRV + amplitude + global stats (CPU)...")
+    print(
+        "💓 Extracting checkpoint-compatible RR/global statistics "
+        "with reserved and amplitude slots fixed to zero (CPU)..."
+    )
 
     feats = np.zeros((len(X), 36), dtype=np.float32)
 
     for i, sig in enumerate(tqdm(X, desc="HRV36")):
-        hrv = extract_hrv_features(sig)
-        amp = extract_amplitude_features(X_raw_amp[i])
+        extracted_hrv = np.asarray(extract_hrv_features(sig), dtype=np.float32)
+        if extracted_hrv.shape != (25,):
+            raise ValueError(
+                f"HRV extractor returned shape={extracted_hrv.shape}; expected (25,)"
+            )
+        hrv = np.zeros(25, dtype=np.float32)
+        hrv[:5] = extracted_hrv[:5]
+        amp = np.zeros(5, dtype=np.float32)
         gstat = extract_global_record_stats(sig)
         feats[i] = np.concatenate([hrv, amp, gstat])
 
@@ -394,6 +479,7 @@ def generate_hrv_cache(
         f"HRV dim mismatch: got {feats.shape[1]}, expected {CONFIG['hrv_dim']}"
     if not np.isfinite(feats).all():
         raise RuntimeError("HRV36 extraction produced non-finite values")
+    validate_checkpoint_compatible_hrv36(feats, context="generated HRV36")
 
     print(f"💾 Saving HRV36 cache to: {cache_path}", flush=True)
     cached_float16 = feats.astype(np.float16)
@@ -404,6 +490,12 @@ def generate_hrv_cache(
         consumer_dtype=np.asarray("float32"),
         quantization_contract=np.asarray("float16_storage_roundtrip_v1"),
         record_order_fingerprint=np.asarray(record_fingerprint or ""),
+        hrv_semantics=np.asarray(semantics),
+        hrv_schema_version=np.asarray(HRV36_SCHEMA_VERSION, dtype=np.int16),
+        active_rr_slots=np.asarray("0:5"),
+        reserved_zero_slots=np.asarray("5:25"),
+        amplitude_zero_slots=np.asarray("25:30"),
+        global_stat_slots=np.asarray("30:36"),
     )
     print(f"✅ Saved HRV36 cache: {feats.shape}")
     print(f"📦 Cache path: {cache_path}")

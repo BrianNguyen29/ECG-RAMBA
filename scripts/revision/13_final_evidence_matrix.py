@@ -33,6 +33,7 @@ from scripts.revision.common import (  # noqa: E402
     sha256_file,
 )
 from scripts.revision.robustness_profile_audit import select_best_profile  # noqa: E402
+from src.features import checkpoint_compatible_hrv36_contract  # noqa: E402
 
 
 REQUIRED_ROBUSTNESS_STRESSES = {
@@ -55,13 +56,18 @@ EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 7
+FINAL_EVIDENCE_SCHEMA_VERSION = 9
 FINAL_EVIDENCE_CAPABILITIES = (
+    "adaptation_learning_curve",
     "claim_readiness_gates",
     "external_learned_comparator_audit",
     "group_safe_score_calibration_v2",
     "hybrid_morphology_paired",
     "learned_comparator_robustness_audit",
+    "matched_cross_fitted_calibration",
+    "matched_structured_ablation_5fold",
+    "matched_structured_ablation_fresh_full",
+    "physiological_interval_probe_gate",
     "representation_probe_v3",
     "reviewer_presentation_assets",
     "reviewer_gap_closure_v1",
@@ -155,6 +161,319 @@ def fmt(value: Any, digits: int = 4) -> str:
 
 def csv_index(rows: list[dict[str, str]], key: str) -> dict[str, dict[str, str]]:
     return {str(row.get(key, "")): row for row in rows}
+
+
+def truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def nonempty_paths(paths: list[Path] | tuple[Path, ...]) -> bool:
+    return all(path.exists() and path.stat().st_size > 0 for path in paths)
+
+
+def normalized_report_path(path: str | Path) -> str:
+    value = str(path).replace("\\", "/")
+    marker = "reports/revision/"
+    return marker + value.split(marker, 1)[1] if marker in value else value
+
+
+def manifest_output_hashes(manifest: dict[str, Any]) -> dict[str, str]:
+    outputs = manifest.get("outputs") or {}
+    if isinstance(outputs, list):
+        return {
+            normalized_report_path(row.get("path", "")): str(row.get("sha256", ""))
+            for row in outputs
+            if isinstance(row, dict) and row.get("path") and row.get("sha256")
+        }
+    if isinstance(outputs, dict):
+        return {
+            normalized_report_path(path): str(value)
+            for path, value in outputs.items()
+            if isinstance(value, str)
+        }
+    return {}
+
+
+def manifest_authenticates_paths(
+    manifest: dict[str, Any],
+    paths: tuple[Path, ...],
+    *,
+    allow_empty: bool = False,
+) -> bool:
+    hashes = manifest_output_hashes(manifest)
+    return all(
+        path.exists()
+        and (allow_empty or path.stat().st_size > 0)
+        and hashes.get(normalized_report_path(path)) == sha256_file(path)
+        for path in paths
+    )
+
+
+def summarize_matched_calibration(
+    summary: dict[str, Any],
+    manifest: dict[str, Any],
+    table_rows: list[dict[str, str]],
+    paired_rows: list[dict[str, str]],
+    *,
+    required_paths: tuple[Path, ...],
+    canonical_contract: dict[str, str],
+) -> dict[str, Any]:
+    required_models = {"full", "minirocket", "resnet", "raw_mamba", "transformer"}
+    calibration_wording = (
+        "Report raw and cross-fitted OOF-score Platt results side by side. Evaluated-fold labels are "
+        "excluded from calibrator fitting, but base models are not refitted in a nested loop. Treat this "
+        "as a secondary post-hoc score-level sensitivity audit: improved Brier, ECE, NLL, slope, or "
+        "intercept does not compensate for lower discrimination or establish clinical threshold safety."
+    )
+    if not any(path.exists() and path.stat().st_size > 0 for path in required_paths):
+        return {
+            "complete": False,
+            "status": "not_run",
+            "issues": ["matched cross-fitted calibration package is absent"],
+            "key_numbers": "matched cross-fitted calibration=not complete",
+            "safe_wording": calibration_wording,
+            "blocker": "Matched cross-fitted calibration package is absent.",
+            "models": {},
+        }
+    issues: list[str] = []
+    if summary.get("status") != "complete":
+        issues.append(f"summary status={summary.get('status', 'missing')}")
+    if summary.get("protocol") != "matched_cross_fitted_per_class_platt_v2":
+        issues.append("protocol mismatch")
+    if summary.get("bootstrap_unit") != "Chapman record; one record per subject":
+        issues.append("calibration bootstrap unit/independence contract is missing")
+    if "calibrators and base models are not refitted" not in str(
+        summary.get("bootstrap_scope", "")
+    ):
+        issues.append("calibration bootstrap conditional-inference scope is missing")
+    if "pools record-class label instances" not in str(
+        summary.get("reliability_figure_scope", "")
+    ):
+        issues.append("reliability figure pooling scope is missing")
+    if manifest.get("status") != "complete":
+        issues.append(f"manifest status={manifest.get('status', 'missing')}")
+    if not nonempty_paths(required_paths):
+        issues.append("one or more required calibration outputs are absent/empty")
+    elif not manifest_authenticates_paths(manifest, required_paths[:-1]):
+        issues.append("calibration manifest does not authenticate required outputs")
+    models = summary.get("models") if isinstance(summary.get("models"), dict) else {}
+    missing_models = sorted(required_models - set(models))
+    if missing_models:
+        issues.append("missing matched models=" + ",".join(missing_models))
+    freeze_contract = summary.get("freeze_contract") if isinstance(summary.get("freeze_contract"), dict) else {}
+    if freeze_contract.get("sha256") != canonical_contract.get("freeze_sha256"):
+        issues.append("freeze manifest SHA mismatch")
+    manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
+    if (manifest_inputs.get("full") or {}).get("sha256") != canonical_contract.get("oof_sha256"):
+        issues.append("Full OOF SHA mismatch")
+    state_pairs = {
+        (str(row.get("model", "")), str(row.get("state", ""))) for row in table_rows
+    }
+    for model in required_models:
+        for state in ("raw", "cross_fitted_platt"):
+            if (model, state) not in state_pairs:
+                issues.append(f"missing table row {model}/{state}")
+    if not paired_rows:
+        issues.append("matched Full-versus-comparator paired table is empty")
+
+    complete = not issues
+    full = models.get("full") if isinstance(models.get("full"), dict) else {}
+    raw = full.get("raw") if isinstance(full.get("raw"), dict) else {}
+    calibrated = (
+        full.get("cross_fitted_platt")
+        if isinstance(full.get("cross_fitted_platt"), dict)
+        else {}
+    )
+    return {
+        "complete": complete,
+        "status": "complete_cross_fitted_matched_calibration" if complete else "blocked_or_incomplete",
+        "issues": issues,
+        "key_numbers": (
+            f"Full raw->cross-fitted OOF-score Platt: Brier {fmt(raw.get('brier_macro'))}->{fmt(calibrated.get('brier_macro'))}, "
+            f"ECE {fmt(raw.get('ece_macro'))}->{fmt(calibrated.get('ece_macro'))}, "
+            f"NLL {fmt(raw.get('nll_macro'))}->{fmt(calibrated.get('nll_macro'))}, "
+            f"slope {fmt(raw.get('calibration_slope_macro'))}->{fmt(calibrated.get('calibration_slope_macro'))}"
+            if complete
+            else "matched cross-fitted calibration=not complete"
+        ),
+        "safe_wording": calibration_wording,
+        "blocker": "" if complete else "; ".join(issues),
+        "models": models,
+    }
+
+
+def summarize_structured_ablation(
+    summary: dict[str, Any],
+    manifest: dict[str, Any],
+    table_rows: list[dict[str, str]],
+    paired_rows: list[dict[str, str]],
+    *,
+    required_paths: tuple[Path, ...],
+    canonical_contract: dict[str, str],
+) -> dict[str, Any]:
+    expected = {"full", "no_morphology", "no_rhythm", "no_context_fusion"}
+    removal_controls = expected - {"full"}
+    ablation_wording = (
+        "Use significant Full-versus-removal deltas only as evidence for contribution within this "
+        "architecture and named control. The No-context/fusion variant removes multiple modules jointly, "
+        "so it cannot identify one causal mechanism. These ablations do not establish global superiority "
+        "or proven morphology-rhythm disentanglement."
+    )
+    if not any(path.exists() and path.stat().st_size > 0 for path in required_paths):
+        return {
+            "complete": False,
+            "status": "not_run",
+            "issues": ["matched five-fold structured ablation package is absent"],
+            "key_numbers": "matched five-fold structured ablations=not complete",
+            "safe_wording": ablation_wording,
+            "blocker": "Matched five-fold structured ablation package is absent.",
+            "interpretation_counts": {},
+        }
+    issues: list[str] = []
+    if summary.get("status") != "complete":
+        issues.append(f"summary status={summary.get('status', 'missing')}")
+    if summary.get("protocol") != "matched_retrained_structured_ablation_5fold_v3":
+        issues.append("protocol mismatch")
+    if manifest.get("status") != "complete":
+        issues.append(f"manifest status={manifest.get('status', 'missing')}")
+    if not nonempty_paths(required_paths):
+        issues.append("one or more required ablation outputs are absent/empty")
+    elif not manifest_authenticates_paths(manifest, required_paths[:-1]):
+        issues.append("ablation manifest does not authenticate required outputs")
+    complete_variants = set(summary.get("complete_variants") or [])
+    if not expected.issubset(complete_variants):
+        issues.append("missing retrained variants=" + ",".join(sorted(expected - complete_variants)))
+    if summary.get("raw_mamba_control_included") is not True:
+        issues.append("Raw Mamba anchor missing")
+    if summary.get("paired_analysis_uses_fresh_matched_full") is not True:
+        issues.append("paired analysis does not use a fresh matched Full control")
+    training_contract = (
+        summary.get("training_contract")
+        if isinstance(summary.get("training_contract"), dict)
+        else {}
+    )
+    if training_contract.get("hrv36_feature_contract") != checkpoint_compatible_hrv36_contract():
+        issues.append("matched ablation HRV36 feature contract is missing or mismatched")
+    canonical = summary.get("canonical_contract") if isinstance(summary.get("canonical_contract"), dict) else {}
+    if ((canonical.get("full_prediction") or {}).get("sha256")) != canonical_contract.get("oof_sha256"):
+        issues.append("Full OOF SHA mismatch")
+    if ((canonical.get("freeze_manifest") or {}).get("sha256")) != canonical_contract.get("freeze_sha256"):
+        issues.append("freeze manifest SHA mismatch")
+    checkpoint_rows = summary.get("checkpoint_status") or []
+    for variant in expected:
+        valid_rows = [
+            row
+            for row in checkpoint_rows
+            if row.get("variant") == variant and truthy(row.get("contract_valid"))
+        ]
+        valid_folds = {int(row.get("fold", -1)) for row in valid_rows}
+        if valid_folds != {1, 2, 3, 4, 5}:
+            issues.append(f"{variant} checkpoint folds invalid/incomplete")
+        if any(
+            not str(row.get("pca_sha256", ""))
+            or not math.isfinite(fnum(row.get("pca_explained_variance")))
+            for row in valid_rows
+        ):
+            issues.append(f"{variant} fold-PCA provenance is incomplete")
+    for fold in range(1, 6):
+        fold_hashes = {
+            str(row.get("pca_sha256", ""))
+            for row in checkpoint_rows
+            if int(row.get("fold", -1)) == fold
+            and row.get("variant") in expected
+            and truthy(row.get("contract_valid"))
+        }
+        if len(fold_hashes) != 1 or "" in fold_hashes:
+            issues.append(f"fold {fold} does not share one authenticated PCA artifact across variants")
+    table_variants = {str(row.get("variant", "")) for row in table_rows}
+    if not ({"canonical_full", "raw_mamba"} | expected).issubset(table_variants):
+        issues.append("ablation metric table is incomplete")
+    paired_by_control = {
+        control: [row for row in paired_rows if row.get("control") == control]
+        for control in removal_controls | {"raw_mamba"}
+    }
+    for control, rows in paired_by_control.items():
+        if len(rows) < 5:
+            issues.append(f"paired metrics incomplete for {control}")
+
+    counts = {
+        variant: {
+            label: sum(row.get("interpretation") == label for row in paired_by_control.get(variant, []))
+            for label in ("full_significantly_better", "control_significantly_better", "inconclusive")
+        }
+        for variant in removal_controls
+    }
+    complete = not issues
+    return {
+        "complete": complete,
+        "status": "complete_matched_retrained_ablation" if complete else "blocked_or_incomplete",
+        "issues": issues,
+        "key_numbers": (
+            "; ".join(
+                f"{variant}: Full-better={values['full_significantly_better']}/5, "
+                f"control-better={values['control_significantly_better']}/5, "
+                f"inconclusive={values['inconclusive']}/5"
+                for variant, values in sorted(counts.items())
+            )
+            if complete
+            else "matched five-fold structured ablations=not complete"
+        ),
+        "safe_wording": ablation_wording,
+        "blocker": "" if complete else "; ".join(issues),
+        "interpretation_counts": counts,
+    }
+
+
+def summarize_physiological_probe(
+    summary: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    required_paths: tuple[Path, ...],
+) -> dict[str, Any]:
+    status = str(summary.get("status", "missing"))
+    blocked_status = status == "blocked_missing_reliable_interval_metadata"
+    issues = []
+    if summary and summary.get("protocol") != "fold_held_out_measured_physiological_interval_probe_v2":
+        issues.append("protocol mismatch")
+    if summary and manifest.get("status") != status:
+        issues.append("manifest status mismatch")
+    required_exist = all(path.exists() for path in required_paths)
+    required_nonempty = nonempty_paths(required_paths)
+    if summary and not required_exist:
+        issues.append("physiological probe outputs are absent/empty")
+    elif summary and not blocked_status and not required_nonempty:
+        issues.append("completed physiological probe contains an empty output")
+    elif summary and not manifest_authenticates_paths(
+        manifest,
+        required_paths[:-1],
+        allow_empty=blocked_status,
+    ):
+        issues.append("physiological probe manifest does not authenticate outputs")
+    complete = status == "complete_measured_target_probe" and not issues
+    targets = [str(value) for value in summary.get("targets") or []]
+    blocked = blocked_status and not issues
+    return {
+        "complete": complete,
+        "status": status,
+        "issues": issues,
+        "key_numbers": (
+            "measured targets=" + ",".join(targets)
+            if complete
+            else "measured HR/PR/QRS/QT/QTc probe unavailable"
+        ),
+        "safe_wording": (
+            "If measured interval targets pass the record-alignment, plausibility, and per-fold coverage gates, "
+            "describe results only as branch-associated linear information. Otherwise report the metadata "
+            "limitation and make no physiological-selectivity or mechanistic disentanglement claim."
+        ),
+        "blocker": (
+            "Reliable measured interval metadata are unavailable; no physiological interval selectivity claim."
+            if blocked or not complete
+            else ""
+        ),
+    }
 
 
 def paired_oof_contract_issues(
@@ -883,6 +1202,8 @@ def main() -> None:
         "true_fewshot_head_ptbxl_table": TABLE_DIR / "table_true_fewshot_head_ptbxl.csv",
         "true_fewshot_head_ptbxl_paired": TABLE_DIR / "table_true_fewshot_head_ptbxl_paired.csv",
         "true_fewshot_head_ptbxl_primary": TABLE_DIR / "table_true_fewshot_head_ptbxl_primary.csv",
+        "true_fewshot_head_ptbxl_learning_curve": TABLE_DIR / "table_true_fewshot_head_ptbxl_learning_curve.csv",
+        "true_fewshot_head_ptbxl_learning_curve_figure": REVISION_DIR / "figures" / "figure_true_fewshot_head_ptbxl_learning_curve.png",
         "true_fewshot_head_ptbxl_bootstrap": METRIC_DIR / "true_fewshot_head_ptbxl_bootstrap.json",
         "true_fewshot_head_ptbxl_coefficients": TABLE_DIR / "table_true_fewshot_head_ptbxl_coefficients.csv",
         "true_fewshot_head_ptbxl_splits": MANIFEST_DIR / "true_fewshot_head_ptbxl_splits.npz",
@@ -910,6 +1231,31 @@ def main() -> None:
         "pooling_sensitivity_external": METRIC_DIR / "pooling_sensitivity_external.csv",
         "pooling_q3_paired_bootstrap": METRIC_DIR / "pooling_q3_paired_bootstrap.json",
         "pooling_sensitivity_external_manifest": MANIFEST_DIR / "pooling_sensitivity_external_manifest.json",
+        "matched_calibration_summary": METRIC_DIR / "matched_oof_calibration_summary.json",
+        "matched_calibration_table": TABLE_DIR / "table_matched_oof_calibration.csv",
+        "matched_calibration_coefficients": TABLE_DIR / "table_matched_oof_calibration_coefficients.csv",
+        "matched_calibration_tex_table": TABLE_DIR / "table_matched_oof_calibration.tex",
+        "matched_calibration_paired_table": TABLE_DIR / "table_paired_matched_oof_calibration.csv",
+        "matched_calibration_bootstrap": METRIC_DIR / "matched_oof_calibration_bootstrap.json",
+        "matched_calibration_figure": REVISION_DIR / "figures" / "figure_matched_calibration_audit.png",
+        "matched_calibration_manifest": MANIFEST_DIR / "matched_oof_calibration_manifest.json",
+        "structured_ablation_summary": METRIC_DIR / "structured_ablation_5fold_summary.json",
+        "structured_ablation_table": TABLE_DIR / "table_structured_ablation_5fold.csv",
+        "structured_ablation_paired_table": TABLE_DIR / "table_paired_structured_ablation_5fold.csv",
+        "structured_ablation_status_table": TABLE_DIR / "table_structured_ablation_checkpoint_status.csv",
+        "structured_ablation_tex_table": TABLE_DIR / "table_structured_ablation_5fold.tex",
+        "structured_ablation_manifest": MANIFEST_DIR / "structured_ablation_5fold_manifest.json",
+        "physiological_probe_summary": METRIC_DIR / "physiological_interval_probe_summary.json",
+        "physiological_probe_table": TABLE_DIR / "table_physiological_interval_probe.csv",
+        "physiological_probe_contrasts": TABLE_DIR
+        / "table_physiological_interval_probe_contrasts.csv",
+        "physiological_probe_tex": TABLE_DIR / "table_physiological_interval_probe.tex",
+        "physiological_probe_audit": TABLE_DIR / "table_physiological_interval_target_audit.csv",
+        "physiological_probe_manifest": MANIFEST_DIR / "physiological_interval_probe_manifest.json",
+        "hypothesis_control_ledger": METRIC_DIR / "hypothesis_control_claim_boundary.json",
+        "hypothesis_control_table": TABLE_DIR / "table_hypothesis_control_finding_claim_boundary.csv",
+        "hypothesis_control_tex": TABLE_DIR / "table_hypothesis_control_finding_claim_boundary.tex",
+        "hypothesis_control_manifest": MANIFEST_DIR / "hypothesis_control_claim_boundary_manifest.json",
     }
     missing = [name for name, path in paths.items() if not path.exists()]
     if args.strict and missing:
@@ -982,6 +1328,67 @@ def main() -> None:
     representation_cka_rows = read_csv_rows(
         optional_paths["representation_cka_table"],
         required=False,
+    )
+    matched_calibration_summary = summarize_matched_calibration(
+        read_json(optional_paths["matched_calibration_summary"], required=False),
+        read_json(optional_paths["matched_calibration_manifest"], required=False),
+        read_csv_rows(optional_paths["matched_calibration_table"], required=False),
+        read_csv_rows(optional_paths["matched_calibration_paired_table"], required=False),
+        required_paths=(
+            optional_paths["matched_calibration_summary"],
+            optional_paths["matched_calibration_table"],
+            optional_paths["matched_calibration_coefficients"],
+            optional_paths["matched_calibration_tex_table"],
+            optional_paths["matched_calibration_paired_table"],
+            optional_paths["matched_calibration_bootstrap"],
+            optional_paths["matched_calibration_figure"],
+            optional_paths["matched_calibration_manifest"],
+        ),
+        canonical_contract=canonical_contract,
+    )
+    structured_ablation_summary = summarize_structured_ablation(
+        read_json(optional_paths["structured_ablation_summary"], required=False),
+        read_json(optional_paths["structured_ablation_manifest"], required=False),
+        read_csv_rows(optional_paths["structured_ablation_table"], required=False),
+        read_csv_rows(optional_paths["structured_ablation_paired_table"], required=False),
+        required_paths=(
+            optional_paths["structured_ablation_summary"],
+            optional_paths["structured_ablation_table"],
+            optional_paths["structured_ablation_paired_table"],
+            optional_paths["structured_ablation_status_table"],
+            optional_paths["structured_ablation_tex_table"],
+            optional_paths["structured_ablation_manifest"],
+        ),
+        canonical_contract=canonical_contract,
+    )
+    physiological_probe_summary = summarize_physiological_probe(
+        read_json(optional_paths["physiological_probe_summary"], required=False),
+        read_json(optional_paths["physiological_probe_manifest"], required=False),
+        required_paths=(
+            optional_paths["physiological_probe_summary"],
+            optional_paths["physiological_probe_table"],
+            optional_paths["physiological_probe_contrasts"],
+            optional_paths["physiological_probe_audit"],
+            optional_paths["physiological_probe_manifest"],
+        ),
+    )
+    hypothesis_control_ledger = read_json(
+        optional_paths["hypothesis_control_ledger"], required=False
+    )
+    hypothesis_control_manifest = read_json(
+        optional_paths["hypothesis_control_manifest"], required=False
+    )
+    hypothesis_control_complete = (
+        hypothesis_control_ledger.get("status") == "complete"
+        and hypothesis_control_manifest.get("status") == "complete"
+        and manifest_authenticates_paths(
+            hypothesis_control_manifest,
+            (
+                optional_paths["hypothesis_control_table"],
+                optional_paths["hypothesis_control_ledger"],
+                optional_paths["hypothesis_control_tex"],
+            ),
+        )
     )
     # Legacy v1 score-calibration outputs are deliberately retained only as
     # provenance. They were row-split analyses and must never become a final
@@ -1060,6 +1467,8 @@ def main() -> None:
                 optional_paths["true_fewshot_head_ptbxl_table"],
                 optional_paths["true_fewshot_head_ptbxl_paired"],
                 optional_paths["true_fewshot_head_ptbxl_primary"],
+                optional_paths["true_fewshot_head_ptbxl_learning_curve"],
+                optional_paths["true_fewshot_head_ptbxl_learning_curve_figure"],
                 optional_paths["true_fewshot_head_ptbxl_bootstrap"],
                 optional_paths["true_fewshot_head_ptbxl_coefficients"],
                 optional_paths["true_fewshot_head_ptbxl_splits"],
@@ -1400,6 +1809,8 @@ def main() -> None:
                 "reports/revision/metrics/true_fewshot_head_ptbxl_summary.csv",
                 "reports/revision/tables/table_true_fewshot_head_ptbxl_paired.csv",
                 "reports/revision/tables/table_true_fewshot_head_ptbxl_primary.csv",
+                "reports/revision/tables/table_true_fewshot_head_ptbxl_learning_curve.csv",
+                "reports/revision/figures/figure_true_fewshot_head_ptbxl_learning_curve.png",
                 "reports/revision/metrics/true_fewshot_head_ptbxl_bootstrap.json",
                 "reports/revision/manifests/true_fewshot_head_ptbxl_splits.npz",
                 "reports/revision/manifests/true_fewshot_head_ptbxl_manifest.json",
@@ -1417,6 +1828,23 @@ def main() -> None:
         f"{item}={reviewer_gap_by_item.get(item, {}).get('status', 'missing')}"
         for item in ("R1-C2", "R1-C5", "R1-C6", "R2-C3")
     )
+    extension_required = {
+        "matched_calibration": matched_calibration_summary["complete"],
+        "structured_ablation": structured_ablation_summary["complete"],
+        "adaptation_learning_curve": true_fewshot_summary.get("complete") is True,
+        "hypothesis_control_claim_boundary": hypothesis_control_complete,
+    }
+    extension_complete = all(extension_required.values())
+    extension_blockers = [
+        value
+        for value in (
+            matched_calibration_summary.get("blocker", ""),
+            structured_ablation_summary.get("blocker", ""),
+            "" if true_fewshot_summary.get("complete") else true_fewshot_summary.get("blocker", ""),
+            "" if hypothesis_control_complete else "Hypothesis-control-claim-boundary ledger is incomplete or unauthenticated.",
+        )
+        if value
+    ]
 
     matrix_rows = [
         {
@@ -1607,6 +2035,51 @@ def main() -> None:
             ),
             "source_claim_status": claim_by_id.get("C06", {}).get("status", ""),
         },
+        {
+            "claim_id": "C07",
+            "claim_topic": "Matched hypothesis testing extensions",
+            "evidence_status": (
+                "complete_matched_hypothesis_testing_extensions"
+                if extension_complete
+                else "partially_complete_claims_gated"
+            ),
+            "key_numbers": (
+                f"{matched_calibration_summary['key_numbers']}; "
+                f"{structured_ablation_summary['key_numbers']}; "
+                f"adaptation learning curve={'complete' if true_fewshot_summary.get('complete') else 'incomplete'}; "
+                f"physiological probe={physiological_probe_summary['status']}"
+            ),
+            "evidence_paths": (
+                "reports/revision/metrics/matched_oof_calibration_summary.json;"
+                "reports/revision/tables/table_matched_oof_calibration.csv;"
+                "reports/revision/tables/table_paired_matched_oof_calibration.csv;"
+                "reports/revision/figures/figure_matched_calibration_audit.png;"
+                "reports/revision/metrics/structured_ablation_5fold_summary.json;"
+                "reports/revision/tables/table_paired_structured_ablation_5fold.csv;"
+                "reports/revision/tables/table_true_fewshot_head_ptbxl_learning_curve.csv;"
+                "reports/revision/figures/figure_true_fewshot_head_ptbxl_learning_curve.png;"
+                "reports/revision/metrics/physiological_interval_probe_summary.json;"
+                "reports/revision/tables/table_physiological_interval_probe_contrasts.csv;"
+                "reports/revision/tables/table_physiological_interval_probe.tex;"
+                "reports/revision/tables/table_hypothesis_control_finding_claim_boundary.csv;"
+                "reports/revision/tables/table_hypothesis_control_finding_claim_boundary.tex"
+            ),
+            "safe_wording": (
+                "The study asks whether explicit morphology and rhythm interfaces retain benefits under matched "
+                "comparisons in discrimination, calibration, perturbation robustness, and target-label adaptation. "
+                f"{matched_calibration_summary['safe_wording']} "
+                f"{structured_ablation_summary['safe_wording']} "
+                "Present 0/1/5/10% target-label results as a learning curve with shared-group bootstrap CIs and "
+                "absolute comparator values; a positive within-model gain is not evidence of few-shot superiority. "
+                f"{physiological_probe_summary['safe_wording']}"
+            ),
+            "blocker": "; ".join(extension_blockers),
+            "source_claim_status": (
+                "enhanced_hypothesis_testing_complete"
+                if extension_complete
+                else "enhanced_hypothesis_testing_pending"
+            ),
+        },
     ]
 
     safe_rows = [
@@ -1625,7 +2098,7 @@ def main() -> None:
         not missing
         and not contract_issues
         and not unresolved_blockers
-        and len(matrix_rows) == 6
+        and len(matrix_rows) == 7
         and len(robustness_claims)
         == len(REQUIRED_ROBUSTNESS_STRESSES) * len(REQUIRED_ROBUSTNESS_METRICS)
     )
@@ -1635,6 +2108,12 @@ def main() -> None:
         "git_commit": git_commit(),
         "final_ready_for_rebuttal": final_ready,
         "all_claims_supported": False,
+        "recommended_title": "ECG-RAMBA: A Protocol-Faithful Evaluation of Structured Morphology-Rhythm ECG Modeling",
+        "central_question": (
+            "We test whether explicit morphology and rhythm interfaces provide benefits that survive "
+            "matched comparisons in discrimination, calibration, perturbation robustness, and "
+            "target-label adaptation."
+        ),
         "missing_inputs": missing,
         "contract_issues": contract_issues,
         "unresolved_blockers": unresolved_blockers,
@@ -1659,6 +2138,14 @@ def main() -> None:
                 "model weights. True few-shot evidence requires the frozen-encoder linear-head protocol and must "
                 "not be described as end-to-end fine-tuning or broad transfer superiority."
             ),
+            "adaptation_learning_curve": (
+                "Present the frozen-encoder 0/1/5/10% PTB-XL experiment as a learning curve with shared patient-group "
+                "bootstrap CIs and absolute comparator values. A positive ECG-RAMBA within-model gain is not a "
+                "few-shot superiority result."
+            ),
+            "matched_calibration": matched_calibration_summary["safe_wording"],
+            "structured_ablation": structured_ablation_summary["safe_wording"],
+            "physiological_interval_probe": physiological_probe_summary["safe_wording"],
             "external": (
                 f"Use only protocol-gated mapped-task wording for passed external datasets: {external_passed_text}. "
                 f"Keep blocked/deferred external datasets limited: {external_limited_text}."
@@ -1731,6 +2218,12 @@ def main() -> None:
         "legacy_row_split_score_calibration": legacy_fewshot_dataset_summaries,
         "group_safe_score_calibration_summary": score_calibration_summary,
         "true_fewshot_head_adaptation_summary": true_fewshot_summary,
+        "matched_cross_fitted_calibration_summary": matched_calibration_summary,
+        "matched_structured_ablation_summary": structured_ablation_summary,
+        "physiological_interval_probe_summary": physiological_probe_summary,
+        "hypothesis_control_claim_boundary": (
+            hypothesis_control_ledger if isinstance(hypothesis_control_ledger, dict) else {}
+        ),
         "external_learned_comparator_audit": external_comparator_audit,
         "robustness_summary": robustness_summary,
         "learned_comparator_robustness_audit": learned_robustness_audit,

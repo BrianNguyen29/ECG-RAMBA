@@ -25,6 +25,27 @@ from src.layers import (
 )
 
 
+STRUCTURED_ABLATION_SPECS = {
+    "full": {},
+    "no_morphology": {"no_rocket": True},
+    "no_rhythm": {"no_hrv": True},
+    "no_fusion": {"no_fusion": True},
+    "no_context_fusion": {"no_context_fusion": True},
+}
+
+
+def resolve_structured_ablation(variant: str | None) -> tuple[str, dict]:
+    """Return the named structural ablation contract used for retraining."""
+
+    name = (variant or "full").strip().lower()
+    if name not in STRUCTURED_ABLATION_SPECS:
+        raise ValueError(
+            f"Unknown structured ablation variant {variant!r}; "
+            f"expected one of {sorted(STRUCTURED_ABLATION_SPECS)}"
+        )
+    return name, dict(STRUCTURED_ABLATION_SPECS[name])
+
+
 # ============================================================
 # MAIN MODEL
 # ============================================================
@@ -104,6 +125,7 @@ class ECGRambaV7Advanced(nn.Module):
             and self.tok is not None
             and self.rocket_perceiver is not None
             and not ablation.get("no_fusion", False)
+            and not ablation.get("no_context_fusion", False)
         )
 
         if self.use_cross_attn:
@@ -125,7 +147,10 @@ class ECGRambaV7Advanced(nn.Module):
         )
 
         # === FINAL PERCEIVER (Fixed Anchor) ===
-        self.use_final_perceiver = cfg.get("use_final_perceiver", True)
+        self.use_final_perceiver = (
+            cfg.get("use_final_perceiver", True)
+            and not ablation.get("no_context_fusion", False)
+        )
         if self.use_final_perceiver:
             n_lat = cfg.get("n_latents", 64)
             self.final_latents = nn.Parameter(torch.randn(1, n_lat, d) * 0.02)
@@ -144,10 +169,14 @@ class ECGRambaV7Advanced(nn.Module):
             )
 
         # === BiMamba BACKBONE ===
-        self.layers = nn.ModuleList([
-            BiMambaBlockV3(d, i, drop=cfg["drop_path_rate"])
-            for i in range(cfg["n_layers"])
-        ])
+        self.layers = nn.ModuleList(
+            []
+            if ablation.get("no_context_fusion", False)
+            else [
+                BiMambaBlockV3(d, i, drop=cfg["drop_path_rate"])
+                for i in range(cfg["n_layers"])
+            ]
+        )
         self.norm = nn.LayerNorm(d)
 
         # === CLASSIFIER ===

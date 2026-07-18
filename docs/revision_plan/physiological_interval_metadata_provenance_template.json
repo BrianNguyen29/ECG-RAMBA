@@ -1,0 +1,34 @@
+{
+  "status": "template_not_reviewed",
+  "record_id_column": "record_id",
+  "record_alignment": "one_row_per_record_id",
+  "independent_of_model_outputs": false,
+  "review_instructions": "Set status=reviewed and independent_of_model_outputs=true only after verifying record alignment and the original measurement source. Replace placeholder measurement kinds before use.",
+  "targets": {
+    "heart_rate_bpm": {
+      "source_column": "heart_rate_bpm",
+      "unit": "bpm",
+      "measurement_kind": "replace_with_measured_device_measured_or_expert_annotated"
+    },
+    "pr_ms": {
+      "source_column": "pr_ms",
+      "unit": "ms",
+      "measurement_kind": "replace_with_measured_device_measured_or_expert_annotated"
+    },
+    "qrs_ms": {
+      "source_column": "qrs_ms",
+      "unit": "ms",
+      "measurement_kind": "replace_with_measured_device_measured_or_expert_annotated"
+    },
+    "qt_ms": {
+      "source_column": "qt_ms",
+      "unit": "ms",
+      "measurement_kind": "replace_with_measured_device_measured_or_expert_annotated"
+    },
+    "qtc_ms": {
+      "source_column": "qtc_ms",
+      "unit": "ms",
+      "measurement_kind": "replace_with_measured_device_measured_or_expert_annotated"
+    }
+  }
+}

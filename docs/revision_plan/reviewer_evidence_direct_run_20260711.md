@@ -107,6 +107,55 @@ Colab bootstrap is expensive.
 | Notebook 06 external pooling / probes | CPU for pooling and probe; GPU + Mamba only for missing embeddings | Reuses v3 probe/figure only when its manifest protocol matches. |
 | Notebook 07 final matrix and claim gates | CPU | Fails on stale required OOF/freeze/paired contracts rather than reusing them. |
 
+## Hypothesis-Testing Extension (2026-07-18)
+
+The P0--P2 extension is implemented as four fail-closed runners. It does not
+replace the frozen source-of-truth package until their artifacts are regenerated
+and Notebook 07 passes in strict mode.
+
+| Question | Notebook / runner | Durable outputs | Claim boundary |
+| --- | --- | --- | --- |
+| Does post-hoc calibration change operating-point behavior under matched records and folds? | Notebook 03 / `42_matched_oof_calibration.py` | raw and cross-fitted Platt table, coefficients, paired bootstrap JSON, pooled reliability figure, manifest | Score-level sensitivity only. Calibrators and base models are not refitted inside bootstrap; this is not a nested deployment estimate or clinical threshold validation. |
+| Do the explicit morphology, rhythm, and context/fusion interfaces contribute inside the architecture? | Notebook 04 / `43_structured_ablation_5fold.py` | 20 fold checkpoints, four OOF prediction sets, paired table, TeX table, checkpoint/PCA/initialization audit, manifest | Fresh matched Full is compared with removal of the fixed-transform morphology stream and its dependent cross-attention interaction, removal of the checkpoint-compatible five-RR-plus-six-global-statistics conditioning interface, and joint removal of the context/fusion stack. Raw ECG remains in the first two controls, and Raw Mamba is a separate architecture control. Any conclusion remains endpoint-specific and internal to this training protocol; the no-morphology control does not isolate the fixed transform from its fusion interaction. |
+| Does target-label adaptation form a reproducible learning curve? | Notebook 02 / `35_true_fewshot_head_adaptation.py` | 0/1/5/10% tables and figure for Full, ResNet, Raw Mamba, and Transformer; group-bootstrap caches and manifest | Frozen-encoder linear-head adaptation, not end-to-end fine-tuning. The 10% budget is primary; encoder/head training uncertainty is not resampled by the reported conditional bootstrap. |
+| Do branch embeddings predict measured physiological intervals selectively? | Notebook 06 / `44_physiological_interval_probe.py` | target audit, fold-held-out probe CSV and manuscript TeX table, branch contrasts, summary and manifest | Runs only with reviewed, record-aligned HR/PR/QRS/QT/QTc measurements independent of model outputs. Missing metadata produces a blocker, removes stale TeX output, and generates no proxy targets. |
+
+Notebook 07 then runs `45_hypothesis_control_claim_boundary.py --strict` and
+requires exactly seven rows: morphology, rhythm, context/fusion, calibration,
+robustness, external transfer, and adaptation. The generated
+`table_hypothesis_control_finding_claim_boundary.tex` is the compact
+Hypothesis--Control--Finding--Claim-boundary table used by the manuscript.
+
+### P1 structured-ablation resume contract
+
+- Use A100 High-RAM. Leave the notebook controls in `auto` mode.
+- Every invocation selects the first fold still missing across the four matched
+  variants. Completed folds are authenticated and skipped.
+- A scalar seed alone is not accepted as a matched initialization. For each
+  fold, the trainer first creates one fold-seeded Full reference and copies the
+  exact overlapping state into every removal variant. Checkpoints record
+  per-module-group initialization hashes; the gate invalidates the whole fold
+  family if any retained group differs from Full. A dedicated DataLoader
+  generator also fixes the minibatch order independently of constructor RNG use.
+- Checkpoints are written directly to
+  `revision_artifacts/reports/revision/experimental/structured_ablation_checkpoints/<variant>/`.
+- Fold PCA files are written directly to
+  `revision_artifacts/reports/revision/experimental/structured_ablation_pca_models/`.
+  All four variants for one fold must declare the same PCA SHA, training-index
+  hash, output dimension, and explained-variance value.
+- OOF fold caches are written to
+  `revision_artifacts/reports/revision/predictions/structured_ablation_folds/<variant>/`.
+- The fixed training batch size, epoch budget, loss schedule, EMA rule, folds,
+  threshold, and Q=3 aggregation remain inherited from the canonical training
+  configuration. `STRUCTURED_ABLATION_OOF_BATCH_SIZE` controls export only.
+- Disconnect only after the cell reports a successful canonical mirror publish.
+  A disconnect during a fold requires that fold to restart; already completed
+  folds remain reusable.
+- Checkpoints created before protocol
+  `matched_retrained_structured_ablation_5fold_v3` lack the common-state hash
+  contract and are intentionally retrained once. This prevents an apparently
+  matched comparison whose retained layers started from different weights.
+
 Use a GPU runtime only while a cell reports that inference or training is
 needed. Once all model-level artifacts exist, the paired, bootstrap, final
 matrix, copy, and publication cells can run on CPU.
@@ -120,13 +169,18 @@ matrix, copy, and publication cells can run on CPU.
    export PTB-XL fold 9 when needed for group-safe adaptation.
 3. Run Notebook 03 through calibration CI. Its reviewer-presentation cell may
    print `Deferred` at this point; that is expected until Notebook 04 paired
-   artifacts are current.
+   artifacts are current. Also run **Matched Cross-Fitted Calibration Audit**;
+   it is CPU-only and reuses bootstrap entries only when the semantic probability
+   hashes and frozen OOF contract match.
 4. Run Notebook 04. Leave the heavy runner controls as `auto`. For any missing
    Raw Mamba, Transformer, frozen-transform MLP, or controlled
    frozen-versus-partially-learnable morphology folds, the notebook runs one
    fold at a time and publishes the Drive mirror immediately. Then run every
    paired-comparison cell, including the controlled-kernel paired bootstrap,
-   and the completion ledger.
+   and the completion ledger. Then run **Matched Five-Fold Structured Ablation
+   Runner** repeatedly on A100 until all four variants have five authenticated
+   folds. Its final invocation exports OOF predictions and computes the paired
+   record-bootstrap table.
 5. Return to the new end-of-Notebook-02 cells. Their first pass after Notebook
    04 produces or verifies zero-target-label PTB-XL/Georgia ResNet1D/CNN and
    Raw Mamba outputs. A Transformer is added only if its in-domain OOF and
@@ -147,8 +201,31 @@ matrix, copy, and publication cells can run on CPU.
    Run
    representation extraction only if missing; it needs the same Mamba runtime
    as Full ECG-RAMBA. The v3 probe runs afterwards and produces the audit
-   figure plus fold-level probe table.
-9. Run Notebook 07. It first runs claim-readiness gates, then writes final
+   figure plus fold-level probe table. The measured physiological interval probe
+   is optional and CPU-only after embeddings exist; a blocker is the correct
+   outcome when reviewed measurements are unavailable.
+
+### Measured physiological-interval metadata gate
+
+Notebook 06 searches for
+`/content/drive/MyDrive/ECG-Ramba/physiological_interval_metadata.csv` and then
+`/content/drive/MyDrive/ECG-Ramba/metadata/physiological_interval_metadata.csv`.
+The table must contain one unique `record_id` row and at least one genuinely
+measured target among `heart_rate_bpm`, `pr_ms`, `qrs_ms`, `qt_ms`, and
+`qtc_ms`. Do not derive these columns from ECG-RAMBA predictions or from the
+branch embeddings being probed.
+
+Place a reviewed sidecar next to the CSV as
+`physiological_interval_metadata.csv.provenance.json`, or pass its path
+explicitly. Start from the checked-in templates
+`docs/revision_plan/physiological_interval_metadata_template.csv` and
+`docs/revision_plan/physiological_interval_metadata_provenance_template.json`.
+The template deliberately fails closed: change `status` to `reviewed`, declare
+`independent_of_model_outputs=true`, and replace every target's source column,
+unit, and measurement kind only after the source audit is complete. Accepted
+measurement kinds are `measured`, `device_measured`, and `expert_annotated`.
+9. Run Notebook 07. It first runs claim-readiness gates and the strict
+   Hypothesis--Control--Finding--Claim-boundary ledger, then writes final
    evidence tables only when calibration and paired OOF contracts match the
    active frozen OOF. It mirrors all artifacts and copies the current source
    tables to the output-only `final_evidence_tables` snapshot with an export

@@ -163,6 +163,51 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook06_physological_probe_is_provenance_bound_and_reusable(self):
+        _, source = notebook_source("06_pooling_and_representation.ipynb")
+        for token in (
+            "scripts/revision/44_physiological_interval_probe.py",
+            "RUNNER_SOURCE_PATH",
+            "--embedding-manifest reports/revision/manifests/representation_embedding_manifest.json",
+            "RUN_PHYSIOLOGICAL_INTERVAL_PROBE = 'auto'",
+            "Physiological probe reusable:",
+            "existing_manifest.get('runner')",
+            "existing_inputs.get('embedding_manifest')",
+            "table_physiological_interval_probe_contrasts.csv",
+            "table_physiological_interval_probe.tex",
+            "existing_outputs.get(physiology_tex_path.as_posix())",
+        ):
+            self.assertIn(token, source)
+
+    def test_notebook04_structured_ablation_uses_canonical_caches_and_source_guard(self):
+        _, source = notebook_source("04_baselines_and_component_checks.ipynb")
+        for token in (
+            "scripts/revision/43_structured_ablation_5fold.py",
+            "scripts/revision/01_generate_predictions.py",
+            "scripts/train.py",
+            "src/model.py",
+            "src/features.py",
+            "matched_retrained_structured_ablation_5fold_v3",
+            "fold_seeded_full_reference_overlap_v1",
+            "structured_ablation_metric_cache",
+            "Structured-ablation OOF package reusable:",
+            "expected_checkpoint_hashes",
+            "prediction_contract.get('sha256')",
+        ):
+            self.assertIn(token, source)
+
+    def test_notebook03_authenticates_every_matched_calibration_input(self):
+        _, source = notebook_source("03_calibration_and_ci.ipynb")
+        for token in (
+            "matched_cross_fitted_per_class_platt_v2",
+            "fully nested deploy-time calibration estimate",
+            "require_canonical_matched_input",
+            "Canonical matched calibration inputs authenticated:",
+            "Matched calibration input is not authenticated by canonical Drive",
+            "Active matched input differs from canonical Drive",
+        ):
+            self.assertIn(token, source)
+
     def test_notebook06_finds_current_notebook02_mamba_installer(self):
         payload = notebook_payload("02_predictions_and_external_eval.ipynb")
         required_markers = (
@@ -202,7 +247,12 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         for token in (
             "FINAL_EVIDENCE_SCHEMA_VERSION",
             "FINAL_EVIDENCE_CAPABILITIES",
+            "adaptation_learning_curve",
             "group_safe_score_calibration_v2",
+            "matched_cross_fitted_calibration",
+            "matched_structured_ablation_5fold",
+            "matched_structured_ablation_fresh_full",
+            "physiological_interval_probe_gate",
             "true_fewshot_frozen_encoder_head_v2",
             "representation_probe_v3",
             "reviewer_presentation_assets",
@@ -213,8 +263,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
-        self.assertIn("required_generator_schema = 7", source)
-        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 7", generator_source)
+        self.assertIn("required_generator_schema = 9", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 9", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 

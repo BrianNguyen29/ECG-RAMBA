@@ -64,8 +64,13 @@ from scripts.revision.common import (  # noqa: E402
     power_mean,
     save_csv,
     save_json,
+    sha256_file,
 )
 from src.provenance import record_order_fingerprint  # noqa: E402
+from src.features import (  # noqa: E402
+    HRV36_CHECKPOINT_SEMANTICS,
+    checkpoint_compatible_hrv36_contract,
+)
 
 CHECKPOINT_KINDS = ["best", "final", "best_ema", "final_ema", "best_raw", "final_raw"]
 AMP_DTYPE = (
@@ -78,6 +83,22 @@ AMP_DTYPE_NAME = (
     if DEVICE == "cuda"
     else "float32"
 )
+
+
+def oof_protocol_names(
+    checkpoint_kind: str,
+    ablation_variant: str,
+    aggregation_q: float,
+) -> tuple[str, str]:
+    """Keep the canonical Full protocol stable while naming retrained removals."""
+
+    variant_token = "" if ablation_variant == "full" else f"_{ablation_variant}"
+    record_protocol = (
+        f"fold_{checkpoint_kind}{variant_token}_{POWER_MEAN_IMPLEMENTATION}_"
+        f"q{float(aggregation_q):g}_threshold_0.5"
+    )
+    slice_protocol = f"slice_level_fold_{checkpoint_kind}{variant_token}"
+    return record_protocol, slice_protocol
 
 
 def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -263,7 +284,10 @@ def fold_pca_model_path(
     tr_idx: np.ndarray,
     source_config_hash: str,
 ) -> Path:
-    cache_dir = Path(PATHS["cache_dir"]) / "revision_pca_models"
+    cache_dir = Path(
+        os.environ.get("ECG_RAMBA_PCA_CACHE_DIR")
+        or (Path(PATHS["cache_dir"]) / "revision_pca_models")
+    )
     train_hash = index_fingerprint(tr_idx)
     return cache_dir / (
         f"fold{fold_num}_pca_v{CACHE_SCHEMA_VERSION}_{source_config_hash}_"
@@ -558,6 +582,28 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["oof"], default="oof")
     parser.add_argument("--checkpoint-kind", choices=CHECKPOINT_KINDS, default="best")
+    parser.add_argument(
+        "--model-dir",
+        type=Path,
+        default=None,
+        help="Checkpoint directory override for a matched retrained architecture variant.",
+    )
+    parser.add_argument(
+        "--folds-path",
+        type=Path,
+        default=None,
+        help="Explicit canonical folds.pkl. Defaults to <model-dir>/folds.pkl.",
+    )
+    parser.add_argument(
+        "--artifact-stem",
+        default=None,
+        help="Output stem override; required for non-Full architecture variants.",
+    )
+    parser.add_argument(
+        "--ablation-variant",
+        default="full",
+        choices=["full", "no_morphology", "no_rhythm", "no_fusion", "no_context_fusion"],
+    )
     parser.add_argument("--batch-size", type=int, default=max(1, int(CONFIG["batch_size"])))
     parser.add_argument(
         "--num-workers",
@@ -626,8 +672,17 @@ def slice_record(x: np.ndarray) -> list[np.ndarray]:
     return slices
 
 
-def load_folds(y: np.ndarray, subjects: np.ndarray) -> list[dict[str, np.ndarray]]:
-    folds_path = Path(PATHS["model_dir"]) / "folds.pkl"
+def load_folds(
+    y: np.ndarray,
+    subjects: np.ndarray,
+    folds_path_override: Path | None = None,
+) -> list[dict[str, np.ndarray]]:
+    folds_path = (
+        folds_path_override
+        if folds_path_override is not None
+        else Path(PATHS["model_dir"]) / "folds.pkl"
+    )
+    folds_path = folds_path if folds_path.is_absolute() else PROJECT_ROOT / folds_path
     if folds_path.exists():
         folds = joblib.load(folds_path)
         normalized = []
@@ -713,6 +768,32 @@ def load_checkpoint_payload(path: Path, checkpoint_kind: str) -> tuple[dict, dic
     source_config_hash = checkpoint.get("config_hash")
     if not source_config_hash:
         raise ValueError(f"Checkpoint lacks config_hash provenance: {path}")
+    expected_feature_contract = {"hrv36": checkpoint_compatible_hrv36_contract()}
+    declared_feature_contract = checkpoint.get("feature_contract")
+    if declared_feature_contract is None:
+        feature_contract = expected_feature_contract
+        feature_contract_provenance = "inferred_audited_legacy_chapman_checkpoint"
+    else:
+        feature_contract = dict(declared_feature_contract)
+        feature_contract_provenance = "declared_in_checkpoint"
+        if feature_contract != expected_feature_contract:
+            raise ValueError(
+                f"Checkpoint feature contract mismatch for {path}: "
+                f"found={feature_contract!r} expected={expected_feature_contract!r}"
+            )
+    architecture_contract = checkpoint.get("architecture_contract")
+    pca_contract = checkpoint.get("pca_contract")
+    if architecture_contract == "ecg_ramba_structured_ablation_v1":
+        if not isinstance(pca_contract, dict):
+            raise ValueError(f"Structured-ablation checkpoint lacks PCA contract: {path}")
+        pca_path_raw = str(pca_contract.get("path") or "")
+        pca_path = Path(pca_path_raw) if pca_path_raw else None
+        if (
+            pca_path is None
+            or not pca_path.is_file()
+            or sha256_file(pca_path) != pca_contract.get("sha256")
+        ):
+            raise ValueError(f"Structured-ablation checkpoint PCA artifact is missing/stale: {path}")
     metadata = {
         "source_config_hash": str(source_config_hash),
         "weights_kind": actual,
@@ -724,6 +805,12 @@ def load_checkpoint_payload(path: Path, checkpoint_kind: str) -> tuple[dict, dic
         "dataset_record_order_fingerprint": checkpoint.get(
             "dataset_record_order_fingerprint"
         ),
+        "ablation_variant": checkpoint.get("ablation_variant", "full"),
+        "ablation_spec": checkpoint.get("ablation_spec", {}),
+        "architecture_contract": architecture_contract,
+        "feature_contract": feature_contract,
+        "feature_contract_provenance": feature_contract_provenance,
+        "pca_contract": pca_contract,
     }
     return checkpoint, metadata
 
@@ -733,8 +820,9 @@ def load_model_for_fold(
     checkpoint_kind: str,
     checkpoint_file: Path | None = None,
     checkpoint_payload: dict | None = None,
+    ablation_variant: str | None = None,
 ) -> torch.nn.Module:
-    from src.model import ECGRambaV7Advanced
+    from src.model import ECGRambaV7Advanced, resolve_structured_ablation
 
     path = checkpoint_file or checkpoint_path(fold, checkpoint_kind)
     print(f"Loading checkpoint: {path}")
@@ -745,7 +833,15 @@ def load_model_for_fold(
     actual = checkpoint.get("weights_kind") if isinstance(checkpoint, dict) else None
     validate_checkpoint_weights_kind(checkpoint_kind, actual, path)
 
-    model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
+    checkpoint_variant = checkpoint.get("ablation_variant", "full")
+    variant, expected_spec = resolve_structured_ablation(ablation_variant or checkpoint_variant)
+    checkpoint_spec = dict(checkpoint.get("ablation_spec", {}))
+    if checkpoint_variant != variant or checkpoint_spec != expected_spec:
+        raise RuntimeError(
+            f"Checkpoint architecture contract mismatch for {path}: "
+            f"checkpoint=({checkpoint_variant}, {checkpoint_spec}) requested=({variant}, {expected_spec})"
+        )
+    model = ECGRambaV7Advanced(cfg=CONFIG, ablation=expected_spec).to(DEVICE)
     try:
         model.load_state_dict(state_dict, strict=True)
     except RuntimeError as exc:
@@ -958,7 +1054,7 @@ def generate_oof(args: argparse.Namespace) -> None:
     X_hrv = generate_hrv_cache(X, X_raw_amp, subjects) if CONFIG["use_hrv"] else np.zeros(
         (n_records, CONFIG["hrv_dim"]), dtype=np.float32
     )
-    folds = load_folds(y, subjects)
+    folds = load_folds(y, subjects, args.folds_path)
 
     if args.limit_records > 0:
         allowed = set(range(n_records))
@@ -1003,6 +1099,11 @@ def generate_oof(args: argparse.Namespace) -> None:
             ckpt_path,
             args.checkpoint_kind,
         )
+        if checkpoint_meta["ablation_variant"] != args.ablation_variant:
+            raise RuntimeError(
+                f"Fold {fold_num} checkpoint variant {checkpoint_meta['ablation_variant']} "
+                f"does not match requested {args.ablation_variant}"
+            )
         if (
             args.limit_records == 0
             and checkpoint_meta["dataset_record_order_fingerprint"]
@@ -1130,6 +1231,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             args.checkpoint_kind,
             checkpoint_file=ckpt_path,
             checkpoint_payload=checkpoint_payload,
+            ablation_variant=args.ablation_variant,
         )
         del checkpoint_payload
         infer_dataset = ECGSliceDatasetInfer(xs, xh, xhr, rids)
@@ -1196,24 +1298,35 @@ def generate_oof(args: argparse.Namespace) -> None:
         print(f"Warning: {missing} records did not receive predictions")
 
     git_commit = run_meta["git"]["commit"] or ""
-    protocol = (
-        f"fold_{args.checkpoint_kind}_{POWER_MEAN_IMPLEMENTATION}_"
-        f"q{float(CONFIG['power_mean_q']):g}_threshold_0.5"
-    )
     threshold = 0.5
     aggregation_q = float(CONFIG["power_mean_q"])
+    protocol, slice_protocol = oof_protocol_names(
+        args.checkpoint_kind,
+        args.ablation_variant,
+        aggregation_q,
+    )
     if len(source_config_hashes) != 1:
         raise RuntimeError(
             "All fold checkpoints must share one source_config_hash; found "
             f"{sorted(source_config_hashes)}"
         )
     source_config_hash = next(iter(source_config_hashes))
+    expected_feature_contract = {"hrv36": checkpoint_compatible_hrv36_contract()}
+    observed_feature_contracts = {
+        json.dumps(info.get("feature_contract"), sort_keys=True)
+        for info in checkpoint_infos
+    }
+    if observed_feature_contracts != {json.dumps(expected_feature_contract, sort_keys=True)}:
+        raise RuntimeError(
+            "Fold checkpoints do not share the checkpoint-compatible HRV36 feature contract"
+        )
+    feature_contract_json = json.dumps(expected_feature_contract, sort_keys=True)
     checkpoint_fingerprints_json = json.dumps(
         sorted(checkpoint_infos, key=lambda row: int(row["fold"])),
         sort_keys=True,
     )
 
-    artifact_stem = oof_artifact_stem(args.checkpoint_kind)
+    artifact_stem = args.artifact_stem or oof_artifact_stem(args.checkpoint_kind)
     out_path = PREDICTION_DIR / f"{artifact_stem}_predictions.npz"
     np.savez_compressed(
         out_path,
@@ -1240,6 +1353,10 @@ def generate_oof(args: argparse.Namespace) -> None:
         cache_schema_version=np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         checkpoint_fingerprints_json=np.asarray(checkpoint_fingerprints_json),
         threshold=np.asarray(threshold, dtype=np.float32),
+        ablation_variant=np.asarray(args.ablation_variant),
+        architecture_contract=np.asarray("ecg_ramba_structured_ablation_v1"),
+        hrv_feature_semantics=np.asarray(HRV36_CHECKPOINT_SEMANTICS),
+        feature_contract_json=np.asarray(feature_contract_json),
     )
     print(f"Wrote: {out_path}")
 
@@ -1254,7 +1371,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             fold_id=np.concatenate(slice_fold_id_all, axis=0),
             class_names=np.asarray(CLASSES),
             dataset=np.asarray("chapman_oof"),
-            protocol=np.asarray(f"slice_level_fold_{args.checkpoint_kind}"),
+            protocol=np.asarray(slice_protocol),
             config_hash=np.asarray(EVALUATION_CONFIG_HASH),
             source_config_hash=np.asarray(source_config_hash),
             evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
@@ -1306,6 +1423,9 @@ def generate_oof(args: argparse.Namespace) -> None:
         "n_classes": int(n_classes),
         "class_names": CLASSES,
         "checkpoint_kind_requested": args.checkpoint_kind,
+        "ablation_variant": args.ablation_variant,
+        "architecture_contract": "ecg_ramba_structured_ablation_v1",
+        "feature_contract": expected_feature_contract,
         "batch_size": int(args.batch_size),
         "inference_amp_dtype": AMP_DTYPE_NAME,
         "num_workers": int(args.num_workers),
@@ -1332,6 +1452,9 @@ def generate_oof(args: argparse.Namespace) -> None:
         "dataset": "chapman_oof",
         "created_utc": created_utc,
         "protocol": protocol,
+        "ablation_variant": args.ablation_variant,
+        "architecture_contract": "ecg_ramba_structured_ablation_v1",
+        "feature_contract": expected_feature_contract,
         "dataset_record_order_fingerprint": dataset_record_fingerprint,
         "runtime": run_meta,
         "config": config_meta,
@@ -1364,6 +1487,11 @@ def generate_oof(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.model_dir is not None:
+        model_dir = args.model_dir if args.model_dir.is_absolute() else PROJECT_ROOT / args.model_dir
+        PATHS["model_dir"] = str(model_dir.resolve())
+    if args.ablation_variant != "full" and not args.artifact_stem:
+        raise ValueError("--artifact-stem is required for non-Full ablation exports")
     validate_runtime_memory(args)
     if args.dataset == "oof":
         generate_oof(args)

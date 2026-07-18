@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.revision.common import (  # noqa: E402
     EXPERIMENTAL_DIR,
+    FIGURE_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
@@ -107,6 +108,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-paired-table", type=Path, default=None)
     parser.add_argument("--out-bootstrap", type=Path, default=None)
     parser.add_argument("--out-primary-table", type=Path, default=None)
+    parser.add_argument("--out-learning-curve-table", type=Path, default=None)
+    parser.add_argument("--out-learning-curve-figure", type=Path, default=None)
     parser.add_argument("--out-coefficients", type=Path, default=None)
     parser.add_argument("--out-splits", type=Path, default=None)
     parser.add_argument("--out-manifest", type=Path, default=None)
@@ -192,6 +195,14 @@ def default_paths(args: argparse.Namespace) -> dict[str, Path]:
         "paired": resolve(args.out_paired_table or TABLE_DIR / f"table_true_fewshot_head_{dataset}_paired.csv"),
         "bootstrap": resolve(args.out_bootstrap or METRIC_DIR / f"true_fewshot_head_{dataset}_bootstrap.json"),
         "primary": resolve(args.out_primary_table or TABLE_DIR / f"table_true_fewshot_head_{dataset}_primary.csv"),
+        "learning_curve": resolve(
+            args.out_learning_curve_table
+            or TABLE_DIR / f"table_true_fewshot_head_{dataset}_learning_curve.csv"
+        ),
+        "learning_curve_figure": resolve(
+            args.out_learning_curve_figure
+            or FIGURE_DIR / f"figure_true_fewshot_head_{dataset}_learning_curve.png"
+        ),
         "coefficients": resolve(args.out_coefficients or TABLE_DIR / f"table_true_fewshot_head_{dataset}_coefficients.csv"),
         "splits": resolve(args.out_splits or MANIFEST_DIR / f"true_fewshot_head_{dataset}_splits.npz"),
         "manifest": resolve(args.out_manifest or MANIFEST_DIR / f"true_fewshot_head_{dataset}_manifest.json"),
@@ -696,6 +707,11 @@ def primary_endpoint_rows(
                 "n_boot_valid": min(adapted_valid, improvement_valid),
                 "bootstrap_seed": bootstrap_seed,
                 "bootstrap_unit": "patient/source-record group",
+                "uncertainty_scope": (
+                    "shared patient-group bootstrap conditional on the fixed encoder/head fits and "
+                    "the pre-specified adaptation seed grid; training-seed and encoder-refit variability "
+                    "are not included"
+                ),
                 "interpretation": interval_interpretation(
                     improvement_low,
                     improvement_high,
@@ -750,6 +766,11 @@ def primary_endpoint_rows(
                     "n_boot_valid": valid,
                     "bootstrap_seed": bootstrap_seed,
                     "bootstrap_unit": "patient/source-record group",
+                    "uncertainty_scope": (
+                        "shared patient-group bootstrap conditional on the fixed encoder/head fits and "
+                        "the pre-specified adaptation seed grid; training-seed and encoder-refit variability "
+                        "are not included"
+                    ),
                     "interpretation": interval_interpretation(
                         low,
                         high,
@@ -768,8 +789,73 @@ def primary_endpoint_rows(
         "n_boot": n_boot,
         "n_groups": len(np.unique(groups)),
         "n_seeds": len(next(iter(predictions.values()))),
+        "uncertainty_scope": (
+            "shared patient-group bootstrap conditional on fixed encoder/head fits and the "
+            "pre-specified adaptation seed grid; no encoder or head refit within bootstrap replicates"
+        ),
         "items": bootstrap_payload,
     }
+
+
+def write_learning_curve_figure(rows: list[dict[str, Any]], path: Path) -> None:
+    """Plot fold-safe patient-bootstrap learning curves for F1 and PR-AUC."""
+
+    import matplotlib.pyplot as plt
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(8.2, 3.4), dpi=180, sharex=True)
+    if not rows:
+        for axis in axes:
+            axis.text(0.5, 0.5, "Shared-test-set learning curve unavailable", ha="center", va="center")
+            axis.set_axis_off()
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+        return
+    colors = {
+        "full": "#226F54",
+        "resnet": "#3366AA",
+        "raw_mamba": "#B34233",
+        "transformer": "#8A5A9E",
+    }
+    for axis, metric, title in zip(axes, ["f1_macro", "pr_auc_macro"], ["Macro F1", "Macro PR-AUC"]):
+        metric_rows = [
+            row
+            for row in rows
+            if row.get("comparison_type") == "adapted_vs_zero_target_label"
+            and row.get("metric") == metric
+        ]
+        for model in sorted({str(row["model"]) for row in metric_rows}):
+            selected = sorted(
+                [row for row in metric_rows if row["model"] == model],
+                key=lambda row: float(row["fraction"]),
+            )
+            x = np.asarray([100.0 * float(row["fraction"]) for row in selected])
+            y = np.asarray([float(row["value_mean_across_seeds"]) for row in selected])
+            low = np.asarray([float(row["value_ci_low"]) for row in selected])
+            high = np.asarray([float(row["value_ci_high"]) for row in selected])
+            axis.errorbar(
+                x,
+                y,
+                yerr=np.vstack([
+                    np.maximum(0.0, y - low),
+                    np.maximum(0.0, high - y),
+                ]),
+                marker="o",
+                linewidth=1.4,
+                capsize=2,
+                label=MODEL_LABELS[model],
+                color=colors.get(model),
+            )
+        axis.set_title(title)
+        axis.set_xlabel("Target labels (%)")
+        axis.grid(alpha=0.25, linewidth=0.5)
+    axes[0].set_ylabel("Metric value")
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=min(4, len(labels)), frameon=False)
+    fig.tight_layout(rect=(0, 0.14, 1, 1))
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
 
 
 def main() -> None:
@@ -849,6 +935,12 @@ def main() -> None:
     primary_zero_probabilities: dict[str, np.ndarray] = {}
     primary_y_true: np.ndarray | None = None
     primary_groups: np.ndarray | None = None
+    curve_predictions: dict[float, dict[str, dict[int, np.ndarray]]] = {
+        fraction: {model: {} for model in models} for fraction in fractions
+    }
+    curve_zero_probabilities: dict[str, np.ndarray] = {}
+    curve_y_true: np.ndarray | None = None
+    curve_groups: np.ndarray | None = None
     for seed in seeds:
         if args.dataset == "ptbxl":
             pool_groups = np.random.default_rng(seed).permutation(
@@ -1049,6 +1141,25 @@ def main() -> None:
                     }
                 bootstrap[f"{model}_{split_key}"] = metric_item
 
+            if args.dataset == "ptbxl":
+                if curve_y_true is None:
+                    curve_y_true = y_test.copy()
+                    curve_groups = groups_test.copy()
+                elif not np.array_equal(curve_y_true, y_test) or not np.array_equal(
+                    curve_groups, groups_test
+                ):
+                    raise RuntimeError("PTB-XL learning-curve test groups differ across seeds")
+                for model in models:
+                    curve_predictions[fraction][model][seed] = predictions_by_model[model].copy()
+                    zero = model_data[model]["test_pred"]["y_prob"][test_idx]
+                    if model in curve_zero_probabilities and not np.array_equal(
+                        curve_zero_probabilities[model], zero
+                    ):
+                        raise RuntimeError(
+                            f"{model}: learning-curve zero-target probabilities changed across seeds"
+                        )
+                    curve_zero_probabilities[model] = zero.copy()
+
             if args.dataset == "ptbxl" and math.isclose(
                 fraction, args.primary_fraction, abs_tol=1e-12
             ):
@@ -1159,6 +1270,43 @@ def main() -> None:
             primary_fraction=args.primary_fraction,
         )
 
+    learning_curve_rows: list[dict[str, Any]] = []
+    learning_curve_bootstrap: dict[str, Any] = {}
+    if args.dataset == "ptbxl":
+        if curve_y_true is None or curve_groups is None:
+            raise RuntimeError("PTB-XL learning-curve predictions were not collected")
+        expected_seed_set = set(seeds)
+        for fraction in fractions:
+            incomplete = {
+                model: sorted(expected_seed_set - set(model_predictions))
+                for model, model_predictions in curve_predictions[fraction].items()
+                if set(model_predictions) != expected_seed_set
+            }
+            if incomplete:
+                raise RuntimeError(
+                    f"Learning-curve seed grid is incomplete at fraction={fraction}: {incomplete}"
+                )
+            fraction_rows, fraction_bootstrap = primary_endpoint_rows(
+                dataset=args.dataset,
+                y_true=curve_y_true,
+                groups=curve_groups,
+                predictions=curve_predictions[fraction],
+                zero_probabilities=curve_zero_probabilities,
+                threshold=args.threshold,
+                n_bins=args.n_bins,
+                n_boot=args.n_boot,
+                primary_fraction=fraction,
+                bootstrap_seed=20260712 + int(round(fraction * 10000)),
+            )
+            for row in fraction_rows:
+                row["fraction"] = fraction
+                row["value_mean_across_seeds"] = row.pop("primary_value_mean_across_seeds", None)
+                row["value_ci_low"] = row.pop("primary_value_ci_low", None)
+                row["value_ci_high"] = row.pop("primary_value_ci_high", None)
+                row["improvement_over_zero"] = row.pop("improvement_primary_over_zero", None)
+            learning_curve_rows.extend(fraction_rows)
+            learning_curve_bootstrap[f"fraction_{fraction:g}"] = fraction_bootstrap
+
     save_npz_compressed_atomic(
         paths["splits"],
         protocol=np.asarray(PROTOCOL),
@@ -1169,6 +1317,8 @@ def main() -> None:
     save_csv(paths["table"], rows)
     save_csv(paths["paired"], paired_rows)
     save_csv(paths["primary"], primary_rows)
+    save_csv(paths["learning_curve"], learning_curve_rows)
+    write_learning_curve_figure(learning_curve_rows, paths["learning_curve_figure"])
     save_csv(paths["coefficients"], coefficient_rows)
     save_json(
         paths["bootstrap"],
@@ -1180,6 +1330,7 @@ def main() -> None:
             "bootstrap_unit": "patient/source-record group",
             "items": bootstrap,
             "primary_endpoint": primary_bootstrap,
+            "learning_curve": learning_curve_bootstrap,
         },
     )
     outputs = list(paths.values())[:-1]
@@ -1215,6 +1366,19 @@ def main() -> None:
                 "uncertainty": "shared_patient_group_bootstrap_applied_to_all_seeds_and_models",
                 "bootstrap_seed": 20260712,
                 "n_boot": args.n_boot,
+            },
+            "learning_curve_inference": {
+                "fractions": fractions,
+                "point_estimate": "mean_metric_across_pre_specified_adaptation_seeds",
+                "uncertainty": "shared_patient_group_bootstrap_within_each_fraction",
+                "uncertainty_scope": (
+                    "Intervals condition on the five pre-specified adaptation seeds and fixed fitted "
+                    "heads; they do not estimate encoder-retraining or adaptation-seed population variance."
+                ),
+                "claim_boundary": (
+                    "Within-model adaptation trajectory; absolute paired model comparisons remain "
+                    "separate and this curve does not establish ECG-RAMBA superiority."
+                ),
             },
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
             "fraction_sampling": "nested_random_group_prefix_per_seed",

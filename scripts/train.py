@@ -35,12 +35,14 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE
 from src.data_loader import load_chapman_multilabel
 from src.features import (
+    HRV36_CHECKPOINT_SEMANTICS,
+    checkpoint_compatible_hrv36_contract,
     generate_raw_rocket_cache,
     generate_hrv_cache,
     fit_pca_on_train,
     apply_pca,
 )
-from src.model import ECGRambaV7Advanced
+from src.model import ECGRambaV7Advanced, resolve_structured_ablation
 from src.training_data import (
     LazyECGSliceDataset,
     audit_fold_splits,
@@ -77,11 +79,128 @@ def index_fingerprint(indices: np.ndarray) -> str:
     return hashlib.sha256(arr.view(np.uint8)).hexdigest()[:16]
 
 
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def cpu_state_dict(model: torch.nn.Module) -> dict:
     return {
         key: value.detach().cpu().clone()
         for key, value in model.state_dict().items()
     }
+
+
+INITIALIZATION_GROUP_PREFIXES = {
+    "raw_tokenizer": ("spatial_attn.", "tok."),
+    "morphology_interface": ("rocket_perceiver.",),
+    "rhythm_interface": ("hrv_proj.",),
+    "cross_fusion": ("cross_fusion.",),
+    "feature_projection": ("feature_proj.",),
+    "final_perceiver": (
+        "final_latents",
+        "final_cross_attn.",
+        "final_self_attn.",
+        "final_norm1.",
+        "final_norm2.",
+        "final_norm3.",
+        "final_ffn.",
+    ),
+    "context_backbone": ("layers.",),
+    "normalization_head": ("norm.", "head."),
+}
+
+
+def initialization_group_hashes(state: dict[str, torch.Tensor]) -> dict[str, str]:
+    """Hash initial tensors by architectural group without serializing a checkpoint."""
+
+    output = {}
+    for group, prefixes in INITIALIZATION_GROUP_PREFIXES.items():
+        keys = sorted(
+            key
+            for key in state
+            if any(key == prefix or key.startswith(prefix) for prefix in prefixes)
+        )
+        if not keys:
+            continue
+        digest = hashlib.sha256()
+        for key in keys:
+            tensor = state[key].detach().cpu().contiguous()
+            digest.update(key.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+        output[group] = digest.hexdigest()
+    return output
+
+
+def initialize_matched_structured_model(
+    *,
+    cfg: dict,
+    ablation_variant: str,
+    ablation_spec: dict,
+    fold_seed: int,
+) -> tuple[torch.nn.Module, dict]:
+    """Initialize every retained module from one fold-specific Full reference.
+
+    Reusing only a scalar seed is insufficient for a structural ablation: removing
+    a module changes RNG consumption and therefore changes the initialization of
+    modules constructed later. Building a Full reference first and copying the
+    exact overlapping state makes retained modules identical at step zero.
+    """
+
+    set_seed(fold_seed)
+    reference = ECGRambaV7Advanced(cfg=cfg, ablation={})
+    reference_state = cpu_state_dict(reference)
+    reference_hashes = initialization_group_hashes(reference_state)
+
+    if ablation_variant == "full":
+        model = reference
+        variant_state = reference_state
+        loaded_keys = sorted(reference_state)
+    else:
+        model = ECGRambaV7Advanced(cfg=cfg, ablation=ablation_spec)
+        variant_initial_state = model.state_dict()
+        variant_keys = sorted(variant_initial_state)
+        missing_from_reference = [key for key in variant_keys if key not in reference_state]
+        shape_mismatches = [
+            key
+            for key in variant_keys
+            if key in reference_state
+            and tuple(variant_initial_state[key].shape) != tuple(reference_state[key].shape)
+        ]
+        if missing_from_reference or shape_mismatches:
+            raise RuntimeError(
+                "Structured ablation is not a strict subset of the Full initialization: "
+                f"missing={missing_from_reference[:8]} shape_mismatch={shape_mismatches[:8]}"
+            )
+        overlap = {key: reference_state[key] for key in variant_keys}
+        model.load_state_dict(overlap, strict=True)
+        variant_state = cpu_state_dict(model)
+        loaded_keys = variant_keys
+        del reference, variant_initial_state
+
+    variant_hashes = initialization_group_hashes(variant_state)
+    for group, observed in variant_hashes.items():
+        if observed != reference_hashes.get(group):
+            raise RuntimeError(
+                f"Matched initialization failed for group={group}: "
+                f"variant={observed} reference={reference_hashes.get(group)}"
+            )
+    contract = {
+        "policy": "fold_seeded_full_reference_overlap_v1",
+        "reference_variant": "full",
+        "reference_seed": int(fold_seed),
+        "loaded_reference_key_count": len(loaded_keys),
+        "variant_state_key_count": len(variant_state),
+        "variant_group_sha256": variant_hashes,
+        "reference_group_sha256": reference_hashes,
+    }
+    del reference_state, variant_state
+    return model, contract
 
 
 def float_metrics(metrics: dict | None) -> dict:
@@ -116,10 +235,15 @@ def checkpoint_payload(
     train_indices: np.ndarray,
     val_indices: np.ndarray,
     pca_variance: float,
+    pca_path: str,
+    pca_sha256: str,
     dataset_record_order_fingerprint: str,
     selection_rule: str,
     metrics_weights_kind: str | None = None,
     selection_metrics: dict | None = None,
+    ablation_variant: str = "full",
+    ablation_spec: dict | None = None,
+    initialization_contract: dict | None = None,
 ) -> dict:
     metrics = float_metrics(metrics)
     selection_metrics = float_metrics(selection_metrics)
@@ -135,6 +259,7 @@ def checkpoint_payload(
         "metrics": metrics,
         "selection_rule": selection_rule,
         "selection_metrics": selection_metrics,
+        "training_seed": int(CONFIG["seeds"][0]) + int(fold),
         "config_hash": CONFIG_HASH,
         "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
         "class_names": list(CLASSES),
@@ -153,6 +278,7 @@ def checkpoint_payload(
             "lr_min": float(CONFIG["lr_min"]),
             "ema_decay": float(CONFIG["ema_decay"]),
             "ema_scope": "trainable_parameters_only",
+            "fold_seed_policy": "base_seed_plus_one_based_fold_id",
             "amp_dtype": AMP_DTYPE_NAME,
             "model_selection": (
                 "fixed_final_epoch_for_manuscript_oof; "
@@ -166,7 +292,22 @@ def checkpoint_payload(
             "val_index_hash": index_fingerprint(val_indices),
         },
         "pca_explained_variance": float(pca_variance),
+        "pca_contract": {
+            "path": str(pca_path),
+            "sha256": str(pca_sha256),
+            "explained_variance_ratio_sum": float(pca_variance),
+            "fit_scope": "training_records_of_this_outer_fold_only",
+            "train_index_hash": index_fingerprint(train_indices),
+            "output_dim": int(CONFIG["hydra_dim"]),
+        },
         "checkpoint_contract": "explicit_weights_kind_v2",
+        "ablation_variant": str(ablation_variant),
+        "ablation_spec": dict(ablation_spec or {}),
+        "architecture_contract": "ecg_ramba_structured_ablation_v1",
+        "initialization_contract": dict(initialization_contract or {}),
+        "feature_contract": {
+            "hrv36": checkpoint_compatible_hrv36_contract(),
+        },
     }
 
 
@@ -186,7 +327,9 @@ def save_fold_pca_model(fold: int, pca, train_indices: np.ndarray) -> str:
 
 
 def fold_pca_model_path(fold: int, train_indices: np.ndarray) -> str:
-    cache_dir = os.path.join(PATHS["cache_dir"], "revision_pca_models")
+    cache_dir = os.environ.get("ECG_RAMBA_PCA_CACHE_DIR") or os.path.join(
+        PATHS["cache_dir"], "revision_pca_models"
+    )
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(
         cache_dir,
@@ -242,7 +385,7 @@ def read_existing_rows(paths: list[str]) -> list[dict]:
     return []
 
 
-def make_loader(dataset, *, shuffle: bool) -> DataLoader:
+def make_loader(dataset, *, shuffle: bool, seed: int | None = None) -> DataLoader:
     workers = int(CONFIG["num_workers"])
     kwargs = {
         "batch_size": int(CONFIG["batch_size"]),
@@ -250,6 +393,10 @@ def make_loader(dataset, *, shuffle: bool) -> DataLoader:
         "num_workers": workers,
         "pin_memory": DEVICE == "cuda",
     }
+    if seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        kwargs["generator"] = generator
     if workers > 0:
         kwargs["persistent_workers"] = True
         kwargs["prefetch_factor"] = 2
@@ -282,7 +429,33 @@ def run_with_heartbeat(label: str, function, *, interval_seconds: int | None = N
 # ==================================================================================
 
 def main():
-    set_seed(CONFIG["seeds"][0])
+    base_training_seed = int(CONFIG["seeds"][0])
+    set_seed(base_training_seed)
+    hrv_feature_semantics = os.environ.get(
+        "ECG_RAMBA_HRV_FEATURE_SEMANTICS",
+        HRV36_CHECKPOINT_SEMANTICS,
+    ).strip()
+    if hrv_feature_semantics != HRV36_CHECKPOINT_SEMANTICS:
+        raise ValueError(
+            "Structured retraining must preserve the current checkpoint HRV36 semantics. "
+            f"Requested {hrv_feature_semantics!r}; expected {HRV36_CHECKPOINT_SEMANTICS!r}. "
+            "A corrected/full HRV schema requires a separately named model family and complete retraining."
+        )
+    ablation_variant, ablation_spec = resolve_structured_ablation(
+        os.environ.get("ECG_RAMBA_ABLATION_VARIANT", "full")
+    )
+    only_folds_raw = os.environ.get("ECG_RAMBA_ONLY_FOLDS", "").strip()
+    selected_folds = (
+        {int(item.strip()) for item in only_folds_raw.split(",") if item.strip()}
+        if only_folds_raw
+        else set(range(1, int(CONFIG["n_folds"]) + 1))
+    )
+    expected_folds = set(range(1, int(CONFIG["n_folds"]) + 1))
+    if not selected_folds or not selected_folds.issubset(expected_folds):
+        raise ValueError(
+            f"ECG_RAMBA_ONLY_FOLDS must be a non-empty subset of {sorted(expected_folds)}; "
+            f"got {sorted(selected_folds)}"
+        )
 
     # ==================================================================================
     # 🔧 RUN HEADER
@@ -294,6 +467,9 @@ def main():
         f"ASYM starts={CONFIG['asym_start_epoch'] + 1} | "
         f"Epochs={CONFIG['epochs']} | Folds={CONFIG['n_folds']}"
     )
+    print(f"   Structural variant={ablation_variant} | spec={ablation_spec}")
+    print(f"   HRV36 semantics={hrv_feature_semantics}")
+    print(f"   Selected folds={sorted(selected_folds)} | model_dir={PATHS['model_dir']}")
 
     # ==================================================================================
     # 🛡️ PHASE 1 | LOAD DATA & AUTO-CLEAN
@@ -338,7 +514,12 @@ def main():
 
     X_rocket_raw = generate_raw_rocket_cache(X, subjects)
     X_hrv_base = (
-        generate_hrv_cache(X, X_raw_amp, subjects)
+        generate_hrv_cache(
+            X,
+            X_raw_amp,
+            subjects,
+            semantics=hrv_feature_semantics,
+        )
         if CONFIG["use_hrv"]
         else None
     )
@@ -379,9 +560,19 @@ def main():
     )
 
     folds_path = os.path.join(PATHS["model_dir"], "folds.pkl")
-    if resume_training and os.path.exists(folds_path):
-        folds = joblib.load(folds_path)
-        print(f"✅ Reusing fold split provenance: {folds_path}")
+    canonical_folds_path = os.environ.get("ECG_RAMBA_FOLDS_PATH", "").strip()
+    reusable_folds_path = (
+        folds_path
+        if os.path.exists(folds_path)
+        else canonical_folds_path
+        if canonical_folds_path and os.path.exists(canonical_folds_path)
+        else ""
+    )
+    if resume_training and reusable_folds_path:
+        folds = joblib.load(reusable_folds_path)
+        if os.path.abspath(reusable_folds_path) != os.path.abspath(folds_path):
+            joblib.dump(folds, folds_path)
+        print(f"✅ Reusing fold split provenance: {reusable_folds_path}")
     else:
         folds = [
             {
@@ -423,6 +614,11 @@ def main():
     completed_folds = set()
     resume_audit_rows = []
     for fold in range(1, int(CONFIG["n_folds"]) + 1):
+        fold_train_indices = np.asarray(folds[fold - 1]["tr_idx"], dtype=np.int64)
+        expected_pca_path = fold_pca_model_path(fold, fold_train_indices)
+        expected_pca_sha256 = (
+            file_sha256(expected_pca_path) if os.path.exists(expected_pca_path) else None
+        )
         epoch_count = sum(
             int(row.get("fold", -1)) == fold
             for row in epoch_logs
@@ -448,7 +644,7 @@ def main():
         )
         if os.path.exists(final_ema_path):
             try:
-                payload = torch.load(final_ema_path, map_location="cpu")
+                payload = torch.load(final_ema_path, map_location="cpu", weights_only=False)
                 final_ema_metadata = {
                     "config_hash": payload.get("config_hash"),
                     "dataset_record_order_fingerprint": payload.get(
@@ -459,7 +655,15 @@ def main():
                     "epoch": int(payload.get("epoch", -1)),
                     "checkpoint_contract": payload.get("checkpoint_contract"),
                     "training_protocol": payload.get("training_protocol"),
+                    "ablation_variant": payload.get("ablation_variant", "full"),
+                    "ablation_spec": payload.get("ablation_spec", {}),
+                    "training_seed": payload.get("training_seed"),
+                    "feature_contract": payload.get("feature_contract"),
+                    "pca_contract": payload.get("pca_contract"),
+                    "initialization_contract": payload.get("initialization_contract"),
                 }
+                pca_contract = payload.get("pca_contract") or {}
+                initialization_contract = payload.get("initialization_contract") or {}
                 checkpoint_metadata_valid = (
                     payload.get("config_hash") == CONFIG_HASH
                     and payload.get("dataset_record_order_fingerprint")
@@ -467,6 +671,31 @@ def main():
                     and payload.get("weights_kind") == "ema"
                     and payload.get("selection_rule") == "fixed_final_epoch"
                     and int(payload.get("epoch", -1)) == int(CONFIG["epochs"])
+                    and payload.get("ablation_variant", "full") == ablation_variant
+                    and dict(payload.get("ablation_spec", {})) == ablation_spec
+                    and int(payload.get("training_seed", -1)) == base_training_seed + fold
+                    and (payload.get("feature_contract") or {}).get("hrv36")
+                    == checkpoint_compatible_hrv36_contract()
+                    and expected_pca_sha256 is not None
+                    and pca_contract.get("sha256") == expected_pca_sha256
+                    and pca_contract.get("train_index_hash")
+                    == index_fingerprint(fold_train_indices)
+                    and int(pca_contract.get("output_dim", -1)) == int(CONFIG["hydra_dim"])
+                    and pca_contract.get("fit_scope")
+                    == "training_records_of_this_outer_fold_only"
+                    and np.isfinite(float(pca_contract.get("explained_variance_ratio_sum", np.nan)))
+                    and initialization_contract.get("policy")
+                    == "fold_seeded_full_reference_overlap_v1"
+                    and initialization_contract.get("reference_variant") == "full"
+                    and int(initialization_contract.get("reference_seed", -1))
+                    == base_training_seed + fold
+                    and bool(initialization_contract.get("variant_group_sha256"))
+                    and all(
+                        value == (initialization_contract.get("reference_group_sha256") or {}).get(group)
+                        for group, value in (
+                            initialization_contract.get("variant_group_sha256") or {}
+                        ).items()
+                    )
                 )
                 del payload
             except Exception as exc:
@@ -506,6 +735,26 @@ def main():
                 "final_ema_selection_rule": final_ema_metadata.get("selection_rule"),
                 "final_ema_epoch": final_ema_metadata.get("epoch"),
                 "expected_final_epoch": int(CONFIG["epochs"]),
+                "final_ema_ablation_variant": final_ema_metadata.get("ablation_variant"),
+                "expected_ablation_variant": ablation_variant,
+                "final_ema_ablation_spec": final_ema_metadata.get("ablation_spec"),
+                "expected_ablation_spec": json.dumps(ablation_spec, sort_keys=True),
+                "final_ema_training_seed": final_ema_metadata.get("training_seed"),
+                "expected_training_seed": base_training_seed + fold,
+                "final_ema_feature_contract": json.dumps(
+                    final_ema_metadata.get("feature_contract"), sort_keys=True
+                ),
+                "expected_feature_contract": json.dumps(
+                    {"hrv36": checkpoint_compatible_hrv36_contract()}, sort_keys=True
+                ),
+                "final_ema_pca_contract": json.dumps(
+                    final_ema_metadata.get("pca_contract"), sort_keys=True
+                ),
+                "final_ema_initialization_contract": json.dumps(
+                    final_ema_metadata.get("initialization_contract"), sort_keys=True
+                ),
+                "expected_pca_path": expected_pca_path,
+                "expected_pca_sha256": expected_pca_sha256,
                 "checkpoint_contract": final_ema_metadata.get("checkpoint_contract"),
                 "training_protocol": final_ema_metadata.get("training_protocol"),
                 "metadata_error": checkpoint_metadata_error,
@@ -521,13 +770,21 @@ def main():
         "config_hash": CONFIG_HASH,
         "expected_epochs": int(CONFIG["epochs"]),
         "expected_folds": int(CONFIG["n_folds"]),
+        "selected_folds": sorted(selected_folds),
+        "ablation_variant": ablation_variant,
+        "ablation_spec": ablation_spec,
         "dataset_record_order_fingerprint": split_audit["record_order_fingerprint"],
+        "feature_contract": {"hrv36": checkpoint_compatible_hrv36_contract()},
         "completed_folds_reused": sorted(int(fold) for fold in completed_folds),
         "skip_policy": (
             "A fold may be skipped only when epoch logs cover all configured epochs, "
             "the CV result row exists, all four explicit checkpoints exist, and "
             "fold*_final_ema.pt metadata matches config hash, dataset fingerprint, "
-            "weights_kind=ema, selection_rule=fixed_final_epoch, and final epoch."
+            "weights_kind=ema, selection_rule=fixed_final_epoch, final epoch, and the "
+            "checkpoint-compatible HRV36 feature contract. The declared fold-PCA SHA, "
+            "training-index hash, and output dimension must also match the current "
+            "training-fold-only PCA artifact. The initialization contract must attest "
+            "that every retained module was copied from the fold-seeded Full reference."
         ),
         "folds": resume_audit_rows,
     }
@@ -544,6 +801,9 @@ def main():
         )
 
     for fold, split in enumerate(folds, start=1):
+        if fold not in selected_folds:
+            print(f"\n⏭️ FOLD {fold}/{CONFIG['n_folds']} not selected for this invocation")
+            continue
         if fold in completed_folds:
             print(f"\n♻️ FOLD {fold}/{CONFIG['n_folds']} already complete; skipping")
             continue
@@ -557,11 +817,18 @@ def main():
         ]
         tr_idx = split["tr_idx"]
         va_idx = split["va_idx"]
+        fold_training_seed = base_training_seed + fold
+        # A fold-specific seed makes interrupted/resumed single-fold runs reproduce
+        # the same initialization and sample order across structural variants.
+        set_seed(fold_training_seed)
         fold_started = time.perf_counter()
         rocket_train_gib = (
             len(tr_idx) * X_rocket_raw.shape[1] * X_rocket_raw.dtype.itemsize
         ) / (1024 ** 3)
-        print(f"\n⚡ FOLD {fold}/{CONFIG['n_folds']}", flush=True)
+        print(
+            f"\n⚡ FOLD {fold}/{CONFIG['n_folds']} | training_seed={fold_training_seed}",
+            flush=True,
+        )
         print(
             f"   ⏳ PCA stage starting on CPU | train={len(tr_idx)} | "
             f"features={X_rocket_raw.shape[1]} | input_copy≈{rocket_train_gib:.2f} GiB",
@@ -661,8 +928,9 @@ def main():
         hydra_tr = apply_pca(pca, X_rocket_raw[tr_idx])
         hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
         pca_variance = float(pca.explained_variance_ratio_.sum())
+        pca_sha256 = file_sha256(pca_path)
         print(f"   🛡️ PCA variance retained: {pca_variance:.3f}")
-        print(f"   💾 Fold PCA object: {pca_path}")
+        print(f"   💾 Fold PCA object: {pca_path} | sha256={pca_sha256[:12]}")
 
         hydra_by_record = np.zeros((len(X), CONFIG["hydra_dim"]), dtype=np.float32)
         hydra_by_record[tr_idx] = hydra_tr
@@ -721,6 +989,7 @@ def main():
                 slice_length=CONFIG["slice_length"],
             ),
             shuffle=True,
+            seed=fold_training_seed,
         )
 
         val_loader = make_loader(
@@ -735,9 +1004,24 @@ def main():
                 slice_length=CONFIG["slice_length"],
             ),
             shuffle=False,
+            seed=fold_training_seed + 100_000,
         )
 
-        model = ECGRambaV7Advanced(cfg=CONFIG).to(DEVICE)
+        model, initialization_contract = initialize_matched_structured_model(
+            cfg=CONFIG,
+            ablation_variant=ablation_variant,
+            ablation_spec=ablation_spec,
+            fold_seed=fold_training_seed,
+        )
+        model = model.to(DEVICE)
+        # Keep model stochasticity reproducible independently of constructor RNG use.
+        set_seed(fold_training_seed)
+        print(
+            "   Matched initialization: "
+            f"policy={initialization_contract['policy']} | "
+            f"groups={sorted(initialization_contract['variant_group_sha256'])}",
+            flush=True,
+        )
         optimizer = torch.optim.AdamW(
             model.parameters(),
             lr=CONFIG["lr_max"],
@@ -905,9 +1189,14 @@ def main():
                     train_indices=tr_idx,
                     val_indices=va_idx,
                     pca_variance=pca_variance,
+                    pca_path=pca_path,
+                    pca_sha256=pca_sha256,
                     dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
                     metrics_weights_kind="ema",
                     selection_rule="max_validation_f1_macro",
+                    ablation_variant=ablation_variant,
+                    ablation_spec=ablation_spec,
+                    initialization_contract=initialization_contract,
                 )
                 save_checkpoint(best_ema_ckpt_path, selected_payload)
                 raw_payload = checkpoint_payload(
@@ -920,10 +1209,15 @@ def main():
                     train_indices=tr_idx,
                     val_indices=va_idx,
                     pca_variance=pca_variance,
+                    pca_path=pca_path,
+                    pca_sha256=pca_sha256,
                     dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
                     metrics_weights_kind=None,
                     selection_rule="paired_with_best_ema_epoch",
                     selection_metrics=best_ema_metrics,
+                    ablation_variant=ablation_variant,
+                    ablation_spec=ablation_spec,
+                    initialization_contract=initialization_contract,
                 )
 
             last_eval_metrics = metrics.copy()
@@ -990,9 +1284,14 @@ def main():
             train_indices=tr_idx,
             val_indices=va_idx,
             pca_variance=pca_variance,
+            pca_path=pca_path,
+            pca_sha256=pca_sha256,
             dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
             metrics_weights_kind=None,
             selection_rule="fixed_final_epoch",
+            ablation_variant=ablation_variant,
+            ablation_spec=ablation_spec,
+            initialization_contract=initialization_contract,
         )
         save_checkpoint(final_raw_ckpt_path, final_raw_payload)
 
@@ -1008,9 +1307,14 @@ def main():
                 train_indices=tr_idx,
                 val_indices=va_idx,
                 pca_variance=pca_variance,
+                pca_path=pca_path,
+                pca_sha256=pca_sha256,
                 dataset_record_order_fingerprint=split_audit["record_order_fingerprint"],
                 metrics_weights_kind="ema",
                 selection_rule="fixed_final_epoch",
+                ablation_variant=ablation_variant,
+                ablation_spec=ablation_spec,
+                initialization_contract=initialization_contract,
             )
             ema.restore(model)
             save_checkpoint(final_ema_ckpt_path, final_ema_payload)
@@ -1020,6 +1324,8 @@ def main():
                 fold=fold,
                 protocol_checkpoint_kind="final_ema",
                 protocol_epoch=int(CONFIG["epochs"]),
+                ablation_variant=ablation_variant,
+                architecture_contract="ecg_ramba_structured_ablation_v1",
                 best_ema_epoch=best_ema_epoch,
                 pca_explained_variance=pca_variance,
                 skipped_nonfinite_validation_slices=int(fold_skipped_nan),

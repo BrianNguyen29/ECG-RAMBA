@@ -12,6 +12,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,15 @@ DEFAULT_MANUSCRIPT_DIR = PROJECT_ROOT.parent / "docs" / "IEEE_JBHI___ECG_RAMBA__
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--original", type=Path, default=DEFAULT_MANUSCRIPT_DIR / "BACKUP.tex")
+    parser.add_argument(
+        "--original",
+        type=Path,
+        default=DEFAULT_MANUSCRIPT_DIR / "main_pre_final_evidence_20260707.tex",
+        help=(
+            "Previous manuscript source used for the marked revision. BACKUP.tex is the IEEE "
+            "template and must not be used as the scientific baseline."
+        ),
+    )
     parser.add_argument("--revised", type=Path, default=DEFAULT_MANUSCRIPT_DIR / "main.tex")
     parser.add_argument("--out-tex", type=Path, default=DEFAULT_MANUSCRIPT_DIR / "main_marked.tex")
     parser.add_argument("--out-pdf", type=Path, default=DEFAULT_MANUSCRIPT_DIR / "main_marked.pdf")
@@ -59,7 +68,15 @@ def executable(name: str) -> str | None:
 
 def run_command(command: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     print("$ " + " ".join(command), flush=True)
-    result = subprocess.run(command, cwd=cwd, text=True, capture_output=True, check=False)
+    result = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+    )
     if result.stdout:
         print(result.stdout[-8000:], flush=True)
     if result.stderr:
@@ -76,6 +93,54 @@ def write_text_atomic(path: Path, text: str) -> None:
     finally:
         if tmp.exists():
             tmp.unlink()
+
+
+def sanitize_revised_view_diff(text: str) -> str:
+    r"""Keep booktabs noalign commands first in their table row.
+
+    ``latexdiff`` can emit a float begin marker immediately before ``\midrule``
+    or another noalign command. TeX then raises ``Misplaced \noalign`` even
+    though the revised source is valid. The revised-view build suppresses
+    deleted text and highlights additions with ``\DIFaddFL{...}``, so these
+    adjacent begin markers carry no visible content and can be removed safely.
+    """
+
+    noalign = r"(?:toprule|midrule|bottomrule|hline|cmidrule)"
+    pattern = re.compile(
+        rf"\\DIF(?:add|del)(?:begin|end)FL\s*(?=\\{noalign}\b)"
+    )
+    return pattern.sub("", text)
+
+
+def restore_revised_bibliography_command(marked_text: str, revised_text: str) -> str:
+    r"""Keep the revised bibliography command outside latexdiff markup.
+
+    ``latexdiff --flatten`` expands the revised ``.bbl`` and can wrap URL
+    escapes and ``\newblock`` in ``\DIFadd`` commands.  That markup is not
+    TeX-safe and reference-only highlighting adds no useful editorial signal.
+    Replace only the generated bibliography block with the exact bibliography
+    command from the revised source; scientific-body additions remain marked.
+    """
+
+    revised_bibliography = re.search(r"\\bibliography\{[^}]+\}", revised_text)
+    if revised_bibliography is None:
+        return marked_text
+
+    flattened_bibliography = re.compile(
+        r"(?:\\DIFaddbegin\s*)?"
+        r"\\begin\{thebibliography\}\{[^}]*\}"
+        r".*?"
+        r"\\end\{thebibliography\}"
+        r"(?:\s*\\DIFaddend)?",
+        flags=re.DOTALL,
+    )
+    bibliography_command = revised_bibliography.group(0)
+    restored, replacements = flattened_bibliography.subn(
+        lambda _match: bibliography_command, marked_text, count=1
+    )
+    if replacements != 1:
+        return marked_text
+    return restored
 
 
 def blocker_payload(
@@ -162,13 +227,20 @@ def main() -> None:
             raise RuntimeError(payload["issue"])
         return
 
+    latexdiff_options = [
+        "--no-del",
+        "--graphics-markup=none",
+        "--flatten",
+    ]
     diff_result = run_command(
-        [str(tools["latexdiff"]), "--flatten", str(original), str(revised)],
+        [str(tools["latexdiff"]), *latexdiff_options, str(original), str(revised)],
         cwd=revised.parent,
     )
     if diff_result.returncode != 0 or not diff_result.stdout.strip():
         raise RuntimeError(f"latexdiff failed with exit code {diff_result.returncode}")
-    write_text_atomic(out_tex, diff_result.stdout)
+    marked_text = sanitize_revised_view_diff(diff_result.stdout)
+    marked_text = restore_revised_bibliography_command(marked_text, revised_text)
+    write_text_atomic(out_tex, marked_text)
 
     compile_log = None
     if args.compile:
@@ -212,6 +284,11 @@ def main() -> None:
             "unified_diff_lines": len(line_diff),
             "original_lines": len(original_text.splitlines()),
             "revised_lines": len(revised_text.splitlines()),
+            "latexdiff_options": latexdiff_options,
+            "presentation": (
+                "revised-view marked manuscript: additions are highlighted; deleted template text "
+                "is suppressed to keep extensive table replacements compilable"
+            ),
         },
         "outputs": outputs,
         "compile_log": str(compile_log) if compile_log else None,
