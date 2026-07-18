@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -31,6 +32,46 @@ def load_script(name: str, relative: str):
 
 
 class HypothesisTestingExtensionTests(unittest.TestCase):
+    def test_final_generator_accepts_authenticated_physiology_blocker_without_tex(self):
+        generator = load_script(
+            "final_generator_physiology_blocker_test_module",
+            "scripts/revision/13_final_evidence_matrix.py",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary_path = root / "summary.json"
+            table_path = root / "table.csv"
+            contrast_path = root / "contrasts.csv"
+            audit_path = root / "audit.csv"
+            tex_path = root / "table.tex"
+            manifest_path = root / "manifest.json"
+            summary_path.write_text("{}", encoding="utf-8")
+            table_path.write_text("", encoding="utf-8")
+            contrast_path.write_text("", encoding="utf-8")
+            audit_path.write_text("", encoding="utf-8")
+            manifest_path.write_text("{}", encoding="utf-8")
+            artifacts = (summary_path, table_path, contrast_path, audit_path)
+            manifest = {
+                "status": "blocked_missing_reliable_interval_metadata",
+                "outputs": {
+                    str(path): generator.sha256_file(path) for path in artifacts
+                },
+            }
+            result = generator.summarize_physiological_probe(
+                {
+                    "status": "blocked_missing_reliable_interval_metadata",
+                    "protocol": "fold_held_out_measured_physiological_interval_probe_v3",
+                },
+                manifest,
+                required_paths=(*artifacts, tex_path, manifest_path),
+            )
+
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(
+            result["status"], "blocked_missing_reliable_interval_metadata"
+        )
+
     def test_canonical_full_oof_protocol_name_remains_backward_compatible(self):
         prediction_runner = load_script(
             "prediction_protocol_test_module",
@@ -89,6 +130,21 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
         self.assertEqual(len(rows), 5)
         self.assertEqual(observed_training_lengths, [(8, 8)] * 5)
         self.assertEqual({row["evaluation_records"] for row in rows}, {2})
+
+    def test_monotone_platt_cannot_reverse_score_order(self):
+        calibration = load_script(
+            "matched_calibration_monotone_test_module",
+            "scripts/revision/42_matched_oof_calibration.py",
+        )
+        probability = np.linspace(0.01, 0.99, 200)
+        labels = (probability < 0.5).astype(np.float64)
+
+        intercept, slope, status = calibration.fit_platt(labels, probability)
+        calibrated = calibration.apply_platt(probability, intercept, slope)
+
+        self.assertGreaterEqual(slope, calibration.PLATT_MIN_SLOPE)
+        self.assertTrue(status.startswith("fitted_monotone"))
+        self.assertTrue(np.all(np.diff(calibrated) >= 0.0))
 
     def test_paired_model_bootstrap_orients_lower_metrics_toward_full(self):
         calibration = load_script(
@@ -296,9 +352,14 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
         )
         provenance = {
             "status": "reviewed",
+            "metadata_sha256": "metadata-sha",
             "record_id_column": "record_id",
             "record_alignment": "one_row_per_record_id",
             "independent_of_model_outputs": False,
+            "independent_of_ecg_ramba_feature_cache": False,
+            "reviewed_by": "reviewer",
+            "reviewed_utc": "2026-07-18T00:00:00+00:00",
+            "source_description": "Device-exported interval measurements",
             "targets": {
                 "qrs_ms": {
                     "source_column": "qrs_ms",
@@ -310,11 +371,83 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
 
         issues = probe.validate_metadata_provenance(
             provenance,
+            metadata_sha256="metadata-sha",
             record_id_column="record_id",
             target_columns={"qrs_ms": "qrs_ms"},
         )
 
         self.assertIn("model_output_independence_not_declared", issues)
+        self.assertIn("ecg_ramba_feature_cache_independence_not_declared", issues)
+
+    def test_physiological_metadata_provenance_binds_exact_csv_hash(self):
+        probe = load_script(
+            "physiological_probe_metadata_hash_test_module",
+            "scripts/revision/44_physiological_interval_probe.py",
+        )
+        provenance = {
+            "status": "reviewed",
+            "metadata_sha256": "old-sha",
+            "record_id_column": "record_id",
+            "record_alignment": "one_row_per_record_id",
+            "independent_of_model_outputs": True,
+            "independent_of_ecg_ramba_feature_cache": True,
+            "reviewed_by": "reviewer",
+            "reviewed_utc": "2026-07-18T00:00:00+00:00",
+            "source_description": "Device-exported interval measurements",
+            "targets": {
+                "qrs_ms": {
+                    "source_column": "qrs_ms",
+                    "unit": "ms",
+                    "measurement_kind": "device_measured",
+                }
+            },
+        }
+
+        issues = probe.validate_metadata_provenance(
+            provenance,
+            metadata_sha256="current-sha",
+            record_id_column="record_id",
+            target_columns={"qrs_ms": "qrs_ms"},
+        )
+
+        self.assertIn("metadata_sha256_mismatch", issues)
+
+    def test_physiological_bootstrap_counts_only_finite_replicates(self):
+        probe = load_script(
+            "physiological_probe_finite_bootstrap_test_module",
+            "scripts/revision/44_physiological_interval_probe.py",
+        )
+        y_true = np.linspace(1.0, 100.0, 200)
+        constant_prediction = np.ones(200)
+
+        result = probe.bootstrap_metrics(y_true, constant_prediction, n_boot=50, seed=42)
+
+        self.assertEqual(result["mae"]["n_boot_valid"], 50)
+        self.assertEqual(result["r2"]["n_boot_valid"], 50)
+        self.assertEqual(result["spearman"]["n_boot_valid"], 0)
+        self.assertIsNone(result["spearman"]["ci_low"])
+
+    def test_physiological_target_gate_rejects_constant_fold(self):
+        probe = load_script(
+            "physiological_probe_target_variation_test_module",
+            "scripts/revision/44_physiological_interval_probe.py",
+        )
+        fold_id = np.repeat(np.arange(1, 6, dtype=np.int16), 4)
+        values = np.arange(20, dtype=np.float64)
+        values[fold_id == 3] = 80.0
+        plausible = np.ones(20, dtype=bool)
+
+        status, records, unique_values = probe.target_coverage_contract(
+            values,
+            fold_id,
+            plausible,
+            min_records=20,
+            min_records_per_fold=4,
+        )
+
+        self.assertEqual(status, "insufficient_target_variation")
+        self.assertEqual(records[3], 4)
+        self.assertEqual(unique_values[3], 1)
 
     def test_physiological_runner_contract_is_content_addressed(self):
         probe = load_script(
@@ -449,6 +582,135 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
                     source_oof_sha256="oof-sha",
                     source_freeze_sha256="freeze-sha",
                 )
+
+    def test_physiological_probe_complete_path_is_end_to_end_runnable(self):
+        probe = load_script(
+            "physiological_probe_end_to_end_test_module",
+            "scripts/revision/44_physiological_interval_probe.py",
+        )
+        rng = np.random.default_rng(42)
+        n_records = 100
+        record_id = np.arange(10_000, 10_000 + n_records, dtype=np.int64)
+        fold_id = np.repeat(np.arange(1, 6, dtype=np.int16), n_records // 5)
+        target = np.linspace(60.0, 120.0, n_records)
+        embeddings = {
+            view: np.column_stack(
+                [target / 100.0 + rng.normal(0.0, 0.01, n_records), rng.normal(size=n_records)]
+            ).astype(np.float32)
+            for view in probe.VIEWS
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            embedding_path = root / "embedding.npz"
+            np.savez_compressed(
+                embedding_path,
+                record_id=record_id,
+                fold_id=fold_id,
+                oof_predictions_sha256=np.asarray("oof-sha"),
+                freeze_manifest_sha256=np.asarray("freeze-sha"),
+                **{f"{view}_embedding": values for view, values in embeddings.items()},
+            )
+            embedding_manifest = root / "embedding_manifest.json"
+            embedding_manifest.write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "missing_records": 0,
+                        "oof_predictions_sha256": "oof-sha",
+                        "freeze_manifest_sha256": "freeze-sha",
+                        "split_contract": {
+                            "fold_assignment_sha256": probe.array_sha256(fold_id, np.int16)
+                        },
+                        "outputs": {
+                            "embedding_npz_sha256": hashlib.sha256(
+                                embedding_path.read_bytes()
+                            ).hexdigest()
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            metadata_path = root / "physiology.csv"
+            metadata_path.write_text(
+                "record_id,qrs_ms\n"
+                + "\n".join(
+                    f"{record},{value:.8f}" for record, value in zip(record_id, target)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            provenance_path = root / "physiology.provenance.json"
+            provenance_path.write_text(
+                json.dumps(
+                    {
+                        "status": "reviewed",
+                        "metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+                        "record_id_column": "record_id",
+                        "record_alignment": "one_row_per_record_id",
+                        "independent_of_model_outputs": True,
+                        "independent_of_ecg_ramba_feature_cache": True,
+                        "reviewed_by": "unit-test reviewer",
+                        "reviewed_utc": "2026-07-18T00:00:00+00:00",
+                        "source_description": "Synthetic measured-target test fixture",
+                        "targets": {
+                            "qrs_ms": {
+                                "source_column": "qrs_ms",
+                                "unit": "ms",
+                                "measurement_kind": "device_measured",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            outputs = {
+                "summary": root / "summary.json",
+                "table": root / "table.csv",
+                "audit": root / "audit.csv",
+                "contrasts": root / "contrasts.csv",
+                "tex": root / "table.tex",
+                "manifest": root / "manifest.json",
+            }
+            command = [
+                sys.executable,
+                str(PROJECT_ROOT / "scripts/revision/44_physiological_interval_probe.py"),
+                "--embedding-npz",
+                str(embedding_path),
+                "--embedding-manifest",
+                str(embedding_manifest),
+                "--metadata-csv",
+                str(metadata_path),
+                "--metadata-provenance-json",
+                str(provenance_path),
+                "--min-records",
+                "50",
+                "--min-records-per-fold",
+                "5",
+                "--n-boot",
+                "10",
+                "--out-summary",
+                str(outputs["summary"]),
+                "--out-table",
+                str(outputs["table"]),
+                "--out-audit",
+                str(outputs["audit"]),
+                "--out-contrast-table",
+                str(outputs["contrasts"]),
+                "--out-tex-table",
+                str(outputs["tex"]),
+                "--out-manifest",
+                str(outputs["manifest"]),
+            ]
+
+            result = subprocess.run(command, cwd=PROJECT_ROOT, capture_output=True, text=True)
+
+            self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
+            summary = json.loads(outputs["summary"].read_text(encoding="utf-8"))
+            self.assertEqual(summary["status"], "complete_measured_target_probe")
+            self.assertTrue(summary["completeness_contract"]["aggregate_bootstrap_complete"])
+            self.assertTrue(summary["completeness_contract"]["contrast_bootstrap_complete"])
+            self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in outputs.values()))
 
 
 if __name__ == "__main__":

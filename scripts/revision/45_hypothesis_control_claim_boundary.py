@@ -238,7 +238,7 @@ def calibration_finding() -> tuple[str, str]:
     authenticated = manifest_authenticates(
         MANIFEST_DIR / "matched_oof_calibration_manifest.json",
         [summary_path, bootstrap_path, paired_path],
-        protocol="matched_cross_fitted_per_class_platt_v2",
+        protocol="matched_cross_fitted_per_class_monotone_platt_v3",
         accepted_statuses={"complete"},
     )
     if (
@@ -247,6 +247,8 @@ def calibration_finding() -> tuple[str, str]:
         or summary.get("bootstrap_unit") != "Chapman record; one record per subject"
         or "pools record-class label instances"
         not in str(summary.get("reliability_figure_scope", ""))
+        or "cannot reverse within-fold score ordering"
+        not in str(summary.get("ranking_contract", ""))
         or (summary.get("completeness_contract") or {}).get("coefficient_grid_complete") is not True
         or (summary.get("completeness_contract") or {}).get("raw_vs_calibrated_bootstrap_complete") is not True
         or (summary.get("completeness_contract") or {}).get("matched_model_bootstrap_complete") is not True
@@ -487,7 +489,7 @@ def main() -> None:
         },
         {
             "hypothesis": "Score calibration",
-            "matched_control": "Raw vs per-class cross-fitted Platt on frozen OOF scores",
+            "matched_control": "Raw vs per-class cross-fitted monotone Platt on frozen OOF scores",
             "evidence_status": calibration_status,
             "finding": calibration_text,
             "claim_boundary": (

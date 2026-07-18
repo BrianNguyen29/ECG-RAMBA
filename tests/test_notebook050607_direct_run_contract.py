@@ -26,6 +26,7 @@ def notebook_payload(name: str) -> dict:
 class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook_v4_structure_is_complete(self):
         for notebook in (
+            "03_calibration_and_ci.ipynb",
             "05_hrv_domain_and_robustness.ipynb",
             "06_pooling_and_representation.ipynb",
             "07_results_freeze.ipynb",
@@ -46,6 +47,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
 
     def test_every_code_cell_compiles(self):
         for notebook in (
+            "03_calibration_and_ci.ipynb",
             "05_hrv_domain_and_robustness.ipynb",
             "06_pooling_and_representation.ipynb",
             "07_results_freeze.ipynb",
@@ -167,15 +169,20 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
         for token in (
             "scripts/revision/44_physiological_interval_probe.py",
+            "fold_held_out_measured_physiological_interval_probe_v3",
             "RUNNER_SOURCE_PATH",
+            "independent_of_ecg_ramba_feature_cache",
+            "metadata_sha256",
             "--embedding-manifest reports/revision/manifests/representation_embedding_manifest.json",
             "RUN_PHYSIOLOGICAL_INTERVAL_PROBE = 'auto'",
             "Physiological probe reusable:",
             "existing_manifest.get('runner')",
             "existing_inputs.get('embedding_manifest')",
+            "physiology_common_output_relatives",
+            "physiology_expected_output_relatives",
+            "authenticated_output_paths",
             "table_physiological_interval_probe_contrasts.csv",
             "table_physiological_interval_probe.tex",
-            "existing_outputs.get(physiology_tex_path.as_posix())",
         ):
             self.assertIn(token, source)
 
@@ -199,10 +206,14 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook03_authenticates_every_matched_calibration_input(self):
         _, source = notebook_source("03_calibration_and_ci.ipynb")
         for token in (
-            "matched_cross_fitted_per_class_platt_v2",
+            "matched_cross_fitted_per_class_monotone_platt_v3",
+            "cannot reverse within-fold score ordering",
             "fully nested deploy-time calibration estimate",
             "require_canonical_matched_input",
             "Canonical matched calibration inputs authenticated:",
+            "Deferred matched calibration audit until Notebook 04 publishes",
+            "matched_required_prediction_paths",
+            "matched_optional_prediction_paths",
             "Matched calibration input is not authenticated by canonical Drive",
             "Active matched input differs from canonical Drive",
         ):
@@ -250,9 +261,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "adaptation_learning_curve",
             "group_safe_score_calibration_v2",
             "matched_cross_fitted_calibration",
+            "matched_monotone_calibration_v3",
             "matched_structured_ablation_5fold",
             "matched_structured_ablation_fresh_full",
             "physiological_interval_probe_gate",
+            "physiological_interval_probe_v3",
             "true_fewshot_frozen_encoder_head_v2",
             "representation_probe_v3",
             "reviewer_presentation_assets",
@@ -263,8 +276,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
-        self.assertIn("required_generator_schema = 9", source)
-        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 9", generator_source)
+        self.assertIn("required_generator_schema = 10", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 10", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 

@@ -56,7 +56,7 @@ EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 9
+FINAL_EVIDENCE_SCHEMA_VERSION = 10
 FINAL_EVIDENCE_CAPABILITIES = (
     "adaptation_learning_curve",
     "claim_readiness_gates",
@@ -65,9 +65,11 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "hybrid_morphology_paired",
     "learned_comparator_robustness_audit",
     "matched_cross_fitted_calibration",
+    "matched_monotone_calibration_v3",
     "matched_structured_ablation_5fold",
     "matched_structured_ablation_fresh_full",
     "physiological_interval_probe_gate",
+    "physiological_interval_probe_v3",
     "representation_probe_v3",
     "reviewer_presentation_assets",
     "reviewer_gap_closure_v1",
@@ -222,7 +224,7 @@ def summarize_matched_calibration(
 ) -> dict[str, Any]:
     required_models = {"full", "minirocket", "resnet", "raw_mamba", "transformer"}
     calibration_wording = (
-        "Report raw and cross-fitted OOF-score Platt results side by side. Evaluated-fold labels are "
+        "Report raw and cross-fitted monotone OOF-score Platt results side by side. Evaluated-fold labels are "
         "excluded from calibrator fitting, but base models are not refitted in a nested loop. Treat this "
         "as a secondary post-hoc score-level sensitivity audit: improved Brier, ECE, NLL, slope, or "
         "intercept does not compensate for lower discrimination or establish clinical threshold safety."
@@ -240,8 +242,10 @@ def summarize_matched_calibration(
     issues: list[str] = []
     if summary.get("status") != "complete":
         issues.append(f"summary status={summary.get('status', 'missing')}")
-    if summary.get("protocol") != "matched_cross_fitted_per_class_platt_v2":
+    if summary.get("protocol") != "matched_cross_fitted_per_class_monotone_platt_v3":
         issues.append("protocol mismatch")
+    if "cannot reverse within-fold score ordering" not in str(summary.get("ranking_contract", "")):
+        issues.append("monotone calibration ranking contract is missing")
     if summary.get("bootstrap_unit") != "Chapman record; one record per subject":
         issues.append("calibration bootstrap unit/independence contract is missing")
     if "calibrators and base models are not refitted" not in str(
@@ -435,22 +439,41 @@ def summarize_physiological_probe(
     status = str(summary.get("status", "missing"))
     blocked_status = status == "blocked_missing_reliable_interval_metadata"
     issues = []
-    if summary and summary.get("protocol") != "fold_held_out_measured_physiological_interval_probe_v2":
+    if summary and summary.get("protocol") != "fold_held_out_measured_physiological_interval_probe_v3":
         issues.append("protocol mismatch")
     if summary and manifest.get("status") != status:
         issues.append("manifest status mismatch")
-    required_exist = all(path.exists() for path in required_paths)
-    required_nonempty = nonempty_paths(required_paths)
+    manifest_path = required_paths[-1]
+    artifact_paths = required_paths[:-1]
+    expected_artifact_paths = (
+        tuple(path for path in artifact_paths if path.suffix.lower() != ".tex")
+        if blocked_status
+        else artifact_paths
+    )
+    required_exist = manifest_path.exists() and all(
+        path.exists() for path in expected_artifact_paths
+    )
+    required_nonempty = manifest_path.exists() and nonempty_paths(expected_artifact_paths)
     if summary and not required_exist:
         issues.append("physiological probe outputs are absent/empty")
     elif summary and not blocked_status and not required_nonempty:
         issues.append("completed physiological probe contains an empty output")
     elif summary and not manifest_authenticates_paths(
         manifest,
-        required_paths[:-1],
+        expected_artifact_paths,
         allow_empty=blocked_status,
     ):
         issues.append("physiological probe manifest does not authenticate outputs")
+    completeness = summary.get("completeness_contract") or {}
+    if status == "complete_measured_target_probe" and not all(
+        completeness.get(key) is True
+        for key in (
+            "point_metrics_complete",
+            "aggregate_bootstrap_complete",
+            "contrast_bootstrap_complete",
+        )
+    ):
+        issues.append("physiological probe completeness contract is missing")
     complete = status == "complete_measured_target_probe" and not issues
     targets = [str(value) for value in summary.get("targets") or []]
     blocked = blocked_status and not issues
@@ -1369,6 +1392,7 @@ def main() -> None:
             optional_paths["physiological_probe_table"],
             optional_paths["physiological_probe_contrasts"],
             optional_paths["physiological_probe_audit"],
+            optional_paths["physiological_probe_tex"],
             optional_paths["physiological_probe_manifest"],
         ),
     )

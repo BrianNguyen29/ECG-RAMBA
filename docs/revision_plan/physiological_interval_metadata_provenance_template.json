@@ -1,9 +1,14 @@
 {
   "status": "template_not_reviewed",
+  "metadata_sha256": "replace_with_exact_sha256_of_physio_metadata_csv",
   "record_id_column": "record_id",
   "record_alignment": "one_row_per_record_id",
   "independent_of_model_outputs": false,
-  "review_instructions": "Set status=reviewed and independent_of_model_outputs=true only after verifying record alignment and the original measurement source. Replace placeholder measurement kinds before use.",
+  "independent_of_ecg_ramba_feature_cache": false,
+  "reviewed_by": "",
+  "reviewed_utc": "",
+  "source_description": "replace_with_original_measurement_or_annotation_source",
+  "review_instructions": "Compute the exact CSV SHA256, verify one-row-per-record alignment against the frozen OOF record IDs, and confirm targets were not copied from ECG-RAMBA outputs, representations, or feature caches. Only then set status=reviewed, both independence flags=true, reviewed_by/reviewed_utc, and accepted measurement kinds.",
   "targets": {
     "heart_rate_bpm": {
       "source_column": "heart_rate_bpm",

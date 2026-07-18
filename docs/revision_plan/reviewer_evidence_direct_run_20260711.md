@@ -115,7 +115,7 @@ and Notebook 07 passes in strict mode.
 
 | Question | Notebook / runner | Durable outputs | Claim boundary |
 | --- | --- | --- | --- |
-| Does post-hoc calibration change operating-point behavior under matched records and folds? | Notebook 03 / `42_matched_oof_calibration.py` | raw and cross-fitted Platt table, coefficients, paired bootstrap JSON, pooled reliability figure, manifest | Score-level sensitivity only. Calibrators and base models are not refitted inside bootstrap; this is not a nested deployment estimate or clinical threshold validation. |
+| Does post-hoc calibration change operating-point behavior under matched records and folds? | Notebook 03 / `42_matched_oof_calibration.py` | raw and cross-fitted monotone-Platt table, coefficients, paired bootstrap JSON, pooled reliability figure, manifest | Positive-slope mappings cannot reverse within-fold score order. This remains a score-level sensitivity only: calibrators and base models are not refitted inside bootstrap, and it is not a nested deployment estimate or clinical threshold validation. |
 | Do the explicit morphology, rhythm, and context/fusion interfaces contribute inside the architecture? | Notebook 04 / `43_structured_ablation_5fold.py` | 20 fold checkpoints, four OOF prediction sets, paired table, TeX table, checkpoint/PCA/initialization audit, manifest | Fresh matched Full is compared with removal of the fixed-transform morphology stream and its dependent cross-attention interaction, removal of the checkpoint-compatible five-RR-plus-six-global-statistics conditioning interface, and joint removal of the context/fusion stack. Raw ECG remains in the first two controls, and Raw Mamba is a separate architecture control. Any conclusion remains endpoint-specific and internal to this training protocol; the no-morphology control does not isolate the fixed transform from its fusion interaction. |
 | Does target-label adaptation form a reproducible learning curve? | Notebook 02 / `35_true_fewshot_head_adaptation.py` | 0/1/5/10% tables and figure for Full, ResNet, Raw Mamba, and Transformer; group-bootstrap caches and manifest | Frozen-encoder linear-head adaptation, not end-to-end fine-tuning. The 10% budget is primary; encoder/head training uncertainty is not resampled by the reported conditional bootstrap. |
 | Do branch embeddings predict measured physiological intervals selectively? | Notebook 06 / `44_physiological_interval_probe.py` | target audit, fold-held-out probe CSV and manuscript TeX table, branch contrasts, summary and manifest | Runs only with reviewed, record-aligned HR/PR/QRS/QT/QTc measurements independent of model outputs. Missing metadata produces a blocker, removes stale TeX output, and generates no proxy targets. |
@@ -167,11 +167,12 @@ matrix, copy, and publication cells can run on CPU.
 2. Run Notebook 02 through the canonical OOF, external Full-model export, and
    external protocol-gate cells. This can run before Notebook 04. It will also
    export PTB-XL fold 9 when needed for group-safe adaptation.
-3. Run Notebook 03 through calibration CI. Its reviewer-presentation cell may
-   print `Deferred` at this point; that is expected until Notebook 04 paired
-   artifacts are current. Also run **Matched Cross-Fitted Calibration Audit**;
-   it is CPU-only and reuses bootstrap entries only when the semantic probability
-   hashes and frozen OOF contract match.
+3. Run Notebook 03 through the canonical calibration CI. The **Matched
+   Cross-Fitted Calibration Audit** and reviewer-presentation cell may print
+   `Deferred` at this point; that is expected until Notebook 04 has published
+   the required learned-baseline OOF artifacts. A missing optional
+   frozen-transform MLP does not block the five-model matched audit. A present
+   artifact with an invalid checksum still fails immediately.
 4. Run Notebook 04. Leave the heavy runner controls as `auto`. For any missing
    Raw Mamba, Transformer, frozen-transform MLP, or controlled
    frozen-versus-partially-learnable morphology folds, the notebook runs one
@@ -188,9 +189,13 @@ matrix, copy, and publication cells can run on CPU.
    PTB-XL group-safe score calibration, optional frozen-encoder representations,
    and true linear-head adaptation. Before Notebook 04 these cells defer
    instead of failing.
-6. Rerun the reviewer-presentation cell in Notebook 03. It creates the
-   reliability figure, compact calibration/paired-CI tables, Q=3 sensitivity
-   table, fold-specific PCA variance table, and training-configuration table.
+6. Return to Notebook 03 and run **Matched Cross-Fitted Calibration Audit**,
+   followed by the reviewer-presentation cell. The calibration cell is CPU-only,
+   uses positive-slope monotone Platt mappings, and reuses bootstrap entries only
+   when probability hashes, protocol v3, and the frozen OOF contract match. The
+   presentation cell creates the reliability figure, compact calibration/paired-CI
+   tables, Q=3 sensitivity table, fold-specific PCA variance table, and
+   training-configuration table.
 7. Run Notebook 05 with `ROBUSTNESS_MULTI_RUN_PROFILE='canonical_resume'`.
    The six stresses are processed separately and publish after each completed
    stage; the shared metric cache resumes interrupted 1,000-bootstrap work.
@@ -220,10 +225,17 @@ Place a reviewed sidecar next to the CSV as
 explicitly. Start from the checked-in templates
 `docs/revision_plan/physiological_interval_metadata_template.csv` and
 `docs/revision_plan/physiological_interval_metadata_provenance_template.json`.
-The template deliberately fails closed: change `status` to `reviewed`, declare
-`independent_of_model_outputs=true`, and replace every target's source column,
-unit, and measurement kind only after the source audit is complete. Accepted
-measurement kinds are `measured`, `device_measured`, and `expert_annotated`.
+The template deliberately fails closed. Compute the exact SHA256 of the CSV and
+set `metadata_sha256` to that value; record `reviewed_by`, a timezone-aware
+`reviewed_utc`, and the original `source_description`. Change `status` to
+`reviewed` and set both `independent_of_model_outputs=true` and
+`independent_of_ecg_ramba_feature_cache=true` only after verifying that the
+targets were not copied from model outputs, branch representations, or the
+audited feature cache. Replace every target's source column, unit, and
+measurement kind only after this source audit. Accepted measurement kinds are
+`measured`, `device_measured`, and `expert_annotated`. Protocol v3 also requires
+at least two measured target values in every evaluated fold and all requested
+pointwise bootstrap replicates to be finite before it emits a complete status.
 9. Run Notebook 07. It first runs claim-readiness gates and the strict
    Hypothesis--Control--Finding--Claim-boundary ledger, then writes final
    evidence tables only when calibration and paired OOF contracts match the
@@ -249,10 +261,10 @@ Use the checked-in defaults unless this table explicitly says otherwise:
 | 00 | All sections, top to bottom | CPU is enough for storage/audit; GPU only if immediately continuing to Mamba inference. Keep migration disabled and storage audit non-strict. | Do not use legacy migration unless the source-audit table was reviewed and conflict-free. |
 | 01 | All sections | CPU. | None. This is a protocol audit, not model training. |
 | 02 first pass | Setup through **External Protocol Gate**, then **PTB-XL Fold 9 Adaptation-Pool Export** | A100 High-RAM when an OOF/external export is missing. Keep OOF/external force flags false and reuse enabled. | The learned-comparator, representation, and true-head sections may defer before Notebook 04; this is expected. |
-| 03 first pass | Setup through calibration CI and reviewer tables | CPU High-RAM. | Presentation assets may defer until Notebook 04 paired tables exist. |
+| 03 first pass | Setup through canonical calibration CI | CPU High-RAM. | Matched calibration and presentation assets defer until Notebook 04 OOF/paired artifacts exist. |
 | 04 | All sections | A100 High-RAM through **Controlled Frozen-vs-Partially-Learnable Morphology Bank**; CPU is enough for paired comparisons and ledgers. Keep runner mode `auto`, force-rerun false, checkpoint saving/reuse true. | Skip Notebook 02a unless the frozen Full final-EMA checkpoint contract itself is invalid and a paper-level retrain was explicitly chosen. |
 | 02 second pass | **External Learned-Comparator Zero-Target-Label Inference** through **True Few-Shot Frozen-Encoder Head Adaptation**, then inventory/mirror | A100 for external comparator inference and source-bound representation extraction. CPU High-RAM for paired bootstrap, group-safe score calibration, and linear heads. Keep `TRUE_FEWSHOT_PRIMARY_FRACTION=0.10`, seeds 42--46, fractions 0/1/5/10%, reuse true. | Old representation protocol-v1 caches are intentionally rejected once; protocol-v2 fold caches resume thereafter. |
-| 03 second pass | **Build Reviewer Presentation Assets**, then mirror | CPU. | None after paired artifacts are current. |
+| 03 second pass | **Matched Cross-Fitted Calibration Audit**, then **Build Reviewer Presentation Assets**, then mirror | CPU High-RAM. Keep 1,000 bootstraps and reuse enabled. | None after the five required baseline OOF artifacts are current; frozen-transform MLP is included when authenticated but is not a blocker. |
 | 05 GPU pass | Setup through **Comparator Stress Prediction Generation** | A100 High-RAM, batch 512; lower to 256 only on OOM. Canonical mode requires all six stresses for ResNet, Raw Mamba, and Transformer. Each stress is published immediately. | Do not rerun completed stress files; the exact checkpoint/prediction contract is checked before reuse. |
 | 05 CPU pass | **Multi-Comparator Robustness Ledger** through mirror/output | CPU High-RAM. Keep `canonical_resume`, `n_boot=1000`, five metrics, and eight bootstrap workers unless RAM pressure requires fewer workers. | Do not present reviewer-minimal output as the canonical six-stress ledger. |
 | 06 | All sections | CPU for pooling/probe; A100 plus Mamba only if representation embeddings are missing/stale. | Existing compatible embeddings/probe artifacts are reused; final pooling requires PTB-XL, Georgia, and CPSC2021. |

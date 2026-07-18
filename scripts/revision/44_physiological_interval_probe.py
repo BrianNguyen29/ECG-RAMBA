@@ -36,8 +36,8 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 2
-PROTOCOL = "fold_held_out_measured_physiological_interval_probe_v2"
+SCHEMA_VERSION = 3
+PROTOCOL = "fold_held_out_measured_physiological_interval_probe_v3"
 RUNNER_SOURCE_PATH = Path(__file__).resolve()
 TARGET_ALIASES = {
     "heart_rate_bpm": ["heart_rate_bpm", "heart_rate", "hr", "ventricular_rate"],
@@ -233,6 +233,7 @@ def find_provenance_path(args: argparse.Namespace, metadata_path: Path) -> Path 
 def validate_metadata_provenance(
     payload: dict,
     *,
+    metadata_sha256: str,
     record_id_column: str,
     target_columns: dict[str, str],
 ) -> list[str]:
@@ -245,6 +246,25 @@ def validate_metadata_provenance(
         issues.append("record_alignment_not_one_row_per_record_id")
     if payload.get("independent_of_model_outputs") is not True:
         issues.append("model_output_independence_not_declared")
+    if payload.get("independent_of_ecg_ramba_feature_cache") is not True:
+        issues.append("ecg_ramba_feature_cache_independence_not_declared")
+    if payload.get("metadata_sha256") != metadata_sha256:
+        issues.append("metadata_sha256_mismatch")
+    if not str(payload.get("reviewed_by") or "").strip():
+        issues.append("reviewer_identity_missing")
+    reviewed_utc = str(payload.get("reviewed_utc") or "").strip()
+    if not reviewed_utc:
+        issues.append("review_timestamp_missing")
+    else:
+        try:
+            reviewed_time = datetime.fromisoformat(reviewed_utc.replace("Z", "+00:00"))
+            if reviewed_time.tzinfo is None:
+                issues.append("review_timestamp_not_timezone_aware")
+        except ValueError:
+            issues.append("review_timestamp_invalid")
+    source_description = str(payload.get("source_description") or "").strip()
+    if not source_description or source_description.lower().startswith("replace_with"):
+        issues.append("measurement_source_description_missing")
     declarations = payload.get("targets") or {}
     for target, source_column in target_columns.items():
         declaration = declarations.get(target) or {}
@@ -333,19 +353,32 @@ def interval(values: list[float]) -> tuple[float | None, float | None]:
     return float(low), float(high)
 
 
+def safe_spearman(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    from scipy.stats import spearmanr
+
+    if len(np.unique(y_true)) < 2 or len(np.unique(y_pred)) < 2:
+        return math.nan
+    return float(spearmanr(y_true, y_pred).statistic)
+
+
 def bootstrap_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_boot: int, seed: int) -> dict:
     from sklearn.metrics import mean_absolute_error, r2_score
-    from scipy.stats import spearmanr
 
     rng = np.random.default_rng(seed)
     values = {"mae": [], "r2": [], "spearman": []}
     for _ in range(n_boot):
         index = rng.integers(0, len(y_true), size=len(y_true))
         yt, yp = y_true[index], y_pred[index]
-        values["mae"].append(float(mean_absolute_error(yt, yp)))
+        mae = float(mean_absolute_error(yt, yp))
+        if np.isfinite(mae):
+            values["mae"].append(mae)
         if len(np.unique(yt)) > 1:
-            values["r2"].append(float(r2_score(yt, yp)))
-            values["spearman"].append(float(spearmanr(yt, yp).statistic))
+            r2 = float(r2_score(yt, yp))
+            spearman = safe_spearman(yt, yp)
+            if np.isfinite(r2):
+                values["r2"].append(r2)
+            if np.isfinite(spearman):
+                values["spearman"].append(spearman)
     result = {}
     for metric, samples in values.items():
         low, high = interval(samples)
@@ -358,6 +391,33 @@ def bootstrap_metrics(y_true: np.ndarray, y_pred: np.ndarray, n_boot: int, seed:
     return result
 
 
+def target_coverage_contract(
+    values: np.ndarray,
+    fold_id: np.ndarray,
+    plausible: np.ndarray,
+    *,
+    min_records: int,
+    min_records_per_fold: int,
+) -> tuple[str, dict[int, int], dict[int, int]]:
+    folds = sorted(int(fold) for fold in np.unique(fold_id))
+    records_by_fold = {
+        fold: int(np.sum(plausible & (fold_id == fold))) for fold in folds
+    }
+    unique_values_by_fold = {
+        fold: int(len(np.unique(values[plausible & (fold_id == fold)]))) for fold in folds
+    }
+    if (
+        int(np.sum(plausible)) < min_records
+        or min(records_by_fold.values(), default=0) < min_records_per_fold
+    ):
+        status = "insufficient_fold_coverage"
+    elif min(unique_values_by_fold.values(), default=0) < 2:
+        status = "insufficient_target_variation"
+    else:
+        status = "usable"
+    return status, records_by_fold, unique_values_by_fold
+
+
 def paired_view_bootstrap(
     y_true: np.ndarray,
     prediction_a: np.ndarray,
@@ -368,15 +428,12 @@ def paired_view_bootstrap(
     """Paired record bootstrap with positive values oriented toward view A."""
 
     from sklearn.metrics import mean_absolute_error, r2_score
-    from scipy.stats import spearmanr
 
     def values(yt: np.ndarray, pa: np.ndarray, pb: np.ndarray) -> dict[str, float]:
         return {
             "mae": float(mean_absolute_error(yt, pb) - mean_absolute_error(yt, pa)),
             "r2": float(r2_score(yt, pa) - r2_score(yt, pb)),
-            "spearman": float(
-                spearmanr(yt, pa).statistic - spearmanr(yt, pb).statistic
-            ),
+            "spearman": float(safe_spearman(yt, pa) - safe_spearman(yt, pb)),
         }
 
     point = values(y_true, prediction_a, prediction_b)
@@ -440,8 +497,9 @@ def blocked_payload(
         "protocol": PROTOCOL,
         "reason": reason,
         "target_policy": (
-            "Only measured, record-aligned HR/PR/QRS/QT/QTc metadata are accepted; targets are not "
-            "derived from rhythm inputs, ECG-RAMBA predictions, or the same representation under audit."
+            "Only measured, record-aligned HR/PR/QRS/QT/QTc metadata are accepted; reviewed provenance "
+            "must bind the exact metadata SHA and confirm independence from ECG-RAMBA outputs, "
+            "representations, and feature caches."
         ),
         "claim_boundary": (
             "Existing morphology/rhythm label probes remain an audit only. No physiological interval "
@@ -477,13 +535,18 @@ def blocked_payload(
 
 def main() -> None:
     import pandas as pd
-    from scipy.stats import spearmanr
     from sklearn.linear_model import Ridge
     from sklearn.metrics import mean_absolute_error, r2_score
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     args = parse_args()
+    if args.n_boot <= 0:
+        raise ValueError("--n-boot must be positive")
+    if args.min_records <= 0 or args.min_records_per_fold <= 0:
+        raise ValueError("minimum record counts must be positive")
+    if args.ridge_alpha <= 0:
+        raise ValueError("--ridge-alpha must be positive")
     ensure_revision_dirs()
     embedding_path = resolve(args.embedding_npz)
     embedding_manifest_path = resolve(args.embedding_manifest)
@@ -535,7 +598,7 @@ def main() -> None:
         return
 
     metadata_path = resolve(args.metadata_csv)
-    metadata = pd.read_csv(metadata_path)
+    metadata = pd.read_csv(metadata_path, dtype=str, keep_default_na=False)
     if args.record_id_column not in metadata.columns:
         blocked_payload(
             args,
@@ -582,6 +645,7 @@ def main() -> None:
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     provenance_issues = validate_metadata_provenance(
         provenance,
+        metadata_sha256=sha256_file(metadata_path),
         record_id_column=args.record_id_column,
         target_columns=declared_target_columns,
     )
@@ -624,12 +688,12 @@ def main() -> None:
         low, high = PLAUSIBLE_RANGES[target]
         matched = np.isfinite(aligned)
         plausible = matched & (aligned >= low) & (aligned <= high)
-        per_fold = {int(fold): int(np.sum(plausible & (fold_id == fold))) for fold in np.unique(fold_id)}
-        status = (
-            "usable"
-            if int(np.sum(plausible)) >= args.min_records
-            and min(per_fold.values(), default=0) >= args.min_records_per_fold
-            else "insufficient_fold_coverage"
+        status, per_fold, unique_values_by_fold = target_coverage_contract(
+            aligned,
+            fold_id,
+            plausible,
+            min_records=args.min_records,
+            min_records_per_fold=args.min_records_per_fold,
         )
         audit_rows.append(
             {
@@ -642,6 +706,7 @@ def main() -> None:
                 "plausible_min": low,
                 "plausible_max": high,
                 "records_by_fold": json.dumps(per_fold, sort_keys=True),
+                "unique_values_by_fold": json.dumps(unique_values_by_fold, sort_keys=True),
             }
         )
         if status == "usable":
@@ -670,6 +735,10 @@ def main() -> None:
             for fold in sorted(int(value) for value in np.unique(fold_id)):
                 train = valid & (fold_id != fold)
                 test = valid & (fold_id == fold)
+                if len(np.unique(values[train])) < 2 or len(np.unique(values[test])) < 2:
+                    raise RuntimeError(
+                        f"{target}/fold{fold}: measured target lacks train/test variation"
+                    )
                 model = make_pipeline(
                     StandardScaler(),
                     Ridge(alpha=args.ridge_alpha, solver="lsqr"),
@@ -686,7 +755,7 @@ def main() -> None:
                         "n_test": int(np.sum(test)),
                         "mae": float(mean_absolute_error(values[test], predictions[test])),
                         "r2": float(r2_score(values[test], predictions[test])),
-                        "spearman": float(spearmanr(values[test], predictions[test]).statistic),
+                        "spearman": safe_spearman(values[test], predictions[test]),
                     }
                 )
             evaluated = valid & np.isfinite(predictions)
@@ -713,9 +782,12 @@ def main() -> None:
                     "r2": float(r2_score(values[evaluated], predictions[evaluated])),
                     "r2_ci_low": bootstrap["r2"]["ci_low"],
                     "r2_ci_high": bootstrap["r2"]["ci_high"],
-                    "spearman": float(spearmanr(values[evaluated], predictions[evaluated]).statistic),
+                    "spearman": safe_spearman(values[evaluated], predictions[evaluated]),
                     "spearman_ci_low": bootstrap["spearman"]["ci_low"],
                     "spearman_ci_high": bootstrap["spearman"]["ci_high"],
+                    "mae_n_boot_valid": bootstrap["mae"]["n_boot_valid"],
+                    "r2_n_boot_valid": bootstrap["r2"]["n_boot_valid"],
+                    "spearman_n_boot_valid": bootstrap["spearman"]["n_boot_valid"],
                 }
             )
         evaluated_index = np.flatnonzero(valid)
@@ -738,11 +810,61 @@ def main() -> None:
                         **result,
                     }
                 )
+    aggregate_rows = [row for row in rows if row.get("row_type") == "aggregate"]
+    expected_aggregate_rows = len(target_columns) * len(VIEWS)
+    expected_contrast_rows = len(target_columns) * math.comb(len(VIEWS), 2) * 3
+    aggregate_bootstrap_complete = (
+        len(aggregate_rows) == expected_aggregate_rows
+        and all(
+            int(row.get(f"{metric}_n_boot_valid", 0)) == args.n_boot
+            and row.get(f"{metric}_ci_low") is not None
+            and row.get(f"{metric}_ci_high") is not None
+            for row in aggregate_rows
+            for metric in ("mae", "r2", "spearman")
+        )
+    )
+    contrast_bootstrap_complete = (
+        len(contrast_rows) == expected_contrast_rows
+        and all(
+            int(row.get("n_boot_valid", 0)) == args.n_boot
+            and row.get("ci_low") is not None
+            and row.get("ci_high") is not None
+            and np.isfinite(float(row.get("improvement_view_a_over_view_b", math.nan)))
+            for row in contrast_rows
+        )
+    )
+    point_metrics_complete = all(
+        np.isfinite(float(row.get(metric, math.nan)))
+        for row in rows
+        for metric in ("mae", "r2", "spearman")
+    )
+    completeness = {
+        "point_metrics_complete": point_metrics_complete,
+        "aggregate_bootstrap_complete": aggregate_bootstrap_complete,
+        "contrast_bootstrap_complete": contrast_bootstrap_complete,
+        "expected_aggregate_rows": expected_aggregate_rows,
+        "observed_aggregate_rows": len(aggregate_rows),
+        "expected_contrast_rows": expected_contrast_rows,
+        "observed_contrast_rows": len(contrast_rows),
+        "required_valid_bootstrap_replicates": int(args.n_boot),
+    }
+    probe_complete = all(
+        completeness[key]
+        for key in (
+            "point_metrics_complete",
+            "aggregate_bootstrap_complete",
+            "contrast_bootstrap_complete",
+        )
+    )
     save_csv(resolve(args.out_table), rows)
     save_csv(resolve(args.out_contrast_table), contrast_rows)
     write_tex_table(rows, args.out_tex_table)
     summary = {
-        "status": "complete_measured_target_probe",
+        "status": (
+            "complete_measured_target_probe"
+            if probe_complete
+            else "incomplete_bootstrap_or_metric_contract"
+        ),
         "schema_version": SCHEMA_VERSION,
         "created_utc": now_utc(),
         "protocol": PROTOCOL,
@@ -769,6 +891,7 @@ def main() -> None:
             "Differences are evidence of branch-associated linear information only; they do not prove "
             "causal or mechanistic morphology-rhythm disentanglement."
         ),
+        "completeness_contract": completeness,
         "inputs": {
             "runner": file_contract(RUNNER_SOURCE_PATH),
             "embedding": file_contract(embedding_path),
@@ -804,6 +927,8 @@ def main() -> None:
         },
     )
     print(json.dumps({"status": summary["status"], "targets": list(target_columns)}, indent=2))
+    if not probe_complete:
+        raise RuntimeError(f"Physiological probe completeness contract failed: {completeness}")
 
 
 if __name__ == "__main__":

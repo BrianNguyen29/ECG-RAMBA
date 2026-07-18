@@ -43,8 +43,10 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 2
-PROTOCOL = "matched_cross_fitted_per_class_platt_v2"
+SCHEMA_VERSION = 3
+PROTOCOL = "matched_cross_fitted_per_class_monotone_platt_v3"
+PLATT_C = 1e6
+PLATT_MIN_SLOPE = 1e-8
 DEFAULT_MODELS = {
     "full": PREDICTION_DIR / "oof_final_ema_predictions.npz",
     "minirocket": PREDICTION_DIR / "minirocket_only_oof_predictions.npz",
@@ -192,7 +194,7 @@ def write_tex_table(rows: list[dict], path: Path) -> None:
         r"\begin{table*}[t]",
         (
             r"\caption{Matched post-hoc calibration audit on frozen Chapman OOF scores. "
-            r"Per-class Platt mappings exclude labels from the evaluated fold. Lower is better "
+            r"Per-class monotone Platt mappings exclude labels from the evaluated fold. Lower is better "
             r"for NLL, Brier, and ECE; ideal diagnostic slope/intercept are 1/0. This is not a "
             r"fully nested deploy-time calibration estimate.}"
         ),
@@ -257,8 +259,14 @@ def load_prediction(name: str, path: Path) -> PredictionSet:
         raise ValueError(f"{name} shape mismatch: {result.y_true.shape} vs {result.y_prob.shape}")
     if len(result.record_id) != len(result.y_true) or len(result.fold_id) != len(result.y_true):
         raise ValueError(f"{name} record/fold length mismatch")
+    if not np.isfinite(result.y_true).all():
+        raise ValueError(f"{name} contains non-finite labels")
+    if not np.isin(result.y_true, [0.0, 1.0]).all():
+        raise ValueError(f"{name} labels must be binary")
     if not np.isfinite(result.y_prob).all():
         raise ValueError(f"{name} contains non-finite probabilities")
+    if np.any(result.y_prob < 0.0) or np.any(result.y_prob > 1.0):
+        raise ValueError(f"{name} probabilities must lie in [0, 1]")
     return result
 
 
@@ -304,16 +312,71 @@ def clipped_logit(prob: np.ndarray) -> np.ndarray:
 
 
 def fit_platt(y: np.ndarray, prob: np.ndarray) -> tuple[float, float, str]:
+    """Fit a monotone Platt map without allowing a ranking reversal."""
+
+    from scipy.optimize import minimize
+    from scipy.special import expit
+
+    y = np.asarray(y, dtype=np.float64)
+    prob = np.asarray(prob, dtype=np.float64)
+    if not np.isfinite(y).all() or not np.isin(y, [0.0, 1.0]).all():
+        raise ValueError("Platt labels must be finite and binary")
+    if not np.isfinite(prob).all() or np.any(prob < 0.0) or np.any(prob > 1.0):
+        raise ValueError("Platt probabilities must be finite and lie in [0, 1]")
+    if len(np.unique(y)) < 2:
+        return 0.0, 1.0, "identity_degenerate_training_label"
+    x = clipped_logit(prob)
+    prevalence = float(np.clip(np.mean(y), 1e-6, 1.0 - 1e-6))
+    initial_slope = 1.0
+    initial_intercept = float(np.log(prevalence / (1.0 - prevalence)) - np.mean(x))
+    n_records = float(len(y))
+
+    def objective(parameters: np.ndarray) -> tuple[float, np.ndarray]:
+        intercept, slope = parameters
+        linear = intercept + slope * x
+        loss = float(
+            np.mean(np.logaddexp(0.0, linear) - y * linear)
+            + 0.5 * slope * slope / (PLATT_C * n_records)
+        )
+        residual = expit(linear) - y
+        gradient = np.asarray(
+            [
+                np.mean(residual),
+                np.mean(residual * x) + slope / (PLATT_C * n_records),
+            ],
+            dtype=np.float64,
+        )
+        return loss, gradient
+
+    fitted = minimize(
+        objective,
+        x0=np.asarray([initial_intercept, initial_slope], dtype=np.float64),
+        method="L-BFGS-B",
+        jac=True,
+        bounds=[(None, None), (PLATT_MIN_SLOPE, None)],
+        options={"maxiter": 5000, "ftol": 1e-12, "gtol": 1e-8},
+    )
+    if not fitted.success or not np.isfinite(fitted.x).all():
+        raise RuntimeError(f"Monotone per-class Platt fit failed: {fitted.message}")
+    intercept, slope = (float(value) for value in fitted.x)
+    if slope < PLATT_MIN_SLOPE:
+        raise RuntimeError("Monotone per-class Platt fit violated its positive-slope bound")
+    status = "fitted_monotone_boundary" if slope <= PLATT_MIN_SLOPE * 1.01 else "fitted_monotone"
+    return intercept, slope, status
+
+
+def fit_calibration_diagnostic(y: np.ndarray, prob: np.ndarray) -> tuple[float, float, str]:
+    """Fit the conventional unconstrained logistic calibration diagnostic."""
+
     from sklearn.linear_model import LogisticRegression
 
     y = np.asarray(y, dtype=np.int8)
     if len(np.unique(y)) < 2:
         return 0.0, 1.0, "identity_degenerate_training_label"
-    x = clipped_logit(prob).reshape(-1, 1)
-    model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=5000)
-    model.fit(x, y)
+    model = LogisticRegression(C=PLATT_C, solver="lbfgs", max_iter=5000)
+    model.fit(clipped_logit(prob).reshape(-1, 1), y)
     if int(model.n_iter_[0]) >= int(model.max_iter):
-        raise RuntimeError("Per-class Platt fit reached max_iter without convergence")
+        raise RuntimeError("Calibration diagnostic reached max_iter without convergence")
     return float(model.intercept_[0]), float(model.coef_[0, 0]), "fitted"
 
 
@@ -366,7 +429,9 @@ def calibration_regression(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[floa
     for class_index in range(y_true.shape[1]):
         if len(np.unique(y_true[:, class_index])) < 2:
             continue
-        intercept, slope, status = fit_platt(y_true[:, class_index], y_prob[:, class_index])
+        intercept, slope, status = fit_calibration_diagnostic(
+            y_true[:, class_index], y_prob[:, class_index]
+        )
         if status == "fitted":
             intercepts.append(intercept)
             slopes.append(slope)
@@ -552,6 +617,12 @@ def write_figure(y_true: np.ndarray, raw: np.ndarray, calibrated: np.ndarray, pa
 
 def main() -> None:
     args = parse_args()
+    if args.n_boot <= 0:
+        raise ValueError("--n-boot must be positive")
+    if args.n_bins < 2:
+        raise ValueError("--n-bins must be at least 2")
+    if not 0.0 < args.threshold < 1.0:
+        raise ValueError("--threshold must lie strictly between 0 and 1")
     ensure_revision_dirs()
     model_paths = parse_models(args.model)
     missing = [name for name, path in model_paths.items() if not resolve(path).exists()]
@@ -759,8 +830,17 @@ def main() -> None:
         "schema_version": SCHEMA_VERSION,
         "created_utc": now_utc(),
         "protocol": PROTOCOL,
-        "method": "per-class Platt scaling",
-        "platt_estimator": "logistic regression on clipped logits, C=1e6, lbfgs",
+        "method": "per-class monotone Platt scaling",
+        "platt_estimator": (
+            "bounded logistic calibration on clipped logits; positive slope >=1e-8; C=1e6; "
+            "L-BFGS-B"
+        ),
+        "ranking_contract": (
+            "Each fold/class calibration map uses a positive fitted slope and is monotone "
+            "non-decreasing after float32 serialization; it cannot reverse within-fold score ordering, "
+            "although finite precision can introduce ties. Fold-specific mappings can still change "
+            "pooled OOF ranking."
+        ),
         "calibration_split_contract": (
             "For each evaluated OOF fold, calibrators are fitted on frozen OOF scores and labels "
             "from the other four folds; labels from the evaluated fold are never used by the "

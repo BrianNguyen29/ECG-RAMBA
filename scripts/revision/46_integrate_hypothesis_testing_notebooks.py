@@ -61,10 +61,12 @@ def replace_in_notebook(path: Path, old: str, new: str, *, marker: str | None = 
         source = "".join(cell.get("source", []))
         if marker is not None and marker not in source:
             continue
-        if old in source:
-            cell["source"] = source_lines(source.replace(old, new))
+        # Check the replacement first because ``new`` may intentionally retain
+        # ``old`` as a prefix. This keeps repeated integration runs idempotent.
+        if new in source:
             replacements += 1
-        elif new in source:
+        elif old in source:
+            cell["source"] = source_lines(source.replace(old, new))
             replacements += 1
     if replacements != 1:
         raise RuntimeError(f"Expected one replacement in {path.name}, found {replacements}: {old[:80]!r}")
@@ -79,7 +81,8 @@ RUN_MATCHED_CALIBRATION_AUDIT = True
 matched_runner = Path('scripts/revision/42_matched_oof_calibration.py')
 matched_runner_source = matched_runner.read_text(encoding='utf-8', errors='replace') if matched_runner.is_file() else ''
 matched_runner_tokens = [
-    'matched_cross_fitted_per_class_platt_v2',
+    'matched_cross_fitted_per_class_monotone_platt_v3',
+    'cannot reverse within-fold score ordering',
     'fully nested deploy-time calibration estimate',
     '--reuse-bootstrap',
 ]
@@ -90,15 +93,20 @@ if missing_matched_runner_tokens:
         + ', '.join(missing_matched_runner_tokens)
     )
 
-matched_prediction_paths = {
+matched_required_prediction_paths = {
     'full': 'predictions/oof_final_ema_predictions.npz',
     'minirocket': 'predictions/minirocket_only_oof_predictions.npz',
     'resnet': 'predictions/resnet1d_cnn_oof_predictions.npz',
     'raw_mamba': 'predictions/raw_mamba_oof_predictions.npz',
     'transformer': 'predictions/transformer_ecg_oof_predictions.npz',
+}
+matched_optional_prediction_paths = {
     'frozen_transform_mlp': 'predictions/hybrid_morphology_oof_predictions.npz',
 }
-restore_selected_from_mirror(list(matched_prediction_paths.values()))
+restore_selected_from_mirror(
+    list(matched_required_prediction_paths.values())
+    + list(matched_optional_prediction_paths.values())
+)
 
 def require_canonical_matched_input(relative):
     import hashlib
@@ -112,7 +120,7 @@ def require_canonical_matched_input(relative):
     source = stable_mirror / relative
     active = Path('reports/revision') / relative
     if row is None or not source.is_file() or source.stat().st_size == 0:
-        raise RuntimeError(f'Matched calibration input is not authenticated by canonical Drive: {relative}')
+        raise FileNotFoundError(f'Matched calibration input is not authenticated by canonical Drive: {relative}')
     def digest(path):
         value = hashlib.sha256()
         with Path(path).open('rb') as handle:
@@ -127,15 +135,30 @@ def require_canonical_matched_input(relative):
         raise RuntimeError(f'Active matched input differs from canonical Drive: {relative}')
     return {'relative_path': relative, 'sha256': expected_sha, 'size_bytes': expected_size}
 
-matched_input_attestations = {
-    name: require_canonical_matched_input(relative)
-    for name, relative in matched_prediction_paths.items()
-}
-print('Canonical matched calibration inputs authenticated:', matched_input_attestations)
+matched_input_attestations = {}
+missing_required_matched_inputs = []
+for name, relative in matched_required_prediction_paths.items():
+    try:
+        matched_input_attestations[name] = require_canonical_matched_input(relative)
+    except FileNotFoundError as error:
+        missing_required_matched_inputs.append(str(error))
+for name, relative in matched_optional_prediction_paths.items():
+    try:
+        matched_input_attestations[name] = require_canonical_matched_input(relative)
+    except FileNotFoundError:
+        print(f'Optional matched calibration comparator deferred: {name} ({relative})')
+if missing_required_matched_inputs:
+    RUN_MATCHED_CALIBRATION_AUDIT = False
+    print(
+        'Deferred matched calibration audit until Notebook 04 publishes the required OOF baselines:\n - '
+        + '\n - '.join(missing_required_matched_inputs)
+    )
+else:
+    print('Canonical matched calibration inputs authenticated:', matched_input_attestations)
 
 matched_model_args = ' '.join(
-    f'--model {name}=reports/revision/{relative}'
-    for name, relative in matched_prediction_paths.items()
+    f"--model {name}=reports/revision/{contract['relative_path']}"
+    for name, contract in matched_input_attestations.items()
 )
 matched_calibration_command = (
     'python -u scripts/revision/42_matched_oof_calibration.py '
@@ -178,6 +201,11 @@ matched_outputs = [
 ]
 for path in matched_outputs:
     print(path, 'exists=', path.is_file(), 'size=', path.stat().st_size if path.is_file() else None)
+if not RUN_MATCHED_CALIBRATION_AUDIT:
+    print(
+        'Matched calibration is deferred. Existing files, if any, are not readiness evidence; '
+        'Notebook 07 requires the authenticated monotone-Platt v3 protocol.'
+    )
 if RUN_MATCHED_CALIBRATION_AUDIT and not all(path.is_file() and path.stat().st_size > 0 for path in matched_outputs):
     raise RuntimeError('Matched calibration audit did not produce every required artifact.')
 '''
@@ -340,6 +368,12 @@ metadata_candidates = [
 physiology_metadata = next((path for path in metadata_candidates if path is not None and path.is_file()), None)
 physiology_provenance = None
 if physiology_metadata is not None:
+    print('Physiological metadata candidate:', physiology_metadata)
+    print('Physiological metadata SHA256 for provenance sidecar:', sha256_file(physiology_metadata))
+    print(
+        'The reviewed sidecar must bind this SHA and set independent_of_model_outputs=true and '
+        'independent_of_ecg_ramba_feature_cache=true.'
+    )
     provenance_candidates = [
         Path(os.environ['ECG_RAMBA_PHYSIOLOGY_PROVENANCE'])
         if os.environ.get('ECG_RAMBA_PHYSIOLOGY_PROVENANCE') else None,
@@ -366,7 +400,6 @@ else:
 
 physiology_summary_path = Path('reports/revision/metrics/physiological_interval_probe_summary.json')
 physiology_manifest_path = Path('reports/revision/manifests/physiological_interval_probe_manifest.json')
-physiology_tex_path = Path('reports/revision/tables/table_physiological_interval_probe.tex')
 physiology_runner_path = Path('scripts/revision/44_physiological_interval_probe.py')
 physiology_embedding_path = Path('reports/revision/predictions/representation_embeddings_final_ema.npz')
 physiology_embedding_manifest_path = Path('reports/revision/manifests/representation_embedding_manifest.json')
@@ -377,11 +410,34 @@ if physiology_summary_path.is_file() and physiology_manifest_path.is_file():
     existing_inputs = existing_manifest.get('inputs') or {}
     existing_outputs = existing_manifest.get('outputs') or {}
     physiology_reusable = (
-        (existing_manifest.get('runner') or {}).get('sha256') == sha256_file(physiology_runner_path)
+        existing_summary.get('protocol') == 'fold_held_out_measured_physiological_interval_probe_v3'
+        and existing_manifest.get('protocol') == 'fold_held_out_measured_physiological_interval_probe_v3'
+        and (existing_manifest.get('runner') or {}).get('sha256') == sha256_file(physiology_runner_path)
         and (existing_inputs.get('embedding') or {}).get('sha256') == sha256_file(physiology_embedding_path)
         and (existing_inputs.get('embedding_manifest') or {}).get('sha256')
         == sha256_file(physiology_embedding_manifest_path)
         and existing_manifest.get('status') == existing_summary.get('status')
+        and existing_summary.get('status') in {
+            'complete_measured_target_probe',
+            'blocked_missing_reliable_interval_metadata',
+        }
+    )
+    physiology_common_output_relatives = [
+        relative for relative in physiology_relative_outputs
+        if not relative.endswith('.tex') and not relative.startswith('manifests/')
+    ]
+    physiology_expected_output_relatives = (
+        physiology_common_output_relatives + ['tables/table_physiological_interval_probe.tex']
+        if existing_summary.get('status') == 'complete_measured_target_probe'
+        else physiology_common_output_relatives
+    )
+    authenticated_output_paths = [
+        Path('reports/revision') / relative for relative in physiology_expected_output_relatives
+    ]
+    physiology_reusable = physiology_reusable and all(
+        path.exists()
+        and existing_outputs.get(path.as_posix()) == sha256_file(path)
+        for path in authenticated_output_paths
     )
     if physiology_metadata is None:
         physiology_reusable = physiology_reusable and existing_summary.get('status') == 'blocked_missing_reliable_interval_metadata'
@@ -396,13 +452,6 @@ if physiology_summary_path.is_file() and physiology_manifest_path.is_file():
             physiology_reusable
             and (existing_inputs.get('metadata') or {}).get('sha256') == sha256_file(physiology_metadata)
             and (existing_inputs.get('metadata_provenance') or {}).get('sha256') == sha256_file(physiology_provenance)
-        )
-    if existing_summary.get('status') == 'complete_measured_target_probe':
-        physiology_reusable = (
-            physiology_reusable
-            and physiology_tex_path.is_file()
-            and physiology_tex_path.stat().st_size > 0
-            and existing_outputs.get(physiology_tex_path.as_posix()) == sha256_file(physiology_tex_path)
         )
 run_physiology_probe = (
     not physiology_reusable
@@ -508,6 +557,34 @@ run(
 
 
 def main() -> None:
+    replace_in_notebook(
+        NOTEBOOK_DIR / "07_results_freeze.ipynb",
+        "required_generator_schema = 9",
+        "required_generator_schema = 10",
+        marker="required_generator_capabilities = {",
+    )
+    replace_in_notebook(
+        NOTEBOOK_DIR / "07_results_freeze.ipynb",
+        "    'matched_cross_fitted_calibration',\n",
+        "    'matched_cross_fitted_calibration',\n"
+        "    'matched_monotone_calibration_v3',\n",
+        marker="required_generator_capabilities = {",
+    )
+    replace_in_notebook(
+        NOTEBOOK_DIR / "07_results_freeze.ipynb",
+        "    'physiological_interval_probe_gate',\n",
+        "    'physiological_interval_probe_gate',\n"
+        "    'physiological_interval_probe_v3',\n",
+        marker="required_generator_capabilities = {",
+    )
+    replace_in_notebook(
+        NOTEBOOK_DIR / "06_pooling_and_representation.ipynb",
+        "'fold_held_out_measured_physiological_interval_probe_v2', 'RUNNER_SOURCE_PATH',\n"
+        "        '--embedding-manifest', 'independent_of_model_outputs',",
+        "'fold_held_out_measured_physiological_interval_probe_v3', 'RUNNER_SOURCE_PATH',\n"
+        "        '--embedding-manifest', 'independent_of_model_outputs',\n"
+        "        'independent_of_ecg_ramba_feature_cache', 'metadata_sha256',",
+    )
     replace_in_notebook(
         NOTEBOOK_DIR / "02_predictions_and_external_eval.ipynb",
         "    Path('reports/revision/tables/table_true_fewshot_head_ptbxl_primary.csv'),\n"
