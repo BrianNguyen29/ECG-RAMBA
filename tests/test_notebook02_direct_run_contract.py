@@ -53,6 +53,11 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("def ensure_oof_group_sidecar():", self.source)
         self.assertIn("Refreshing the strict OOF freeze metadata on CPU", self.source)
         self.assertIn(
+            "freeze_refresh_command = freeze_command + ' --metadata-refresh-from-existing-oof'",
+            self.source,
+        )
+        self.assertIn("verified_metadata_only_refresh", self.source)
+        self.assertIn(
             "oof_inference_required = bool(FORCE_RERUN_OOF or not oof_core_available)",
             self.source,
         )

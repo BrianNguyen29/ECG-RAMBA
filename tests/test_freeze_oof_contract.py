@@ -164,6 +164,13 @@ class FreezeOOFContractTests(unittest.TestCase):
                     "dataset": "chapman_oof",
                     "dataset_record_order_fingerprint": dataset_fingerprint,
                     "inputs": {"checkpoints": checkpoint_rows},
+                    "outputs": {
+                        "prediction_file": {
+                            "path": str(record_file),
+                            "sha256": sha256_file(record_file),
+                            "size_bytes": record_file.stat().st_size,
+                        }
+                    },
                 }
             ),
             encoding="utf-8",
@@ -266,6 +273,63 @@ class FreezeOOFContractTests(unittest.TestCase):
             payload["group_contract"]["source_patient_record_counts"],
             freeze_oof.SUBJECT_GROUP_REFERENCE_COUNTS,
         )
+
+    def test_metadata_refresh_authenticates_unchanged_oof_without_generation_log(self):
+        args, log_dir, checkpoint_rows, _, _ = self._fixture()
+        initial = self._validate(args, log_dir, checkpoint_rows)
+        args.freeze_manifest.write_text(json.dumps(initial), encoding="utf-8")
+        args.metadata_refresh_from_existing_oof = True
+        (log_dir / "oof_generate_predictions.log").unlink()
+
+        refreshed = self._validate(args, log_dir, checkpoint_rows)
+
+        provenance = refreshed["generation_provenance"]
+        self.assertEqual(provenance["status"], "verified_metadata_only_refresh")
+        self.assertFalse(provenance["prediction_values_changed"])
+        self.assertEqual(provenance["record_file_sha256"], sha256_file(args.record_file))
+
+    def test_metadata_refresh_rejects_prior_freeze_with_different_oof_sha(self):
+        args, log_dir, checkpoint_rows, _, _ = self._fixture()
+        initial = self._validate(args, log_dir, checkpoint_rows)
+        for row in initial["artifacts"]:
+            if Path(str(row.get("path", ""))).name == args.record_file.name:
+                row["sha256"] = "0" * 64
+        args.freeze_manifest.write_text(json.dumps(initial), encoding="utf-8")
+        args.metadata_refresh_from_existing_oof = True
+        (log_dir / "oof_generate_predictions.log").unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "Prior freeze manifest does not authenticate"):
+            self._validate(args, log_dir, checkpoint_rows)
+
+    def test_metadata_refresh_rejects_run_manifest_with_different_oof_sha(self):
+        args, log_dir, checkpoint_rows, _, _ = self._fixture()
+        initial = self._validate(args, log_dir, checkpoint_rows)
+        run_manifest = json.loads(args.run_manifest.read_text(encoding="utf-8"))
+        run_manifest["outputs"]["prediction_file"]["sha256"] = "0" * 64
+        args.run_manifest.write_text(json.dumps(run_manifest), encoding="utf-8")
+        for row in initial["artifacts"]:
+            if Path(str(row.get("path", ""))).name == args.run_manifest.name:
+                row["sha256"] = sha256_file(args.run_manifest)
+                row["size_bytes"] = args.run_manifest.stat().st_size
+        args.freeze_manifest.write_text(json.dumps(initial), encoding="utf-8")
+        args.metadata_refresh_from_existing_oof = True
+        (log_dir / "oof_generate_predictions.log").unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "run manifest does not authenticate"):
+            self._validate(args, log_dir, checkpoint_rows)
+
+    def test_metadata_refresh_rejects_run_manifest_not_bound_by_prior_freeze(self):
+        args, log_dir, checkpoint_rows, _, _ = self._fixture()
+        initial = self._validate(args, log_dir, checkpoint_rows)
+        args.freeze_manifest.write_text(json.dumps(initial), encoding="utf-8")
+        run_manifest = json.loads(args.run_manifest.read_text(encoding="utf-8"))
+        run_manifest["created_utc"] = "mutated-after-freeze"
+        args.run_manifest.write_text(json.dumps(run_manifest), encoding="utf-8")
+        args.metadata_refresh_from_existing_oof = True
+        (log_dir / "oof_generate_predictions.log").unlink()
+
+        with self.assertRaisesRegex(RuntimeError, "does not authenticate the current OOF prediction run manifest"):
+            self._validate(args, log_dir, checkpoint_rows)
 
     def test_non_strict_freeze_is_not_manuscript_ready(self):
         args, log_dir, checkpoint_rows, _, _ = self._fixture()

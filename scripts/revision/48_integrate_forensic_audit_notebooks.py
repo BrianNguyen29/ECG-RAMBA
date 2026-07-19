@@ -76,6 +76,8 @@ REVISION_TOKEN_REQUIREMENTS = {
     'scripts/revision/06_freeze_oof.py': [
         '--check-existing-freeze',
         'Validated without rewrite',
+        '--metadata-refresh-from-existing-oof',
+        'verified_metadata_only_refresh',
         '--manuscript-ready-strict',
         'source_archive_sha256',
     ],
@@ -773,8 +775,9 @@ def integrate_notebook02() -> None:
 oof_core_available = all(path.is_file() and path.stat().st_size > 0 for path in OOF_CORE_ARTIFACTS)
 if not FORCE_RERUN_OOF and not oof_ready and oof_core_available and CANONICAL_GROUP_SIDECAR.is_file():
     print('Refreshing the strict OOF freeze metadata on CPU; existing predictions remain unchanged.')
+    freeze_refresh_command = freeze_command + ' --metadata-refresh-from-existing-oof'
     refresh_result = run(
-        freeze_command,
+        freeze_refresh_command,
         check=False,
         log_path='reports/revision/logs/oof_final_ema_freeze_refresh.log',
     )

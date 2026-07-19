@@ -84,6 +84,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--allow-missing-log", action="store_true")
     parser.add_argument(
+        "--metadata-refresh-from-existing-oof",
+        action="store_true",
+        help=(
+            "Permit a metadata-only strict refreeze when the original generation log is unavailable, "
+            "but only after the prior frozen manifest and prediction run manifest independently bind "
+            "the exact current OOF prediction SHA256. No predictions are regenerated."
+        ),
+    )
+    parser.add_argument(
         "--manuscript-ready-strict",
         action="store_true",
         help=(
@@ -708,6 +717,60 @@ def validate_group_contract(
     }
 
 
+def validate_metadata_refresh_provenance(args: argparse.Namespace) -> dict:
+    """Authenticate an unchanged OOF artifact for a metadata-only refreeze."""
+
+    if not args.freeze_manifest.is_file() or args.freeze_manifest.stat().st_size == 0:
+        raise FileNotFoundError(
+            "Metadata-only refresh requires a non-empty prior freeze manifest"
+        )
+    prior_freeze_sha = sha256_file(args.freeze_manifest)
+    prior = json.loads(args.freeze_manifest.read_text(encoding="utf-8"))
+    if prior.get("status") != "frozen" or prior.get("manuscript_ready") is not True:
+        raise RuntimeError(
+            "Metadata-only refresh requires a prior frozen, manuscript-ready OOF manifest"
+        )
+    record_sha = sha256_file(args.record_file)
+    prior_record_rows = [
+        row
+        for row in prior.get("artifacts", [])
+        if Path(str(row.get("path", ""))).name == args.record_file.name
+    ]
+    if len(prior_record_rows) != 1 or prior_record_rows[0].get("sha256") != record_sha:
+        raise RuntimeError(
+            "Prior freeze manifest does not authenticate the exact current OOF prediction SHA256"
+        )
+    current_run_manifest_sha = sha256_file(args.run_manifest)
+    prior_run_manifest_rows = [
+        row
+        for row in prior.get("artifacts", [])
+        if Path(str(row.get("path", ""))).name == args.run_manifest.name
+    ]
+    if (
+        len(prior_run_manifest_rows) != 1
+        or prior_run_manifest_rows[0].get("sha256") != current_run_manifest_sha
+    ):
+        raise RuntimeError(
+            "Prior freeze manifest does not authenticate the current OOF prediction run manifest"
+        )
+    run_manifest = json.loads(args.run_manifest.read_text(encoding="utf-8"))
+    run_prediction = (run_manifest.get("outputs") or {}).get("prediction_file") or {}
+    if run_prediction.get("sha256") != record_sha:
+        raise RuntimeError(
+            "OOF prediction run manifest does not authenticate the exact current OOF prediction SHA256"
+        )
+    if int(run_prediction.get("size_bytes", -1)) != args.record_file.stat().st_size:
+        raise RuntimeError("OOF prediction run manifest size differs from the current OOF artifact")
+    return {
+        "status": "verified_metadata_only_refresh",
+        "prediction_values_changed": False,
+        "record_file_sha256": record_sha,
+        "prior_freeze_manifest_sha256": prior_freeze_sha,
+        "run_manifest_sha256": current_run_manifest_sha,
+        "reason": "group/split provenance metadata refresh with unchanged SHA-bound OOF predictions",
+    }
+
+
 def validate_existing_freeze(args: argparse.Namespace, current: dict) -> dict:
     if not args.freeze_manifest.exists() or args.freeze_manifest.stat().st_size == 0:
         raise FileNotFoundError(f"Existing freeze manifest is missing: {args.freeze_manifest}")
@@ -1018,7 +1081,10 @@ def validate_oof(args: argparse.Namespace) -> dict:
             if path.is_file() and path.stat().st_size > 0
         }
     )
-    if not logs and not args.allow_missing_log:
+    metadata_refresh_provenance = None
+    if not logs and getattr(args, "metadata_refresh_from_existing_oof", False):
+        metadata_refresh_provenance = validate_metadata_refresh_provenance(args)
+    elif not logs and not args.allow_missing_log:
         raise FileNotFoundError("No non-empty OOF generation/re-aggregation log found")
 
     support_files = required + logs
@@ -1073,6 +1139,14 @@ def validate_oof(args: argparse.Namespace) -> dict:
         "strict_manuscript_contract": strict_manuscript_contract,
         "membership_contract": membership_contract,
         "group_contract": group_contract,
+        "generation_provenance": (
+            metadata_refresh_provenance
+            or {
+                "status": "generation_or_reaggregation_log_present",
+                "prediction_values_changed": None,
+                "logs": [artifact_info(path) for path in logs],
+            }
+        ),
         "source_checkpoints": [source_checkpoints[i] for i in sorted(source_checkpoints)],
         "current_checkpoints": current_checkpoints_list,
         "git_commit": git_commit(),
