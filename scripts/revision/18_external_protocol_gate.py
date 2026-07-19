@@ -47,6 +47,8 @@ from scripts.revision.common import (  # noqa: E402
 
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
+NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"
+NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1
 GATE_SCHEMA_VERSION = 5
 METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
 EXPECTED_EXTERNAL_PROTOCOLS = {

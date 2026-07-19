@@ -273,6 +273,31 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertEqual(len(candidates), 1)
         self.assertIn("INSTALL_MODEL_DEPS = 'auto'", candidates[0])
 
+    def test_notebook02_uses_authority_bound_capability_preflight(self):
+        _, source = notebook_source("02_predictions_and_external_eval.ipynb")
+        self.assertIn("# BEGIN FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT", source)
+        self.assertIn("NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY", source)
+        self.assertIn("external_export_full10s_grouped_v1", source)
+        self.assertIn("NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY", source)
+        self.assertIn("external_gate_full10s_grouped_v1", source)
+        self.assertIn("_compat_ast.parse", source)
+        self.assertNotIn("raw.githubusercontent.com/BrianNguyen29/ECG-RAMBA", source)
+        self.assertNotIn("annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal", source)
+        self.assertNotIn("GATE_SCHEMA_VERSION = 4", source)
+
+        export_source = (PROJECT_ROOT / "scripts/revision/03_generate_external_predictions.py").read_text(encoding="utf-8")
+        gate_source = (PROJECT_ROOT / "scripts/revision/18_external_protocol_gate.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY = "external_export_full10s_grouped_v1"',
+            export_source,
+        )
+        self.assertIn("NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION = 1", export_source)
+        self.assertIn(
+            'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"',
+            gate_source,
+        )
+        self.assertIn("NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1", gate_source)
+
     def test_installer_discovery_uses_exact_capability_schema_pair(self):
         _, notebook02_source = notebook_source("02_predictions_and_external_eval.ipynb")
         markers = (

@@ -22,6 +22,157 @@ AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
 GROUP_SEMANTICS = "physionet_ecg_arrhythmia_one_patient_per_record_v1"
 GROUP_REFERENCE = "https://physionet.org/content/ecg-arrhythmia/1.0.0/"
+NOTEBOOK02_PREFLIGHT_START = "# BEGIN FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT"
+NOTEBOOK02_PREFLIGHT_END = "# END FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT"
+
+
+NOTEBOOK02_CAPABILITY_PREFLIGHT = r'''# BEGIN FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT
+# The immutable authority checkout is the source of code. Validate reviewed,
+# machine-readable capabilities without downloading mutable branch files into
+# the detached checkout.
+import ast as _compat_ast
+
+REVISION_CAPABILITY_REQUIREMENTS = {
+    'scripts/revision/03_generate_external_predictions.py': {
+        'NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY': 'external_export_full10s_grouped_v1',
+        'NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION': 1,
+    },
+    'scripts/revision/18_external_protocol_gate.py': {
+        'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
+        'NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION': 1,
+    },
+}
+REVISION_TOKEN_REQUIREMENTS = {
+    'scripts/revision/common.py': [
+        'one-label mapped task retains positive-label',
+        'average="binary"',
+    ],
+    'scripts/revision/artifact_mirror.py': [
+        '--verify-existing',
+        '--include-prefix',
+        'discovered_unmanifested_count',
+        'recoverable_publish_transaction_v1',
+        'PUBLISH_TRANSACTION_NAME',
+    ],
+    'scripts/revision/01_generate_predictions.py': [
+        '--fold-cache-dir',
+        'OOF_CACHE_PROVENANCE_SCHEMA_VERSION',
+        'cache_contract_sha256',
+    ],
+    'scripts/revision/03_generate_external_predictions.py': [
+        '--georgia-mapping-review',
+        '--georgia-code-inventory-out',
+        '--cpsc-annotation-audit-out',
+        'validate_checkpoint_files_against_oof_run_manifest',
+    ],
+    'scripts/revision/06_freeze_oof.py': [
+        '--check-existing-freeze',
+        'Validated without rewrite',
+        '--manuscript-ready-strict',
+        'source_archive_sha256',
+    ],
+    'scripts/revision/18_external_protocol_gate.py': [
+        'georgia_mapping_inventory',
+        'cpsc_annotation_audit',
+        'metric_implementation_sha256',
+        'positive_label_multilabel_reduction',
+    ],
+    'scripts/revision/31_generate_external_comparator_predictions.py': [
+        'validate_checkpoint_set',
+        '--fold-cache-dir',
+        'Verified final external comparator artifacts were not reusable',
+    ],
+    'scripts/revision/32_paired_external_comparators.py': [
+        'Paired external bootstrap requires at least two groups',
+        'probabilities must be in [0,1]',
+    ],
+    'scripts/revision/33_group_safe_score_calibration.py': [
+        '--primary-fraction',
+        'pre_specified_before_test_metric_evaluation',
+        'independent_target_groups_from_adaptation_pool',
+    ],
+    'scripts/revision/34_extract_external_representations.py': [
+        'checkpoint_source_contract',
+        'validate_checkpoint_files_against_oof_run_manifest',
+        'frozen_encoder_external_record_representation_v2_source_bound',
+        'validate_source_provenance',
+        'current runner/canonical contract',
+    ],
+    'scripts/revision/35_true_fewshot_head_adaptation.py': [
+        'embedding_manifest_path',
+        'Embedding manifest is stale or incomplete',
+        'independent_target_groups_from_adaptation_pool',
+        'REPRESENTATION_PROTOCOL_VERSION = 2',
+        'pre_specified_before_test_metric_evaluation',
+        'primary_endpoint_rows',
+    ],
+}
+REVISION_REQUIRED_FILES = [
+    'docs/revision_plan/georgia_label_mapping_review_20260703.csv',
+]
+
+
+def _literal_module_assignments(path):
+    try:
+        tree = _compat_ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+    except Exception as exc:
+        raise RuntimeError(f'Could not parse capability source {path}: {exc}') from exc
+    assignments = {}
+    for node in tree.body:
+        if isinstance(node, _compat_ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], _compat_ast.Name):
+            try:
+                assignments[node.targets[0].id] = _compat_ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+        elif isinstance(node, _compat_ast.AnnAssign) and isinstance(node.target, _compat_ast.Name):
+            try:
+                assignments[node.target.id] = _compat_ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+    return assignments
+
+
+compatibility_failures = []
+for rel_path, expected in REVISION_CAPABILITY_REQUIREMENTS.items():
+    path = REPO_DIR / rel_path
+    if not path.is_file() or path.stat().st_size == 0:
+        compatibility_failures.append(f'{rel_path}: missing or empty')
+        continue
+    observed = _literal_module_assignments(path)
+    mismatches = {
+        key: {'expected': value, 'observed': observed.get(key)}
+        for key, value in expected.items()
+        if observed.get(key) != value
+    }
+    if mismatches:
+        compatibility_failures.append(f'{rel_path}: capability mismatch {mismatches}')
+
+for rel_path, required_tokens in REVISION_TOKEN_REQUIREMENTS.items():
+    path = REPO_DIR / rel_path
+    if not path.is_file() or path.stat().st_size == 0:
+        compatibility_failures.append(f'{rel_path}: missing or empty')
+        continue
+    source_text = path.read_text(encoding='utf-8', errors='replace')
+    missing_tokens = [token for token in required_tokens if token not in source_text]
+    if missing_tokens:
+        compatibility_failures.append(f'{rel_path}: missing contract tokens {missing_tokens}')
+
+for rel_path in REVISION_REQUIRED_FILES:
+    path = REPO_DIR / rel_path
+    if not path.is_file() or path.stat().st_size == 0:
+        compatibility_failures.append(f'{rel_path}: missing or empty')
+
+if compatibility_failures:
+    authority = (CODE_AUTHORITY or {}).get('commit', 'unknown')
+    raise RuntimeError(
+        f'Notebook 02 is incompatible with pinned authority {authority}: '
+        + ' ; '.join(compatibility_failures)
+        + '. Do not hotfix a detached authority checkout from mutable GitHub main. '
+        'Commit and review the required change, then rotate authority through Notebook 00.'
+    )
+print('Revision capability preflight: OK')
+# END FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT
+'''
 
 
 RUN_HISTORY_WRAPPER = r'''
@@ -488,19 +639,20 @@ def integrate_notebook02() -> None:
     )
     for cell in notebook["cells"]:
         text = source(cell)
-        if "REVISION_COMPATIBILITY_REQUIREMENTS = {" in text:
-            text = text.replace(
-                "'scripts/revision/artifact_mirror.py': ['--verify-existing', '--include-prefix', 'discovered_unmanifested_count'],",
-                "'scripts/revision/artifact_mirror.py': ['--verify-existing', '--include-prefix', 'discovered_unmanifested_count', 'recoverable_publish_transaction_v1', 'PUBLISH_TRANSACTION_NAME'],",
-            )
-            text = text.replace(
-                "'scripts/revision/01_generate_predictions.py': ['--fold-cache-dir'],",
-                "'scripts/revision/01_generate_predictions.py': ['--fold-cache-dir', 'OOF_CACHE_PROVENANCE_SCHEMA_VERSION', 'cache_contract_sha256'],",
-            )
-            text = text.replace(
-                "'scripts/revision/06_freeze_oof.py': ['--check-existing-freeze', 'Validated without rewrite'],",
-                "'scripts/revision/06_freeze_oof.py': ['--check-existing-freeze', 'Validated without rewrite', '--manuscript-ready-strict', 'source_archive_sha256'],",
-            )
+        legacy_start = "# Notebook 02 may be rerun in a fresh /content clone"
+        if NOTEBOOK02_PREFLIGHT_START in text:
+            start = text.index(NOTEBOOK02_PREFLIGHT_START)
+            end = text.index(NOTEBOOK02_PREFLIGHT_END, start) + len(NOTEBOOK02_PREFLIGHT_END)
+            if end < len(text) and text[end] == "\n":
+                end += 1
+            text = text[:start] + NOTEBOOK02_CAPABILITY_PREFLIGHT + text[end:]
+        elif legacy_start in text and "print('Revision compatibility preflight: OK')" in text:
+            start = text.index(legacy_start)
+            terminal = "print('Revision compatibility preflight: OK')"
+            end = text.index(terminal, start) + len(terminal)
+            if end < len(text) and text[end] == "\n":
+                end += 1
+            text = text[:start] + NOTEBOOK02_CAPABILITY_PREFLIGHT + text[end:]
         if (
             "scripts/revision/06_freeze_oof.py" in text
             and "--manuscript-ready-strict" not in text
@@ -974,11 +1126,20 @@ def validate() -> None:
     for token in (
         "--manuscript-ready-strict",
         "oof_final_ema_group_sidecar.npz",
-        "OOF_CACHE_PROVENANCE_SCHEMA_VERSION",
-        "recoverable_publish_transaction_v1",
+        NOTEBOOK02_PREFLIGHT_START,
+        "NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY",
+        "NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY",
+        "_compat_ast.parse",
     ):
         if token not in notebook02_text:
             raise RuntimeError(f"Notebook 02 strict OOF contract token missing: {token}")
+    for forbidden in (
+        "raw.githubusercontent.com/BrianNguyen29/ECG-RAMBA",
+        "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
+        "GATE_SCHEMA_VERSION = 4",
+    ):
+        if forbidden in notebook02_text:
+            raise RuntimeError(f"Notebook 02 stale/mutable compatibility token remains: {forbidden}")
     for name in (
         "00_colab_bootstrap.ipynb",
         "01_a0_protocol_audit.ipynb",

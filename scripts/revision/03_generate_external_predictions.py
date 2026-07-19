@@ -74,6 +74,10 @@ AMP_DTYPE_NAME = (
 )
 
 
+NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY = "external_export_full10s_grouped_v1"
+NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION = 1
+
+
 def patch_wfdb_annotation_numpy2_overflow() -> None:
     """Patch old wfdb annotation parsing that overflows on NumPy 2 uint8 arrays."""
 
