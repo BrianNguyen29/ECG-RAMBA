@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -25,6 +26,22 @@ import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
+)
+
+PRESENTATION_CONTRACT_SCHEMA_VERSION = 2
+PRESENTATION_CAPABILITIES = {
+    "authenticated_patient_record_bootstrap",
+    "fixed_seed_rocket_family_identity",
+    "paired_inference_scope_audit",
+}
+
 DEFAULT_REVISION_ROOT = PROJECT_ROOT / "reports" / "revision"
 PAIR_FILES = {
     "Fixed-transform-only": "paired_full_vs_minirocket_comparison.json",
@@ -196,10 +213,14 @@ def validate_primary_contract(args: argparse.Namespace, paths: dict[str, Path]) 
     if int(calibration.get("n_boot", -1)) < 1000:
         errors.append("calibration bootstrap uses fewer than 1000 resamples")
     bootstrap_contract = calibration.get("bootstrap") or {}
-    if bootstrap_contract.get("unit") != "chapman_record_subject":
-        errors.append("calibration bootstrap unit is not declared as chapman_record_subject")
-    if bootstrap_contract.get("independence_contract") != "one_chapman_record_per_subject":
-        errors.append("calibration does not declare the one-record-per-subject independence contract")
+    if bootstrap_contract.get("unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        errors.append("calibration bootstrap unit is not an authenticated source patient-record")
+    if bootstrap_contract.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS:
+        errors.append("calibration does not declare the reviewed patient-record semantics")
+    if bootstrap_contract.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        errors.append("calibration patient-record semantics are not bound to PhysioNet")
+    if not bootstrap_contract.get("group_sidecar_sha256"):
+        errors.append("calibration does not bind its patient-record group sidecar SHA256")
     if errors:
         raise RuntimeError("Primary evidence contract failed: " + "; ".join(errors))
     return {
@@ -209,6 +230,10 @@ def validate_primary_contract(args: argparse.Namespace, paths: dict[str, Path]) 
         "checkpoint_kind": freeze.get("checkpoint_kind"),
         "validated_records": int(freeze.get("validated_records")),
         "n_classes": int(freeze.get("n_classes")),
+        "bootstrap_unit": bootstrap_contract.get("unit"),
+        "group_semantics": bootstrap_contract.get("independence_contract"),
+        "group_semantics_reference": bootstrap_contract.get("group_semantics_reference"),
+        "group_sidecar_sha256": bootstrap_contract.get("group_sidecar_sha256"),
     }
 
 
@@ -321,7 +346,10 @@ def paired_rows(metric_dir: Path, contract: dict[str, Any], strict: bool) -> tup
                     "improvement_full_over_comparator": metric.get("improvement_full_over_comparator"),
                     "improvement_ci_low": metric.get("improvement_ci_low"),
                     "improvement_ci_high": metric.get("improvement_ci_high"),
-                    "holm_p_value_two_sided": metric.get("holm_p_value_two_sided"),
+                    "inference_scope": metric.get("inference_scope", "pointwise_percentile_ci_effect_size_only"),
+                    "multiplicity_adjustment": metric.get(
+                        "multiplicity_adjustment", "not_applicable_no_null_test"
+                    ),
                     "n_boot_valid": metric.get("n_boot_valid"),
                     "interpretation": metric.get("interpretation"),
                     "safe_wording": metric.get("safe_wording"),

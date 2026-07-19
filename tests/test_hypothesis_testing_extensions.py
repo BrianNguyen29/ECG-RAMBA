@@ -171,7 +171,37 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
 
         self.assertGreater(result["improvement_full_over_comparator"], 0)
         self.assertGreater(result["ci_low"], 0)
-        self.assertEqual(result["interpretation"], "full_significantly_better")
+        self.assertEqual(result["interpretation"], "full_nominal_95ci_better")
+
+    def test_matched_calibration_rejects_incomplete_or_nonfinite_bootstrap(self):
+        calibration = load_script(
+            "matched_calibration_hardening_test_module",
+            "scripts/revision/42_matched_oof_calibration.py",
+        )
+        valid = {"n_boot_valid": 100, "ci_low": -0.1, "ci_high": 0.2}
+        calibration.validate_bootstrap_result(
+            valid,
+            n_boot=100,
+            ci_fields=("ci_low", "ci_high"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "exactly 100"):
+            calibration.validate_bootstrap_result(
+                {**valid, "n_boot_valid": 99},
+                n_boot=100,
+                ci_fields=("ci_low", "ci_high"),
+            )
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            calibration.validate_bootstrap_result(
+                {**valid, "ci_high": float("nan")},
+                n_boot=100,
+                ci_fields=("ci_low", "ci_high"),
+            )
+        with self.assertRaisesRegex(RuntimeError, "legacy significance"):
+            calibration.validate_bootstrap_result(
+                {**valid, "interpretation": "full_significantly_better"},
+                n_boot=100,
+                ci_fields=("ci_low", "ci_high"),
+            )
 
     def test_structured_ablation_checkpoint_uses_trainer_fold_fingerprint(self):
         try:
@@ -484,7 +514,7 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
             self.assertGreater(result[metric]["improvement_view_a_over_view_b"], 0)
             self.assertGreater(result[metric]["ci_low"], 0)
             self.assertEqual(
-                result[metric]["interpretation"], "view_a_significantly_better"
+                result[metric]["interpretation"], "view_a_nominal_95ci_better"
             )
 
     def test_physiological_probe_tex_is_scale_free_and_claim_bounded(self):

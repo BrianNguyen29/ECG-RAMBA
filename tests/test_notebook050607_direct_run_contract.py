@@ -1,10 +1,27 @@
 import ast
+import hashlib
 import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PIPELINE_NOTEBOOKS = (
+    "00_colab_bootstrap.ipynb",
+    "01_a0_protocol_audit.ipynb",
+    "02_predictions_and_external_eval.ipynb",
+    "02a_retrain_best_ema.ipynb",
+    "03_calibration_and_ci.ipynb",
+    "04_baselines_and_component_checks.ipynb",
+    "05_hrv_domain_and_robustness.ipynb",
+    "06_pooling_and_representation.ipynb",
+    "07_results_freeze.ipynb",
+)
 
 
 def notebook_source(name: str) -> tuple[list[str], str]:
@@ -21,6 +38,34 @@ def notebook_source(name: str) -> tuple[list[str], str]:
 def notebook_payload(name: str) -> dict:
     path = PROJECT_ROOT / "notebooks" / name
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def compilable_notebook_source(source: str) -> str:
+    """Replace IPython line magics with Python no-ops before syntax validation."""
+    lines = []
+    for line in source.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith(("!", "%")):
+            indentation = line[: len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            lines.append(indentation + "pass  # IPython line magic" + newline)
+        else:
+            lines.append(line)
+    return "".join(lines)
+
+
+def authority_block_source(name: str, *, occurrence: int = 0) -> str:
+    cells, _ = notebook_source(name)
+    blocks = []
+    start_marker = "# BEGIN FORENSIC CODE AUTHORITY PIN"
+    end_marker = "# END FORENSIC CODE AUTHORITY PIN"
+    for cell in cells:
+        if start_marker not in cell:
+            continue
+        start = cell.index(start_marker)
+        end = cell.index(end_marker, start) + len(end_marker)
+        blocks.append(cell[start:end] + "\n")
+    return blocks[occurrence]
 
 
 class Notebook050607DirectRunContractTests(unittest.TestCase):
@@ -46,15 +91,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                     self.assertIsInstance(cell.get("outputs"), list)
 
     def test_every_code_cell_compiles(self):
-        for notebook in (
-            "03_calibration_and_ci.ipynb",
-            "05_hrv_domain_and_robustness.ipynb",
-            "06_pooling_and_representation.ipynb",
-            "07_results_freeze.ipynb",
-        ):
+        for notebook in PIPELINE_NOTEBOOKS:
             cells, _ = notebook_source(notebook)
             for index, source in enumerate(cells):
-                compile(source, f"{notebook}:cell_{index}", "exec")
+                compile(compilable_notebook_source(source), f"{notebook}:cell_{index}", "exec")
 
     def test_notebook05_selects_authenticated_robustness_profile(self):
         cells, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
@@ -121,9 +161,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook05_finds_current_notebook02_mamba_installer(self):
         _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
         for token in (
-            "MODEL_DEPS_SHOULD_RUN",
+            "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'",
             "candidate_count={len(installer_candidates)}",
-            "Mamba wheel environment",
+            "len(installer_candidates) == 1",
         ):
             self.assertIn(token, source)
         self.assertNotIn("'INSTALL_MODEL_DEPS = True' in source", source)
@@ -221,20 +261,188 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
 
     def test_notebook06_finds_current_notebook02_mamba_installer(self):
         payload = notebook_payload("02_predictions_and_external_eval.ipynb")
-        required_markers = (
-            "INSTALL_MODEL_DEPS",
-            "MODEL_DEPS_SHOULD_RUN",
-            "AUTO_PIN_TORCH_FOR_MAMBA",
-            "Mamba wheel environment",
-        )
+        capability = "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'"
+        schema = "MAMBA_INSTALLER_SCHEMA_VERSION = 1"
         candidates = [
             "".join(cell.get("source", []))
             for cell in payload["cells"]
             if cell.get("cell_type") == "code"
-            and all(marker in "".join(cell.get("source", [])) for marker in required_markers)
+            and capability in "".join(cell.get("source", []))
+            and schema in "".join(cell.get("source", []))
         ]
         self.assertEqual(len(candidates), 1)
         self.assertIn("INSTALL_MODEL_DEPS = 'auto'", candidates[0])
+
+    def test_installer_discovery_uses_exact_capability_schema_pair(self):
+        _, notebook02_source = notebook_source("02_predictions_and_external_eval.ipynb")
+        markers = (
+            "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'",
+            "MAMBA_INSTALLER_SCHEMA_VERSION = 1",
+            "BASE_INSTALLER_CAPABILITY = 'ecg_ramba_base_installer_v1'",
+            "BASE_INSTALLER_SCHEMA_VERSION = 1",
+        )
+        for marker in markers:
+            self.assertEqual(notebook02_source.count(marker), 1, marker)
+
+        for notebook in (
+            "00_colab_bootstrap.ipynb",
+            "02a_retrain_best_ema.ipynb",
+            "05_hrv_domain_and_robustness.ipynb",
+            "06_pooling_and_representation.ipynb",
+        ):
+            _, source = notebook_source(notebook)
+            self.assertIn(markers[0], source)
+            self.assertIn(markers[1], source)
+            self.assertTrue(
+                "expected exactly one" in source
+                or "len(installer_candidates) == 1" in source,
+                notebook,
+            )
+        _, retrain_source = notebook_source("02a_retrain_best_ema.ipynb")
+        self.assertIn("def canonical_installer_source(capability_marker, schema_marker):", retrain_source)
+        self.assertIn("if len(candidates) != 1:", retrain_source)
+        self.assertNotIn("def canonical_installer_source(*markers):", retrain_source)
+
+    def test_code_authority_is_pinned_across_direct_runs(self):
+        capability = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_git_commit_pin_v1'"
+        schema = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 1"
+        for notebook in PIPELINE_NOTEBOOKS:
+            cells, source = notebook_source(notebook)
+            expected_count = 2 if notebook == "07_results_freeze.ipynb" else 1
+            self.assertEqual(source.count(capability), expected_count, notebook)
+            self.assertEqual(source.count(schema), expected_count, notebook)
+            self.assertIn("notebook_code_authority.json", source)
+            self.assertIn("git('checkout', '--detach', expected_commit)", source)
+            self.assertIn("git('cat-file', '-e', expected_commit + '^{commit}')", source)
+            self.assertIn("Tracked files differ from git before authority checkout", source)
+            setup_cells = [cell for cell in cells if capability in cell]
+            for setup in setup_cells:
+                self.assertLess(setup.rfind("git pull --ff-only"), setup.index(capability))
+
+        _, notebook00_source = notebook_source("00_colab_bootstrap.ipynb")
+        self.assertIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", notebook00_source)
+        self.assertIn("ECG_RAMBA_RESET_CODE_AUTHORITY", notebook00_source)
+        for notebook in PIPELINE_NOTEBOOKS[1:]:
+            _, source = notebook_source(notebook)
+            self.assertNotIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", source)
+            self.assertIn("_AUTHORITY_BOOTSTRAP_ALLOWED = False", source)
+
+    def test_code_authority_manifest_fails_closed_and_pins_moving_branch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            canonical = root / "canonical"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "audit@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Audit Test"], cwd=repo, check=True)
+            (repo / "authority.txt").write_text("first\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "first"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            first_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+
+            namespace = {
+                "MIRROR_REVISION_ROOT": canonical,
+                "REPO_DIR": repo,
+                "REPO_URL": "https://github.com/BrianNguyen29/ECG-RAMBA.git",
+                "BRANCH": "main",
+            }
+            clean_environment = {
+                "ECG_RAMBA_AUTHORITY_COMMIT": "",
+                "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
+            }
+            with mock.patch.dict(os.environ, clean_environment, clear=False):
+                exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
+                manifest_path = canonical / "manifests" / "notebook_code_authority.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                self.assertEqual(manifest["git_commit"], first_commit)
+
+                subprocess.run(["git", "checkout", "-B", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+                (repo / "authority.txt").write_text("second\n", encoding="utf-8")
+                subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+                subprocess.run(["git", "commit", "-m", "second"], cwd=repo, check=True, stdout=subprocess.PIPE)
+                second_commit = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+                ).strip()
+                self.assertNotEqual(first_commit, second_commit)
+
+                downstream_namespace = dict(namespace)
+                exec(
+                    authority_block_source("01_a0_protocol_audit.ipynb"),
+                    downstream_namespace,
+                    downstream_namespace,
+                )
+                observed = subprocess.check_output(
+                    ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+                ).strip()
+                self.assertEqual(observed, first_commit)
+
+            missing_namespace = {
+                "MIRROR_REVISION_ROOT": root / "missing-canonical",
+                "REPO_DIR": repo,
+                "REPO_URL": namespace["REPO_URL"],
+                "BRANCH": "main",
+            }
+            with mock.patch.dict(os.environ, clean_environment, clear=False):
+                with self.assertRaises(FileNotFoundError):
+                    exec(
+                        authority_block_source("01_a0_protocol_audit.ipynb"),
+                        missing_namespace,
+                        missing_namespace,
+                    )
+
+    def test_notebook02a_training_streams_stage_run_id_logs_to_drive(self):
+        cells, source = notebook_source("02a_retrain_best_ema.ipynb")
+        training = next(
+            cell for cell in cells
+            if "FORENSIC_RETRAIN_STREAMING_LOG_CAPABILITY" in cell
+        )
+        for token in (
+            "stage_run_id_durable_stream_v1",
+            "run(\n        training_command",
+            "MIRROR_REVISION_ROOT / 'logs' / 'history' / 'retrain_best_ema_train'",
+            "durable_model_log_path",
+        ):
+            self.assertIn(token, training)
+        self.assertNotIn("subprocess.Popen", training)
+        self.assertIn("FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'", source)
+
+    def test_notebook07_updates_current_authority_then_rechecks_full_sha(self):
+        cells, _ = notebook_source("07_results_freeze.ipynb")
+        gate = next(cell for cell in cells if "FORENSIC_NOTEBOOK07_FINAL_GATE" in cell)
+        for token in (
+            "strict_full_sha_authority_update_v3",
+            "--source-conflict-policy newer",
+            "final_pipeline_storage_audit_strict_full_sha.log",
+            "final_forensic_audit_authority_publish.log",
+            "final_pipeline_storage_audit_post_publish_strict_full_sha.log",
+            "CODE_AUTHORITY.get('git_commit')",
+        ):
+            self.assertIn(token, gate)
+        self.assertNotIn("--source-conflict-policy fail", gate)
+        first_storage = gate.index("final_pipeline_storage_audit_strict_full_sha.log")
+        forensic = gate.index("final_notebook_forensic_audit.log")
+        authority_publish = gate.index("final_forensic_audit_authority_publish.log")
+        final_storage = gate.index("final_pipeline_storage_audit_post_publish_strict_full_sha.log")
+        self.assertLess(first_storage, forensic)
+        self.assertLess(forensic, authority_publish)
+        self.assertLess(authority_publish, final_storage)
+
+    def test_forensic_integrator_is_idempotent(self):
+        integrator = PROJECT_ROOT / "scripts" / "revision" / "48_integrate_forensic_audit_notebooks.py"
+
+        def notebook_hashes():
+            return {
+                name: hashlib.sha256((PROJECT_ROOT / "notebooks" / name).read_bytes()).hexdigest()
+                for name in PIPELINE_NOTEBOOKS
+            }
+
+        subprocess.run([sys.executable, str(integrator)], cwd=PROJECT_ROOT, check=True)
+        first = notebook_hashes()
+        subprocess.run([sys.executable, str(integrator)], cwd=PROJECT_ROOT, check=True)
+        self.assertEqual(first, notebook_hashes())
 
     def test_notebook07_uses_targeted_restore_and_exports_profiles(self):
         _, source = notebook_source("07_results_freeze.ipynb")
@@ -308,7 +516,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         _, source = notebook_source("07_results_freeze.ipynb")
         for token in (
             "bootstrap.unit=",
-            "one_chapman_record_per_subject",
+            "authenticated_source_patient_record",
+            "physionet_ecg_arrhythmia_one_patient_per_record_v1",
             "04_calibration_ci.py",
             "29_reviewer_presentation_assets.py --strict",
             "final_evidence_calibration_contract_refresh.log",

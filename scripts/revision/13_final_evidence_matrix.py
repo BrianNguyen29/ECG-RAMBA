@@ -320,7 +320,7 @@ def summarize_structured_ablation(
     expected = {"full", "no_morphology", "no_rhythm", "no_context_fusion"}
     removal_controls = expected - {"full"}
     ablation_wording = (
-        "Use significant Full-versus-removal deltas only as evidence for contribution within this "
+        "Use pointwise paired 95% effect-size intervals only as evidence for contribution within this "
         "architecture and named control. The No-context/fusion variant removes multiple modules jointly, "
         "so it cannot identify one causal mechanism. These ablations do not establish global superiority "
         "or proven morphology-rhythm disentanglement."
@@ -405,7 +405,7 @@ def summarize_structured_ablation(
     counts = {
         variant: {
             label: sum(row.get("interpretation") == label for row in paired_by_control.get(variant, []))
-            for label in ("full_significantly_better", "control_significantly_better", "inconclusive")
+            for label in ("full_nominal_95ci_better", "control_nominal_95ci_better", "inconclusive")
         }
         for variant in removal_controls
     }
@@ -416,8 +416,8 @@ def summarize_structured_ablation(
         "issues": issues,
         "key_numbers": (
             "; ".join(
-                f"{variant}: Full-better={values['full_significantly_better']}/5, "
-                f"control-better={values['control_significantly_better']}/5, "
+                f"{variant}: Full-better(pointwise 95% CI)={values['full_nominal_95ci_better']}/5, "
+                f"control-better(pointwise 95% CI)={values['control_nominal_95ci_better']}/5, "
                 f"inconclusive={values['inconclusive']}/5"
                 for variant, values in sorted(counts.items())
             )
@@ -568,16 +568,13 @@ def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
         degradation = str(row.get("degradation_interpretation", ""))
         stressed = str(row.get("stressed_performance_interpretation", ""))
         metric = str(row.get("metric", ""))
-        if degradation in {"full_nominal_95ci_less_degraded", "full_significantly_less_degraded"}:
+        if degradation == "full_nominal_95ci_less_degraded":
             normalized_degradation = "full_nominal_95ci_less_degraded"
             degradation_wording = (
                 "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
                 "favors Full ECG-RAMBA for the clean-to-stress change."
             )
-        elif degradation in {
-            "minirocket_nominal_95ci_less_degraded",
-            "minirocket_significantly_less_degraded",
-        }:
+        elif degradation == "minirocket_nominal_95ci_less_degraded":
             normalized_degradation = "minirocket_nominal_95ci_less_degraded"
             degradation_wording = (
                 "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
@@ -590,19 +587,13 @@ def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
                 "clean-to-stress change difference."
             )
 
-        if stressed in {
-            "full_nominal_95ci_better_under_stress",
-            "full_significantly_better_under_stress",
-        }:
+        if stressed == "full_nominal_95ci_better_under_stress":
             normalized_stressed = "full_nominal_95ci_better_under_stress"
             stressed_wording = (
                 "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
                 "favors Full ECG-RAMBA at the stressed operating point."
             )
-        elif stressed in {
-            "minirocket_nominal_95ci_better_under_stress",
-            "minirocket_significantly_better_under_stress",
-        }:
+        elif stressed == "minirocket_nominal_95ci_better_under_stress":
             normalized_stressed = "minirocket_nominal_95ci_better_under_stress"
             stressed_wording = (
                 "For this named stress/metric, the nominal unadjusted paired 95% record-bootstrap CI "
@@ -653,29 +644,22 @@ def summarize_robustness(rows: list[dict[str, str]]) -> dict[str, Any]:
     full_less_degraded = [
         row
         for row in rows
-        if row.get("degradation_interpretation")
-        in {"full_nominal_95ci_less_degraded", "full_significantly_less_degraded"}
+        if row.get("degradation_interpretation") == "full_nominal_95ci_less_degraded"
     ]
     mini_less_degraded = [
         row
         for row in rows
-        if row.get("degradation_interpretation")
-        in {"minirocket_nominal_95ci_less_degraded", "minirocket_significantly_less_degraded"}
+        if row.get("degradation_interpretation") == "minirocket_nominal_95ci_less_degraded"
     ]
     full_better_stress = [
         row
         for row in rows
-        if row.get("stressed_performance_interpretation")
-        in {"full_nominal_95ci_better_under_stress", "full_significantly_better_under_stress"}
+        if row.get("stressed_performance_interpretation") == "full_nominal_95ci_better_under_stress"
     ]
     mini_better_stress = [
         row
         for row in rows
-        if row.get("stressed_performance_interpretation")
-        in {
-            "minirocket_nominal_95ci_better_under_stress",
-            "minirocket_significantly_better_under_stress",
-        }
+        if row.get("stressed_performance_interpretation") == "minirocket_nominal_95ci_better_under_stress"
     ]
     return {
         "n_rows": len(rows),
@@ -1636,7 +1620,10 @@ def main() -> None:
     task_by_id = csv_index(task_board, "id")
 
     full = baseline_by_name.get("Full ECG-RAMBA frozen OOF", {})
-    mini = baseline_by_name.get("MiniRocket-only", {})
+    mini = baseline_by_name.get(
+        "Fixed-seed ROCKET-family MAX+PPV linear head",
+        baseline_by_name.get("MiniRocket-only", {}),
+    )
     hrv_only = baseline_by_name.get("HRV-only", {})
     resnet = baseline_by_name.get("ResNet1D/CNN", {})
     raw_mamba = baseline_by_name.get("Raw Mamba", {})
@@ -1719,12 +1706,12 @@ def main() -> None:
     if missing_fair_comparators:
         c01_evidence_status = "blocked_fair_baselines_missing"
         c01_blocker = (
-            f"{', '.join(missing_fair_comparators)} fair comparator row(s) remain incomplete "
+            f"{', '.join(missing_fair_comparators)} same-fold comparator row(s) remain incomplete "
             "under the frozen OOF protocol."
         )
     else:
         c01_evidence_status = "complete_baseline_matrix_requires_metric_specific_interpretation"
-        c01_blocker = "No missing required fair comparator rows; interpret only metric-specific paired deltas."
+        c01_blocker = "No missing required same-fold comparator rows; interpret only metric-specific paired deltas and do not imply budget matching."
 
     paired_minirocket_metrics = paired_minirocket.get("metrics", {}) if isinstance(paired_minirocket, dict) else {}
     paired_resnet_metrics = paired_resnet.get("metrics", {}) if isinstance(paired_resnet, dict) else {}
@@ -1873,7 +1860,7 @@ def main() -> None:
     matrix_rows = [
         {
             "claim_id": "C01",
-            "claim_topic": "Fair baseline superiority / external transfer",
+            "claim_topic": "Same-fold comparator scope / external transfer",
             "evidence_status": c01_evidence_status,
             "key_numbers": (
                 f"Full PR-AUC={fmt(full.get('pr_auc_macro'))}, F1={fmt(full.get('f1_macro'))}; "
@@ -1898,9 +1885,9 @@ def main() -> None:
                 + ";".join(selected_robustness_evidence_paths)
             ),
             "safe_wording": (
-                "Do not claim superiority over all fair baselines. Report comparator-specific, "
-                "metric-specific paired deltas. In-domain fair comparators show ResNet1D/CNN "
-                "and Raw Mamba are stronger on discrimination/F1 metrics; narrow ECG-RAMBA "
+                "Do not claim broad superiority across comparator families. Report comparator-specific, "
+                "metric-specific paired deltas. In-domain same-fold comparisons have higher "
+                "ResNet1D/CNN and Raw Mamba point estimates on several discrimination/F1 endpoints; narrow ECG-RAMBA "
                 "claims to supported calibration tradeoffs, architecture analysis, and "
                 "documented limitations. "
                 f"{external_comparator_audit['safe_wording']} "
@@ -1952,8 +1939,9 @@ def main() -> None:
             ),
             "safe_wording": (
                 "Frozen OOF supports only metric-specific operating-point statements. ECG-RAMBA "
-                "has calibration/error advantages over the fixed-transform-only comparator and Raw Mamba, but "
-                "ResNet1D/CNN is stronger on PR-AUC, ROC-AUC, F1, Brier, and ECE; do not "
+                "has nominal pointwise calibration/error interval advantages over the fixed-transform-only comparator and Raw Mamba, but "
+                "ResNet1D/CNN has favorable point estimates and nominal pointwise intervals on PR-AUC, ROC-AUC, F1, Brier, and ECE; do not "
+                "interpret these pointwise intervals as multiplicity-adjusted significance and do not "
                 "claim a general fixed-threshold or calibration advantage."
             ),
             "blocker": "",
@@ -2142,7 +2130,7 @@ def main() -> None:
         "contract_issues": contract_issues,
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
-            "global_superiority": "Avoid broad fair-baseline advantage wording.",
+            "global_superiority": "Avoid broad comparator-family advantage wording.",
             "resnet_in_domain": (
                 "The completed paired ResNet1D/CNN comparison favors ResNet on frozen Chapman OOF "
                 "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim an ECG-RAMBA in-domain "
@@ -2185,8 +2173,8 @@ def main() -> None:
                 "identical, but weak fold-safe linear probes do not support established morphology-rhythm separation."
             ),
             "raw_mamba": (
-                "Use Raw Mamba only as a comparator-specific fair-baseline result. "
-                "It does not restore a broad fair-baseline advantage if ResNet1D/CNN remains stronger."
+                "Use Raw Mamba only as a comparator-specific same-fold result. "
+                "It does not restore a broad comparator-family advantage."
             ),
             "transformer": (
                 "Use Transformer ECG only as optional comparator-specific evidence if "
@@ -2219,7 +2207,7 @@ def main() -> None:
                 "learnability only within that matched sensitivity experiment; it is not causal proof for ECG-RAMBA."
             ),
             "external_zero_target_ci": (
-                "Report paired bootstrap CIs separately by dataset, comparator, and metric, with Holm-adjusted conclusions for each dataset family. "
+                "Report paired bootstrap CIs separately by dataset, comparator, and metric as pointwise effect-size intervals; do not describe them as Holm-adjusted significance tests. "
                 "PTB-XL uses patient IDs, CPSC2021 uses source-record groups, and Georgia uses record-level resampling under an explicit independence assumption because patient IDs are unavailable. "
                 "Do not pool PTB-XL, Georgia, and CPSC2021 or claim general zero-shot superiority."
             ),

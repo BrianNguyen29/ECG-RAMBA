@@ -189,16 +189,27 @@ class ECGRambaV7Advanced(nn.Module):
     # FORWARD
     # ========================================================
 
-    def forward_features(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
-        """
-        Args:
-            x: Raw ECG (B, 12, L)
-            xh: Rocket Features
-            xhr: HRV Features
-            use_rocket (bool): Inference flag for Rocket stream
-            use_hrv (bool): Inference flag for HRV stream
-            use_fusion (bool): Inference flag to toggle Cross-Attn vs Concat
-        """
+    @staticmethod
+    def _mean_or_zeros(sequence, *, batch, d_model, reference):
+        if sequence is None:
+            return torch.zeros(
+                batch,
+                d_model,
+                device=reference.device,
+                dtype=reference.dtype,
+            )
+        return sequence.mean(dim=1)
+
+    def _forward_feature_bundle(
+        self,
+        x,
+        xh,
+        xhr,
+        use_rocket=True,
+        use_hrv=True,
+        use_fusion=True,
+    ):
+        """Run the canonical feature path and expose auditable branch summaries."""
         B = x.size(0)
 
         # --- 1. SPATIAL ---
@@ -237,6 +248,27 @@ class ECGRambaV7Advanced(nn.Module):
                  hrv_feat = torch.zeros(B, 1, d_model, device=x.device, dtype=x.dtype)
             else:
                  hrv_feat = None
+
+        branch_embeddings = {
+            "context_embedding": self._mean_or_zeros(
+                mamba_feat,
+                batch=B,
+                d_model=self.cfg["d_model"],
+                reference=mamba_feat,
+            ),
+            "morphology_embedding": self._mean_or_zeros(
+                rocket_feat,
+                batch=B,
+                d_model=self.cfg["d_model"],
+                reference=mamba_feat,
+            ),
+            "rhythm_embedding": self._mean_or_zeros(
+                hrv_feat,
+                batch=B,
+                d_model=self.cfg["d_model"],
+                reference=mamba_feat,
+            ),
+        }
 
         # --- 5. FUSION ---
         # Logic: Must have CrossAttn module AND inputs AND Flag enabled
@@ -285,10 +317,32 @@ class ECGRambaV7Advanced(nn.Module):
         for layer in self.layers:
             seq = layer(seq)
 
-        return self.norm(seq).mean(dim=1)
+        pooled = self.norm(seq).mean(dim=1)
+        branch_embeddings["fused_embedding"] = pooled
+        return pooled, branch_embeddings
+
+    def forward_features(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
+        """
+        Args:
+            x: Raw ECG (B, 12, L)
+            xh: Rocket Features
+            xhr: HRV Features
+            use_rocket (bool): Inference flag for Rocket stream
+            use_hrv (bool): Inference flag for HRV stream
+            use_fusion (bool): Inference flag to toggle Cross-Attn vs Concat
+        """
+        pooled, _ = self._forward_feature_bundle(
+            x,
+            xh,
+            xhr,
+            use_rocket=use_rocket,
+            use_hrv=use_hrv,
+            use_fusion=use_fusion,
+        )
+        return pooled
 
     def forward(self, x, xh, xhr, use_rocket=True, use_hrv=True, use_fusion=True):
-        pooled = self.forward_features(
+        pooled, _ = self._forward_feature_bundle(
             x,
             xh,
             xhr,
@@ -297,6 +351,30 @@ class ECGRambaV7Advanced(nn.Module):
             use_fusion=use_fusion,
         )
         return self.head(pooled)
+
+    def forward_with_embeddings(
+        self,
+        x,
+        xh,
+        xhr,
+        use_rocket=True,
+        use_hrv=True,
+        use_fusion=True,
+    ):
+        """Return canonical logits and branch summaries from the same forward pass.
+
+        The summaries are audit features, not independent latent factors. Callers
+        must keep checkpoint-local coordinates together when fitting probes.
+        """
+        pooled, embeddings = self._forward_feature_bundle(
+            x,
+            xh,
+            xhr,
+            use_rocket=use_rocket,
+            use_hrv=use_hrv,
+            use_fusion=use_fusion,
+        )
+        return self.head(pooled), embeddings
 
 
 # ============================================================

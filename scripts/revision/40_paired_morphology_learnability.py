@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +89,53 @@ def resolve(path: Path) -> Path:
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def canonical_json_sha256(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def authenticated_group_contract(freeze_info: dict) -> dict:
+    group = freeze_info.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    required = {
+        "status": group.get("status"),
+        "bootstrap_unit": group.get("bootstrap_unit"),
+        "one_record_per_group": group.get("one_record_per_group"),
+        "n_records": group.get("n_records"),
+        "n_groups": group.get("n_groups"),
+        "group_semantics": group.get("group_semantics"),
+        "group_semantics_reference": group.get("group_semantics_reference"),
+        "group_sidecar": sidecar.get("path"),
+        "group_sidecar_sha256": sidecar.get("sha256"),
+    }
+    if (
+        required["status"] != "verified"
+        or required["one_record_per_group"] is not True
+        or int(required["n_records"] or -1) != int(required["n_groups"] or -2)
+        or not required["group_sidecar_sha256"]
+    ):
+        raise RuntimeError("Morphology paired output lacks a verified one-record-per-group contract")
+    required["group_contract_sha256"] = canonical_json_sha256(group)
+    return required
+
+
+def validate_paired_interval(ci: dict, samples: list[dict], n_boot: int) -> None:
+    if int(ci.get("n_boot_valid", -1)) != int(n_boot) or len(samples) != int(n_boot):
+        raise RuntimeError(
+            f"Morphology paired bootstrap is incomplete: "
+            f"n_boot_valid={ci.get('n_boot_valid')} samples={len(samples)} expected={n_boot}"
+        )
+    for key in ("bootstrap_mean", "ci_low", "ci_high", "raw_diff_ci_low", "raw_diff_ci_high"):
+        try:
+            value = float(ci[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Morphology paired bootstrap lacks numeric {key}") from exc
+        if not math.isfinite(value):
+            raise RuntimeError(f"Morphology paired bootstrap has non-finite {key}")
+    if "significant" in json.dumps(ci, sort_keys=True).lower():
+        raise RuntimeError("Morphology paired bootstrap contains prohibited legacy significance wording")
 
 
 def npz_scalar(payload: np.lib.npyio.NpzFile, key: str, default=None):
@@ -186,24 +235,32 @@ def validate_experiment_package(summary_path: Path, manifest_path: Path, control
 
 def safe_wording(comparison: str, metric_family: str, interpretation: str) -> str:
     if comparison == "partial_vs_frozen":
-        if interpretation == "full_significantly_better":
+        if interpretation == "full_nominal_95ci_better":
             return (
-                "In the reduced-bank controlled sensitivity experiment, the partially learnable bank is stronger "
-                f"for this {metric_family} endpoint than the identically initialized frozen bank."
+                "In the reduced-bank controlled sensitivity experiment, the nominal pointwise 95% interval "
+                f"favored the partially learnable bank for this {metric_family} endpoint; no "
+                "multiplicity-adjusted superiority test was performed."
             )
-        if interpretation == "comparator_significantly_better":
+        if interpretation == "comparator_nominal_95ci_better":
             return (
-                "In the reduced-bank controlled sensitivity experiment, the frozen bank is stronger "
-                f"for this {metric_family} endpoint than the partially learnable bank."
+                "In the reduced-bank controlled sensitivity experiment, the nominal pointwise 95% interval "
+                f"favored the identically initialized frozen bank for this {metric_family} endpoint; no "
+                "multiplicity-adjusted superiority test was performed."
             )
         return (
             "The reduced-bank controlled sensitivity experiment does not resolve a paired difference "
             f"for this {metric_family} endpoint."
         )
-    if interpretation == "full_significantly_better":
-        return "Full ECG-RAMBA is stronger for this paired endpoint than the reduced partially learnable control."
-    if interpretation == "comparator_significantly_better":
-        return "The reduced partially learnable morphology control is stronger for this paired endpoint than Full ECG-RAMBA."
+    if interpretation == "full_nominal_95ci_better":
+        return (
+            "The nominal pointwise 95% interval favored Full ECG-RAMBA over the reduced partially "
+            "learnable control; no multiplicity-adjusted superiority test was performed."
+        )
+    if interpretation == "comparator_nominal_95ci_better":
+        return (
+            "The nominal pointwise 95% interval favored the reduced partially learnable morphology "
+            "control over Full ECG-RAMBA; no multiplicity-adjusted superiority test was performed."
+        )
     return "The Full ECG-RAMBA versus reduced partially learnable control difference is inconclusive for this endpoint."
 
 
@@ -233,6 +290,7 @@ def compare(
             n_boot=args.n_boot,
             seed=args.seed + metric_index * 1009,
         )
+        validate_paired_interval(ci, metric_samples, args.n_boot)
         print(f"{comparison}: paired bootstrap {spec.name} done", flush=True)
         rows.append(
             {
@@ -249,14 +307,13 @@ def compare(
                 "improvement_bootstrap_mean": ci["bootstrap_mean"],
                 "improvement_ci_low": ci["ci_low"],
                 "improvement_ci_high": ci["ci_high"],
-                "p_value_two_sided": ci["p_value_two_sided"],
                 "n_boot_valid": ci["n_boot_valid"],
                 "interpretation": helpers.interpretation_from_ci(ci["ci_low"], ci["ci_high"]),
             }
         )
         for item in metric_samples:
             samples.append({"comparison": comparison, **item})
-    helpers.add_holm_adjustment(rows)
+    helpers.mark_pointwise_inference(rows)
     for row in rows:
         row["safe_wording"] = safe_wording(comparison, row["metric_family"], row["interpretation"])
     return rows, samples
@@ -272,6 +329,9 @@ def main() -> None:
     freeze_info = helpers.validate_freeze_manifest(
         args.freeze_manifest, canonical, args.expected_checkpoint_kind
     )
+    group_contract = authenticated_group_contract(freeze_info)
+    runner_sha256 = sha256_file(Path(__file__).resolve())
+    paired_helper_sha256 = sha256_file(Path(helpers.__file__).resolve())
     if canonical.y_true.shape != (args.expected_records, args.expected_classes):
         raise ValueError(f"Unexpected canonical shape: {canonical.y_true.shape}")
     controls = {
@@ -315,14 +375,19 @@ def main() -> None:
     payload = {
         "status": True,
         "created_utc": now_utc(),
+        "runner_sha256": runner_sha256,
+        "paired_helper_sha256": paired_helper_sha256,
         "comparison_scope": "controlled_reduced_bank_mechanism_sensitivity",
         "protocol": EXPECTED_PROTOCOL,
         "paired_bootstrap": {
-            "sample_unit": "Chapman record/subject",
+            "sample_unit": group_contract["bootstrap_unit"],
             "n_boot": args.n_boot,
             "seed": args.seed,
             "alpha": 0.05,
-            "holm_adjustment": "within each five-metric comparison",
+            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
+            "group_contract": group_contract,
         },
         "inputs": {
             "full_predictions": {"path": str(canonical.path), "sha256": canonical.sha256},
@@ -345,15 +410,19 @@ def main() -> None:
         "status": "complete",
         "created_utc": now_utc(),
         "git_commit": git_commit(),
-        "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "runner_sha256": runner_sha256,
+        "paired_helper_sha256": paired_helper_sha256,
         "protocol": EXPECTED_PROTOCOL,
         "comparison_scope": "controlled_reduced_bank_mechanism_sensitivity",
         "canonical_contract": {
             "oof_sha256": canonical.sha256,
             "freeze_sha256": freeze_info["sha256"],
+            "group_contract_sha256": group_contract["group_contract_sha256"],
+            "group_sidecar_sha256": group_contract["group_sidecar_sha256"],
         },
         "n_boot": args.n_boot,
-        "bootstrap_unit": "Chapman record/subject",
+        "bootstrap_unit": group_contract["bootstrap_unit"],
+        "group_contract": group_contract,
         "input_sha256": {
             "full_predictions": canonical.sha256,
             "freeze_manifest": freeze_info["sha256"],
@@ -361,6 +430,10 @@ def main() -> None:
             "partial_predictions": controls["partial"]["sha256"],
             "experiment_summary": package["summary"]["sha256"],
             "experiment_manifest": package["manifest"]["sha256"],
+            "runner": runner_sha256,
+            "paired_helper": paired_helper_sha256,
+            "group_contract": group_contract["group_contract_sha256"],
+            "group_sidecar": group_contract["group_sidecar_sha256"],
         },
         "artifacts": {
             "json": str(out_json),

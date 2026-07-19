@@ -109,6 +109,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
                 manuscript_ready=np.asarray(False),
                 aggregation_method=np.asarray("power_mean"),
                 aggregation_q=np.asarray(float(gate.CONFIG["power_mean_q"]), dtype=np.float32),
+                threshold=np.asarray(0.5, dtype=np.float32),
                 cache_schema_version=np.asarray(gate.CACHE_SCHEMA_VERSION, dtype=np.int16),
                 checkpoint_fingerprints_json=np.asarray(json.dumps(checkpoint_rows)),
                 pca_fingerprints_json=np.asarray(json.dumps(pca_rows)),
@@ -138,6 +139,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
                 "n_records": 4,
                 "n_classes": 4,
                 "checkpoint_kind": "final_ema",
+                "threshold": 0.5,
                 "load_summary": {
                     "label_protocol": gate.EXPECTED_EXTERNAL_PROTOCOLS["ptbxl"],
                     "unsupported_superclasses": {"HYP": 2},
@@ -155,6 +157,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
                     "path": str(archive),
                     "size_bytes": archive.stat().st_size,
                     "fingerprint": gate.file_fingerprint(archive),
+                    "sha256": gate.sha256_file(archive),
                 },
                 "pca": {
                     "scope": "fold_specific_chapman_training_only",
@@ -203,6 +206,77 @@ class ExternalProtocolGateTests(unittest.TestCase):
             self.assertEqual(cached_payload["gate_cache_key"], payload["gate_cache_key"])
             self.assertEqual(cached_metrics, [])
             self.assertEqual(cached_labels, [])
+
+            # A semantic mutation must not pass merely because dimensions and files still exist.
+            mutated = y_prob.copy()
+            mutated[0, 0] = 0.4
+            np.savez_compressed(
+                output / "ptbxl_full_slice_predictions.npz",
+                slice_prob=mutated,
+                record_index=np.asarray([0, 1, 2, 3], dtype=np.int64),
+                record_id=np.asarray(["1", "2", "3", "4"]),
+                group_id=np.asarray(["patient_1", "patient_2", "patient_3", "patient_4"]),
+                split_id=np.asarray(["ptbxl_fold10"] * 4),
+                slice_index=np.asarray([0, 0, 0, 0], dtype=np.int64),
+                class_names=np.asarray(["NORM", "MI", "STTC", "CD"]),
+                dataset=np.asarray("ptbxl"),
+                cache_schema_version=np.asarray(gate.CACHE_SCHEMA_VERSION, dtype=np.int16),
+                evidence_status=np.asarray("experimental"),
+                manuscript_ready=np.asarray(False),
+            )
+            args.reuse_existing = False
+            with (
+                patch.object(gate, "METRIC_DIR", metrics_dir),
+                patch.object(gate, "TABLE_DIR", tables_dir),
+                patch.object(gate, "MANIFEST_DIR", manifests_dir),
+                patch.dict(gate.PATHS, {"ptb_zip": str(archive)}),
+            ):
+                mutated_payload, _, _ = gate.validate_dataset("ptbxl", args, oof_checkpoints)
+            self.assertFalse(mutated_payload["protocol_gate_passed"])
+            self.assertIn("do not reconstruct", "; ".join(mutated_payload["issues"]))
+
+            np.savez_compressed(
+                output / "ptbxl_full_slice_predictions.npz",
+                slice_prob=y_prob,
+                record_index=np.asarray([0, 1, 2, 3], dtype=np.int64),
+                record_id=np.asarray(["1", "1", "3", "4"]),
+                group_id=np.asarray(["patient_1", "patient_2", "patient_3", "patient_4"]),
+                split_id=np.asarray(["ptbxl_fold10"] * 4),
+                slice_index=np.asarray([0, 0, 0, 0], dtype=np.int64),
+                class_names=np.asarray(["NORM", "MI", "STTC", "CD"]),
+                dataset=np.asarray("ptbxl"),
+                cache_schema_version=np.asarray(gate.CACHE_SCHEMA_VERSION, dtype=np.int16),
+                evidence_status=np.asarray("experimental"),
+                manuscript_ready=np.asarray(False),
+            )
+            np.savez_compressed(
+                prediction,
+                y_true=y_true,
+                y_prob=y_prob,
+                record_id=np.asarray(["1", "1", "3", "4"]),
+                group_id=np.asarray(["patient_1", "patient_2", "patient_3", "patient_4"]),
+                split_id=np.asarray(["ptbxl_fold10"] * 4),
+                group_unit=np.asarray("patient_id"),
+                class_names=np.asarray(["NORM", "MI", "STTC", "CD"]),
+                dataset=np.asarray("ptbxl"),
+                evidence_status=np.asarray("experimental"),
+                manuscript_ready=np.asarray(False),
+                aggregation_method=np.asarray("power_mean"),
+                aggregation_q=np.asarray(float(gate.CONFIG["power_mean_q"]), dtype=np.float32),
+                threshold=np.asarray(0.5, dtype=np.float32),
+                cache_schema_version=np.asarray(gate.CACHE_SCHEMA_VERSION, dtype=np.int16),
+                checkpoint_fingerprints_json=np.asarray(json.dumps(checkpoint_rows)),
+                pca_fingerprints_json=np.asarray(json.dumps(pca_rows)),
+            )
+            with (
+                patch.object(gate, "METRIC_DIR", metrics_dir),
+                patch.object(gate, "TABLE_DIR", tables_dir),
+                patch.object(gate, "MANIFEST_DIR", manifests_dir),
+                patch.dict(gate.PATHS, {"ptb_zip": str(archive)}),
+            ):
+                duplicate_payload, _, _ = gate.validate_dataset("ptbxl", args, oof_checkpoints)
+            self.assertFalse(duplicate_payload["protocol_gate_passed"])
+            self.assertIn("record_id values must be unique", "; ".join(duplicate_payload["issues"]))
 
     def test_synthetic_ptb_gate_blocks_without_oof_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

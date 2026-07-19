@@ -1,8 +1,10 @@
 """Run a fold-safe Raw Mamba comparator under the frozen OOF protocol.
 
 This runner trains the ECG-RAMBA raw-signal Mamba backbone from scratch after
-structurally removing MiniRocket/PCA and HRV inputs. It is a fair comparator,
-not an inference ablation of the already-trained full model.
+structurally removing the fixed-seed morphology transform/PCA and HRV inputs.
+It is not an inference ablation of the already-trained full model. Because
+training budgets and tuning provenance are not established as equal to
+ECG-RAMBA, it is reported as a same-fold comparator, not budget-matched.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from scripts.revision.common import (  # noqa: E402
     PREDICTION_DIR,
     TABLE_DIR,
     bootstrap_ci,
+    build_comparator_training_contract,
     calibration_summary,
     ensure_revision_dirs,
     macro_pr_auc,
@@ -1196,7 +1199,7 @@ def main() -> None:
 
     device = select_device(args.device)
     print("=" * 80, flush=True)
-    print("RAW MAMBA FAIR COMPARATOR UNDER FROZEN OOF", flush=True)
+    print("RAW MAMBA SAME-FOLD COMPARATOR UNDER FROZEN OOF", flush=True)
     print("=" * 80, flush=True)
     print(f"protocol={PROTOCOL}", flush=True)
     print(f"device={device} torch={torch.__version__} cuda={torch.version.cuda}", flush=True)
@@ -1281,6 +1284,7 @@ def main() -> None:
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
         "selection_rule": "fixed_final_epoch",
+        "tuning_provenance": "explicit CLI configuration; no validation-driven tuning in this runner",
         "weights_kind": "ema" if args.ema_decay > 0 else "raw",
         "ema_decay": float(args.ema_decay),
         "uses_hrv": False,
@@ -1494,6 +1498,55 @@ def main() -> None:
     save_csv(FOLD_TABLE, fold_rows)
     require_complete_checkpoint_contract(checkpoint_contract)
 
+    signal_length = int(X.shape[-1])
+    slice_length = int(CONFIG["slice_length"])
+    slice_stride = int(CONFIG["slice_stride"])
+    max_slices = int(CONFIG["max_slices_per_record"])
+    slices_per_record = (
+        min(max_slices, 1 + (signal_length - slice_length) // slice_stride)
+        if signal_length >= slice_length
+        else 0
+    )
+    if slices_per_record <= 0:
+        raise RuntimeError("Raw Mamba comparator contract found no valid raw-ECG slices")
+    training_units_per_fold = {
+        int(split["fold"]): int(len(split["tr_idx"]) * slices_per_record)
+        for split in folds
+    }
+    comparator_contract = build_comparator_training_contract(
+        display_name="Raw Mamba",
+        n_records=len(y),
+        folds=sorted(training_units_per_fold),
+        preprocessing={
+            "input": "raw_12_lead_ecg",
+            "slice_length": slice_length,
+            "slice_stride": slice_stride,
+            "max_slices_per_record": max_slices,
+            "record_aggregation": f"power_mean_q{float(CONFIG['power_mean_q']):g}",
+            "removed_inputs": ["fixed_seed_rocket_family", "pca", "hrv", "fusion"],
+        },
+        training_unit="raw_ecg_slice",
+        training_units_per_fold=training_units_per_fold,
+        batch_size=int(args.batch_size),
+        epochs=int(args.epochs),
+        loss={
+            "schedule": model_params["loss"],
+            "switch_epoch": int(args.asym_start_epoch),
+            "bce_positive_weight": model_params["bce_pos_weight_formula"],
+        },
+        regularization={
+            "weight_decay": float(args.weight_decay),
+            "gradient_clip_norm": 1.0,
+            "ema_decay": float(args.ema_decay),
+        },
+        amp=bool(args.amp),
+        seed=int(args.seed),
+        fold_seed_formula="seed + fold",
+        checkpoint_rule=model_params["selection_rule"],
+        tuning_provenance=model_params["tuning_provenance"],
+        protocol=PROTOCOL,
+    )
+
     summary = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
@@ -1502,6 +1555,7 @@ def main() -> None:
         "feature_contract": FEATURE_CONTRACT,
         "model": "raw_mamba_retrained_baseline",
         "model_params": model_params,
+        "comparator_contract": comparator_contract,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
         "threshold": float(args.threshold),
@@ -1538,6 +1592,7 @@ def main() -> None:
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "model_params": model_params,
+        "comparator_contract": comparator_contract,
         "checkpoint_contract": checkpoint_contract,
         "runner_sha256": sha256_file(Path(__file__).resolve()),
         "artifacts": summary["artifacts"],

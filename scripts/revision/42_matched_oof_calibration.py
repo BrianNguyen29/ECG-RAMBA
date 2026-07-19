@@ -1,9 +1,11 @@
-"""Matched cross-fitted calibration audit for the frozen Chapman OOF cohort.
+"""Matched fold-excluded post-hoc calibration sensitivity on frozen OOF scores.
 
 For each held-out outer fold, per-class Platt calibrators are fitted only on
-OOF scores and labels from the other four folds. The evaluated fold therefore
-never contributes labels to its own calibration mapping. All models use the
-same records, folds, calibration method, threshold, and paired bootstrap.
+OOF scores and labels from the other four folds. This exclusion applies to the
+calibrator fit only: the base predictors are not nested-refitted, and models
+behind the four calibration-fold score blocks may have trained on records in
+the evaluated fold. The result is a conditional post-hoc sensitivity audit,
+not a leakage-free estimate of a deploy-time calibration pipeline.
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     FIGURE_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
@@ -43,8 +48,8 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 3
-PROTOCOL = "matched_cross_fitted_per_class_monotone_platt_v3"
+SCHEMA_VERSION = 6
+PROTOCOL = "matched_fold_excluded_platt_posthoc_sensitivity_v5"
 PLATT_C = 1e6
 PLATT_MIN_SLOPE = 1e-8
 DEFAULT_MODELS = {
@@ -57,7 +62,7 @@ DEFAULT_MODELS = {
 }
 MODEL_LABELS = {
     "full": "ECG-RAMBA",
-    "minirocket": "MiniRocket-only",
+    "minirocket": "Fixed-seed ROCKET-family MAX+PPV linear head",
     "resnet": "ResNet1D/CNN",
     "raw_mamba": "Raw Mamba",
     "transformer": "Transformer ECG",
@@ -194,9 +199,10 @@ def write_tex_table(rows: list[dict], path: Path) -> None:
         r"\begin{table*}[t]",
         (
             r"\caption{Matched post-hoc calibration audit on frozen Chapman OOF scores. "
-            r"Per-class monotone Platt mappings exclude labels from the evaluated fold. Lower is better "
-            r"for NLL, Brier, and ECE; ideal diagnostic slope/intercept are 1/0. This is not a "
-            r"fully nested deploy-time calibration estimate.}"
+            r"The calibrator fit excludes labels from the evaluated fold, but base predictors are not "
+            r"nested-refitted. Lower is better for NLL, Brier, and ECE; ideal diagnostic "
+            r"slope/intercept are 1/0. Results are a conditional post-hoc sensitivity, not a "
+            r"deploy-time calibration estimate.}"
         ),
         r"\label{tab:matched_oof_calibration}",
         r"\centering",
@@ -207,7 +213,7 @@ def write_tex_table(rows: list[dict], path: Path) -> None:
         r"\midrule",
     ]
     for row in rows:
-        state = "Raw" if row["state"] == "raw" else "Cross-fitted Platt"
+        state = "Raw" if row["state"] == "raw" else "Fold-excluded Platt"
         lines.append(
             "{} & {} & {:.4f} & {:.4f} & {:.4f} & {:.3f} & {:.3f} \\\\".format(
                 latex_escape(row["model_label"]),
@@ -297,13 +303,78 @@ def validate_contract(predictions: dict[str, PredictionSet], freeze_path: Path) 
         raise RuntimeError("Full OOF freeze contract is not valid")
     if artifacts[full_rel].get("sha256") != full.sha256:
         raise RuntimeError("Full OOF checksum differs from freeze manifest")
+    group = freeze.get("group_contract") or {}
+    group_errors = []
+    if group.get("status") != "verified":
+        group_errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        group_errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        group_errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        group_errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        group_errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != len(full.record_id):
+        group_errors.append("n_records")
+    if int(group.get("n_groups", -1)) != len(full.record_id):
+        group_errors.append("n_groups")
+    sidecar = group.get("sidecar") or {}
+    sidecar_path = Path(str(sidecar.get("path") or ""))
+    if not str(sidecar.get("path") or ""):
+        group_errors.append("sidecar_path")
+    elif not sidecar_path.is_absolute():
+        sidecar_path = PROJECT_ROOT / sidecar_path
+    if not sidecar_path.is_file():
+        group_errors.append("sidecar_missing")
+    elif not sidecar.get("sha256") or sha256_file(sidecar_path) != sidecar.get("sha256"):
+        group_errors.append("sidecar_sha256")
+    if group_errors:
+        raise RuntimeError(
+            "Matched calibration requires the authenticated frozen patient-record contract: "
+            + ", ".join(group_errors)
+        )
+    group_contract_sha256 = hashlib.sha256(
+        json.dumps(group, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
     return {
         "path": rel(freeze_path),
         "sha256": sha256_file(freeze_path),
         "checkpoint_kind": freeze.get("checkpoint_kind"),
-        "bootstrap_unit": "chapman_record_subject",
+        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+        "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+        "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+        "group_contract": group,
+        "group_contract_sha256": group_contract_sha256,
+        "group_sidecar": rel(sidecar_path),
+        "group_sidecar_sha256": sidecar["sha256"],
+        "n_records": int(group["n_records"]),
+        "n_groups": int(group["n_groups"]),
         "one_record_per_subject": True,
     }
+
+
+def validate_bootstrap_result(
+    result: dict,
+    *,
+    n_boot: int,
+    ci_fields: tuple[str, str],
+) -> None:
+    if int(result.get("n_boot_valid", -1)) != int(n_boot):
+        raise RuntimeError(
+            f"Bootstrap cache/result has n_boot_valid={result.get('n_boot_valid')}; "
+            f"exactly {n_boot} are required."
+        )
+    for field in ci_fields:
+        try:
+            value = float(result[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Bootstrap cache/result lacks numeric {field}") from exc
+        if not math.isfinite(value):
+            raise RuntimeError(f"Bootstrap cache/result contains non-finite {field}")
+    for key, value in result.items():
+        if "significant" in str(key).lower() or "significant" in str(value).lower():
+            raise RuntimeError("Bootstrap cache/result contains prohibited legacy significance wording")
 
 
 def clipped_logit(prob: np.ndarray) -> np.ndarray:
@@ -509,12 +580,14 @@ def paired_bootstrap(
         "improvement_ci_low": float(low),
         "improvement_ci_high": float(high),
         "n_boot_valid": len(improvements),
+        "inference_scope": "pointwise_percentile_ci_effect_size_only",
+        "null_test": "not_run",
         "interpretation": (
-            "calibrated_significantly_better"
+            "calibrated_nominal_95ci_better"
             if low > 0
-            else "raw_significantly_better"
+            else "raw_nominal_95ci_better"
             if high < 0
-            else "no_significant_difference"
+            else "pointwise_ci_overlaps_zero"
         ),
     }
 
@@ -565,10 +638,12 @@ def paired_model_bootstrap(
         "ci_low": float(low),
         "ci_high": float(high),
         "n_boot_valid": len(values),
+        "inference_scope": "pointwise_percentile_ci_effect_size_only",
+        "null_test": "not_run",
         "interpretation": (
-            "full_significantly_better"
+            "full_nominal_95ci_better"
             if low > 0
-            else "comparator_significantly_better"
+            else "comparator_nominal_95ci_better"
             if high < 0
             else "inconclusive"
         ),
@@ -631,6 +706,7 @@ def main() -> None:
     model_paths = {name: path for name, path in model_paths.items() if resolve(path).exists()}
     predictions = {name: load_prediction(name, path) for name, path in model_paths.items()}
     freeze_contract = validate_contract(predictions, args.freeze_manifest)
+    runner_sha256 = sha256_file(Path(__file__).resolve())
 
     print("=" * 80)
     print("MATCHED CROSS-FITTED OOF-SCORE CALIBRATION AUDIT")
@@ -641,6 +717,10 @@ def main() -> None:
     audit_metric_specs = metric_specs(args.threshold, args.n_bins)
     bootstrap_payload = {
         "protocol": PROTOCOL,
+        "schema_version": SCHEMA_VERSION,
+        "inference_scope": "pointwise_percentile_ci_effect_size_only",
+        "null_test": "not_run",
+        "multiplicity_adjustment": "not_applicable_no_null_test",
         "models": {},
         "matched_model_comparisons": {},
     }
@@ -664,6 +744,9 @@ def main() -> None:
             class_names=pred.class_names,
             protocol=np.asarray(PROTOCOL),
             source_prediction_sha256=np.asarray(pred.sha256),
+            freeze_manifest_sha256=np.asarray(freeze_contract["sha256"]),
+            group_contract_sha256=np.asarray(freeze_contract["group_contract_sha256"]),
+            group_sidecar_sha256=np.asarray(freeze_contract["group_sidecar_sha256"]),
         )
         calibrated_prediction_outputs[name] = prediction_out
         calibrated_probability_sha256 = array_sha256(calibrated)
@@ -683,7 +766,11 @@ def main() -> None:
             cache_path = resolve(args.metric_cache_dir) / f"{name}__{spec.name}.json"
             cache_contract = {
                 "schema_version": SCHEMA_VERSION,
+                "runner_sha256": runner_sha256,
                 "source_sha256": pred.sha256,
+                "freeze_manifest_sha256": freeze_contract["sha256"],
+                "group_contract_sha256": freeze_contract["group_contract_sha256"],
+                "group_sidecar_sha256": freeze_contract["group_sidecar_sha256"],
                 "calibrated_probability_sha256": calibrated_probability_sha256,
                 "metric": spec.name,
                 "n_boot": args.n_boot,
@@ -694,7 +781,17 @@ def main() -> None:
             if args.reuse_bootstrap and cache_path.exists():
                 candidate = json.loads(cache_path.read_text(encoding="utf-8"))
                 if candidate.get("contract") == cache_contract:
-                    cached = candidate.get("result")
+                    candidate_result = candidate.get("result")
+                    try:
+                        validate_bootstrap_result(
+                            candidate_result,
+                            n_boot=args.n_boot,
+                            ci_fields=("improvement_ci_low", "improvement_ci_high"),
+                        )
+                    except (AttributeError, TypeError, RuntimeError):
+                        print(f"Rejecting invalid matched-calibration cache: {cache_path}", flush=True)
+                    else:
+                        cached = candidate_result
             if cached is None:
                 result = paired_bootstrap(
                     pred.y_true,
@@ -704,9 +801,19 @@ def main() -> None:
                     n_boot=args.n_boot,
                     seed=cache_contract["seed"],
                 )
+                validate_bootstrap_result(
+                    result,
+                    n_boot=args.n_boot,
+                    ci_fields=("improvement_ci_low", "improvement_ci_high"),
+                )
                 save_json(cache_path, {"contract": cache_contract, "result": result})
             else:
                 result = cached
+            validate_bootstrap_result(
+                result,
+                n_boot=args.n_boot,
+                ci_fields=("improvement_ci_low", "improvement_ci_high"),
+            )
             bootstrap_payload["models"][name][spec.name] = result
             print(f"{name} {spec.name}: {result}")
 
@@ -726,8 +833,12 @@ def main() -> None:
                 )
                 cache_contract = {
                     "schema_version": SCHEMA_VERSION,
+                    "runner_sha256": runner_sha256,
                     "full_source_sha256": full.sha256,
                     "comparator_source_sha256": pred.sha256,
+                    "freeze_manifest_sha256": freeze_contract["sha256"],
+                    "group_contract_sha256": freeze_contract["group_contract_sha256"],
+                    "group_sidecar_sha256": freeze_contract["group_sidecar_sha256"],
                     "full_state_prediction_sha256": (
                         full.sha256
                         if state == "raw"
@@ -749,7 +860,17 @@ def main() -> None:
                 if args.reuse_bootstrap and cache_path.exists():
                     candidate = json.loads(cache_path.read_text(encoding="utf-8"))
                     if candidate.get("contract") == cache_contract:
-                        result = candidate.get("result")
+                        candidate_result = candidate.get("result")
+                        try:
+                            validate_bootstrap_result(
+                                candidate_result,
+                                n_boot=args.n_boot,
+                                ci_fields=("ci_low", "ci_high"),
+                            )
+                        except (AttributeError, TypeError, RuntimeError):
+                            print(f"Rejecting invalid paired-calibration cache: {cache_path}", flush=True)
+                        else:
+                            result = candidate_result
                 if result is None:
                     result = paired_model_bootstrap(
                         full.y_true,
@@ -759,7 +880,17 @@ def main() -> None:
                         n_boot=args.n_boot,
                         seed=seed,
                     )
+                    validate_bootstrap_result(
+                        result,
+                        n_boot=args.n_boot,
+                        ci_fields=("ci_low", "ci_high"),
+                    )
                     save_json(cache_path, {"contract": cache_contract, "result": result})
+                validate_bootstrap_result(
+                    result,
+                    n_boot=args.n_boot,
+                    ci_fields=("ci_low", "ci_high"),
+                )
                 paired_rows.append(
                     {
                         "comparison": f"full_vs_{name}",
@@ -773,6 +904,8 @@ def main() -> None:
                             "paired record bootstrap conditional on fixed base models and fitted "
                             "cross-fitted calibrators; no model or calibrator refit per replicate"
                         ),
+                        "inference_scope": "pointwise_percentile_ci_effect_size_only",
+                        "null_test": "not_run",
                         **result,
                     }
                 )
@@ -830,6 +963,7 @@ def main() -> None:
         "schema_version": SCHEMA_VERSION,
         "created_utc": now_utc(),
         "protocol": PROTOCOL,
+        "runner_sha256": runner_sha256,
         "method": "per-class monotone Platt scaling",
         "platt_estimator": (
             "bounded logistic calibration on clipped logits; positive slope >=1e-8; C=1e6; "
@@ -842,9 +976,9 @@ def main() -> None:
             "pooled OOF ranking."
         ),
         "calibration_split_contract": (
-            "For each evaluated OOF fold, calibrators are fitted on frozen OOF scores and labels "
-            "from the other four folds; labels from the evaluated fold are never used by the "
-            "calibrator."
+            "For each evaluated OOF fold, only the calibrator fit excludes that fold's labels. "
+            "The base predictors are not nested-refitted, so this exclusion must not be interpreted "
+            "as an independent outer-fold calibration estimate."
         ),
         "nested_refit_scope": (
             "Base models are not refitted in a nested calibration loop. Models that generated the "
@@ -853,7 +987,7 @@ def main() -> None:
             "unbiased nested estimate of a deploy-time calibration pipeline."
         ),
         "evaluation_contract": "same frozen records, folds, threshold, bins, and paired record bootstrap",
-        "bootstrap_unit": "Chapman record; one record per subject",
+        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
         "bootstrap_scope": (
             "Paired record bootstrap conditions on the already cross-fitted raw and calibrated OOF "
             "scores; calibrators and base models are not refitted within bootstrap resamples."
@@ -862,6 +996,7 @@ def main() -> None:
             "Intervals are nominal pointwise 95% intervals over pre-specified metrics; no family-wise "
             "calibration-superiority claim is made."
         ),
+        "null_test": "not_run",
         "calibration_slope_intercept_scope": (
             "Reported slope/intercept values are evaluation diagnostics fitted to held-out OOF scores; "
             "they are not the transformations used to score those same records."
@@ -914,6 +1049,7 @@ def main() -> None:
         "created_utc": now_utc(),
         "protocol": PROTOCOL,
         "git_commit": git_commit(),
+        "runner_sha256": runner_sha256,
         "inputs": {name: {"path": rel(pred.path), "sha256": pred.sha256} for name, pred in predictions.items()},
         "freeze_contract": freeze_contract,
         "outputs": {

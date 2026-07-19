@@ -36,7 +36,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 PROTOCOL = "fold_held_out_measured_physiological_interval_probe_v3"
 RUNNER_SOURCE_PATH = Path(__file__).resolve()
 TARGET_ALIASES = {
@@ -456,10 +456,12 @@ def paired_view_bootstrap(
             "ci_low": low,
             "ci_high": high,
             "n_boot_valid": len(samples[metric]),
+            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+            "null_test": "not_run",
             "interpretation": (
-                "view_a_significantly_better"
+                "view_a_nominal_95ci_better"
                 if low is not None and low > 0
-                else "view_b_significantly_better"
+                else "view_b_nominal_95ci_better"
                 if high is not None and high < 0
                 else "inconclusive"
             ),

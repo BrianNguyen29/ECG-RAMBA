@@ -6,8 +6,9 @@ intervals. ECG-RAMBA model weights remain unchanged, so outputs must be called
 score calibration rather than few-shot model fine-tuning.
 
 For PTB-XL, official fold 9 is the adaptation pool and fold 10 is the fixed
-test set. Georgia/CPSC2021 use repeated group-random splits with nested
-adaptation-group prefixes because no equivalent official target split exists.
+test set. Georgia/CPSC2021 use SHA256-seeded, label-independent group splits
+with nested adaptation-group prefixes because no equivalent official target
+split exists.
 """
 
 from __future__ import annotations
@@ -32,9 +33,9 @@ from scripts.revision.common import (  # noqa: E402
     METRIC_DIR,
     PREDICTION_DIR,
     TABLE_DIR,
-    balanced_group_train_test_split,
     calibration_summary,
     cluster_bootstrap_ci,
+    hash_group_train_test_split,
     macro_pr_auc,
     macro_roc_auc,
     multilabel_metrics,
@@ -407,12 +408,10 @@ def main() -> None:
                 "group_overlap": 0,
             }
         else:
-            pool_groups, test_groups, split_audit = balanced_group_train_test_split(
-                test["y_true"],
+            pool_groups, test_groups, split_audit = hash_group_train_test_split(
                 test["group_id"],
                 args.test_fraction,
                 seed,
-                n_candidates=args.split_candidates,
             )
             split_audits[f"seed{seed}"] = split_audit
             test_idx = group_rows(test["group_id"], test_groups)
@@ -453,7 +452,7 @@ def main() -> None:
                 "fraction": fraction,
                 "budget_role": budget_role(fraction, args.primary_fraction),
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                 "train_groups": int(len(selected_train_groups)),
                 "train_records_or_windows": int(len(train_idx)),
                 "test_groups": int(len(np.unique(zero_groups))),
@@ -463,7 +462,7 @@ def main() -> None:
                 "split_policy": (
                     "official_ptbxl_fold9_adaptation_fold10_test"
                     if args.dataset == "ptbxl"
-                    else "group_random_fixed_test_nested_adaptation_prefix"
+                    else "sha256_label_independent_fixed_test_nested_adaptation_prefix"
                 ),
                 **points,
             }
@@ -607,7 +606,7 @@ def main() -> None:
             "primary_fraction": args.primary_fraction,
             "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-            "fraction_sampling": "nested_random_group_prefix_per_seed",
+        "fraction_sampling": "nested_seeded_label_independent_group_prefix",
             "seeds": seeds,
             "split_audits": split_audits,
             "n_boot": args.n_boot,

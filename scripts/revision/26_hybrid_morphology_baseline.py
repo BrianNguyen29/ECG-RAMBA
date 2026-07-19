@@ -721,7 +721,11 @@ def main() -> None:
         "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
         "canonical_minirocket": False,
         "seed": int(args.seed),
+        "fold_seed_formula": "seed + fold",
+        "amp": args.device == "cuda",
         "allow_tf32": bool(args.allow_tf32),
+        "selection_rule": "fixed_final_epoch",
+        "tuning_provenance": "explicit CLI configuration; no validation-driven tuning in this runner",
     }
     runtime_config = {
         "device": args.device,
@@ -866,6 +870,41 @@ def main() -> None:
     helpers._save_csv(fold_path, fold_rows)
     require_complete_checkpoint_contract(checkpoint_contract)
 
+    training_units_per_fold = {
+        int(split["fold"]): int(len(split["tr_idx"])) for split in folds
+    }
+    comparator_contract = helpers.build_comparator_training_contract(
+        display_name="Frozen-transform morphology MLP",
+        n_records=len(y),
+        folds=sorted(training_units_per_fold),
+        preprocessing={
+            "feature_transform": EVALUATED_TRANSFORM_NAME,
+            "statistics": ["MAX", "PPV"],
+            "transform_weights": "fixed_seed_not_learned",
+            "standardization": (
+                "fit_on_training_fold_only" if args.standardize == "train_fold" else "none"
+            ),
+            "canonical_minirocket": False,
+        },
+        training_unit="record_feature_vector",
+        training_units_per_fold=training_units_per_fold,
+        batch_size=int(args.batch_size),
+        epochs=int(args.epochs),
+        loss=classifier_params["loss"],
+        regularization={
+            "weight_decay": float(args.weight_decay),
+            "dropout": float(args.dropout),
+            "gradient_clip_norm": 1.0,
+            "positive_class_weight": classifier_params["pos_weight"],
+        },
+        amp=bool(classifier_params["amp"]),
+        seed=int(args.seed),
+        fold_seed_formula="seed + fold",
+        checkpoint_rule=classifier_params["selection_rule"],
+        tuning_provenance=classifier_params["tuning_provenance"],
+        protocol=PROTOCOL,
+    )
+
     summary = {
         "created_utc": now_utc(),
         "git_commit": git_output(["rev-parse", "HEAD"]),
@@ -877,6 +916,7 @@ def main() -> None:
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "model": model_name,
         "classifier_params": classifier_params,
+        "comparator_contract": comparator_contract,
         "runtime_config": runtime_config,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
@@ -906,6 +946,7 @@ def main() -> None:
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "classifier_params": classifier_params,
+        "comparator_contract": comparator_contract,
         "runtime_config": runtime_config,
         "checkpoint_contract": checkpoint_contract,
         "runner_sha256": sha256_file(Path(__file__).resolve()),

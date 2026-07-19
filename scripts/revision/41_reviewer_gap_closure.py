@@ -24,6 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
     TABLE_DIR,
@@ -48,7 +51,7 @@ STRESSES = (
 )
 METRICS = ("pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro")
 ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
-ROBUSTNESS_BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+ROBUSTNESS_BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
     "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 )
@@ -237,29 +240,25 @@ def fmt(value: Any, digits: int = 4) -> str:
     return f"{float(value):.{digits}f}"
 
 
-def holm_adjusted_conclusion(
+def pointwise_ci_conclusion(
     row: dict[str, Any],
     *,
     first_label: str,
     second_label: str,
     low_key: str = "improvement_ci_low",
     high_key: str = "improvement_ci_high",
-    p_key: str = "holm_p_value_two_sided",
 ) -> str:
-    """Return a conservative family-wise conclusion for reviewer-facing tables."""
+    """Return an effect-size CI conclusion without implying a null test."""
 
     low = float_value(row, low_key)
     high = float_value(row, high_key)
-    adjusted_p = float_value(row, p_key)
-    if not 0.0 <= adjusted_p <= 1.0:
-        raise ValueError(f"Invalid Holm-adjusted p-value: {row}")
-    if adjusted_p >= 0.05 or low <= 0.0 <= high:
-        return "No Holm-adjusted difference"
+    if low <= 0.0 <= high:
+        return "Pointwise 95% CI includes zero"
     if low > 0.0:
-        return f"Holm-adjusted evidence favors {first_label}"
+        return f"Pointwise 95% CI favors {first_label}"
     if high < 0.0:
-        return f"Holm-adjusted evidence favors {second_label}"
-    return "No Holm-adjusted difference"
+        return f"Pointwise 95% CI favors {second_label}"
+    return "Pointwise 95% CI includes zero"
 
 
 def latex_escape(value: Any) -> str:
@@ -326,7 +325,6 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
             "improvement_full_over_comparator",
             "improvement_ci_low",
             "improvement_ci_high",
-            "holm_p_value_two_sided",
         ):
             float_value(row, key)
     if summary.get("status") not in {True, "complete"}:
@@ -336,7 +334,7 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
     for row in rows:
         if row["metric"] not in {"pr_auc_macro", "f1_macro"}:
             continue
-        adjusted = holm_adjusted_conclusion(
+        adjusted = pointwise_ci_conclusion(
             row,
             first_label="Full",
             second_label=row["comparator_label"],
@@ -350,10 +348,9 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
                 "Comparator value": fmt(row["comparator_value"]),
                 "Delta Full-comparator": fmt(row["improvement_full_over_comparator"]),
                 "Pointwise 95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
-                "Holm p": fmt(row["holm_p_value_two_sided"]),
                 "Groups": int_value(row, "n_groups"),
                 "Resampling unit": row["group_unit"],
-                "Holm-adjusted conclusion": adjusted,
+                "Inference scope": adjusted,
             }
         )
     return {
@@ -363,7 +360,7 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
         "issues": issues,
         "evidence": [str(resolve(args.external_table)), str(resolve(args.external_manifest))],
         "safe_wording": (
-            "Report zero-target-label paired effects separately by dataset, comparator, and metric with pointwise CIs and Holm-adjusted conclusions; do not pool tasks. "
+            "Report zero-target-label paired effects separately by dataset, comparator, and metric with pointwise effect-size CIs; do not call these multiplicity-adjusted significance tests and do not pool tasks. "
             "PTB-XL uses patient IDs, CPSC2021 uses source-record groups, and Georgia uses record-level resampling under an explicit independence assumption because patient IDs are unavailable."
         ),
     }, compact
@@ -482,10 +479,9 @@ def validate_morphology(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                 "improvement_first_over_second",
                 "improvement_ci_low",
                 "improvement_ci_high",
-                "holm_p_value_two_sided",
             ):
                 float_value(row, key)
-            adjusted = holm_adjusted_conclusion(
+            adjusted = pointwise_ci_conclusion(
                 row,
                 first_label=row.get("first_label") or "first model",
                 second_label=row.get("second_label") or "second model",
@@ -498,8 +494,7 @@ def validate_morphology(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                     "Second": fmt(row["second_value"]),
                     "Oriented delta": fmt(row["improvement_first_over_second"]),
                     "Pointwise 95% CI": f"[{fmt(row['improvement_ci_low'])}, {fmt(row['improvement_ci_high'])}]",
-                    "Holm p": fmt(row["holm_p_value_two_sided"]),
-                    "Holm-adjusted conclusion": adjusted,
+                    "Inference scope": adjusted,
                 }
             )
     except (FileNotFoundError, KeyError, TypeError, ValueError) as exc:
@@ -556,7 +551,9 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             independence = payload.get("bootstrap_independence_contract") or {}
             if (
                 independence.get("unit") != ROBUSTNESS_BOOTSTRAP_UNIT
-                or independence.get("independence_contract") != "one_chapman_record_per_subject"
+                or independence.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS
+                or independence.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE
+                or not independence.get("group_sidecar_sha256")
                 or independence.get("training_variability_scope")
                 != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE
             ):

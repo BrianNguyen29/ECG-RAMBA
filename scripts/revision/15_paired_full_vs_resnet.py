@@ -24,6 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
@@ -156,14 +159,14 @@ def load_prediction_set(path: Path, label: str) -> PredictionSet:
     if not path.exists():
         raise FileNotFoundError(f"Missing prediction NPZ for {label}: {path}")
     with np.load(path, allow_pickle=False) as data:
-        required = {"y_true", "y_prob", "record_id", "class_names"}
+        required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"{path} is missing required keys: {sorted(missing)}")
         y_true = np.asarray(data["y_true"], dtype=np.float32)
         y_prob = np.asarray(data["y_prob"], dtype=np.float32)
         record_id = np.asarray(data["record_id"], dtype=np.int64)
-        fold_id = np.asarray(data["fold_id"], dtype=np.int16) if "fold_id" in data.files else None
+        fold_id = np.asarray(data["fold_id"], dtype=np.int16)
         class_names = np.asarray(data["class_names"]).astype(str).tolist()
         metadata = {
             key: json_safe(scalar_from_npz(data, key))
@@ -188,7 +191,7 @@ def load_prediction_set(path: Path, label: str) -> PredictionSet:
         raise ValueError(f"{label} prediction shape mismatch: y_true={y_true.shape}, y_prob={y_prob.shape}")
     if len(record_id) != len(y_true):
         raise ValueError(f"{label} record_id length mismatch: {len(record_id)} vs {len(y_true)}")
-    if fold_id is not None and len(fold_id) != len(y_true):
+    if len(fold_id) != len(y_true):
         raise ValueError(f"{label} fold_id length mismatch: {len(fold_id)} vs {len(y_true)}")
     if not np.all(np.isfinite(y_prob)):
         raise ValueError(f"{label} probabilities contain non-finite values.")
@@ -225,6 +228,33 @@ def validate_freeze_manifest(path: Path, full: PredictionSet, expected_checkpoin
     expected_sha = artifacts[rel].get("sha256")
     if full.sha256 != expected_sha:
         raise RuntimeError(f"Full OOF SHA mismatch: {full.sha256} != {expected_sha}")
+    group = payload.get("group_contract") or {}
+    group_errors = []
+    if group.get("status") != "verified":
+        group_errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        group_errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        group_errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        group_errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        group_errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != len(full.y_true) or int(group.get("n_groups", -1)) != len(full.y_true):
+        group_errors.append("group_counts")
+    sidecar = group.get("sidecar") or {}
+    sidecar_path = Path(str(sidecar.get("path", "")))
+    if sidecar_path and not sidecar_path.is_absolute():
+        sidecar_path = PROJECT_ROOT / sidecar_path
+    if not sidecar_path.is_file():
+        group_errors.append("sidecar_missing")
+    elif sha256_file(sidecar_path) != sidecar.get("sha256"):
+        group_errors.append("sidecar_sha256")
+    if group_errors:
+        raise RuntimeError(
+            "Paired OOF comparison lacks an authenticated patient/group bootstrap contract: "
+            + ", ".join(group_errors)
+        )
     return {
         "path": str(path),
         "relative_path": project_relative(path),
@@ -233,6 +263,7 @@ def validate_freeze_manifest(path: Path, full: PredictionSet, expected_checkpoin
         "validated_records": payload.get("validated_records"),
         "n_classes": payload.get("n_classes"),
         "dataset_record_order_fingerprint": payload.get("dataset_record_order_fingerprint"),
+        "group_contract": group,
     }
 
 
@@ -383,39 +414,28 @@ def paired_bootstrap_difference(
     raw_diffs = np.asarray([row["raw_difference_full_minus_comparator"] for row in samples], dtype=np.float64)
     ci_low, ci_high = np.quantile(improvements, [0.025, 0.975])
     raw_low, raw_high = np.quantile(raw_diffs, [0.025, 0.975])
-    p_lower = (float(np.sum(improvements <= 0.0)) + 1.0) / (len(improvements) + 1.0)
-    p_upper = (float(np.sum(improvements >= 0.0)) + 1.0) / (len(improvements) + 1.0)
-    p_two_sided = min(1.0, 2.0 * min(p_lower, p_upper))
     return {
         "bootstrap_mean": float(np.mean(improvements)),
         "ci_low": float(ci_low),
         "ci_high": float(ci_high),
         "raw_diff_ci_low": float(raw_low),
         "raw_diff_ci_high": float(raw_high),
-        "p_value_two_sided": float(p_two_sided),
+        "p_value_two_sided": math.nan,
         "n_boot_valid": int(len(improvements)),
     }, samples
 
 
-def add_holm_adjustment(rows: list[dict]) -> None:
-    finite = [(idx, row["p_value_two_sided"]) for idx, row in enumerate(rows) if np.isfinite(row["p_value_two_sided"])]
-    finite.sort(key=lambda item: item[1])
-    m = len(finite)
-    running = 0.0
-    adjusted = {}
-    for rank, (idx, p_value) in enumerate(finite):
-        candidate = min(1.0, (m - rank) * float(p_value))
-        running = max(running, candidate)
-        adjusted[idx] = running
-    for idx, row in enumerate(rows):
-        row["holm_p_value_two_sided"] = float(adjusted[idx]) if idx in adjusted else math.nan
+def mark_pointwise_inference(rows: list[dict]) -> None:
+    for row in rows:
+        row["holm_p_value_two_sided"] = math.nan
+        row["multiplicity_adjustment"] = "not_applicable_no_null_test"
 
 
 def interpretation_from_ci(ci_low: float, ci_high: float) -> str:
     if ci_low > 0.0:
-        return "full_significantly_better"
+        return "full_nominal_95ci_better"
     if ci_high < 0.0:
-        return "comparator_significantly_better"
+        return "comparator_nominal_95ci_better"
     return "inconclusive"
 
 
@@ -503,32 +523,20 @@ def main() -> None:
         rows.append(row)
         sample_rows.extend(samples)
 
-    add_holm_adjustment(rows)
+    mark_pointwise_inference(rows)
     for row in rows:
-        if row["interpretation"] == "comparator_significantly_better":
-            if row["metric_family"] == "ranking":
-                row["safe_wording"] = (
-                    "ResNet1D/CNN is stronger for rank-based discrimination on frozen Chapman OOF."
-                )
-            elif row["metric_family"] == "fixed_threshold":
-                row["safe_wording"] = (
-                    "ResNet1D/CNN is stronger at the fixed threshold under the frozen Chapman OOF protocol."
-                )
-            elif row["metric_family"] == "calibration":
-                row["safe_wording"] = (
-                    "ResNet1D/CNN has the lower calibration/error metric under the frozen Chapman OOF protocol."
-                )
-            else:
-                row["safe_wording"] = (
-                    "ResNet1D/CNN is stronger for this paired metric under the frozen Chapman OOF protocol."
-                )
-        elif row["metric_family"] == "ranking" and row["interpretation"] == "full_significantly_better":
+        row["inference_scope"] = "pointwise_percentile_ci_effect_size_only"
+        if row["interpretation"] in {"comparator_nominal_95ci_better", "full_nominal_95ci_better"}:
+            favored = "ResNet1D/CNN" if row["interpretation"].startswith("comparator") else "Full ECG-RAMBA"
+            endpoint = {
+                "ranking": "rank-based discrimination",
+                "fixed_threshold": "the fixed-threshold endpoint",
+                "calibration": "the calibration/error endpoint",
+            }.get(row["metric_family"], "this paired endpoint")
             row["safe_wording"] = (
-                "Full ECG-RAMBA is stronger for rank-based discrimination under the frozen Chapman OOF protocol."
-            )
-        elif row["metric_family"] in {"fixed_threshold", "calibration"} and row["interpretation"] == "full_significantly_better":
-            row["safe_wording"] = (
-                "Full ECG-RAMBA is stronger for this metric under the frozen Chapman OOF protocol."
+                f"The nominal pointwise 95% interval favored {favored} for {endpoint} under "
+                "the frozen Chapman OOF protocol; no multiplicity-adjusted superiority test "
+                "was performed."
             )
         else:
             row["safe_wording"] = "Do not claim a paired difference for this metric without qualification."
@@ -553,7 +561,9 @@ def main() -> None:
             "n_boot": int(args.n_boot),
             "seed": int(args.seed),
             "alpha": 0.05,
-            "p_value": "two-sided sign bootstrap with +1 finite-sample smoothing; Holm-adjusted across metrics",
+            "p_value": "not_reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
         },
         "threshold": float(args.threshold),
         "n_bins": int(args.n_bins),

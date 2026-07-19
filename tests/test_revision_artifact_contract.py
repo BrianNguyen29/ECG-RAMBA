@@ -176,6 +176,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fold.npz"
             n_classes = len(CLASSES)
+            cache_contract = {"contract_sha256": "cache-contract"}
             np.savez_compressed(
                 path,
                 record_id=np.asarray([0, 1], dtype=np.int64),
@@ -186,6 +187,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 cache_schema_version=np.asarray(2, dtype=np.int16),
                 checkpoint_sha256=np.asarray("checkpoint"),
                 aggregation_implementation=np.asarray("power_mean_v2"),
+                cache_contract_sha256=np.asarray("cache-contract"),
                 slice_prob=np.zeros((1, n_classes), dtype=np.float32),
                 slice_record_id=np.asarray([0], dtype=np.int64),
                 slice_index=np.asarray([0], dtype=np.int16),
@@ -205,6 +207,7 @@ class RevisionArtifactContractTests(unittest.TestCase):
                 slice_index_all=[],
                 slice_fold_id_all=[],
                 checkpoint_sha256="checkpoint",
+                cache_contract=cache_contract,
             )
             self.assertIsNone(result)
 

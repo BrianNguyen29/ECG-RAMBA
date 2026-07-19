@@ -15,12 +15,17 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from scripts.revision.common import sha256_file
+from scripts.revision.common import (
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
+    sha256_file,
+)
 
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
-BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 METRIC_CACHE_SCHEMA_VERSION = 2
 MACRO_CLASS_SUPPORT_POLICY = (
@@ -220,7 +225,9 @@ def validate_profile(
         independence = payload.get("bootstrap_independence_contract") or {}
         if (
             independence.get("unit") != BOOTSTRAP_UNIT
-            or independence.get("independence_contract") != "one_chapman_record_per_subject"
+            or independence.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS
+            or independence.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE
+            or not independence.get("group_sidecar_sha256")
             or independence.get("training_variability_scope") != TRAINING_VARIABILITY_SCOPE
         ):
             issues.append(f"{label}.bootstrap_independence_contract_invalid")

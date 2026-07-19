@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 import numpy as np
 
-from scripts.revision.common import sha256_file
+from scripts.revision.common import (
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
+    sha256_file,
+)
 
 
 ROBUSTNESS = importlib.import_module("scripts.revision.21_robustness_multicomparator")
@@ -17,7 +22,7 @@ FINAL_EVIDENCE = importlib.import_module("scripts.revision.13_final_evidence_mat
 
 
 class RobustnessMulticomparatorContractTests(unittest.TestCase):
-    def test_legacy_minirocket_interpretations_are_normalized_to_nominal_ci_wording(self):
+    def test_legacy_significance_labels_are_not_accepted_as_nominal_ci_evidence(self):
         row = {
             "stress_test": "snr5db",
             "metric": "pr_auc_macro",
@@ -27,11 +32,11 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
         normalized = FINAL_EVIDENCE.robustness_claim_rows([row])[0]
         self.assertEqual(
             normalized["degradation_interpretation"],
-            "full_nominal_95ci_less_degraded",
+            "nominal_95ci_inconclusive_degradation_difference",
         )
         self.assertEqual(
             normalized["stressed_performance_interpretation"],
-            "minirocket_nominal_95ci_better_under_stress",
+            "nominal_95ci_inconclusive_stressed_difference",
         )
         self.assertNotIn("significant", normalized["safe_wording_degradation"].lower())
         self.assertNotIn("superiority", normalized["safe_wording_stressed_performance"].lower())
@@ -187,15 +192,21 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
             "comparator_nominal_95ci_more_favorable_change",
         )
 
-    def test_legacy_metric_cache_requires_exact_numeric_contract_attestation(self):
+    def test_metric_cache_rejects_legacy_or_incomplete_inference_contracts(self):
         expected_metadata = {
             "protocol": ROBUSTNESS.PROTOCOL,
             "stress": "snr5db",
             "comparator": "resnet",
             "metric": "pr_auc_macro",
+            "n_boot": 1000,
             "metric_cache_schema_version": ROBUSTNESS.METRIC_CACHE_SCHEMA_VERSION,
             "bootstrap_engine_contract": ROBUSTNESS.BOOTSTRAP_ENGINE,
             "macro_class_support_policy": ROBUSTNESS.MACRO_CLASS_SUPPORT_POLICY,
+            "runner_sha256": "runner",
+            "oof_sha256": "oof",
+            "freeze_sha256": "freeze",
+            "group_contract_sha256": "group-contract",
+            "group_sidecar_sha256": "group-sidecar",
         }
         legacy_metadata = {
             key: value
@@ -222,28 +233,53 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            row = ROBUSTNESS.read_metric_cache(path, expected_metadata)
-            self.assertIsNotNone(row)
-            self.assertEqual(
-                row["metric_cache_compatibility_attestation"],
-                "legacy_schema_exact_regression_parity_verified",
-            )
+            self.assertIsNone(ROBUSTNESS.read_metric_cache(path, expected_metadata))
 
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["row"]["bootstrap_engine"] = "unknown_buggy_engine"
+            valid_row = {
+                "status": "complete",
+                "bootstrap_engine": ROBUSTNESS.BOOTSTRAP_ENGINE,
+                "n_boot_valid": 1000,
+                "degradation_adv_ci_low": -0.1,
+                "degradation_adv_ci_high": 0.1,
+                "stressed_adv_ci_low": -0.2,
+                "stressed_adv_ci_high": 0.2,
+            }
+            payload = {"metadata": expected_metadata, "row": valid_row}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual(ROBUSTNESS.read_metric_cache(path, expected_metadata), valid_row)
+
+            payload["row"]["n_boot_valid"] = 999
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertIsNone(ROBUSTNESS.read_metric_cache(path, expected_metadata))
+            payload["row"]["n_boot_valid"] = 1000
+            payload["row"]["degradation_adv_ci_low"] = float("nan")
             path.write_text(json.dumps(payload), encoding="utf-8")
             self.assertIsNone(ROBUSTNESS.read_metric_cache(path, expected_metadata))
 
     def test_bootstrap_unit_contract_is_bound_to_current_oof_and_freeze(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=ROBUSTNESS.PROJECT_ROOT) as tmp:
             path = Path(tmp) / "calibration.json"
-            canonical = {"oof_sha256": "oof", "freeze_sha256": "freeze"}
+            sidecar = Path(tmp) / "test_group_sidecar.npz"
+            sidecar.write_bytes(b"authenticated-group-sidecar")
+            sidecar_relative = sidecar.resolve().relative_to(ROBUSTNESS.PROJECT_ROOT.resolve()).as_posix()
+            sidecar_sha = sha256_file(sidecar)
+            canonical = {
+                "oof_sha256": "oof",
+                "freeze_sha256": "freeze",
+                "group_sidecar_sha256": sidecar_sha,
+                "n_groups": 1,
+            }
             path.write_text(
                 json.dumps(
                     {
                         "bootstrap": {
-                            "unit": "chapman_record_subject",
-                            "independence_contract": "one_chapman_record_per_subject",
+                            "unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                            "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+                            "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+                            "group_sidecar": sidecar_relative,
+                            "group_sidecar_sha256": sidecar_sha,
+                            "records": 1,
+                            "unique_groups": 1,
                         },
                         "predictions_sha256": "oof",
                         "freeze_manifest_sha256": "freeze",
@@ -456,8 +492,11 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
                 json.dumps(
                     {
                         "bootstrap": {
-                            "unit": "chapman_record_subject",
-                            "independence_contract": "one_chapman_record_per_subject",
+                            "unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                            "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+                            "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+                            "group_sidecar": "manifests/test_group_sidecar.npz",
+                            "group_sidecar_sha256": "1" * 64,
                         }
                     }
                 ),
@@ -465,7 +504,10 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
             )
             bootstrap_contract = {
                 "unit": READINESS.ROBUSTNESS_BOOTSTRAP_UNIT,
-                "independence_contract": "one_chapman_record_per_subject",
+                "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+                "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+                "group_sidecar": "manifests/test_group_sidecar.npz",
+                "group_sidecar_sha256": "1" * 64,
                 "source": bootstrap_source.relative_to(READINESS.PROJECT_ROOT).as_posix(),
                 "source_sha256": sha256_file(bootstrap_source),
                 "training_variability_scope": READINESS.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,

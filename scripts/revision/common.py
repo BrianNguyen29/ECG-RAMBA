@@ -12,10 +12,13 @@ import json
 import math
 import os
 import subprocess
+import uuid
 from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
+
+from src.provenance import exclusive_cache_writer, ndarray_sha256
 
 from src.aggregation import (  # noqa: E402
     POWER_MEAN_IMPLEMENTATION,
@@ -35,6 +38,45 @@ TABLE_DIR = REVISION_DIR / "tables"
 EXPERIMENTAL_DIR = REVISION_DIR / "experimental"
 
 CACHE_SCHEMA_VERSION = 2
+AUTHENTICATED_RECORD_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
+CHAPMAN_GROUP_SEMANTICS = "physionet_ecg_arrhythmia_one_patient_per_record_v1"
+CHAPMAN_GROUP_REFERENCE = "https://physionet.org/content/ecg-arrhythmia/1.0.0/"
+CHAPMAN_GROUP_REFERENCE_COUNTS = {
+    "chapman_shaoxing": {"patients": 10247, "recordings": 10247},
+    "ningbo": {"patients": 34905, "recordings": 34905},
+}
+
+
+def _partial_path(path: Path, *, suffix: str = "") -> Path:
+    run_id = f"{os.getpid()}-{uuid.uuid4().hex[:12]}"
+    return path.with_name(f".{path.name}.partial.{run_id}{suffix}")
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sha256_path(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _commit_verified_temporary(temporary: Path, destination: Path) -> None:
+    staged_sha256 = _sha256_path(temporary)
+    os.replace(temporary, destination)
+    _fsync_directory(destination.parent)
+    if _sha256_path(destination) != staged_sha256:
+        raise RuntimeError(f"Atomic writer readback checksum mismatch: {destination}")
 
 
 CURRENT_HRV36_SCHEMA = [
@@ -134,16 +176,18 @@ def save_json_atomic(path: os.PathLike[str] | str, payload: dict) -> None:
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    tmp_path = _partial_path(path)
+    with exclusive_cache_writer(path):
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            json.loads(tmp_path.read_text(encoding="utf-8"))
+            _commit_verified_temporary(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
 
 def save_npz_compressed_atomic(path: os.PathLike[str] | str, **arrays: np.ndarray) -> None:
@@ -151,37 +195,57 @@ def save_npz_compressed_atomic(path: os.PathLike[str] | str, **arrays: np.ndarra
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.stem}.{os.getpid()}.partial.npz")
-    try:
-        np.savez_compressed(tmp_path, **arrays)
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    tmp_path = _partial_path(path, suffix=".npz")
+    with exclusive_cache_writer(path):
+        try:
+            np.savez_compressed(tmp_path, **arrays)
+            with tmp_path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            expected = {
+                key: ndarray_sha256(np.asarray(value)) for key, value in arrays.items()
+            }
+            with np.load(tmp_path, allow_pickle=False) as payload:
+                if set(payload.files) != set(arrays):
+                    raise RuntimeError(f"NPZ readback key mismatch: {tmp_path}")
+                observed = {
+                    key: ndarray_sha256(np.asarray(payload[key]))
+                    for key in payload.files
+                }
+            if observed != expected:
+                raise RuntimeError(f"NPZ readback checksum mismatch: {tmp_path}")
+            _commit_verified_temporary(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
 
 def save_csv(path: os.PathLike[str] | str, rows: Iterable[dict]) -> None:
     rows = list(rows)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.partial")
-    try:
-        if not rows:
-            with tmp_path.open("w", encoding="utf-8") as f:
-                f.flush()
-                os.fsync(f.fileno())
-        else:
-            with tmp_path.open("w", newline="", encoding="utf-8") as f:
-                fieldnames = list(dict.fromkeys(key for row in rows for key in row))
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(rows)
-                f.flush()
-                os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()
+    tmp_path = _partial_path(path)
+    with exclusive_cache_writer(path):
+        try:
+            if not rows:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                with tmp_path.open("w", newline="", encoding="utf-8") as f:
+                    fieldnames = list(dict.fromkeys(key for row in rows for key in row))
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    f.flush()
+                    os.fsync(f.fileno())
+                with tmp_path.open("r", newline="", encoding="utf-8") as handle:
+                    parsed = list(csv.DictReader(handle))
+                if len(parsed) != len(rows):
+                    raise RuntimeError(f"CSV readback row-count mismatch: {tmp_path}")
+            _commit_verified_temporary(tmp_path, path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
 
 def sha256_file(path: os.PathLike[str] | str, chunk_size: int = 1024 * 1024) -> str:
@@ -525,6 +589,62 @@ def balanced_group_train_test_split(
     return best[1], best[2], best[3]
 
 
+def hash_group_train_test_split(
+    groups: np.ndarray,
+    test_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Create a deterministic, label-independent group split.
+
+    This is the manuscript-safe fallback for external datasets without an
+    official train/test partition. Group membership is ordered only by a
+    SHA256 digest of ``seed`` and the group identifier; labels and predictions
+    are deliberately absent from the split rule.
+    """
+
+    groups = np.asarray(groups).astype(str)
+    if groups.ndim != 1:
+        raise ValueError(f"groups must be one-dimensional, found {groups.shape}")
+    if not 0 < float(test_fraction) < 1:
+        raise ValueError("test_fraction must be in (0,1)")
+    unique_groups = np.unique(groups)
+    if len(unique_groups) < 2:
+        raise ValueError("Group split requires at least two independent groups")
+    n_test = min(
+        max(int(round(len(unique_groups) * float(test_fraction))), 1),
+        len(unique_groups) - 1,
+    )
+
+    def digest(group: str) -> str:
+        return hashlib.sha256(f"{int(seed)}\0{group}".encode("utf-8")).hexdigest()
+
+    ordered = np.asarray(
+        sorted(unique_groups.tolist(), key=lambda group: (digest(group), group)),
+        dtype=unique_groups.dtype,
+    )
+    test_groups = ordered[:n_test]
+    train_groups = ordered[n_test:]
+    test_mask = np.isin(groups, test_groups)
+    assignment_payload = "\n".join(
+        [f"train\t{group}" for group in train_groups]
+        + [f"test\t{group}" for group in test_groups]
+    )
+    audit = {
+        "split_policy": "sha256_seeded_group_order_label_independent_v1",
+        "seed": int(seed),
+        "target_test_fraction": float(test_fraction),
+        "row_test_fraction": float(np.mean(test_mask)),
+        "train_groups": int(len(train_groups)),
+        "test_groups": int(len(test_groups)),
+        "label_independent": True,
+        "prediction_independent": True,
+        "assignment_sha256": hashlib.sha256(
+            assignment_payload.encode("utf-8")
+        ).hexdigest(),
+    }
+    return train_groups, test_groups, audit
+
+
 def macro_pr_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
     from sklearn.metrics import average_precision_score
 
@@ -545,3 +665,97 @@ def macro_roc_auc(y_true: np.ndarray, y_prob: np.ndarray) -> float:
             continue
         scores.append(roc_auc_score(y_true[:, c], y_prob[:, c]))
     return float(np.mean(scores)) if scores else math.nan
+
+
+def build_comparator_training_contract(
+    *,
+    display_name: str,
+    n_records: int,
+    folds: list[int],
+    preprocessing: object,
+    training_unit: str,
+    training_units_per_fold: dict[int, int] | None,
+    batch_size: int | str,
+    epochs: int | str,
+    loss: object,
+    regularization: object,
+    amp: bool | str,
+    seed: int | str,
+    fold_seed_formula: str,
+    checkpoint_rule: str,
+    tuning_provenance: str,
+    protocol: str,
+    comparison_scope: str = "same_folds_not_budget_matched",
+) -> dict:
+    """Build the reviewer-facing training contract for a same-fold comparator.
+
+    Missing legacy metadata must be passed explicitly as a descriptive string.
+    In particular, inference batch size must never be substituted for an
+    unrecorded training batch size.
+    """
+
+    ordered_folds = sorted({int(fold) for fold in folds})
+    if not ordered_folds:
+        raise ValueError("Comparator contract requires at least one fold")
+    optimizer_steps: dict[str, object]
+    if (
+        training_units_per_fold is not None
+        and isinstance(batch_size, int)
+        and isinstance(epochs, int)
+        and batch_size > 0
+        and epochs > 0
+    ):
+        per_fold = []
+        for fold in ordered_folds:
+            units = int(training_units_per_fold[fold])
+            steps = int(math.ceil(units / batch_size) * epochs)
+            per_fold.append(
+                {
+                    "fold": fold,
+                    "training_units": units,
+                    "optimizer_steps": steps,
+                }
+            )
+        optimizer_steps = {
+            "total": int(sum(row["optimizer_steps"] for row in per_fold)),
+            "per_fold": per_fold,
+            "formula": "ceil(training_units / batch_size) * epochs",
+        }
+    else:
+        optimizer_steps = {
+            "total": "not_recorded_in_legacy_checkpoint",
+            "per_fold": [],
+            "formula": "not_available",
+        }
+
+    return {
+        "schema_version": 1,
+        "display_name": str(display_name),
+        "comparison_scope": str(comparison_scope),
+        "n_records": int(n_records),
+        "folds": ordered_folds,
+        "fold_assignment_source": "frozen_oof_fold_id",
+        "protocol": str(protocol),
+        "preprocessing": preprocessing,
+        "training_unit": str(training_unit),
+        "training_units_per_fold": (
+            {str(fold): int(training_units_per_fold[fold]) for fold in ordered_folds}
+            if training_units_per_fold is not None
+            else "not_recorded_in_legacy_checkpoint"
+        ),
+        "optimizer_steps": optimizer_steps,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "loss": loss,
+        "regularization": regularization,
+        "amp": amp,
+        "seed": seed,
+        "fold_seed_formula": str(fold_seed_formula),
+        "checkpoint_rule": str(checkpoint_rule),
+        "tuning_provenance": str(tuning_provenance),
+        "fairness_boundary": (
+            "Same fold assignments and endpoint protocol only. Do not describe "
+            "this comparison as training-budget matched unless every training "
+            "field is observed and an explicit parity audit passes."
+        ),
+    }

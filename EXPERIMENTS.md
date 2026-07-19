@@ -1,163 +1,39 @@
-# Reproducing Experiments
+# Reproducing Reviewer Evidence
 
-This document provides exact commands to reproduce the results reported in our paper.
+The revision notebooks are the supported experiment entry points. Do not use historical metric values in this file as evidence. The generated `table_final_evidence_matrix.csv` and `table_final_safe_wording.csv` are the only manuscript/rebuttal source of truth.
 
----
+See [`docs/revision_plan/notebook_forensic_audit_runbook.md`](docs/revision_plan/notebook_forensic_audit_runbook.md) for the complete hardware, cache, resume, provenance, and statistical protocol.
 
-## Hardware Requirements
+## Canonical storage
 
-| Component   | Minimum                      | Recommended                    |
-| :---------- | :--------------------------- | :----------------------------- |
-| **GPU**     | NVIDIA RTX 3080 (10GB VRAM)  | NVIDIA RTX 3090 / A100 (24GB+) |
-| **RAM**     | 32 GB                        | 64 GB                          |
-| **Storage** | 50 GB (for datasets + cache) | 100 GB                         |
-| **CUDA**    | 11.8                         | 12.x                           |
+- Canonical artifacts: `/content/drive/MyDrive/ECG-Ramba/revision_artifacts/reports/revision`
+- Convenience output only: `/content/drive/MyDrive/ECG-Ramba/final_evidence_tables`
+- Legacy audit-only checkout: `/content/drive/MyDrive/ECG-Ramba/ECG-RAMBA/reports/revision`
 
-> **Note**: Training with `batch_size=192` requires ~20GB VRAM. Reduce to 64-128 for smaller GPUs.
+File presence is not a reuse contract. A reusable artifact must match the canonical manifest SHA, current input/source/config hashes, record order, and producer authority.
 
----
+## Notebook order
 
-## Dataset Preparation
+1. `00_colab_bootstrap.ipynb` on CPU.
+2. `01_a0_protocol_audit.ipynb` on CPU.
+   Run `02a_retrain_best_ema.ipynb` on A100 only if the fixed checkpoint protocol itself must be retrained; skip it for a normal evidence refresh.
+3. `02_predictions_and_external_eval.ipynb` on A100 only for missing inference.
+4. `03_calibration_and_ci.ipynb` on CPU High-RAM.
+5. `04_baselines_and_component_checks.ipynb` on A100 for missing folds, then CPU for paired ledgers.
+6. Run Notebook 02 again for missing PTB-XL fold 9/external representations; adaptation statistics are CPU-only after predictions exist.
+7. `05_hrv_domain_and_robustness.ipynb` on A100 for missing stress predictions, then CPU for aggregation.
+8. `06_pooling_and_representation.ipynb` on A100 only when checkpoint-local embeddings are missing.
+9. `07_results_freeze.ipynb` on CPU High-RAM. Run all cells in order.
 
-1. Download datasets from PhysioNet (see [data/README.md](data/README.md))
-2. Extract to the following structure:
-   ```
-   data/
-   ├── chapman/          # ~45k records
-   ├── cpsc2021/         # For zero-shot AF
-   └── ptbxl/            # For zero-shot multi-class
-   ```
+## Experiment identity
 
----
+- The morphology transform is a fixed-seed ROCKET-family ternary-kernel MAX+PPV transform, not canonical MiniRocket.
+- ResNet1D/CNN, Raw Mamba, compact Transformer ECG, and morphology MLP are same-fold comparators unless a complete budget-matching contract proves otherwise.
+- External PTB-XL and Georgia results are separate mapped record-level tasks.
+- CPSC2021 is a separate annotation-aligned 10-second AF/AFL mapped-window task.
+- Score calibration and frozen-encoder head adaptation are separate protocols.
+- Checkpoint-local probes and fold CKA are representation audits, not proof of mechanistic separation.
 
-## Interactive Experiments (Web App)
+## Final verification
 
-For real-time inference and clinical visualization, we provide a full-stack web application.
-
-```bash
-# Start the Clinical Dashboard
-cd web_app
-run_app.bat
-```
-
-See [web_app/README.md](web_app/README.md) for detailed usage.
-
----
-
-## Table 1: Chapman-Shaoxing 5-Fold Cross-Validation
-
-**Expected Results:** Macro F1 ≈ 0.31, ROC-AUC ≈ 0.85
-
-### Training
-
-```bash
-# Full training (5 folds, 20 epochs each)
-python scripts/train.py
-```
-
-**Output:**
-
-- Checkpoints: `models/fold{1-5}_best.pt`
-- Logs: `reports/logs/training_log_epochs.csv`
-
-### Evaluation (OOF)
-
-```bash
-python scripts/eval_oof.py
-```
-
-**Expected Output:**
-
-```
-f1_macro           0.3115 ± 0.0132
-precision_macro    0.3421 ± 0.0198
-recall_macro       0.3012 ± 0.0156
-auprc_macro        0.2845 ± 0.0187
-```
-
----
-
-## Table 2: Zero-Shot Transfer (CPSC-2021)
-
-**Expected Results:** PR-AUC (AF) ≈ 0.708
-
-### Prerequisites
-
-1. Complete Table 1 training (need `fold*_best.pt`)
-2. Prepare CPSC-2021 dataset in `data/cpsc2021/`
-
-### Evaluation
-
-```bash
-python scripts/eval_zeroshot.py
-```
-
----
-
-## Table 3: Ablation Study
-
-Ablations are controlled via the `ablation` dict passed to `ECGRambaV7Advanced`:
-
-```python
-from src.model import ECGRambaV7Advanced
-from configs.config import CONFIG
-
-# Full model (default)
-model_full = ECGRambaV7Advanced(CONFIG, ablation={})
-
-# Without MiniRocket
-model_no_rocket = ECGRambaV7Advanced(CONFIG, ablation={"no_rocket": True})
-
-# Without HRV
-model_no_hrv = ECGRambaV7Advanced(CONFIG, ablation={"no_hrv": True})
-
-# Without Multi-Scale Tokenizer
-model_no_multiscale = ECGRambaV7Advanced(CONFIG, ablation={"no_multiscale": True})
-
-# Without Cross-Attention Fusion
-model_no_fusion = ECGRambaV7Advanced(CONFIG, ablation={"no_fusion": True})
-```
-
-To run ablation experiments, modify `scripts/train.py` to pass the desired ablation config.
-
----
-
-## Inference-Time Ablation
-
-For quick ablation during inference (without retraining):
-
-```python
-# Disable MiniRocket features at inference
-logits = model(x, xh, xhr, use_rocket=False)
-
-# Disable HRV features at inference
-logits = model(x, xh, xhr, use_hrv=False)
-
-# Disable Cross-Attention Fusion (use simple concat)
-logits = model(x, xh, xhr, use_fusion=False)
-```
-
----
-
-## Troubleshooting
-
-| Issue                          | Solution                                     |
-| :----------------------------- | :------------------------------------------- |
-| `CUDA out of memory`           | Reduce `batch_size` in `configs/config.py`   |
-| `mamba-ssm` installation fails | Use pre-built wheels or install from source  |
-| Different results              | Ensure `numpy==1.26.4` and same CUDA version |
-
----
-
-## Citation
-
-If you use these experiments, please cite:
-
-```bibtex
-@article{nguyen2025ecg,
-  title={ECG-RAMBA: Zero-Shot ECG Generalization...},
-  author={Nguyen, Hai Duong and Tran, Xuan-The},
-  journal={arXiv preprint arXiv:2512.23347},
-  year={2025}
-}
-```
+Notebook 07 must pass the strict full-SHA storage audit and forensic notebook audit before creating `final_evidence_tables`. Submission assets are generated only after those gates pass and the forbidden-claim scan is clean.

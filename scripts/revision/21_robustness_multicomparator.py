@@ -1,7 +1,8 @@
 """Aggregate perturbation robustness across multiple comparators.
 
 This script does not generate new stress predictions. It validates and compares
-existing clean/stressed prediction artifacts for Full ECG-RAMBA, MiniRocket-only,
+existing clean/stressed prediction artifacts for Full ECG-RAMBA, the fixed-seed
+ROCKET-family MAX+PPV linear head,
 ResNet1D/CNN, Raw Mamba, and Transformer ECG. Missing comparator-stress artifacts are recorded as
 blocked rows rather than silently omitted.
 
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import math
 import sys
@@ -29,6 +31,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
@@ -47,9 +52,9 @@ from scripts.revision.common import (  # noqa: E402
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
 BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
-METRIC_CACHE_SCHEMA_VERSION = 2
+METRIC_CACHE_SCHEMA_VERSION = 3
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
-BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 MACRO_CLASS_SUPPORT_POLICY = (
     "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
@@ -84,10 +89,10 @@ COMPARATORS = {
         "stress": "robustness_full_{stress}_predictions.npz",
     },
     "minirocket": {
-        "label": "MiniRocket-only",
+        "label": "Fixed-seed ROCKET-family MAX+PPV linear head",
         # Stress predictions use the dedicated robustness heads. Degradation
         # must therefore use the clean reference from those exact heads, not
-        # the separately trained canonical MiniRocket-only baseline.
+        # the separately trained fixed-seed ROCKET-family MAX+PPV baseline.
         "clean": "robustness_minirocket_clean_ref_predictions.npz",
         "stress": "robustness_minirocket_{stress}_predictions.npz",
     },
@@ -293,6 +298,8 @@ def cache_metadata(
     comp_clean: dict[str, Any],
     comp_stress: dict[str, Any],
     seed: int,
+    canonical_contract: dict[str, Any],
+    bootstrap_contract: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL,
@@ -304,6 +311,7 @@ def cache_metadata(
         "n_bins": int(args.n_bins),
         "n_boot": int(args.n_boot),
         "seed": int(seed),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
         "bootstrap_engine_contract": BOOTSTRAP_ENGINE,
         "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
@@ -311,7 +319,36 @@ def cache_metadata(
         "full_stress_sha256": full_stress["sha256"],
         "comp_clean_sha256": comp_clean["sha256"],
         "comp_stress_sha256": comp_stress["sha256"],
+        "oof_sha256": canonical_contract["oof_sha256"],
+        "freeze_sha256": canonical_contract["freeze_sha256"],
+        "group_contract_sha256": canonical_contract["group_contract_sha256"],
+        "group_sidecar_sha256": canonical_contract["group_sidecar_sha256"],
+        "bootstrap_contract_source_sha256": bootstrap_contract["source_sha256"],
     }
+
+
+def validate_metric_cache_row(row: dict[str, Any], metadata: dict[str, Any]) -> None:
+    if row.get("status") != "complete":
+        raise ValueError("metric cache row status is not complete")
+    if int(row.get("n_boot_valid", -1)) != int(metadata["n_boot"]):
+        raise ValueError("metric cache does not contain the exact requested bootstrap count")
+    if row.get("bootstrap_engine") != BOOTSTRAP_ENGINE:
+        raise ValueError("metric cache bootstrap engine differs from the current exact engine")
+    for field in (
+        "degradation_adv_ci_low",
+        "degradation_adv_ci_high",
+        "stressed_adv_ci_low",
+        "stressed_adv_ci_high",
+    ):
+        try:
+            value = float(row[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"metric cache lacks a numeric {field}") from exc
+        if not math.isfinite(value):
+            raise ValueError(f"metric cache contains a non-finite {field}")
+    for key, value in row.items():
+        if "significant" in str(key).lower() or "significant" in str(value).lower():
+            raise ValueError("metric cache contains prohibited legacy significance wording")
 
 
 def read_metric_cache(path: Path, metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -327,35 +364,14 @@ def read_metric_cache(path: Path, metadata: dict[str, Any]) -> dict[str, Any] | 
     if not isinstance(row, dict):
         return None
     observed_metadata = payload.get("metadata")
-    if observed_metadata == metadata:
-        return row
-
-    # The original cache schema omitted explicit engine/support-policy fields.
-    # Accept it only when every numerical input field matches and the stored
-    # row identifies an engine covered by exact regression-parity tests.
-    compatibility_fields = {
-        "metric_cache_schema_version",
-        "bootstrap_engine_contract",
-        "macro_class_support_policy",
-    }
-    legacy_expected = {
-        key: value for key, value in metadata.items() if key not in compatibility_fields
-    }
-    allowed_legacy_engines = {
-        BOOTSTRAP_ENGINE,
-        "record_index_resample_v1",
-        "record_index_resample_v1_cached_exact",
-    }
-    if (
-        observed_metadata == legacy_expected
-        and str(row.get("bootstrap_engine") or "") in allowed_legacy_engines
-    ):
-        row = dict(row)
-        row["metric_cache_compatibility_attestation"] = (
-            "legacy_schema_exact_regression_parity_verified"
-        )
-        return row
-    return None
+    if observed_metadata != metadata:
+        return None
+    try:
+        validate_metric_cache_row(row, metadata)
+    except (TypeError, ValueError) as exc:
+        print(f"WARNING: rejecting invalid metric cache {path}: {exc}", flush=True)
+        return None
+    return dict(row)
 
 
 def write_metric_cache(path: Path, metadata: dict[str, Any], row: dict[str, Any]) -> None:
@@ -502,11 +518,27 @@ def load_clean_checkpoint_contract(comparator: str, clean_data: dict[str, Any]) 
     return expected_hashes.tolist()
 
 
-def load_canonical_contract(clean_sha256: str) -> dict[str, str]:
+def _canonical_json_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_group_sidecar(path_value: Any) -> Path:
+    path = Path(str(path_value or ""))
+    if not str(path):
+        raise RuntimeError("Frozen OOF group sidecar path is missing")
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_canonical_contract(clean_sha256: str) -> dict[str, Any]:
     if not OOF_FREEZE_MANIFEST.exists() or OOF_FREEZE_MANIFEST.stat().st_size == 0:
         raise FileNotFoundError(f"Missing frozen OOF manifest: {OOF_FREEZE_MANIFEST}")
     payload = json.loads(OOF_FREEZE_MANIFEST.read_text(encoding="utf-8"))
-    if payload.get("status") != "frozen" or payload.get("checkpoint_kind") != "final_ema":
+    if (
+        payload.get("status") != "frozen"
+        or payload.get("manuscript_ready") is not True
+        or payload.get("checkpoint_kind") != "final_ema"
+    ):
         raise RuntimeError("Frozen OOF manifest is not the canonical final_ema contract")
     prediction_rows = [
         row
@@ -515,9 +547,44 @@ def load_canonical_contract(clean_sha256: str) -> dict[str, str]:
     ]
     if len(prediction_rows) != 1 or prediction_rows[0].get("sha256") != clean_sha256:
         raise RuntimeError("Full clean prediction SHA does not match the frozen OOF manifest")
+    group = payload.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    group_errors = []
+    if group.get("status") != "verified":
+        group_errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        group_errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        group_errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        group_errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        group_errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != int(payload.get("validated_records", -2)):
+        group_errors.append("n_records")
+    if int(group.get("n_groups", -1)) != int(payload.get("validated_records", -2)):
+        group_errors.append("n_groups")
+    try:
+        sidecar_path = _resolve_group_sidecar(sidecar.get("path"))
+    except RuntimeError:
+        sidecar_path = Path()
+        group_errors.append("sidecar_path")
+    if not sidecar_path.is_file():
+        group_errors.append("sidecar_missing")
+    elif sha256_file(sidecar_path) != sidecar.get("sha256"):
+        group_errors.append("sidecar_sha256")
+    if group_errors:
+        raise RuntimeError(
+            "Frozen OOF manifest lacks an authenticated live patient/group contract: "
+            + ", ".join(group_errors)
+        )
     return {
         "oof_sha256": clean_sha256,
         "freeze_sha256": sha256_file(OOF_FREEZE_MANIFEST),
+        "group_contract_sha256": _canonical_json_sha256(group),
+        "group_sidecar": project_relative(sidecar_path),
+        "group_sidecar_sha256": str(sidecar["sha256"]),
+        "n_groups": int(group["n_groups"]),
     }
 
 
@@ -532,17 +599,35 @@ def load_bootstrap_independence_contract(canonical_contract: dict[str, str]) -> 
         )
     payload = json.loads(path.read_text(encoding="utf-8"))
     bootstrap = payload.get("bootstrap") or {}
-    if bootstrap.get("unit") != "chapman_record_subject":
-        raise RuntimeError("Calibration contract does not declare Chapman record-subject bootstrap units")
-    if bootstrap.get("independence_contract") != "one_chapman_record_per_subject":
-        raise RuntimeError("Calibration contract does not declare one Chapman record per subject")
+    if bootstrap.get("unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        raise RuntimeError("Calibration contract does not declare authenticated patient-record units")
+    if bootstrap.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS:
+        raise RuntimeError("Calibration contract does not declare the reviewed patient-record semantics")
+    if bootstrap.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        raise RuntimeError("Calibration contract is not bound to the reviewed PhysioNet source")
+    if not bootstrap.get("group_sidecar") or not bootstrap.get("group_sidecar_sha256"):
+        raise RuntimeError("Calibration contract does not authenticate its patient-record sidecar")
     if payload.get("predictions_sha256") != canonical_contract["oof_sha256"]:
         raise RuntimeError("Calibration bootstrap contract references a different canonical OOF artifact")
     if payload.get("freeze_manifest_sha256") != canonical_contract["freeze_sha256"]:
         raise RuntimeError("Calibration bootstrap contract references a different OOF freeze manifest")
+    sidecar_path = _resolve_group_sidecar(bootstrap["group_sidecar"])
+    if not sidecar_path.is_file():
+        raise RuntimeError("Calibration bootstrap group sidecar is missing")
+    if sha256_file(sidecar_path) != bootstrap["group_sidecar_sha256"]:
+        raise RuntimeError("Calibration bootstrap group sidecar SHA256 is stale")
+    if bootstrap["group_sidecar_sha256"] != canonical_contract["group_sidecar_sha256"]:
+        raise RuntimeError("Calibration bootstrap group sidecar differs from the frozen OOF contract")
+    if int(bootstrap.get("records", -1)) != int(canonical_contract["n_groups"]):
+        raise RuntimeError("Calibration bootstrap record count differs from the frozen OOF group contract")
+    if int(bootstrap.get("unique_groups", -1)) != int(canonical_contract["n_groups"]):
+        raise RuntimeError("Calibration bootstrap group count differs from the frozen OOF group contract")
     return {
         "unit": BOOTSTRAP_UNIT,
-        "independence_contract": "one_chapman_record_per_subject",
+        "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+        "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+        "group_sidecar": project_relative(sidecar_path),
+        "group_sidecar_sha256": bootstrap["group_sidecar_sha256"],
         "source": project_relative(path),
         "source_sha256": sha256_file(path),
         "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
@@ -1331,6 +1416,8 @@ def main() -> None:
                     comp_clean=clean[comp],
                     comp_stress=stress_data[comp],
                     seed=seed,
+                    canonical_contract=canonical_contract,
+                    bootstrap_contract=bootstrap_independence_contract,
                 )
                 cache_path = metric_cache_path(args.metric_cache_dir, stress, comp, spec["name"])
                 row = read_metric_cache(cache_path, metadata) if args.reuse_metric_cache else None
@@ -1379,13 +1466,11 @@ def main() -> None:
                         "bootstrap_engine": boot.get("bootstrap_engine"),
                         "interpretation": interp,
                     }
+                    validate_metric_cache_row(row, metadata)
                     write_metric_cache(cache_path, metadata, row)
                     print(f"{stress} {comp} {spec['name']}: bootstrap done", flush=True)
-                row.setdefault("bootstrap_engine", "record_index_resample_v1_cached_exact")
+                validate_metric_cache_row(row, metadata)
                 interp = row_interpretation(row)
-                previous_interpretation = str(row.get("interpretation") or "").strip()
-                if previous_interpretation and previous_interpretation != interp:
-                    row["legacy_interpretation"] = previous_interpretation
                 row.update(
                     {
                         **base_row,

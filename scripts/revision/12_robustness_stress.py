@@ -1,4 +1,4 @@
-"""Run perturbation robustness tests for Full ECG-RAMBA vs MiniRocket-only.
+"""Run perturbation robustness tests versus a fixed-seed ROCKET-family head.
 
 This runner is intentionally heavier than the HRV/domain notebook cells. It
 re-runs inference on perturbed Chapman OOF validation records instead of
@@ -7,9 +7,10 @@ deriving robustness claims from clean predictions.
 Protocol guarantees:
 - The Full model uses frozen fold checkpoints, existing training-fold PCA
   objects, Q=3 power-mean slice aggregation, and the same OOF fold contract.
-- MiniRocket-only heads are trained on clean train-fold MiniRocket features and
-  evaluated on perturbed validation-fold MiniRocket features. The heads are
-  reusable and tied to the clean MiniRocket cache SHA and hyperparameters.
+- Linear heads are trained on clean train-fold fixed-seed random-convolution
+  MAX+PPV features and evaluated on matched perturbed validation features. The
+  heads are reusable and tied to the legacy-named feature-cache SHA and
+  hyperparameters; the transform is not canonical MiniRocket.
 - Paired bootstrap resamples records with one shared index vector across clean,
   perturbed, Full, and MiniRocket predictions.
 """
@@ -72,6 +73,9 @@ from src.provenance import record_order_fingerprint  # noqa: E402
 
 PROTOCOL = "robustness_full_vs_minirocket_perturbation_v1"
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+INFERENCE_SCOPE = "pointwise_percentile_ci_effect_size_only"
+NULL_TEST = "not_run"
+MULTIPLICITY_ADJUSTMENT = "not_applicable_no_null_test"
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 PERTURBATION_REALIZATION_SCOPE = "single_fixed_seed_conditional_stress_audit"
 MINIROCKET_HEAD_PROTOCOL = "minirocket_clean_heads_for_robustness_v1"
@@ -314,7 +318,7 @@ def load_prediction_npz(path: Path, label: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Missing {label} predictions: {path}")
     with np.load(path, allow_pickle=False) as data:
-        required = {"y_true", "y_prob", "record_id", "class_names"}
+        required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"{path} missing required keys: {sorted(missing)}")
@@ -509,6 +513,22 @@ def load_oof_checkpoint_contract(args: argparse.Namespace) -> dict:
             "dataset_record_order_fingerprint": row.get("dataset_record_order_fingerprint"),
         }
 
+    pca_objects: dict[int, dict] = {}
+    for row in payload.get("fold_summaries", []):
+        fold = int(row.get("fold", 0))
+        pca_path_raw = row.get("pca_object_path")
+        pca_sha = row.get("pca_object_sha256")
+        if fold > 0 and pca_path_raw and pca_sha:
+            pca_objects[fold] = {
+                "path": str(resolve_path(Path(pca_path_raw))),
+                "sha256": str(pca_sha),
+            }
+    if set(pca_objects) != set(checkpoints):
+        raise ValueError(
+            "OOF run manifest lacks a complete fold-PCA object contract: "
+            f"pca_folds={sorted(pca_objects)} checkpoint_folds={sorted(checkpoints)}"
+        )
+
     print(f"Loaded OOF checkpoint contract: {manifest_path} | folds={sorted(checkpoints)}", flush=True)
     return {
         "path": str(manifest_path),
@@ -517,6 +537,7 @@ def load_oof_checkpoint_contract(args: argparse.Namespace) -> dict:
         "protocol": payload.get("protocol"),
         "dataset_record_order_fingerprint": payload.get("dataset_record_order_fingerprint"),
         "checkpoints": checkpoints,
+        "pca_objects": pca_objects,
     }
 
 
@@ -938,6 +959,7 @@ def predict_full_model(
     stress_name: str,
     dataset_record_fingerprint: str,
     checkpoint_contract: dict[int, dict],
+    pca_contract: dict[int, dict],
 ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
     gen = load_revision_module("01_generate_predictions.py", "_ecg_ramba_generate_predictions_for_robustness")
     n_records, n_classes = y.shape
@@ -976,11 +998,20 @@ def predict_full_model(
                 f"!= loaded dataset fingerprint {dataset_record_fingerprint}"
             )
         source_config_hash = checkpoint_meta["source_config_hash"]
-        pca_path = gen.fold_pca_model_path(fold_num, tr_idx, source_config_hash)
+        pca_record = pca_contract.get(fold_num)
+        if not pca_record:
+            raise RuntimeError(f"Missing frozen OOF PCA contract for fold {fold_num}")
+        pca_path = resolve_path(Path(pca_record["path"]))
         if not pca_path.exists():
             raise FileNotFoundError(
                 f"Missing training-fold PCA object for fold {fold_num}: {pca_path}. "
                 "Run the final_ema OOF export/training pipeline first; robustness must not fit a new PCA."
+            )
+        actual_pca_sha = sha256_file(pca_path)
+        if actual_pca_sha != pca_record.get("sha256"):
+            raise RuntimeError(
+                f"Fold {fold_num} PCA SHA mismatch: {actual_pca_sha} != "
+                f"{pca_record.get('sha256')} ({pca_path})"
             )
         pca = joblib.load(pca_path)
         hydra_va = pca.transform(X_rocket[va_idx]).astype(np.float32)
@@ -1320,17 +1351,12 @@ def paired_bootstrap_robustness(
             "stressed_advantage_mean": math.nan,
             "stressed_advantage_ci_low": math.nan,
             "stressed_advantage_ci_high": math.nan,
-            "p_value_degradation_two_sided": math.nan,
-            "p_value_stressed_two_sided": math.nan,
+            "p_value_degradation_two_sided": None,
+            "p_value_stressed_two_sided": None,
             "n_boot_valid": 0,
         }, samples
     deg_adv = np.asarray([row["robustness_advantage_full_less_degradation"] for row in samples], dtype=np.float64)
     stressed_adv = np.asarray([row["stressed_advantage_full_over_minirocket"] for row in samples], dtype=np.float64)
-
-    def p_two_sided(values: np.ndarray) -> float:
-        p_lower = (float(np.sum(values <= 0.0)) + 1.0) / (len(values) + 1.0)
-        p_upper = (float(np.sum(values >= 0.0)) + 1.0) / (len(values) + 1.0)
-        return float(min(1.0, 2.0 * min(p_lower, p_upper)))
 
     deg_lo, deg_hi = np.quantile(deg_adv, [0.025, 0.975])
     stress_lo, stress_hi = np.quantile(stressed_adv, [0.025, 0.975])
@@ -1341,8 +1367,10 @@ def paired_bootstrap_robustness(
         "stressed_advantage_mean": float(np.mean(stressed_adv)),
         "stressed_advantage_ci_low": float(stress_lo),
         "stressed_advantage_ci_high": float(stress_hi),
-        "p_value_degradation_two_sided": p_two_sided(deg_adv),
-        "p_value_stressed_two_sided": p_two_sided(stressed_adv),
+        # Percentile bootstrap draws estimate the sampling distribution of an
+        # effect; tail mass around zero is not a null-centred randomisation test.
+        "p_value_degradation_two_sided": None,
+        "p_value_stressed_two_sided": None,
         "n_boot_valid": int(len(samples)),
     }, samples
 
@@ -1366,7 +1394,7 @@ def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
     print("=" * 80, flush=True)
-    print("ROBUSTNESS STRESS TEST: FULL ECG-RAMBA VS MINIROCKET-ONLY", flush=True)
+    print("ROBUSTNESS STRESS TEST: FULL ECG-RAMBA VS FIXED-SEED ROCKET-FAMILY HEAD", flush=True)
     print("=" * 80, flush=True)
     print(f"stress_tests={args.stress_tests}", flush=True)
     print(f"n_boot={args.n_boot} threshold={args.threshold} n_bins={args.n_bins}", flush=True)
@@ -1381,6 +1409,7 @@ def main() -> None:
     contract = validate_clean_prediction_contract(full_clean, mini_clean_canonical, args)
     checkpoint_contract_payload = load_oof_checkpoint_contract(args)
     checkpoint_contract = checkpoint_contract_payload.get("checkpoints", {})
+    pca_contract = checkpoint_contract_payload.get("pca_objects", {})
     y = full_clean["y_true"]
     fold_id = np.asarray(full_clean["fold_id"], dtype=np.int16)
     folds = fold_list_from_fold_id(fold_id)
@@ -1636,6 +1665,7 @@ def main() -> None:
                     stress_name=stress_name,
                     dataset_record_fingerprint=record_fp,
                     checkpoint_contract=checkpoint_contract,
+                    pca_contract=pca_contract,
                 )
                 write_prediction(
                     full_pred_path,
@@ -1714,7 +1744,7 @@ def main() -> None:
             metric_seed = args.seed + 10007 * (metric_index + 1) + int(stress_hash[:6], 16)
             cache_metadata = {
                 "protocol": PROTOCOL,
-                "cache_version": 1,
+                "cache_version": 2,
                 "stress_test": stress_name,
                 "stress_hash": stress_hash,
                 "stress_json": json.dumps(stress, sort_keys=True),
@@ -1800,6 +1830,9 @@ def main() -> None:
                 "p_value_stressed_two_sided": ci["p_value_stressed_two_sided"],
                 "n_boot_valid": ci["n_boot_valid"],
                 "ci_scope": CI_SCOPE,
+                "inference_scope": INFERENCE_SCOPE,
+                "null_test": NULL_TEST,
+                "multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT,
                 "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
                 "perturbation_realization_scope": PERTURBATION_REALIZATION_SCOPE,
                 "degradation_interpretation": interpretation(
@@ -1845,10 +1878,17 @@ def main() -> None:
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "protocol": PROTOCOL,
+        "statistical_inference": {
+            "ci_scope": CI_SCOPE,
+            "inference_scope": INFERENCE_SCOPE,
+            "null_test": NULL_TEST,
+            "multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT,
+        },
         "claim_guidance": {
             "robustness": (
-                "Claim Full ECG-RAMBA is more robust than MiniRocket-only only for metrics/perturbations "
-                "where degradation_advantage_full_less_degradation has a positive paired CI."
+                "Report metric- and perturbation-specific paired degradation estimates with nominal "
+                "95% percentile CIs. Do not call them statistically significant because no null-centred "
+                "test or multiplicity correction is performed."
             ),
             "ranking_warning": (
                 "Stressed AUROC/AUPRC may still favor MiniRocket-only even when fixed-threshold/calibration "

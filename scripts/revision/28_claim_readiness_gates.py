@@ -23,6 +23,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
     TABLE_DIR,
@@ -36,7 +39,7 @@ from scripts.revision.common import (  # noqa: E402
 
 ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v1"
 ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
-ROBUSTNESS_BOOTSTRAP_UNIT = "chapman_record_one_record_per_subject"
+ROBUSTNESS_BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
     "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 )
@@ -446,7 +449,9 @@ def robustness_contract_issues(
         independence = payload.get("bootstrap_independence_contract") or {}
         if (
             independence.get("unit") != ROBUSTNESS_BOOTSTRAP_UNIT
-            or independence.get("independence_contract") != "one_chapman_record_per_subject"
+            or independence.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS
+            or independence.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE
+            or not independence.get("group_sidecar_sha256")
             or independence.get("training_variability_scope")
             != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE
         ):
@@ -1089,7 +1094,7 @@ def main() -> None:
         ),
         row(
             claim_id="transformer_ecg_baseline",
-            claim_area="Compact Transformer ECG fair comparator",
+            claim_area="Compact Transformer ECG same-fold comparator",
             status=transformer_status,
             manuscript_ready=transformer_status.startswith("complete"),
             evidence_status="optional_comparator_specific",

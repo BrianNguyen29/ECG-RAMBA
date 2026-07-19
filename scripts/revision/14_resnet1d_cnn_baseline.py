@@ -35,6 +35,7 @@ from scripts.revision.common import (  # noqa: E402
     PREDICTION_DIR,
     TABLE_DIR,
     bootstrap_ci,
+    build_comparator_training_contract,
     calibration_summary,
     ensure_revision_dirs,
     macro_pr_auc,
@@ -1578,6 +1579,11 @@ def main() -> None:
         "power_mean_q": float(CONFIG["power_mean_q"]),
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
+        "seed": int(args.seed),
+        "fold_seed_formula": "seed + fold",
+        "amp": bool(args.amp),
+        "amp_dtype": "float16" if args.amp else "disabled",
+        "allow_tf32": bool(args.allow_tf32),
         "lr": float(args.lr),
         "weight_decay": float(args.weight_decay),
         "dropout": float(args.dropout),
@@ -1587,6 +1593,7 @@ def main() -> None:
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
         "selection_rule": "fixed_final_epoch",
+        "tuning_provenance": "explicit CLI configuration; no validation-driven tuning in this runner",
         "uses_hrv": False,
         "uses_minirocket": False,
         "uses_pca": False,
@@ -1776,6 +1783,51 @@ def main() -> None:
     _save_csv(FOLD_TABLE, fold_rows)
     require_complete_checkpoint_contract(checkpoint_contract)
 
+    signal_length = int(X.shape[-1])
+    slice_length = int(CONFIG["slice_length"])
+    slice_stride = int(CONFIG["slice_stride"])
+    max_slices = int(CONFIG["max_slices_per_record"])
+    slices_per_record = (
+        min(max_slices, 1 + (signal_length - slice_length) // slice_stride)
+        if signal_length >= slice_length
+        else 0
+    )
+    if slices_per_record <= 0:
+        raise RuntimeError("Comparator training contract found no valid raw-ECG slices")
+    training_units_per_fold = {
+        int(split["fold"]): int(len(split["tr_idx"]) * slices_per_record)
+        for split in folds
+    }
+    comparator_contract = build_comparator_training_contract(
+        display_name=RUNNER_DISPLAY_NAME,
+        n_records=len(y),
+        folds=sorted(training_units_per_fold),
+        preprocessing={
+            "input": "raw_12_lead_ecg",
+            "slice_length": slice_length,
+            "slice_stride": slice_stride,
+            "max_slices_per_record": max_slices,
+            "record_aggregation": f"power_mean_q{float(CONFIG['power_mean_q']):g}",
+        },
+        training_unit="raw_ecg_slice",
+        training_units_per_fold=training_units_per_fold,
+        batch_size=int(args.batch_size),
+        epochs=int(args.epochs),
+        loss=model_params["loss"],
+        regularization={
+            "weight_decay": float(args.weight_decay),
+            "dropout": float(args.dropout),
+            "gradient_clip_norm": 1.0,
+            "positive_class_weight": model_params["pos_weight"],
+        },
+        amp=bool(args.amp),
+        seed=int(args.seed),
+        fold_seed_formula="seed + fold",
+        checkpoint_rule=model_params["selection_rule"],
+        tuning_provenance=model_params["tuning_provenance"],
+        protocol=PROTOCOL,
+    )
+
     summary = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
@@ -1784,6 +1836,7 @@ def main() -> None:
         "feature_contract": FEATURE_CONTRACT,
         "model": MODEL_NAME,
         "model_params": model_params,
+        "comparator_contract": comparator_contract,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
         "threshold": float(args.threshold),
@@ -1820,6 +1873,7 @@ def main() -> None:
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "model_params": model_params,
+        "comparator_contract": comparator_contract,
         "checkpoint_contract": checkpoint_contract,
         "runner_sha256": sha256_file(RUNNER_SOURCE_PATH),
         "artifacts": summary["artifacts"],

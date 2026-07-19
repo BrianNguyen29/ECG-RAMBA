@@ -12,7 +12,9 @@ Example:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +26,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     FIGURE_DIR,
     REVISION_DIR,
     TABLE_DIR,
@@ -107,7 +112,7 @@ def validate_freeze_manifest(
     pred_path: Path,
     y_true: np.ndarray,
     class_names: list[str] | None,
-) -> str:
+) -> dict:
     freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
     if freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
         raise ValueError(f"Invalid OOF freeze manifest: {freeze_path}")
@@ -123,7 +128,59 @@ def validate_freeze_manifest(
         raise ValueError("Prediction class count differs from freeze manifest")
     if class_names is not None and freeze.get("class_names") and freeze["class_names"] != class_names:
         raise ValueError("Prediction class order differs from freeze manifest")
-    return sha256_file(freeze_path)
+    group = freeze.get("group_contract") or {}
+    group_errors = []
+    if group.get("status") != "verified":
+        group_errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        group_errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        group_errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        group_errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        group_errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != y_true.shape[0]:
+        group_errors.append("n_records")
+    if int(group.get("n_groups", -1)) != y_true.shape[0]:
+        group_errors.append("n_groups")
+    sidecar = group.get("sidecar") or {}
+    if not sidecar.get("sha256") or not sidecar.get("path"):
+        group_errors.append("sidecar")
+    sidecar_path = Path(str(sidecar.get("path", "")))
+    if sidecar_path and not sidecar_path.is_absolute():
+        sidecar_path = PROJECT_ROOT / sidecar_path
+    if not sidecar_path.is_file():
+        group_errors.append("sidecar_missing")
+    elif sha256_file(sidecar_path) != sidecar.get("sha256"):
+        group_errors.append("sidecar_sha256")
+    if group_errors:
+        raise RuntimeError(
+            "Freeze manifest lacks an authenticated patient-record bootstrap contract: "
+            + ", ".join(group_errors)
+        )
+    group_contract_sha256 = hashlib.sha256(
+        json.dumps(group, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "freeze_manifest_sha256": sha256_file(freeze_path),
+        "group_contract": group,
+        "group_contract_sha256": group_contract_sha256,
+        "bootstrap": {
+            "unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+            "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+            "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+            "group_sidecar": sidecar.get("path"),
+            "group_sidecar_sha256": sidecar.get("sha256"),
+            "group_contract_sha256": group_contract_sha256,
+            "records": int(group["n_records"]),
+            "unique_groups": int(group["n_groups"]),
+            "description": (
+                "Rows are resampled as authenticated source patient-records under the "
+                "SHA-bound frozen OOF group contract."
+            ),
+        },
+    }
 
 
 def reliability_bins(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int) -> list[dict]:
@@ -264,7 +321,40 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Reject prediction files explicitly marked manuscript_ready=false.",
     )
+    parser.add_argument(
+        "--allow-unauthenticated-exploratory",
+        action="store_true",
+        help=(
+            "Allow an explicitly exploratory analysis without a freeze/group contract. "
+            "The output must be under reports/revision/experimental and is always "
+            "marked manuscript_ready=false."
+        ),
+    )
     return parser.parse_args()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def validate_bootstrap_ci_payload(ci: dict[str, dict], n_boot: int) -> None:
+    for metric, result in ci.items():
+        if int(result.get("n_boot_valid", -1)) != int(n_boot):
+            raise RuntimeError(
+                f"Bootstrap CI for {metric} has {result.get('n_boot_valid')} valid replicates; "
+                f"exactly {n_boot} are required."
+            )
+        for field in ("mean", "lo", "hi"):
+            try:
+                value = float(result[field])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"Bootstrap CI for {metric} lacks numeric {field}") from exc
+            if not math.isfinite(value):
+                raise RuntimeError(f"Bootstrap CI for {metric} contains non-finite {field}")
 
 
 def main() -> None:
@@ -279,14 +369,39 @@ def main() -> None:
             raise ValueError(f"Prediction artifact is not manuscript-ready: {pred_path}")
 
     y_true, y_prob, class_names = validate_prediction_payload(data, pred_path)
+    out_path = Path(args.out)
+    exploratory = args.freeze_manifest is None
+    if exploratory:
+        if not args.allow_unauthenticated_exploratory:
+            raise RuntimeError(
+                "Canonical calibration requires --freeze-manifest with an authenticated group contract. "
+                "Use --allow-unauthenticated-exploratory only for non-manuscript analysis."
+            )
+        experimental_root = REVISION_DIR / "experimental"
+        if not _is_within(out_path, experimental_root):
+            raise RuntimeError(
+                "Unauthenticated calibration output must be written under "
+                f"{experimental_root}."
+            )
     freeze_manifest_sha256 = None
+    freeze_contract = None
+    bootstrap_contract = {
+        "unit": "record_row_unverified",
+        "independence_contract": "not_authenticated_without_freeze_manifest",
+        "description": (
+            "Rows are resampled without a freeze-authenticated patient/group sidecar; "
+            "this output is exploratory and not manuscript-ready."
+        ),
+    }
     if args.freeze_manifest:
-        freeze_manifest_sha256 = validate_freeze_manifest(
+        freeze_contract = validate_freeze_manifest(
             freeze_path=args.freeze_manifest,
             pred_path=pred_path,
             y_true=y_true,
             class_names=class_names,
         )
+        freeze_manifest_sha256 = freeze_contract["freeze_manifest_sha256"]
+        bootstrap_contract = freeze_contract["bootstrap"]
 
     metrics = multilabel_metrics(y_true, y_prob, threshold=args.threshold)
     calibration = calibration_summary(y_true, y_prob, n_bins=args.n_bins)
@@ -320,12 +435,19 @@ def main() -> None:
             seed=args.seed,
         ),
     }
+    validate_bootstrap_ci_payload(ci, args.n_boot)
     dataset = scalar_from_npz(data, "dataset", pred_path.stem)
     protocol = scalar_from_npz(data, "protocol", None)
     reliability = reliability_bins(y_true, y_prob, n_bins=args.n_bins)
-    reliability_csv = TABLE_DIR / f"reliability_bins_{pred_path.stem}.csv"
-    class_calibration_csv = TABLE_DIR / f"calibration_by_class_{pred_path.stem}.csv"
-    reliability_fig = FIGURE_DIR / f"reliability_{pred_path.stem}.png"
+    if exploratory:
+        exploratory_artifact_root = out_path.parent / f"{out_path.stem}_artifacts"
+        reliability_csv = exploratory_artifact_root / f"reliability_bins_{pred_path.stem}.csv"
+        class_calibration_csv = exploratory_artifact_root / f"calibration_by_class_{pred_path.stem}.csv"
+        reliability_fig = exploratory_artifact_root / f"reliability_{pred_path.stem}.png"
+    else:
+        reliability_csv = TABLE_DIR / f"reliability_bins_{pred_path.stem}.csv"
+        class_calibration_csv = TABLE_DIR / f"calibration_by_class_{pred_path.stem}.csv"
+        reliability_fig = FIGURE_DIR / f"reliability_{pred_path.stem}.png"
     save_csv_rows(reliability_csv, reliability)
     save_csv_rows(
         class_calibration_csv,
@@ -342,19 +464,20 @@ def main() -> None:
         "protocol": protocol,
         "class_names": class_names,
         "git_commit": current_git_commit(),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "evidence_status": (
+            "experimental_unauthenticated" if exploratory else "authenticated_manuscript_evidence"
+        ),
+        "manuscript_ready": not exploratory,
+        "group_contract_sha256": (
+            freeze_contract["group_contract_sha256"] if freeze_contract else None
+        ),
         "shape": {"y_true": list(y_true.shape), "y_prob": list(y_prob.shape)},
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
         "seed": args.seed,
-        "bootstrap": {
-            "unit": "chapman_record_subject",
-            "independence_contract": "one_chapman_record_per_subject",
-            "description": (
-                "Rows are resampled as independent Chapman records; the data-loader contract "
-                "defines one record per subject, so this is also subject-level resampling."
-            ),
-        },
+        "bootstrap": bootstrap_contract,
         "metrics": metrics,
         "calibration": calibration,
         "calibration_micro": calibration_micro,
@@ -371,9 +494,9 @@ def main() -> None:
         },
     }
 
-    save_json(args.out, payload)
+    save_json(out_path, payload)
     print(json.dumps(payload, indent=2, sort_keys=True))
-    print(f"\nWrote: {args.out}")
+    print(f"\nWrote: {out_path}")
 
 
 if __name__ == "__main__":

@@ -169,22 +169,16 @@ def validate_hybrid_morphology_artifacts(
 
 
 def safe_wording(metric_family: str, interpretation: str) -> str:
-    if interpretation == "comparator_significantly_better":
-        if metric_family == "ranking":
-            return "The frozen-transform morphology MLP head is stronger for rank-based discrimination on frozen Chapman OOF."
-        if metric_family == "fixed_threshold":
-            return "The frozen-transform morphology MLP head is stronger at the fixed threshold under the frozen Chapman OOF protocol."
-        if metric_family == "calibration":
-            return "The frozen-transform morphology MLP head has the lower calibration/error metric under the frozen Chapman OOF protocol."
-        return "The frozen-transform morphology MLP head is stronger for this paired metric under the frozen Chapman OOF protocol."
-    if interpretation == "full_significantly_better":
-        if metric_family == "ranking":
-            return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head for rank-based discrimination under frozen Chapman OOF."
-        if metric_family == "fixed_threshold":
-            return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head at the fixed threshold under frozen Chapman OOF."
-        if metric_family == "calibration":
-            return "Full ECG-RAMBA has the lower calibration/error metric than the frozen-transform morphology MLP head under frozen Chapman OOF."
-        return "Full ECG-RAMBA is stronger than the frozen-transform morphology MLP head for this paired metric under frozen Chapman OOF."
+    if interpretation in {"comparator_nominal_95ci_better", "full_nominal_95ci_better"}:
+        favored = (
+            "the frozen-transform morphology MLP head"
+            if interpretation.startswith("comparator")
+            else "Full ECG-RAMBA"
+        )
+        return (
+            f"The nominal pointwise 95% interval favored {favored} for this {metric_family} "
+            "endpoint under frozen Chapman OOF; no multiplicity-adjusted superiority test was performed."
+        )
     return "Do not claim a paired Full-vs-Hybrid morphology difference for this metric without qualification."
 
 
@@ -261,7 +255,7 @@ def main() -> None:
         rows.append(row)
         sample_rows.extend(samples)
 
-    paired_helpers.add_holm_adjustment(rows)
+    paired_helpers.mark_pointwise_inference(rows)
     for row in rows:
         row["safe_wording"] = safe_wording(row["metric_family"], row["interpretation"])
 
@@ -285,7 +279,7 @@ def main() -> None:
             "n_boot": int(args.n_boot),
             "seed": int(args.seed),
             "alpha": 0.05,
-            "p_value": "two-sided sign bootstrap with +1 finite-sample smoothing; Holm-adjusted across metrics",
+            "p_value": "not reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
         },
         "threshold": float(args.threshold),
         "n_bins": int(args.n_bins),
@@ -357,4 +351,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

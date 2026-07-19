@@ -10,8 +10,10 @@ aggregation protocol.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -114,6 +116,53 @@ def project_relative(path: Path) -> str:
     return resolve_path(path).resolve().relative_to(PROJECT_ROOT.resolve()).as_posix()
 
 
+def canonical_json_sha256(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def authenticated_group_contract(freeze_info: dict) -> dict:
+    group = freeze_info.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    required = {
+        "status": group.get("status"),
+        "bootstrap_unit": group.get("bootstrap_unit"),
+        "one_record_per_group": group.get("one_record_per_group"),
+        "n_records": group.get("n_records"),
+        "n_groups": group.get("n_groups"),
+        "group_semantics": group.get("group_semantics"),
+        "group_semantics_reference": group.get("group_semantics_reference"),
+        "group_sidecar": sidecar.get("path"),
+        "group_sidecar_sha256": sidecar.get("sha256"),
+    }
+    if (
+        required["status"] != "verified"
+        or required["one_record_per_group"] is not True
+        or int(required["n_records"] or -1) != int(required["n_groups"] or -2)
+        or not required["group_sidecar_sha256"]
+    ):
+        raise RuntimeError("Paired Transformer output lacks a verified one-record-per-group contract")
+    required["group_contract_sha256"] = canonical_json_sha256(group)
+    return required
+
+
+def validate_paired_interval(ci: dict, samples: list[dict], n_boot: int) -> None:
+    if int(ci.get("n_boot_valid", -1)) != int(n_boot) or len(samples) != int(n_boot):
+        raise RuntimeError(
+            f"Paired Transformer bootstrap is incomplete: "
+            f"n_boot_valid={ci.get('n_boot_valid')} samples={len(samples)} expected={n_boot}"
+        )
+    for key in ("bootstrap_mean", "ci_low", "ci_high", "raw_diff_ci_low", "raw_diff_ci_high"):
+        try:
+            value = float(ci[key])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Paired Transformer bootstrap lacks numeric {key}") from exc
+        if not math.isfinite(value):
+            raise RuntimeError(f"Paired Transformer bootstrap has non-finite {key}")
+    if "significant" in json.dumps(ci, sort_keys=True).lower():
+        raise RuntimeError("Paired Transformer bootstrap contains prohibited legacy significance wording")
+
+
 def validate_transformer_artifacts(
     *,
     summary_path: Path,
@@ -170,22 +219,12 @@ def validate_transformer_artifacts(
 
 
 def safe_wording(metric_family: str, interpretation: str) -> str:
-    if interpretation == "comparator_significantly_better":
-        if metric_family == "ranking":
-            return "Transformer ECG is stronger for rank-based discrimination on frozen Chapman OOF."
-        if metric_family == "fixed_threshold":
-            return "Transformer ECG is stronger at the fixed threshold under the frozen Chapman OOF protocol."
-        if metric_family == "calibration":
-            return "Transformer ECG has the lower calibration/error metric under the frozen Chapman OOF protocol."
-        return "Transformer ECG is stronger for this paired metric under the frozen Chapman OOF protocol."
-    if interpretation == "full_significantly_better":
-        if metric_family == "ranking":
-            return "Full ECG-RAMBA is stronger than Transformer ECG for rank-based discrimination under frozen Chapman OOF."
-        if metric_family == "fixed_threshold":
-            return "Full ECG-RAMBA is stronger than Transformer ECG at the fixed threshold under frozen Chapman OOF."
-        if metric_family == "calibration":
-            return "Full ECG-RAMBA has the lower calibration/error metric than Transformer ECG under frozen Chapman OOF."
-        return "Full ECG-RAMBA is stronger than Transformer ECG for this paired metric under frozen Chapman OOF."
+    if interpretation in {"comparator_nominal_95ci_better", "full_nominal_95ci_better"}:
+        favored = "Transformer ECG" if interpretation.startswith("comparator") else "Full ECG-RAMBA"
+        return (
+            f"The nominal pointwise 95% interval favored {favored} for this {metric_family} "
+            "endpoint under frozen Chapman OOF; no multiplicity-adjusted superiority test was performed."
+        )
     return "Do not claim a paired Full-vs-Transformer difference for this metric without qualification."
 
 
@@ -207,6 +246,9 @@ def main() -> None:
     print(f"Loaded Transformer ECG: shape={comparator.y_true.shape} sha256={comparator.sha256}", flush=True)
 
     freeze_info = paired_helpers.validate_freeze_manifest(args.freeze_manifest, full, args.expected_checkpoint_kind)
+    group_contract = authenticated_group_contract(freeze_info)
+    runner_sha256 = sha256_file(Path(__file__).resolve())
+    paired_helper_sha256 = sha256_file(Path(paired_helpers.__file__).resolve())
     transformer_info = validate_transformer_artifacts(
         summary_path=args.comparator_summary,
         manifest_path=args.comparator_manifest,
@@ -237,6 +279,7 @@ def main() -> None:
             n_boot=args.n_boot,
             seed=args.seed + metric_index * 1009,
         )
+        validate_paired_interval(ci, samples, args.n_boot)
         print(f"  paired bootstrap {spec.name} done: {ci}", flush=True)
         row = {
             "comparison": "full_ecg_ramba_vs_transformer_ecg",
@@ -255,14 +298,13 @@ def main() -> None:
             "improvement_ci_high": ci["ci_high"],
             "raw_diff_ci_low": ci["raw_diff_ci_low"],
             "raw_diff_ci_high": ci["raw_diff_ci_high"],
-            "p_value_two_sided": ci["p_value_two_sided"],
             "n_boot_valid": ci["n_boot_valid"],
             "interpretation": paired_helpers.interpretation_from_ci(ci["ci_low"], ci["ci_high"]),
         }
         rows.append(row)
         sample_rows.extend(samples)
 
-    paired_helpers.add_holm_adjustment(rows)
+    paired_helpers.mark_pointwise_inference(rows)
     for row in rows:
         row["safe_wording"] = safe_wording(row["metric_family"], row["interpretation"])
 
@@ -277,16 +319,22 @@ def main() -> None:
         "status": True,
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "runner_sha256": runner_sha256,
+        "paired_helper_sha256": paired_helper_sha256,
         "comparison": "full_ecg_ramba_vs_transformer_ecg",
         "full_label": FULL_LABEL,
         "comparator_label": COMPARATOR_LABEL,
         "paired_bootstrap": {
-            "sample_unit": "record",
-            "description": "One bootstrap index vector is applied to both model prediction matrices.",
+            "sample_unit": group_contract["bootstrap_unit"],
+            "description": (
+                "One bootstrap index vector is applied to both model prediction matrices; "
+                "the authenticated freeze contract verifies one Chapman record per subject/group."
+            ),
             "n_boot": int(args.n_boot),
             "seed": int(args.seed),
             "alpha": 0.05,
-            "p_value": "two-sided sign bootstrap with +1 finite-sample smoothing; Holm-adjusted across metrics",
+            "p_value": "not reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
+            "group_contract": group_contract,
         },
         "threshold": float(args.threshold),
         "n_bins": int(args.n_bins),
@@ -327,6 +375,8 @@ def main() -> None:
     manifest = {
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "runner_sha256": runner_sha256,
+        "paired_helper_sha256": paired_helper_sha256,
         "comparison": "full_ecg_ramba_vs_transformer_ecg",
         "input_sha256": {
             "full_predictions": full.sha256,
@@ -334,6 +384,10 @@ def main() -> None:
             "freeze_manifest": freeze_info["sha256"],
             "transformer_summary": transformer_info["summary"]["sha256"],
             "transformer_manifest": transformer_info["manifest"]["sha256"],
+            "runner": runner_sha256,
+            "paired_helper": paired_helper_sha256,
+            "group_contract": group_contract["group_contract_sha256"],
+            "group_sidecar": group_contract["group_sidecar_sha256"],
         },
         "artifacts": {
             "json": str(out_json),

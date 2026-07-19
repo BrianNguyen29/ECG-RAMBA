@@ -26,6 +26,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     EXPERIMENTAL_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
@@ -43,7 +46,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 3
 COMPARATOR_STEMS = {
     "resnet": "resnet1d_cnn",
     "raw_mamba": "raw_mamba",
@@ -115,7 +118,18 @@ def resolve(path: Path) -> Path:
     return path if path.is_absolute() else PROJECT_ROOT / path
 
 
-def canonical_contract() -> dict[str, str]:
+def canonical_json_sha256(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def resolve_contract_path(value: Any) -> Path:
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def canonical_contract() -> dict[str, Any]:
     oof = PREDICTION_DIR / "oof_final_ema_predictions.npz"
     freeze = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
     if not oof.exists() or not freeze.exists():
@@ -134,7 +148,40 @@ def canonical_contract() -> dict[str, str]:
     )
     if expected_oof_sha != oof_sha:
         raise RuntimeError(f"Freeze OOF SHA mismatch: {expected_oof_sha} != {oof_sha}")
-    return {"oof_sha256": oof_sha, "freeze_sha256": sha256_file(freeze)}
+    group = freeze_payload.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    errors = []
+    if group.get("status") != "verified":
+        errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != int(freeze_payload.get("validated_records", -2)):
+        errors.append("n_records")
+    if int(group.get("n_groups", -1)) != int(freeze_payload.get("validated_records", -2)):
+        errors.append("n_groups")
+    sidecar_path = resolve_contract_path(sidecar.get("path"))
+    if not str(sidecar.get("path") or "") or not sidecar_path.is_file():
+        errors.append("group_sidecar_missing")
+    elif not sidecar.get("sha256") or sha256_file(sidecar_path) != sidecar.get("sha256"):
+        errors.append("group_sidecar_sha256")
+    if errors:
+        raise RuntimeError(
+            "Canonical freeze lacks an authenticated live patient/group contract: "
+            + ", ".join(errors)
+        )
+    return {
+        "oof_sha256": oof_sha,
+        "freeze_sha256": sha256_file(freeze),
+        "group_contract_sha256": canonical_json_sha256(group),
+        "group_sidecar_sha256": sidecar["sha256"],
+        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    }
 
 
 def now_utc() -> str:
@@ -217,6 +264,15 @@ def load_predictions(path: Path, expected_dataset: str) -> dict[str, Any]:
         raise ValueError(f"{path}: fewer than two independent groups")
     payload["path"] = path
     payload["sha256"] = sha256_file(path)
+    group_rows = [
+        f"{record_id}\x1e{group_id}\x1e{split_id}"
+        for record_id, group_id, split_id in zip(
+            payload["record_id"], payload["group_id"], payload["split_id"]
+        )
+    ]
+    payload["group_assignment_sha256"] = hashlib.sha256(
+        "\x1f".join(group_rows).encode("utf-8")
+    ).hexdigest()
     return payload
 
 
@@ -243,7 +299,20 @@ def validate_full_gate(dataset: str, full: dict[str, Any]) -> dict[str, Any]:
     expected_sha = ((gate.get("artifacts") or {}).get("prediction") or {}).get("sha256")
     if expected_sha and expected_sha != full["sha256"]:
         raise RuntimeError(f"{dataset}: Full external gate is stale for prediction NPZ")
-    return {"path": str(path), "sha256": sha256_file(path), "gate_cache_key": gate.get("gate_cache_key")}
+    if int(gate.get("n_records", -1)) != len(full["record_id"]):
+        raise RuntimeError(f"{dataset}: Full external gate record count differs from predictions")
+    if int(gate.get("n_groups", -1)) != len(np.unique(full["group_id"])):
+        raise RuntimeError(f"{dataset}: Full external gate group count differs from predictions")
+    if str(gate.get("group_unit") or "") != full["group_unit"]:
+        raise RuntimeError(f"{dataset}: Full external gate group unit differs from predictions")
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "gate_cache_key": gate.get("gate_cache_key"),
+        "group_assignment_sha256": full["group_assignment_sha256"],
+        "n_groups": int(len(np.unique(full["group_id"]))),
+        "group_unit": full["group_unit"],
+    }
 
 
 def metric_specs(threshold: float, n_bins: int) -> list[MetricSpec]:
@@ -271,15 +340,21 @@ def metric_specs(threshold: float, n_bins: int) -> list[MetricSpec]:
     ]
 
 
-def cache_key(
+def metric_cache_contract(
     dataset: str,
     comparator: str,
     metric: str,
     full_sha: str,
     comparator_sha: str,
     args: argparse.Namespace,
-) -> str:
-    payload = {
+    *,
+    group_assignment_sha256: str,
+    canonical: dict[str, Any],
+    full_gate_sha256: str,
+    comparator_manifest_sha256: str,
+    bootstrap_seed: int,
+) -> dict[str, Any]:
+    return {
         "protocol_version": PROTOCOL_VERSION,
         "runner_sha256": sha256_file(Path(__file__).resolve()),
         "dataset": dataset,
@@ -290,9 +365,42 @@ def cache_key(
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
-        "seed": args.seed,
+        "seed": int(bootstrap_seed),
+        "group_assignment_sha256": group_assignment_sha256,
+        "canonical_oof_sha256": canonical["oof_sha256"],
+        "canonical_freeze_sha256": canonical["freeze_sha256"],
+        "canonical_group_contract_sha256": canonical["group_contract_sha256"],
+        "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
+        "full_gate_sha256": full_gate_sha256,
+        "comparator_manifest_sha256": comparator_manifest_sha256,
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def metric_cache_key(contract: dict[str, Any]) -> str:
+    return canonical_json_sha256(contract)
+
+
+def validate_bootstrap_payload(
+    result: dict[str, Any],
+    samples: np.ndarray,
+    *,
+    n_boot: int,
+) -> None:
+    samples = np.asarray(samples, dtype=np.float64)
+    if samples.ndim != 1 or len(samples) != int(n_boot) or not np.isfinite(samples).all():
+        raise RuntimeError("Paired external metric cache lacks the exact finite bootstrap sample count")
+    if int(result.get("n_boot_valid", -1)) != int(n_boot):
+        raise RuntimeError("Paired external metric cache n_boot_valid differs from the request")
+    for field in ("improvement_ci_low", "improvement_ci_high"):
+        try:
+            value = float(result[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Paired external metric cache lacks numeric {field}") from exc
+        if not math.isfinite(value):
+            raise RuntimeError(f"Paired external metric cache contains non-finite {field}")
+    for key, value in result.items():
+        if "significant" in str(key).lower() or "significant" in str(value).lower():
+            raise RuntimeError("Paired external metric cache contains legacy significance wording")
 
 
 def paired_group_bootstrap(
@@ -330,10 +438,6 @@ def paired_group_bootstrap(
     comparator_value = float(spec.fn(y_true, comparator_prob))
     raw = full_value - comparator_value
     point = raw if spec.higher_is_better else -raw
-    p_two_sided = 2.0 * min(
-        (float(np.sum(values <= 0.0)) + 1.0) / (len(values) + 1.0),
-        (float(np.sum(values >= 0.0)) + 1.0) / (len(values) + 1.0),
-    )
     return (
         {
             "full_value": full_value,
@@ -343,36 +447,30 @@ def paired_group_bootstrap(
             "improvement_bootstrap_mean": float(np.mean(values)),
             "improvement_ci_low": float(np.quantile(values, 0.025)),
             "improvement_ci_high": float(np.quantile(values, 0.975)),
-            "p_value_two_sided": min(1.0, p_two_sided),
+            "p_value_two_sided": None,
             "n_boot_valid": int(len(values)),
             "n_groups": int(len(unique)),
             "sample_unit": "patient/source-record group",
+            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+            "null_test": "not_run",
         },
         values,
     )
 
 
-def holm_adjust(rows: list[dict[str, Any]]) -> None:
-    by_dataset: dict[str, list[dict[str, Any]]] = {}
+def mark_pointwise_inference(rows: list[dict[str, Any]]) -> None:
     for row in rows:
-        by_dataset.setdefault(row["dataset"], []).append(row)
-    for dataset_rows in by_dataset.values():
-        ordered = sorted(dataset_rows, key=lambda row: float(row["p_value_two_sided"]))
-        running = 0.0
-        total = len(ordered)
-        for rank, row in enumerate(ordered):
-            adjusted = min(1.0, (total - rank) * float(row["p_value_two_sided"]))
-            running = max(running, adjusted)
-            row["holm_p_value_two_sided"] = running
+        row["holm_p_value_two_sided"] = None
+        row["multiplicity_adjustment"] = "not_applicable_no_null_test"
 
 
 def interpretation(row: dict[str, Any]) -> str:
     low = float(row["improvement_ci_low"])
     high = float(row["improvement_ci_high"])
     if low > 0:
-        return "full_significantly_better"
+        return "full_nominal_95ci_better"
     if high < 0:
-        return "comparator_significantly_better"
+        return "comparator_nominal_95ci_better"
     return "paired_difference_inconclusive"
 
 
@@ -383,10 +481,10 @@ def safe_wording(row: dict[str, Any]) -> str:
     scope = "CPSC2021 AF/AFL mapped-window" if dataset == "cpsc2021" else f"{dataset} mapped-task"
     outcome = row["interpretation"]
     direction = "higher" if row["higher_is_better"] else "lower"
-    if outcome == "full_significantly_better":
-        return f"ECG-RAMBA is {direction} on {metric} than {comparator} for this zero-target-label {scope} comparison."
-    if outcome == "comparator_significantly_better":
-        return f"{comparator} is {direction} on {metric} than ECG-RAMBA for this zero-target-label {scope} comparison."
+    if outcome == "full_nominal_95ci_better":
+        return f"The pointwise 95% paired effect-size interval favors ECG-RAMBA ({direction} {metric}) over {comparator} for this zero-target-label {scope} comparison."
+    if outcome == "comparator_nominal_95ci_better":
+        return f"The pointwise 95% paired effect-size interval favors {comparator} ({direction} {metric}) over ECG-RAMBA for this zero-target-label {scope} comparison."
     return f"The paired {metric} difference between ECG-RAMBA and {comparator} is inconclusive for this zero-target-label {scope} comparison."
 
 
@@ -443,12 +541,28 @@ def main() -> None:
                     ]
                 )
                 for metric_index, spec in enumerate(metric_specs(args.threshold, args.n_bins)):
-                    key = cache_key(dataset, comparator, spec.name, full["sha256"], comp["sha256"], args)
+                    bootstrap_seed = args.seed + metric_index * 1009
+                    manifest_sha256 = sha256_file(manifest_path)
+                    cache_contract = metric_cache_contract(
+                        dataset,
+                        comparator,
+                        spec.name,
+                        full["sha256"],
+                        comp["sha256"],
+                        args,
+                        group_assignment_sha256=full["group_assignment_sha256"],
+                        canonical=canonical,
+                        full_gate_sha256=gate_info["sha256"],
+                        comparator_manifest_sha256=manifest_sha256,
+                        bootstrap_seed=bootstrap_seed,
+                    )
+                    key = metric_cache_key(cache_contract)
                     path = cache_dir / f"{dataset}_{comparator}_{spec.name}_{key[:16]}.json"
                     if args.reuse_existing and path.exists():
                         cached = json.loads(path.read_text(encoding="utf-8"))
                         if (
                             cached.get("cache_key") != key
+                            or cached.get("contract") != cache_contract
                             or cached.get("dataset") != dataset
                             or cached.get("comparator") != comparator
                             or cached.get("metric") != spec.name
@@ -456,8 +570,7 @@ def main() -> None:
                             raise RuntimeError(f"Paired external metric cache contract mismatch: {path}")
                         result = cached["result"]
                         samples = np.asarray(cached["samples"], dtype=np.float64)
-                        if samples.ndim != 1 or not len(samples) or not np.isfinite(samples).all():
-                            raise RuntimeError(f"Paired external metric cache samples are invalid: {path}")
+                        validate_bootstrap_payload(result, samples, n_boot=args.n_boot)
                     else:
                         result, samples = paired_group_bootstrap(
                             full["y_true"],
@@ -466,12 +579,14 @@ def main() -> None:
                             full["group_id"],
                             spec,
                             args.n_boot,
-                            args.seed + metric_index * 1009,
+                            bootstrap_seed,
                         )
+                        validate_bootstrap_payload(result, samples, n_boot=args.n_boot)
                         save_json_atomic(
                             path,
                             {
                                 "cache_key": key,
+                                "contract": cache_contract,
                                 "dataset": dataset,
                                 "comparator": comparator,
                                 "metric": spec.name,
@@ -493,9 +608,10 @@ def main() -> None:
                         "metric_family": spec.family,
                         "higher_is_better": spec.higher_is_better,
                         "group_unit": full["group_unit"],
+                        "group_assignment_sha256": full["group_assignment_sha256"],
                         **result,
                         "full_gate_sha256": gate_info["sha256"],
-                        "comparator_manifest_sha256": sha256_file(manifest_path),
+                        "comparator_manifest_sha256": manifest_sha256,
                     }
                     rows.append(row)
                     sample_rows.extend(
@@ -519,7 +635,7 @@ def main() -> None:
             if args.strict:
                 raise
 
-    holm_adjust(rows)
+    mark_pointwise_inference(rows)
     for row in rows:
         row["interpretation"] = interpretation(row)
         row["safe_wording"] = safe_wording(row)
@@ -534,9 +650,17 @@ def main() -> None:
         {
             "status": "complete" if not failures else "incomplete",
             "created_utc": now_utc(),
-            "protocol": "paired_group_bootstrap_external_zero_target_label_v1",
+            "protocol": "paired_group_bootstrap_external_zero_target_label_v2_pointwise_ci",
+            "inference": {
+                "confidence_interval": "paired group-percentile bootstrap",
+                "p_value": "not_reported",
+                "reason": "bootstrap-tail proportions are not null-centered tests",
+                "multiplicity_adjustment": "not_applicable_no_null_test",
+            },
             "n_boot": args.n_boot,
             "seed": args.seed,
+            "runner_sha256": sha256_file(Path(__file__).resolve()),
+            "canonical_contract": canonical,
             "rows": rows,
             "failures": failures,
             "safe_wording": (

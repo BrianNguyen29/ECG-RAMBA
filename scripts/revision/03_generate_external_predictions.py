@@ -57,6 +57,7 @@ from src.features import (  # noqa: E402
     extract_global_record_stats,
     extract_hrv_features,
 )
+from src.provenance import ndarray_sha256, source_bundle_sha256  # noqa: E402
 
 
 STANDARD_LEADS = ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]
@@ -594,7 +595,7 @@ def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
             for header in headers
         ],
         {
-            "label_protocol": "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
+            "label_protocol": "annotation_aligned_full_10s_windows_strict_majority_af_or_normal_v2",
         },
     )
 
@@ -635,6 +636,9 @@ def load_cpsc_windows(
     positive_windows = 0
     negative_windows = 0
     ambiguous_windows = 0
+    partial_windows_excluded = 0
+    tie_windows_excluded = 0
+    transition_windows_excluded = 0
     missing_leads = []
     audit_rows = []
     for row in tqdm(metadata, desc="Loading cpsc2021 windows"):
@@ -651,6 +655,9 @@ def load_cpsc_windows(
             "negative_windows": 0,
             "transition_windows": 0,
             "ambiguous_windows": 0,
+            "partial_windows_excluded": 0,
+            "tie_windows_excluded": 0,
+            "transition_windows_excluded": 0,
             "missing_leads": "",
             "error": "",
         }
@@ -694,6 +701,9 @@ def load_cpsc_windows(
             record_positive_windows = 0
             record_negative_windows = 0
             record_ambiguous_windows = 0
+            record_partial_windows_excluded = 0
+            record_tie_windows_excluded = 0
+            record_transition_windows_excluded = 0
             source_fs = float(record.fs)
             if source_fs != FS:
                 raw = resample_poly(raw, int(FS), int(round(source_fs)), axis=-1).astype(np.float32)
@@ -706,7 +716,8 @@ def load_cpsc_windows(
             for start in range(0, filtered.shape[-1], 5000):
                 stop = min(start + 5000, filtered.shape[-1])
                 valid_length = stop - start
-                if valid_length < 2500:
+                if valid_length != 5000:
+                    record_partial_windows_excluded += 1
                     continue
                 af_samples = interval_overlap(target_intervals, start, stop, "AF_or_AFL")
                 normal_samples = interval_overlap(target_intervals, start, stop, "normal")
@@ -714,14 +725,18 @@ def load_cpsc_windows(
                 normal_fraction = normal_samples / valid_length
                 if 0.0 < af_fraction < 1.0:
                     record_transition_windows += 1
-                if af_fraction >= 0.5:
+                    record_transition_windows_excluded += 1
+                    continue
+                if af_fraction > 0.5:
                     label = 1.0
                     record_positive_windows += 1
-                elif normal_fraction >= 0.5:
+                elif normal_fraction > 0.5:
                     label = 0.0
                     record_negative_windows += 1
                 else:
                     record_ambiguous_windows += 1
+                    if np.isclose(af_fraction, normal_fraction, atol=0.0, rtol=0.0):
+                        record_tie_windows_excluded += 1
                     continue
                 segment = pad_or_truncate(filtered[:, start:stop], target_len=5000).astype(np.float32)
                 normalized = normalize_signal(segment).astype(np.float32)
@@ -740,12 +755,18 @@ def load_cpsc_windows(
             positive_windows += record_positive_windows
             negative_windows += record_negative_windows
             ambiguous_windows += record_ambiguous_windows
+            partial_windows_excluded += record_partial_windows_excluded
+            tie_windows_excluded += record_tie_windows_excluded
+            transition_windows_excluded += record_transition_windows_excluded
             audit["status"] = "loaded" if record_signals else "skipped_no_majority_windows"
             audit["loaded_windows"] = len(record_signals)
             audit["positive_windows"] = record_positive_windows
             audit["negative_windows"] = record_negative_windows
             audit["transition_windows"] = record_transition_windows
             audit["ambiguous_windows"] = record_ambiguous_windows
+            audit["partial_windows_excluded"] = record_partial_windows_excluded
+            audit["tie_windows_excluded"] = record_tie_windows_excluded
+            audit["transition_windows_excluded"] = record_transition_windows_excluded
             audit_rows.append(audit)
         except Exception as exc:
             skipped_signal += 1
@@ -785,6 +806,14 @@ def load_cpsc_windows(
             "negative_windows": negative_windows,
             "transition_windows": transition_windows,
             "ambiguous_windows": ambiguous_windows,
+            "partial_windows_excluded": partial_windows_excluded,
+            "tie_windows_excluded": tie_windows_excluded,
+            "transition_windows_excluded": transition_windows_excluded,
+            "primary_window_length_samples": 5000,
+            "primary_window_length_seconds": 10.0,
+            "primary_requires_full_window": True,
+            "primary_excludes_transition_windows": True,
+            "primary_requires_strict_majority": True,
             "skipped_annotation_records": skipped_annotation,
             "skipped_signal_records": skipped_signal,
             "annotation_audit_csv": str(annotation_audit_out) if annotation_audit_out is not None else "",
@@ -894,19 +923,32 @@ def record_id_fingerprint(record_ids: np.ndarray) -> str:
 def feature_cache_path(
     dataset: str,
     archive: Path,
+    signals: np.ndarray,
     pca_paths: list[Path],
     record_ids: np.ndarray,
-) -> Path:
+) -> tuple[Path, dict[str, str]]:
     cache_dir = Path(PATHS["cache_dir"]) / "revision_external_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     pca_fingerprint = hashlib.sha256(
         ":".join(file_fingerprint(path) for path in pca_paths).encode()
     ).hexdigest()[:16]
-    return cache_dir / (
+    source_sha = source_bundle_sha256(
+        [Path(__file__).resolve(), PROJECT_ROOT / "src" / "features.py", PROJECT_ROOT / "src" / "data_loader.py"]
+    )
+    contract = {
+        "archive_sha256": sha256_file(archive),
+        "signal_sha256": ndarray_sha256(np.asarray(signals, dtype=np.float32)),
+        "extractor_source_sha256": source_sha,
+        "config_sha256": EVALUATION_CONFIG_HASH,
+        "record_order_sha256": record_id_fingerprint(record_ids),
+    }
+    contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
+    path = cache_dir / (
         f"{dataset}_features_v{CACHE_SCHEMA_VERSION}_{EVALUATION_CONFIG_HASH}_"
-        f"{file_fingerprint(archive)}_{pca_fingerprint}_"
+        f"{contract_sha[:16]}_{pca_fingerprint}_"
         f"N{len(record_ids)}_{record_id_fingerprint(record_ids)}.npz"
     )
+    return path, contract
 
 
 def generate_features(
@@ -917,15 +959,20 @@ def generate_features(
     pca_paths: list[Path],
     force: bool,
 ) -> tuple[list[np.ndarray], np.ndarray, Path, bool]:
-    cache_path = feature_cache_path(dataset, archive, pca_paths, record_ids)
+    cache_path, cache_contract = feature_cache_path(dataset, archive, signals, pca_paths, record_ids)
     hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
     if cache_path.exists() and not force:
         with np.load(cache_path, allow_pickle=False) as data:
             schema = int(data["cache_schema_version"]) if "cache_schema_version" in data.files else 0
             hydra = [data[key] for key in hydra_keys] if all(key in data.files for key in hydra_keys) else []
             hrv = data["X_hrv"]
+            observed_contract = {
+                key: str(data[key].item()) if key in data.files else ""
+                for key in cache_contract
+            }
             if (
                 schema == CACHE_SCHEMA_VERSION
+                and observed_contract == cache_contract
                 and len(hydra) == len(pca_paths)
                 and all(values.dtype == np.float32 for values in hydra)
                 and hrv.dtype == np.float32
@@ -958,6 +1005,7 @@ def generate_features(
         "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
         "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
     }
+    payload.update({key: np.asarray(value) for key, value in cache_contract.items()})
     payload.update({key: values for key, values in zip(hydra_keys, hydra)})
     # Feature construction can run for hours on CPSC2021. A partial cache must
     # never be mistaken for a valid reusable cache after a Colab disconnect.
@@ -1368,7 +1416,7 @@ def main() -> None:
         )
     if args.dataset == "cpsc2021":
         restrictions.append(
-            "CPSC2021 is evaluated as annotation-aligned 10-second majority-rhythm windows, not as the official episode-boundary challenge score."
+            "CPSC2021 primary evaluation uses only complete annotation-aligned 10-second windows with a strict AF/AFL or normal majority; partial, transition, tie, and ambiguous windows are excluded and this is not the official episode-boundary challenge score."
         )
 
     save_npz_compressed_atomic(
@@ -1440,6 +1488,7 @@ def main() -> None:
         "split_ids": sorted(str(value) for value in np.unique(split_ids)),
         "metrics": metrics,
         "aggregation": {"method": "power_mean", "q": aggregation_q},
+        "threshold": threshold,
         "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
         "feature_cache": str(feature_cache),
         "feature_cache_hit": feature_cache_hit,
@@ -1468,6 +1517,7 @@ def main() -> None:
                 "path": str(archive),
                 "size_bytes": archive.stat().st_size,
                 "fingerprint": file_fingerprint(archive),
+                "sha256": sha256_file(archive),
             },
             "pca": {
                 "scope": "fold_specific_chapman_training_only",

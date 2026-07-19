@@ -741,12 +741,13 @@ def paired_bootstrap(
         "ci_high": float(high),
         "n_boot_valid": len(values),
         "interpretation": (
-            "full_significantly_better"
+            "full_nominal_95ci_better"
             if low > 0
-            else "control_significantly_better"
+            else "control_nominal_95ci_better"
             if high < 0
             else "inconclusive"
         ),
+        "inference_scope": "pointwise_percentile_ci_effect_size_only",
     }
 
 
@@ -979,7 +980,7 @@ def aggregate(args: argparse.Namespace, variants: list[str], status_rows: list[d
             for fold in range(1, 6)
         },
         "claim_boundary": (
-            "A significant Full-versus-removal difference supports within-architecture complementarity "
+            "A pointwise paired 95% effect-size interval excluding zero supports within-architecture complementarity "
             "for that named control. The no-morphology control also removes its dependent cross-attention "
             "interaction, and the context/fusion control removes several modules jointly; neither isolates "
             "a single mechanism. No result establishes global superiority."

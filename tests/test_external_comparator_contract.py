@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -38,6 +39,96 @@ class ExternalComparatorContractTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 paired.load_predictions(path, "ptbxl")
+
+    def test_external_group_assignment_and_cache_contract_are_content_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "predictions.npz"
+            self._write_prediction(
+                path,
+                np.asarray([[0.8, 0.2], [0.3, 0.8], [0.7, 0.9]], dtype=np.float32),
+            )
+            loaded = paired.load_predictions(path, "ptbxl")
+            args = SimpleNamespace(threshold=0.5, n_bins=15, n_boot=1000)
+            canonical = {
+                "oof_sha256": "a" * 64,
+                "freeze_sha256": "b" * 64,
+                "group_contract_sha256": "c" * 64,
+                "group_sidecar_sha256": "d" * 64,
+            }
+            contract = paired.metric_cache_contract(
+                "ptbxl",
+                "resnet",
+                "pr_auc_macro",
+                loaded["sha256"],
+                "e" * 64,
+                args,
+                group_assignment_sha256=loaded["group_assignment_sha256"],
+                canonical=canonical,
+                full_gate_sha256="f" * 64,
+                comparator_manifest_sha256="1" * 64,
+                bootstrap_seed=42,
+            )
+            changed_boot = {**contract, "n_boot": 999}
+            changed_group = {**contract, "group_assignment_sha256": "2" * 64}
+            self.assertNotEqual(paired.metric_cache_key(contract), paired.metric_cache_key(changed_boot))
+            self.assertNotEqual(paired.metric_cache_key(contract), paired.metric_cache_key(changed_group))
+            self.assertEqual(contract["canonical_group_sidecar_sha256"], "d" * 64)
+
+    def test_external_bootstrap_cache_requires_exact_finite_count(self):
+        valid = {
+            "n_boot_valid": 10,
+            "improvement_ci_low": -0.1,
+            "improvement_ci_high": 0.2,
+        }
+        paired.validate_bootstrap_payload(valid, np.arange(10, dtype=float), n_boot=10)
+        with self.assertRaisesRegex(RuntimeError, "exact finite bootstrap"):
+            paired.validate_bootstrap_payload(valid, np.arange(9, dtype=float), n_boot=10)
+        with self.assertRaisesRegex(RuntimeError, "non-finite"):
+            paired.validate_bootstrap_payload(
+                {**valid, "improvement_ci_high": float("nan")},
+                np.arange(10, dtype=float),
+                n_boot=10,
+            )
+
+    def test_true_fewshot_metric_cache_binds_group_and_runner_contract(self):
+        args = SimpleNamespace(
+            dataset="ptbxl",
+            threshold=0.5,
+            n_bins=15,
+            n_boot=1000,
+        )
+        canonical = {
+            "oof_sha256": "a" * 64,
+            "freeze_sha256": "b" * 64,
+            "group_contract_sha256": "c" * 64,
+            "group_sidecar_sha256": "d" * 64,
+        }
+        contract = fewshot.metric_cache_contract(
+            args,
+            comparison="full_vs_resnet",
+            metric="f1_macro",
+            seed=42,
+            fraction=0.10,
+            prediction_keys={"full": "e" * 64, "resnet": "f" * 64},
+            train_groups=np.asarray(["g1", "g2"]),
+            test_groups=np.asarray(["g3", "g4"]),
+            canonical=canonical,
+        )
+        self.assertEqual(contract["canonical_group_contract_sha256"], "c" * 64)
+        self.assertEqual(contract["canonical_group_sidecar_sha256"], "d" * 64)
+        self.assertNotEqual(
+            fewshot.metric_cache_key(contract),
+            fewshot.metric_cache_key({**contract, "n_boot": 999}),
+        )
+        valid = {"n_boot_valid": 10, "lo": -0.1, "hi": 0.2}
+        fewshot.validate_interval_payload(valid, n_boot=10, low_field="lo", high_field="hi")
+        with self.assertRaisesRegex(RuntimeError, "exactly 10"):
+            fewshot.validate_interval_payload(
+                {**valid, "n_boot_valid": 9},
+                n_boot=10,
+                low_field="lo",
+                high_field="hi",
+            )
 
     def test_embedding_requires_current_manifest_and_checkpoint_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

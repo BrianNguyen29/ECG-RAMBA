@@ -213,17 +213,17 @@ def ablation_finding(control: str) -> tuple[str, str]:
     counts = {
         label: sum(row.get("interpretation") == label for row in selected)
         for label in [
-            "full_significantly_better",
-            "control_significantly_better",
+            "full_nominal_95ci_better",
+            "control_nominal_95ci_better",
             "inconclusive",
         ]
     }
     return (
         "complete_paired_ablation",
         (
-            f"Across {len(selected)} pre-specified metrics, paired record bootstrap favors Full on "
-            f"{counts['full_significantly_better']}, favors the removal control on "
-            f"{counts['control_significantly_better']}, and is inconclusive on "
+            f"Across {len(selected)} pre-specified metrics, nominal pointwise paired record-bootstrap "
+            f"intervals favor Full on {counts['full_nominal_95ci_better']}, favor the removal control on "
+            f"{counts['control_nominal_95ci_better']}, and overlap zero on "
             f"{counts['inconclusive']}."
         ),
     )
@@ -266,7 +266,7 @@ def calibration_finding() -> tuple[str, str]:
     improved = sorted(
         metric
         for metric, payload in interpretations.items()
-        if payload.get("interpretation") == "calibrated_significantly_better"
+        if payload.get("interpretation") == "calibrated_nominal_95ci_better"
     )
     return (
         "complete_oof_score_calibration_sensitivity",
@@ -274,7 +274,7 @@ def calibration_finding() -> tuple[str, str]:
             f"For ECG-RAMBA, cross-fitted OOF-score Platt changes Brier {raw.get('brier_macro', float('nan')):.4f}"
             f" to {calibrated.get('brier_macro', float('nan')):.4f}, ECE "
             f"{raw.get('ece_macro', float('nan')):.4f} to "
-            f"{calibrated.get('ece_macro', float('nan')):.4f}; CI-supported improvements: "
+            f"{calibrated.get('ece_macro', float('nan')):.4f}; nominal pointwise CI-favored changes: "
             f"{', '.join(improved) if improved else 'none'}."
         ),
     )
@@ -385,8 +385,8 @@ def robustness_finding() -> tuple[str, str]:
             "The canonical six-stress, four-comparator, five-metric ledger is not authenticated as complete.",
         )
     interpretations = [str(row.get("interpretation", "")) for row in rows]
-    full = sum(value.startswith("full_significantly") for value in interpretations)
-    comparator = sum(value.startswith("comparator_significantly") for value in interpretations)
+    full = sum(value.startswith("full_nominal_95ci") for value in interpretations)
+    comparator = sum(value.startswith("comparator_nominal_95ci") for value in interpretations)
     inconclusive = len(rows) - full - comparator
     return (
         "complete_metric_specific_robustness_ledger",

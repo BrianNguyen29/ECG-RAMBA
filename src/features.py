@@ -11,13 +11,15 @@ Design principles (STRICT):
 
 Guarantees:
 - NEVER fits PCA on full dataset
-- RAW MiniRocket features ONLY
+- Fixed-seed ROCKET-family MAX+PPV features only (not canonical MiniRocket)
 - PCA fitted strictly inside CV folds
 - HRV + amplitude + global record stats (fixed dim = 36)
 """
 
 import os
+from pathlib import Path
 import numpy as np
+import scipy
 import torch
 import torch.nn as nn
 from typing import List
@@ -30,18 +32,48 @@ try:
     import neurokit2 as nk
     HAS_NEUROKIT = True
 except ImportError:
+    nk = None
     HAS_NEUROKIT = False
 
 from configs.config import CONFIG, PATHS, SEQ_LEN, FS
-from src.provenance import record_order_fingerprint
+from src.provenance import (
+    canonical_json_sha256,
+    ndarray_sha256,
+    record_order_fingerprint,
+    save_npz_atomic,
+    source_bundle_sha256,
+)
 
 
 HRV36_SCHEMA_VERSION = 2
+HRV36_CACHE_SCHEMA_VERSION = 3
 HRV36_CHECKPOINT_SEMANTICS = "checkpoint_compatible_amplitude_slots_zero"
 HRV36_ACTIVE_RR_SLICE = slice(0, 5)
 HRV36_RESERVED_SLICE = slice(5, 25)
 HRV36_AMPLITUDE_SLICE = slice(25, 30)
 HRV36_GLOBAL_SLICE = slice(30, 36)
+
+
+def hrv_extractor_runtime_contract() -> dict:
+    """Describe every runtime choice that can change RR peak extraction."""
+
+    return {
+        "cache_schema_version": HRV36_CACHE_SCHEMA_VERSION,
+        "detector_policy": (
+            "neurokit2_ecg_peaks_then_scipy_find_peaks_fallback"
+            if HAS_NEUROKIT
+            else "scipy_find_peaks_only"
+        ),
+        "neurokit2_available": bool(HAS_NEUROKIT),
+        "neurokit2_version": (
+            str(getattr(nk, "__version__", "unknown")) if HAS_NEUROKIT else None
+        ),
+        "numpy_version": str(np.__version__),
+        "scipy_version": str(scipy.__version__),
+        "fallback_height_z": 1.5,
+        "fallback_min_distance_seconds": 0.25,
+        "rr_filter_ms": [300.0, 2000.0],
+    }
 
 
 def checkpoint_compatible_hrv36_contract() -> dict:
@@ -78,7 +110,7 @@ def validate_checkpoint_compatible_hrv36(
 
 
 # ============================================================
-# MINI-ROCKET (DETERMINISTIC, CPU-ONLY, PAPER-SAFE)
+# LEGACY-NAMED FIXED-SEED ROCKET-FAMILY TRANSFORM
 # ============================================================
 
 class MiniRocketNative(nn.Module):
@@ -162,12 +194,47 @@ class MiniRocketNative(nn.Module):
 # RAW MINI-ROCKET CACHE (STABLE, CONFIG-INDEPENDENT)
 # ============================================================
 
+def fixed_rocket_cache_contract(
+    X: np.ndarray,
+    record_ids: np.ndarray | None = None,
+) -> dict:
+    """Return the content/source/config identity for the fixed transform."""
+
+    if X.ndim != 3:
+        raise ValueError("X must be (N, C, T)")
+    record_fingerprint = (
+        record_order_fingerprint(record_ids)
+        if record_ids is not None
+        else None
+    )
+    transform_config = {
+        "identity": "fixed_seed_rocket_family_ternary_conv_gaussian_bias_max_ppv",
+        "seed": 42,
+        "requested_kernels": 10000,
+        "kernel_length": 9,
+        "statistics": ["max", "ppv"],
+        "input_shape": list(X.shape),
+    }
+    return {
+        "schema_version": 1,
+        "record_order_fingerprint": record_fingerprint or "",
+        "input_signal_sha256": ndarray_sha256(X),
+        "extractor_source_sha256": source_bundle_sha256(
+            [Path(__file__), Path(__file__).resolve().parents[1] / "configs" / "config.py"]
+        ),
+        "transform_config": transform_config,
+        "transform_config_sha256": canonical_json_sha256(transform_config),
+    }
+
+
 def generate_raw_rocket_cache(
     X: np.ndarray,
     record_ids: np.ndarray | None = None,
-) -> np.ndarray:
+    *,
+    return_contract: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict]:
     """
-    RAW MiniRocket features.
+    Fixed-seed ROCKET-family MAX+PPV features.
 
     Cache properties:
     - Depends ONLY on dataset shape + kernel definition
@@ -177,11 +244,12 @@ def generate_raw_rocket_cache(
 
     assert X.ndim == 3, "X must be (N, C, T)"
 
-    record_fingerprint = (
-        record_order_fingerprint(record_ids)
-        if record_ids is not None
-        else None
-    )
+    contract = fixed_rocket_cache_contract(X, record_ids)
+    record_fingerprint = contract["record_order_fingerprint"] or None
+    input_signal_sha256 = contract["input_signal_sha256"]
+    extractor_source_sha256 = contract["extractor_source_sha256"]
+    transform_config = contract["transform_config"]
+    transform_config_sha256 = contract["transform_config_sha256"]
     rocket_cache_name = (
         f"rocket_raw_"
         f"N{len(X)}_"
@@ -190,6 +258,10 @@ def generate_raw_rocket_cache(
         f"K10000_"
         f"S42"
         f"{f'_R{record_fingerprint}' if record_fingerprint else ''}.npz"
+    )
+    rocket_cache_name = rocket_cache_name.replace(
+        ".npz",
+        f"_I{input_signal_sha256[:16]}_E{extractor_source_sha256[:12]}_C{transform_config_sha256[:12]}.npz",
     )
 
     cache_path = os.path.join(PATHS["cache_dir"], rocket_cache_name)
@@ -202,6 +274,9 @@ def generate_raw_rocket_cache(
                 if "record_order_fingerprint" in payload.files
                 else None
             )
+            cached_input_sha = str(payload["input_signal_sha256"].item()) if "input_signal_sha256" in payload.files else None
+            cached_source_sha = str(payload["extractor_source_sha256"].item()) if "extractor_source_sha256" in payload.files else None
+            cached_config_sha = str(payload["transform_config_sha256"].item()) if "transform_config_sha256" in payload.files else None
         expected_shape = (len(X), 20000)
         fingerprint_matches = (
             record_fingerprint is None
@@ -211,18 +286,25 @@ def generate_raw_rocket_cache(
             cached.shape == expected_shape
             and np.isfinite(cached).all()
             and fingerprint_matches
+            and cached_input_sha == input_signal_sha256
+            and cached_source_sha == extractor_source_sha256
+            and cached_config_sha == transform_config_sha256
         ):
-            print(f"✅ Loaded RAW MiniRocket cache: {cached.shape}")
-            return cached.astype(np.float32)
+            print(f"✅ Loaded fixed-seed ROCKET-family cache: {cached.shape}")
+            values = cached.astype(np.float32)
+            return (values, contract) if return_contract else values
         else:
             print(
                 "⚠️ Rocket cache contract mismatch "
                 f"(found={cached.shape}, expected={expected_shape}, "
                 f"finite={bool(np.isfinite(cached).all())}, "
-                f"record_fingerprint_match={fingerprint_matches}) → regenerating"
+                f"record_fingerprint_match={fingerprint_matches}, "
+                f"input_sha_match={cached_input_sha == input_signal_sha256}, "
+                f"source_sha_match={cached_source_sha == extractor_source_sha256}, "
+                f"config_sha_match={cached_config_sha == transform_config_sha256}) → regenerating"
             )
 
-    print("🚀 Generating RAW MiniRocket features (CPU, deterministic)...")
+    print("🚀 Generating fixed-seed ROCKET-family MAX+PPV features (CPU, deterministic)...")
 
     model = MiniRocketNative(
         c_in=X.shape[1],
@@ -248,19 +330,24 @@ def generate_raw_rocket_cache(
 
     print(f"💾 Saving RAW MiniRocket cache to: {cache_path}", flush=True)
     cached_float16 = X_rocket.astype(np.float16)
-    np.savez_compressed(
+    save_npz_atomic(
         cache_path,
         X=cached_float16,
         storage_dtype=np.asarray("float16"),
         consumer_dtype=np.asarray("float32"),
         quantization_contract=np.asarray("float16_storage_roundtrip_v1"),
         record_order_fingerprint=np.asarray(record_fingerprint or ""),
+        input_signal_sha256=np.asarray(input_signal_sha256),
+        extractor_source_sha256=np.asarray(extractor_source_sha256),
+        transform_config_sha256=np.asarray(transform_config_sha256),
+        transform_identity=np.asarray(transform_config["identity"]),
     )
     print(f"✅ Saved RAW MiniRocket cache: {X_rocket.shape}")
     print(f"📦 Cache path: {cache_path}")
 
     # Cold-cache and warm-cache runs must consume identical values.
-    return cached_float16.astype(np.float32)
+    values = cached_float16.astype(np.float32)
+    return (values, contract) if return_contract else values
 
 
 # ============================================================
@@ -403,11 +490,30 @@ def generate_hrv_cache(
         if record_ids is not None
         else None
     )
+    input_signal_sha256 = ndarray_sha256(X)
+    input_amplitude_sha256 = ndarray_sha256(X_raw_amp)
+    extractor_source_sha256 = source_bundle_sha256(
+        [Path(__file__), Path(__file__).resolve().parents[1] / "configs" / "config.py"]
+    )
+    hrv_config = {
+        **hrv_extractor_runtime_contract(),
+        "semantics": semantics,
+        "schema_version": HRV36_SCHEMA_VERSION,
+        "fs_hz": int(FS),
+        "hrv_dim": int(CONFIG["hrv_dim"]),
+        "active_rr_slots": "0:5",
+        "reserved_zero_slots": "5:25",
+        "amplitude_zero_slots": "25:30",
+        "global_stat_slots": "30:36",
+    }
+    hrv_config_sha256 = canonical_json_sha256(hrv_config)
     cache_path = os.path.join(
         PATHS["cache_dir"],
         (
             f"hrv36_N{len(X)}_C{X.shape[1]}_L{X.shape[-1]}"
-            f"{f'_R{record_fingerprint}' if record_fingerprint else ''}.npz"
+            f"{f'_R{record_fingerprint}' if record_fingerprint else ''}"
+            f"_I{input_signal_sha256[:16]}_A{input_amplitude_sha256[:12]}"
+            f"_E{extractor_source_sha256[:12]}_C{hrv_config_sha256[:12]}.npz"
         ),
     )
 
@@ -424,6 +530,11 @@ def generate_hrv_cache(
                 if "hrv_semantics" in payload.files
                 else None
             )
+            cached_input_sha = str(payload["input_signal_sha256"].item()) if "input_signal_sha256" in payload.files else None
+            cached_amplitude_sha = str(payload["input_amplitude_sha256"].item()) if "input_amplitude_sha256" in payload.files else None
+            cached_source_sha = str(payload["extractor_source_sha256"].item()) if "extractor_source_sha256" in payload.files else None
+            cached_config_sha = str(payload["hrv_config_sha256"].item()) if "hrv_config_sha256" in payload.files else None
+            cached_cache_schema = int(payload["hrv_cache_schema_version"].item()) if "hrv_cache_schema_version" in payload.files else None
         expected_shape = (len(X), int(CONFIG["hrv_dim"]))
         fingerprint_matches = (
             record_fingerprint is None
@@ -441,6 +552,11 @@ def generate_hrv_cache(
             and fingerprint_matches
             and semantics_match
             and feature_contract_valid
+            and cached_input_sha == input_signal_sha256
+            and cached_amplitude_sha == input_amplitude_sha256
+            and cached_source_sha == extractor_source_sha256
+            and cached_config_sha == hrv_config_sha256
+            and cached_cache_schema == HRV36_CACHE_SCHEMA_VERSION
         ):
             provenance = "legacy-value-verified" if cached_semantics is None else "metadata-verified"
             print(
@@ -453,7 +569,10 @@ def generate_hrv_cache(
             f"finite={bool(np.isfinite(cached).all())}, "
             f"record_fingerprint_match={fingerprint_matches}, "
             f"semantics_match={semantics_match}, "
-            f"feature_contract_valid={feature_contract_valid}) → regenerating"
+            f"feature_contract_valid={feature_contract_valid}, "
+            f"input_sha_match={cached_input_sha == input_signal_sha256}, "
+            f"source_sha_match={cached_source_sha == extractor_source_sha256}, "
+            f"config_sha_match={cached_config_sha == hrv_config_sha256}) → regenerating"
         )
 
     print(
@@ -483,7 +602,7 @@ def generate_hrv_cache(
 
     print(f"💾 Saving HRV36 cache to: {cache_path}", flush=True)
     cached_float16 = feats.astype(np.float16)
-    np.savez_compressed(
+    save_npz_atomic(
         cache_path,
         X=cached_float16,
         storage_dtype=np.asarray("float16"),
@@ -492,10 +611,15 @@ def generate_hrv_cache(
         record_order_fingerprint=np.asarray(record_fingerprint or ""),
         hrv_semantics=np.asarray(semantics),
         hrv_schema_version=np.asarray(HRV36_SCHEMA_VERSION, dtype=np.int16),
+        hrv_cache_schema_version=np.asarray(HRV36_CACHE_SCHEMA_VERSION, dtype=np.int16),
         active_rr_slots=np.asarray("0:5"),
         reserved_zero_slots=np.asarray("5:25"),
         amplitude_zero_slots=np.asarray("25:30"),
         global_stat_slots=np.asarray("30:36"),
+        input_signal_sha256=np.asarray(input_signal_sha256),
+        input_amplitude_sha256=np.asarray(input_amplitude_sha256),
+        extractor_source_sha256=np.asarray(extractor_source_sha256),
+        hrv_config_sha256=np.asarray(hrv_config_sha256),
     )
     print(f"✅ Saved HRV36 cache: {feats.shape}")
     print(f"📦 Cache path: {cache_path}")

@@ -51,7 +51,7 @@ class RepresentationEmbeddingReuseTests(unittest.TestCase):
         }
         return old_oof, current_oof, checkpoint_contracts, payload, embeddings
 
-    def test_semantically_equivalent_oof_repack_refreshes_without_inference(self):
+    def test_semantically_equivalent_but_sha_changed_oof_requires_regeneration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = root / "embedding.npz"
@@ -68,27 +68,19 @@ class RepresentationEmbeddingReuseTests(unittest.TestCase):
             audit = extract.inspect_final_embedding_reuse(
                 path, current_oof, "final_ema", checkpoint_contracts
             )
-            self.assertTrue(audit["reusable"])
+            self.assertFalse(audit["reusable"])
             self.assertTrue(audit["semantic_contract_match"])
             self.assertTrue(audit["checkpoint_contract_match"])
             self.assertFalse(audit["exact_source_contract"])
+            self.assertIn("canonical_source_sha_mismatch", audit["issues"])
 
-            attestation = extract.refresh_final_embedding_contract(
-                path=path,
-                oof=current_oof,
-                checkpoint_kind="final_ema",
-                reuse_audit=audit,
-            )
-            self.assertEqual(attestation["status"], "verified_semantic_repack")
-
-            refreshed = extract.inspect_final_embedding_reuse(
-                path, current_oof, "final_ema", checkpoint_contracts
-            )
-            self.assertTrue(refreshed["reusable"])
-            self.assertTrue(refreshed["exact_source_contract"])
-            with np.load(path, allow_pickle=False) as data:
-                self.assertEqual(str(data["oof_predictions_sha256"].item()), "current-oof-sha")
-                self.assertEqual(str(data["freeze_manifest_sha256"].item()), "current-freeze-sha")
+            with self.assertRaisesRegex(RuntimeError, "cannot be refreshed"):
+                extract.refresh_final_embedding_contract(
+                    path=path,
+                    oof=current_oof,
+                    checkpoint_kind="final_ema",
+                    reuse_audit=audit,
+                )
 
     def test_checkpoint_contract_mismatch_blocks_semantic_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,7 +160,9 @@ class RepresentationEmbeddingReuseTests(unittest.TestCase):
             )
             mismatched = dict(old_oof)
             mismatched["fold_id"] = np.roll(old_oof["fold_id"], 1)
-            with self.assertRaisesRegex(RuntimeError, "mismatched_records"):
+            with self.assertRaisesRegex(
+                RuntimeError, "membership differs|mismatched_records"
+            ):
                 extract.validate_checkpoint_fold_contract(mismatched, checkpoint_contracts)
 
 

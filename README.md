@@ -1,13 +1,13 @@
-# ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling
+# ECG-RAMBA: A Protocol-Faithful Evaluation of Structured Morphology-Rhythm ECG Modeling
 
 [![arXiv](https://img.shields.io/badge/arXiv-2512.23347-b31b1b.svg)](https://arxiv.org/abs/2512.23347)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Keywords:** ECG foundation model, zero-shot generalization, morphology-rhythm disentanglement, Mamba / SSM, MiniRocket, HRV, CPSC2021, PTB-XL.
+**Keywords:** ECG classification, structured morphology-rhythm interfaces, Mamba / SSM, fixed-seed ROCKET-family features, calibration, perturbation robustness, mapped external evaluation.
 
 This is the **Official PyTorch Implementation** of the paper:
-**"ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling"**
+**"ECG-RAMBA: A Protocol-Faithful Evaluation of Structured Morphology-Rhythm ECG Modeling"**
 _Hai Duong Nguyen, Xuan-The Tran (2025)_
 
 📄 **[Paper (ArXiv)](https://arxiv.org/abs/2512.23347)** | 🤗 **[Model Weights](https://drive.google.com/drive/folders/1cVN8o8jVimZOrKIRFVXEm60RbIDx1zyU?usp=sharing)** | 📊 **[Experiments](EXPERIMENTS.md)**
@@ -39,9 +39,9 @@ Pretrained checkpoints are provided here:
 
 ## 📖 Abstract
 
-Deep learning has achieved strong performance for electrocardiogram (ECG) classification within individual datasets, yet dependable generalization across heterogeneous acquisition settings remains a major obstacle. A key limitation of many model architectures is the implicit entanglement of morphological waveform patterns and rhythm dynamics, which can promote shortcut learning.
+Deep learning has achieved strong performance for electrocardiogram (ECG) classification within individual datasets, yet behavior across heterogeneous acquisition settings remains difficult to characterize. This repository tests whether explicit morphology and rhythm interfaces provide benefits that survive matched comparisons in discrimination, calibration, perturbation robustness, and target-label adaptation.
 
-We propose **ECG-RAMBA**, a framework that separates morphology and rhythm and then re-integrates them through context-aware fusion.
+We evaluate **ECG-RAMBA**, a framework with explicit morphology and rhythm interfaces that are re-integrated through context-aware fusion. The interface is an architectural hypothesis; representation probes and CKA are audits, not proof of mechanistic separation.
 
 <div align="center">
   <img src="reports/figures/architecture.png" alt="ECG-RAMBA Architecture" width="800"/>
@@ -49,21 +49,21 @@ We propose **ECG-RAMBA**, a framework that separates morphology and rhythm and t
 
 **Key Contributions:**
 
-1.  **Disentangled Architecture**: Combines deterministic morphological features (**MiniRocket**) with global rhythm descriptors (**HRV**) and long-range contextual modeling (**Bi-Mamba**).
-2.  **Context-Aware Fusion**: Re-integrates independent streams via Cross-Attention to capture non-linear interactions suitable for complex arrhythmias.
-3.  **Power Mean Pooling ($Q=3$)**: A numerically stable pooling operator that emphasizes high-evidence segments without the brittleness of max pooling.
-4.  **Zero-Shot Robustness**: Achieves state-of-the-art zero-shot transfer performance on standard benchmarks (CPSC-2021, PTB-XL).
+1.  **Structured Interfaces**: Combines a fixed-seed ROCKET-family MAX+PPV morphology transform, checkpoint-compatible rhythm/statistical conditioning, and long-range contextual modeling with Bi-Mamba.
+2.  **Matched Controls**: Uses same-fold learned comparators, structured ablations, paired record-level uncertainty estimates, and explicit claim boundaries.
+3.  **Pooling Audit**: Freezes power-mean pooling at $Q=3$ and reports sensitivity against alternative aggregation rules rather than claiming universal optimality.
+4.  **External and Adaptation Audits**: Reports dataset-specific mapped tasks, zero-target-label inference, score calibration, and frozen-encoder head adaptation as distinct protocols.
 
 ---
 
 ## 💡 Key Innovations
 
-### 1. Morphology-Rhythm Disentanglement
+### 1. Morphology-Rhythm Interfaces
 
-Unlike traditional CNNs that entangle waveform shapes with rhythm, **ECG-RAMBA** explicitly separates them:
+**ECG-RAMBA** exposes morphology and rhythm as explicit model interfaces:
 
-- **Morphology Stream**: Uses **MiniRocket**, a deterministic convolution kernel ensuring consistent feature extraction regardless of training distribution.
-- **Rhythm Stream**: Computes global HRV descriptors (RMSSD, SDNN, Poincaré) to capture long-term autonomic nervous system dynamics.
+- **Morphology Stream**: Uses a fixed-seed ROCKET-family ternary-kernel transform with MAX+PPV summaries. It is not the canonical MiniRocket algorithm.
+- **Rhythm Stream**: Uses the rhythm/statistical inputs implemented by the frozen checkpoint contract. Reserved amplitude slots remain zero; the released checkpoints do not implement a full RMSSD/SDNN/LF-HF feature set.
 
 ### 2. Bi-Directional Mamba Backbone
 
@@ -71,15 +71,15 @@ Leverages **State Space Models (SSM)** to model long-range dependencies across 5
 
 ### 3. Power Mean Pooling ($Q=3$)
 
-Introduces a numerically stable pooling operator that improves sensitivity to transient abnormalities (like Paroxysmal AF). Unlike Max Pooling (brittle) or Average Pooling (diluting), Power Mean with $Q=3$ emphasizes high-evidence segments while remaining robust to noise.
+Uses a numerically stable power-mean operator with the frozen operating point $Q=3$ to emphasize high-evidence segments without reducing each record to its single largest slice score. The revision reports paired sensitivity analyses against mean, max, and alternative power values; $Q=3$ is a fixed design choice rather than a universally optimal or generally robust pooling rule.
 
-### 4. Zero-Shot Generalization
+### 4. External Mapped-Task Evaluation
 
-Designed for **clinical reliability**:
+The external protocol records model behavior without expanding it into a deployment claim:
 
-- **No Test-Time Adaptation**: Works out-of-the-box on unseen datasets.
+- **Zero-Target-Label Inference**: Evaluates frozen weights before any target-label use.
 - **Fixed Threshold ($\tau=0.5$)**: No dataset-specific threshold tuning required.
-- **Subject-Aware Protocol**: Strict evaluation preventing identity leakage.
+- **Group-Aware Protocol**: Uses dataset-specific group splits and separates score calibration from frozen-encoder head adaptation.
 
 ---
 
@@ -114,7 +114,7 @@ cd ECG-RAMBA
 pip install -r requirements.txt
 ```
 
-> **Note**: The `mamba-ssm` library requires CUDA. For CPU-only inference, a fallback path is provided but performance will be significantly slower.
+> **Note**: Full ECG-RAMBA inference requires a compatible `mamba-ssm` runtime and is run on CUDA in the supported revision workflow. Metric recomputation, protocol gates, paired ledgers, and final evidence generation can run on CPU after prediction artifacts are available.
 
 ---
 
@@ -127,12 +127,12 @@ This repository supports standard ECG benchmarks. Download from PhysioNet and or
 ```text
 data/
 ├── chapman/       # ~45k records (.mat and .hea files)
-├── cpsc2021/      # For zero-shot AF detection
-└── ptbxl/         # For zero-shot multi-class evaluation
+├── cpsc2021/      # Annotation-aligned AF/AFL mapped-window evaluation
+└── ptbxl/         # Mapped-superclass external evaluation
 ```
 
 - **Chapman-Shaoxing** (large-scale 12-lead ECG)
-- **CPSC 2021** (AF detection / zero-shot transfer)
+- **CPSC 2021** (annotation-aligned AF/AFL mapped-window task)
 - **PTB-XL** (multi-label ECG classification)
 
 See [`data/README.md`](data/README.md) for preprocessing steps and file structure.
@@ -153,19 +153,19 @@ python scripts/train.py
 # Out-of-Fold evaluation (Chapman)
 python scripts/eval_oof.py
 
-# Zero-Shot transfer (CPSC-2021, PTB-XL)
+# Legacy script name; external outputs require dataset-specific protocol gates
 python scripts/eval_zeroshot.py
 ```
 
-### CPU-only Inference
+### CPU-only Evidence Checks
 
-If you do not have CUDA, you can still run inference on CPU (slower):
+CPU runtimes are supported for the post-inference audit stages documented in `EXPERIMENTS.md`. Do not use the command below as a substitute for the CUDA/Mamba inference contract.
 
 ```bash
-CUDA_VISIBLE_DEVICES="" python scripts/eval_zeroshot.py --ckpt models/fold1_best.pt
+python -u scripts/revision/47_forensic_notebook_audit.py --canonical-root reports/revision
 ```
 
-�📌 For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
+For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
 ---
 
@@ -182,17 +182,17 @@ ECG-RAMBA/
 ├── src/                # Core source code
 │   ├── model.py        # ECGRamba
 │   ├── layers.py       # BiMamba, Perceiver, Fusion blocks
-│   ├── features.py     # MiniRocket, HRV extraction
+│   ├── features.py     # Fixed-seed ROCKET-family and rhythm/statistical features
 │   ├── data_loader.py  # Chapman data pipeline
 │   └── utils.py        # Metrics, losses, EMA
-└── web_app/            # Deployment application
+└── web_app/            # Research visualization and inference demo
 ```
 
 ---
 
 ## 💻 Web Application
 
-The repository includes a modern React/FastAPI web application for real-time ECG analysis and clinical interaction.
+The repository includes a React/FastAPI research interface for waveform inspection and model-output visualization. It is a software demonstration, not a validated medical device or clinical decision-support system.
 
 <div align="center">
   <img src="reports/figures/Screenshot_2026-01-17_175832.png" alt="ECG-RAMBA Clinical Dashboard" width="800"/>
@@ -200,16 +200,16 @@ The repository includes a modern React/FastAPI web application for real-time ECG
 
 ### Key Features:
 
-1.  **Clinical Cockpit**:
+1.  **Waveform Workbench**:
     - **12-Lead Visualization**: High-fidelity rendering (500Hz) with medical grid system (5mm/1mm).
     - **Focus Analysis**: Interactive zoom, pan, and single-lead detailed inspection.
     - **Digital Calipers**: Precision measurement tools for $\Delta t$ (ms) and $\Delta V$ (mV).
 2.  **AI Integration**:
-    - **Real-time Inference**: Deployed Mamba2 backend for millisecond-latency classification.
-    - **Explainable AI**: Grad-CAM attention maps visualizing morphological saliency on the waveform.
+    - **Interactive Inference**: Mamba2-backed model-output visualization for uploaded research records.
+    - **Saliency View**: Gradient-based maps for exploratory inspection of model sensitivity on the waveform.
     - **Confidence Scoring**: Probability distribution over 4 diagnostic classes (Normal, AFib, GSVT, SB).
 3.  **Reporting & Workflow**:
-    - **PDF Export**: One-click generation of clinical-grade reports for patient files.
+    - **PDF Export**: One-click generation of research-session summaries for uploaded files.
     - **Patient Queue**: Drag-and-drop file upload (`.mat`, `.csv`, `.json`) and history tracking.
 
 ### Run Web App (Local)
@@ -235,7 +235,7 @@ If you use this code or model in your research, please cite:
 
 ```bibtex
 @article{nguyen2025ecg,
-  title={ECG-RAMBA: Zero-Shot ECG Generalization by Morphology-Rhythm Disentanglement and Long-Range Modeling},
+  title={ECG-RAMBA: A Protocol-Faithful Evaluation of Structured Morphology-Rhythm ECG Modeling},
   author={Nguyen, Hai Duong and Tran, Xuan-The},
   journal={arXiv preprint arXiv:2512.23347},
   year={2025},

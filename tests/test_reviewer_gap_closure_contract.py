@@ -90,8 +90,9 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                             "improvement_full_over_comparator": 0.1,
                             "improvement_ci_low": 0.05,
                             "improvement_ci_high": 0.15,
-                            "holm_p_value_two_sided": 0.01,
-                            "interpretation": "full_significantly_better",
+                            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+                            "null_test": "not_run",
+                            "interpretation": "full_nominal_95ci_better",
                         }
                     )
         write_csv(self.args.external_table, rows)
@@ -166,8 +167,9 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                         "improvement_first_over_second": 0.1,
                         "improvement_ci_low": 0.05,
                         "improvement_ci_high": 0.15,
-                        "holm_p_value_two_sided": 0.01,
-                        "interpretation": "full_significantly_better",
+                        "inference_scope": "pointwise_percentile_ci_effect_size_only",
+                        "null_test": "not_run",
+                        "interpretation": "full_nominal_95ci_better",
                     }
                 )
         write_csv(self.args.morphology_table, rows)
@@ -187,7 +189,10 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
     def _write_robustness(self):
         independence = {
             "unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
-            "independence_contract": "one_chapman_record_per_subject",
+            "independence_contract": self.module.CHAPMAN_GROUP_SEMANTICS,
+            "group_semantics_reference": self.module.CHAPMAN_GROUP_REFERENCE,
+            "group_sidecar": "manifests/test_group_sidecar.npz",
+            "group_sidecar_sha256": "1" * 64,
             "source": str(self.robustness_bootstrap_contract),
             "source_sha256": self.module.sha256_file(self.robustness_bootstrap_contract),
             "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
@@ -286,7 +291,7 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
 
         external_status, external_compact = self.module.validate_external(self.args)
         self.assertIn("record-level resampling", external_status["safe_wording"])
-        self.assertTrue(all("Holm-adjusted conclusion" in row for row in external_compact))
+        self.assertTrue(all("Inference scope" in row for row in external_compact))
         robustness_status, robustness_compact = self.module.validate_robustness(self.args)
         self.assertIn("pointwise", robustness_status["safe_wording"])
         self.assertTrue(all("Nominal pointwise CI overlaps zero" in row for row in robustness_compact))
@@ -303,11 +308,11 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         self.assertEqual(status["status"], "incomplete")
         self.assertTrue(any("short" in issue for issue in status["issues"]))
 
-    def test_holm_adjustment_controls_reviewer_facing_morphology_conclusion(self):
+    def test_pointwise_interval_controls_reviewer_facing_morphology_conclusion(self):
         with self.args.morphology_table.open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
-        rows[0]["holm_p_value_two_sided"] = "0.5"
-        rows[0]["interpretation"] = "full_significantly_better"
+        rows[0]["improvement_ci_low"] = "-0.01"
+        rows[0]["interpretation"] = "full_nominal_95ci_better"
         write_csv(self.args.morphology_table, rows)
         manifest = json.loads(self.args.morphology_manifest.read_text(encoding="utf-8"))
         manifest["outputs"][0] = self.output_row(self.args.morphology_table)
@@ -316,7 +321,7 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         status, compact = self.module.validate_morphology(self.args)
         self.assertEqual(status["status"], "complete", status["issues"])
         first = next(row for row in compact if row["Comparison"] == "partial_vs_frozen")
-        self.assertEqual(first["Holm-adjusted conclusion"], "No Holm-adjusted difference")
+        self.assertEqual(first["Inference scope"], "Pointwise 95% CI includes zero")
 
     def test_nonfinite_robustness_interval_is_rejected(self):
         with self.args.robustness_table.open(encoding="utf-8", newline="") as handle:

@@ -7,7 +7,7 @@ probabilities are averaged. This is genuine parameter adaptation, but it is not
 end-to-end encoder fine-tuning.
 
 PTB-XL uses official fold 9 for adaptation and fold 10 for testing. Georgia and
-CPSC2021 use repeated group-random splits. All uncertainty resamples intact
+CPSC2021 use repeated SHA256-seeded, label-independent group splits. All uncertainty resamples intact
 patient/source-record groups.
 """
 
@@ -29,16 +29,19 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     EXPERIMENTAL_DIR,
     FIGURE_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
     TABLE_DIR,
-    balanced_group_train_test_split,
     calibration_summary,
     cluster_bootstrap_ci,
     git_commit,
+    hash_group_train_test_split,
     macro_pr_auc,
     macro_roc_auc,
     multilabel_metrics,
@@ -147,7 +150,18 @@ def interval_interpretation(
     return inconclusive
 
 
-def canonical_contract() -> dict[str, str]:
+def canonical_json_sha256(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def resolve_contract_path(value: Any) -> Path:
+    path = Path(str(value or ""))
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def canonical_contract() -> dict[str, Any]:
     oof = PREDICTION_DIR / "oof_final_ema_predictions.npz"
     freeze = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
     if not oof.exists() or not freeze.exists():
@@ -166,7 +180,40 @@ def canonical_contract() -> dict[str, str]:
     )
     if expected != oof_sha:
         raise RuntimeError(f"Freeze OOF SHA mismatch: {expected} != {oof_sha}")
-    return {"oof_sha256": oof_sha, "freeze_sha256": sha256_file(freeze)}
+    group = payload.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    errors = []
+    if group.get("status") != "verified":
+        errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != int(payload.get("validated_records", -2)):
+        errors.append("n_records")
+    if int(group.get("n_groups", -1)) != int(payload.get("validated_records", -2)):
+        errors.append("n_groups")
+    sidecar_path = resolve_contract_path(sidecar.get("path"))
+    if not str(sidecar.get("path") or "") or not sidecar_path.is_file():
+        errors.append("group_sidecar_missing")
+    elif not sidecar.get("sha256") or sha256_file(sidecar_path) != sidecar.get("sha256"):
+        errors.append("group_sidecar_sha256")
+    if errors:
+        raise RuntimeError(
+            "Canonical freeze lacks an authenticated live patient/group contract: "
+            + ", ".join(errors)
+        )
+    return {
+        "oof_sha256": oof_sha,
+        "freeze_sha256": sha256_file(freeze),
+        "group_contract_sha256": canonical_json_sha256(group),
+        "group_sidecar_sha256": sidecar["sha256"],
+        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    }
 
 
 def parse_list(value: str) -> list[str]:
@@ -274,7 +321,21 @@ def load_prediction(path: Path, dataset: str) -> dict[str, Any]:
         raise ValueError(f"{path}: probabilities must be in [0,1]")
     if len(np.unique(out["group_id"])) < 2:
         raise ValueError(f"{path}: fewer than two independent groups")
-    out.update({"path": path, "sha256": sha256_file(path)})
+    group_rows = [
+        f"{record_id}\x1e{group_id}\x1e{split_id}"
+        for record_id, group_id, split_id in zip(
+            out["record_id"], out["group_id"], out["split_id"]
+        )
+    ]
+    out.update(
+        {
+            "path": path,
+            "sha256": sha256_file(path),
+            "group_assignment_sha256": hashlib.sha256(
+                "\x1f".join(group_rows).encode("utf-8")
+            ).hexdigest(),
+        }
+    )
     return out
 
 
@@ -525,6 +586,9 @@ def cache_key(
     adaptation_embedding_sha: str,
     train_groups: np.ndarray,
     test_groups: np.ndarray,
+    canonical: dict[str, Any],
+    test_group_assignment_sha256: str,
+    adaptation_group_assignment_sha256: str,
 ) -> str:
     payload = {
         "protocol": PROTOCOL,
@@ -538,6 +602,12 @@ def cache_key(
         "test_pred_sha": test_pred_sha,
         "test_embedding_sha": test_embedding_sha,
         "adaptation_embedding_sha": adaptation_embedding_sha,
+        "canonical_oof_sha256": canonical["oof_sha256"],
+        "canonical_freeze_sha256": canonical["freeze_sha256"],
+        "canonical_group_contract_sha256": canonical["group_contract_sha256"],
+        "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
+        "test_group_assignment_sha256": test_group_assignment_sha256,
+        "adaptation_group_assignment_sha256": adaptation_group_assignment_sha256,
         "train_groups_sha256": hashlib.sha256(
             np.asarray(train_groups).astype(str).tobytes()
         ).hexdigest(),
@@ -548,7 +618,7 @@ def cache_key(
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
-def metric_cache_key(
+def metric_cache_contract(
     args: argparse.Namespace,
     *,
     comparison: str,
@@ -558,8 +628,9 @@ def metric_cache_key(
     prediction_keys: dict[str, str],
     train_groups: np.ndarray,
     test_groups: np.ndarray,
-) -> str:
-    payload = {
+    canonical: dict[str, Any],
+) -> dict[str, Any]:
+    return {
         "protocol": PROTOCOL,
         "runner_sha256": sha256_file(Path(__file__).resolve()),
         "dataset": args.dataset,
@@ -573,8 +644,38 @@ def metric_cache_key(
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "canonical_oof_sha256": canonical["oof_sha256"],
+        "canonical_freeze_sha256": canonical["freeze_sha256"],
+        "canonical_group_contract_sha256": canonical["group_contract_sha256"],
+        "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
     }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def metric_cache_key(contract: dict[str, Any]) -> str:
+    return canonical_json_sha256(contract)
+
+
+def validate_interval_payload(
+    payload: dict[str, Any],
+    *,
+    n_boot: int,
+    low_field: str,
+    high_field: str,
+) -> None:
+    if int(payload.get("n_boot_valid", -1)) != int(n_boot):
+        raise RuntimeError(
+            f"Bootstrap payload has n_boot_valid={payload.get('n_boot_valid')}; exactly {n_boot} are required"
+        )
+    for field in (low_field, high_field):
+        try:
+            value = float(payload[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Bootstrap payload lacks numeric {field}") from exc
+        if not math.isfinite(value):
+            raise RuntimeError(f"Bootstrap payload contains non-finite {field}")
+    for key, value in payload.items():
+        if "significant" in str(key).lower() or "significant" in str(value).lower():
+            raise RuntimeError("Bootstrap payload contains prohibited legacy significance wording")
 
 
 def exact_zero_delta(n_boot: int, n_groups: int) -> dict[str, Any]:
@@ -687,6 +788,18 @@ def primary_endpoint_rows(
                 adapted_values - zero_values if higher_is_better else zero_values - adapted_values
             )
             improvement_low, improvement_high, improvement_valid = interval(oriented_values)
+            if adapted_valid != int(n_boot) or improvement_valid != int(n_boot):
+                raise RuntimeError(
+                    f"Primary endpoint bootstrap for {model}/{metric_name} did not produce "
+                    f"the exact requested {n_boot} finite replicates"
+                )
+            if not all(
+                math.isfinite(value)
+                for value in (adapted_low, adapted_high, improvement_low, improvement_high)
+            ):
+                raise RuntimeError(
+                    f"Primary endpoint bootstrap for {model}/{metric_name} contains non-finite CI bounds"
+                )
             row = {
                 "dataset": dataset,
                 "comparison_type": "adapted_vs_zero_target_label",
@@ -745,6 +858,11 @@ def primary_endpoint_rows(
                 else comparator_values - full_values
             )
             low, high, valid = interval(oriented_values)
+            if valid != int(n_boot) or not math.isfinite(low) or not math.isfinite(high):
+                raise RuntimeError(
+                    f"Primary paired bootstrap for full vs {comparator}/{metric_name} "
+                    f"did not produce {n_boot} finite replicates"
+                )
             metric_rows.append(
                 {
                     "dataset": dataset,
@@ -955,12 +1073,10 @@ def main() -> None:
                 "group_overlap": 0,
             }
         else:
-            pool_groups, test_groups, split_audit = balanced_group_train_test_split(
-                reference["y_true"],
+            pool_groups, test_groups, split_audit = hash_group_train_test_split(
                 reference["group_id"],
                 args.test_fraction,
                 seed,
-                n_candidates=args.split_candidates,
             )
             split_audits[f"seed{seed}"] = split_audit
             test_idx = group_indices(reference["group_id"], test_groups)
@@ -990,6 +1106,9 @@ def main() -> None:
                     data["adapt_emb"]["sha256"],
                     train_groups,
                     test_groups,
+                    canonical,
+                    data["test_pred"]["group_assignment_sha256"],
+                    data["adapt_pred"]["group_assignment_sha256"],
                 )
                 cache = cache_dir / f"{model}_{split_key}_{key[:16]}.npz"
                 coefficient_cache = cache.with_suffix(".coefficients.json")
@@ -999,8 +1118,18 @@ def main() -> None:
                         cached_test = np.asarray(saved["test_index"], dtype=np.int64)
                         cached_train_groups = np.asarray(saved["train_group_id"]).astype(str)
                         cached_key = str(saved["cache_key"].item())
+                        cached_runner_sha256 = str(saved["runner_sha256"].item())
+                        cached_group_contract_sha256 = str(
+                            saved["canonical_group_contract_sha256"].item()
+                        )
+                        cached_group_sidecar_sha256 = str(
+                            saved["canonical_group_sidecar_sha256"].item()
+                        )
                     if (
                         cached_key != key
+                        or cached_runner_sha256 != sha256_file(Path(__file__).resolve())
+                        or cached_group_contract_sha256 != canonical["group_contract_sha256"]
+                        or cached_group_sidecar_sha256 != canonical["group_sidecar_sha256"]
                         or adapted_prob.shape != zero_prob.shape
                         or not np.isfinite(adapted_prob).all()
                         or not np.array_equal(cached_test, test_idx)
@@ -1008,10 +1137,19 @@ def main() -> None:
                     ):
                         raise RuntimeError(f"Adaptation cache contract mismatch: {cache}")
                     coefficient_payload = json.loads(coefficient_cache.read_text(encoding="utf-8"))
+                    if (
+                        not isinstance(coefficient_payload, dict)
+                        or coefficient_payload.get("cache_key") != key
+                        or coefficient_payload.get("runner_sha256")
+                        != sha256_file(Path(__file__).resolve())
+                        or coefficient_payload.get("canonical_group_contract_sha256")
+                        != canonical["group_contract_sha256"]
+                        or coefficient_payload.get("canonical_group_sidecar_sha256")
+                        != canonical["group_sidecar_sha256"]
+                    ):
+                        raise RuntimeError(f"Coefficient cache contract mismatch: {coefficient_cache}")
                     coefficients = (
                         coefficient_payload.get("coefficients", [])
-                        if isinstance(coefficient_payload, dict)
-                        else coefficient_payload
                     )
                     print(f"Reusing {model}/{split_key}: {cache}", flush=True)
                 elif len(train_idx) == 0:
@@ -1023,8 +1161,28 @@ def main() -> None:
                         test_index=test_idx,
                         train_group_id=train_groups,
                         cache_key=np.asarray(key),
+                        runner_sha256=np.asarray(sha256_file(Path(__file__).resolve())),
+                        canonical_group_contract_sha256=np.asarray(
+                            canonical["group_contract_sha256"]
+                        ),
+                        canonical_group_sidecar_sha256=np.asarray(
+                            canonical["group_sidecar_sha256"]
+                        ),
                     )
-                    save_json_atomic(coefficient_cache, {"coefficients": []})
+                    save_json_atomic(
+                        coefficient_cache,
+                        {
+                            "cache_key": key,
+                            "runner_sha256": sha256_file(Path(__file__).resolve()),
+                            "canonical_group_contract_sha256": canonical[
+                                "group_contract_sha256"
+                            ],
+                            "canonical_group_sidecar_sha256": canonical[
+                                "group_sidecar_sha256"
+                            ],
+                            "coefficients": [],
+                        },
+                    )
                 else:
                     adapted_prob, coefficients = fit_fold_heads(
                         data["adapt_emb"]["embedding"][:, train_idx, :],
@@ -1042,8 +1200,28 @@ def main() -> None:
                         test_index=test_idx,
                         train_group_id=train_groups,
                         cache_key=np.asarray(key),
+                        runner_sha256=np.asarray(sha256_file(Path(__file__).resolve())),
+                        canonical_group_contract_sha256=np.asarray(
+                            canonical["group_contract_sha256"]
+                        ),
+                        canonical_group_sidecar_sha256=np.asarray(
+                            canonical["group_sidecar_sha256"]
+                        ),
                     )
-                    save_json_atomic(coefficient_cache, {"coefficients": coefficients})
+                    save_json_atomic(
+                        coefficient_cache,
+                        {
+                            "cache_key": key,
+                            "runner_sha256": sha256_file(Path(__file__).resolve()),
+                            "canonical_group_contract_sha256": canonical[
+                                "group_contract_sha256"
+                            ],
+                            "canonical_group_sidecar_sha256": canonical[
+                                "group_sidecar_sha256"
+                            ],
+                            "coefficients": coefficients,
+                        },
+                    )
                     print(f"Wrote {model}/{split_key}: {cache}", flush=True)
                 predictions_by_model[model] = adapted_prob
                 prediction_keys_by_model[model] = key
@@ -1069,7 +1247,7 @@ def main() -> None:
                     "fraction": fraction,
                     "budget_role": budget_role(fraction, args.primary_fraction),
                     "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                    "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                     "embedding_dimension": int(data["test_emb"]["embedding"].shape[2]),
                     "representation_pooling": "mean_of_preclassifier_slice_embeddings_per_fold",
                     "fold_heads": 0 if len(train_idx) == 0 else 5,
@@ -1084,7 +1262,7 @@ def main() -> None:
                 metric_item: dict[str, Any] = {}
                 for metric_name, (metric_fn, higher) in metric_functions(args.threshold, args.n_bins).items():
                     zero = data["test_pred"]["y_prob"][test_idx]
-                    metric_key = metric_cache_key(
+                    metric_contract = metric_cache_contract(
                         args,
                         comparison=f"{model}_adapted_vs_zero",
                         metric=metric_name,
@@ -1093,13 +1271,19 @@ def main() -> None:
                         prediction_keys={model: key},
                         train_groups=train_groups,
                         test_groups=test_groups,
+                        canonical=canonical,
                     )
+                    metric_key = metric_cache_key(metric_contract)
                     metric_cache = metric_cache_dir / (
                         f"{model}_{split_key}_{metric_name}_{metric_key[:16]}.json"
                     )
+                    metric_cache_needs_write = False
                     if args.reuse_existing and not args.force_rerun and metric_cache.exists():
                         cached_metric = json.loads(metric_cache.read_text(encoding="utf-8"))
-                        if cached_metric.get("cache_key") != metric_key:
+                        if (
+                            cached_metric.get("cache_key") != metric_key
+                            or cached_metric.get("contract") != metric_contract
+                        ):
                             raise RuntimeError(f"Metric cache key mismatch: {metric_cache}")
                         ci = cached_metric["cluster_ci"]
                         paired = cached_metric["paired_adapted_minus_zero"]
@@ -1126,10 +1310,25 @@ def main() -> None:
                                 seed=seed,
                             )
                         )
+                        metric_cache_needs_write = True
+                    validate_interval_payload(
+                        ci,
+                        n_boot=args.n_boot,
+                        low_field="lo",
+                        high_field="hi",
+                    )
+                    validate_interval_payload(
+                        paired,
+                        n_boot=args.n_boot,
+                        low_field="lo",
+                        high_field="hi",
+                    )
+                    if metric_cache_needs_write:
                         save_json_atomic(
                             metric_cache,
                             {
                                 "cache_key": metric_key,
+                                "contract": metric_contract,
                                 "cluster_ci": ci,
                                 "paired_adapted_minus_zero": paired,
                             },
@@ -1182,7 +1381,7 @@ def main() -> None:
             full_prob = predictions_by_model["full"]
             for comparator in [model for model in models if model != "full"]:
                 for metric_name, (metric_fn, higher) in metric_functions(args.threshold, args.n_bins).items():
-                    metric_key = metric_cache_key(
+                    metric_contract = metric_cache_contract(
                         args,
                         comparison=f"full_vs_{comparator}",
                         metric=metric_name,
@@ -1194,13 +1393,18 @@ def main() -> None:
                         },
                         train_groups=train_groups,
                         test_groups=test_groups,
+                        canonical=canonical,
                     )
+                    metric_key = metric_cache_key(metric_contract)
                     metric_cache = metric_cache_dir / (
                         f"full_vs_{comparator}_{split_key}_{metric_name}_{metric_key[:16]}.json"
                     )
                     if args.reuse_existing and not args.force_rerun and metric_cache.exists():
                         cached_metric = json.loads(metric_cache.read_text(encoding="utf-8"))
-                        if cached_metric.get("cache_key") != metric_key:
+                        if (
+                            cached_metric.get("cache_key") != metric_key
+                            or cached_metric.get("contract") != metric_contract
+                        ):
                             raise RuntimeError(f"Metric cache key mismatch: {metric_cache}")
                         paired = cached_metric["paired"]
                         print(f"Reusing paired metric cache: {metric_cache}", flush=True)
@@ -1216,8 +1420,18 @@ def main() -> None:
                         )
                         save_json_atomic(
                             metric_cache,
-                            {"cache_key": metric_key, "paired": paired},
+                            {
+                                "cache_key": metric_key,
+                                "contract": metric_contract,
+                                "paired": paired,
+                            },
                         )
+                    validate_interval_payload(
+                        paired,
+                        n_boot=args.n_boot,
+                        low_field="lo",
+                        high_field="hi",
+                    )
                     point = paired["point_delta_a_minus_b"] if higher else -paired["point_delta_a_minus_b"]
                     low, high = (paired["lo"], paired["hi"]) if higher else (-paired["hi"], -paired["lo"])
                     paired_rows.append(
@@ -1232,10 +1446,12 @@ def main() -> None:
                             "improvement_ci_low": low,
                             "improvement_ci_high": high,
                             "n_boot_valid": paired["n_boot_valid"],
+                            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+                            "null_test": "not_run",
                             "interpretation": (
-                                "full_significantly_better"
+                                "full_nominal_95ci_better"
                                 if low > 0
-                                else "comparator_significantly_better" if high < 0 else "inconclusive"
+                                else "comparator_nominal_95ci_better" if high < 0 else "inconclusive"
                             ),
                         }
                     )
@@ -1328,6 +1544,14 @@ def main() -> None:
             "dataset": args.dataset,
             "n_boot": args.n_boot,
             "bootstrap_unit": "patient/source-record group",
+            "canonical_group_contract": {
+                "group_contract_sha256": canonical["group_contract_sha256"],
+                "group_sidecar_sha256": canonical["group_sidecar_sha256"],
+                "bootstrap_unit": canonical["bootstrap_unit"],
+            },
+            "inference_scope": "pointwise_percentile_ci_effect_size_only",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
             "items": bootstrap,
             "primary_endpoint": primary_bootstrap,
             "learning_curve": learning_curve_bootstrap,
@@ -1366,6 +1590,8 @@ def main() -> None:
                 "uncertainty": "shared_patient_group_bootstrap_applied_to_all_seeds_and_models",
                 "bootstrap_seed": 20260712,
                 "n_boot": args.n_boot,
+                "inference_scope": "pointwise_percentile_ci_effect_size_only",
+                "null_test": "not_run",
             },
             "learning_curve_inference": {
                 "fractions": fractions,
@@ -1381,10 +1607,14 @@ def main() -> None:
                 ),
             },
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-            "fraction_sampling": "nested_random_group_prefix_per_seed",
+            "fraction_sampling": "nested_seeded_label_independent_group_prefix",
             "seeds": seeds,
             "split_audits": split_audits,
             "cache_contract": {
+                "schema_version": 2,
+                "runner_sha256": sha256_file(Path(__file__).resolve()),
+                "canonical_group_contract_sha256": canonical["group_contract_sha256"],
+                "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
                 "prediction_cache_dir": str(cache_dir),
                 "metric_cache_dir": str(metric_cache_dir),
                 "atomic_npz_writes": True,
@@ -1404,6 +1634,12 @@ def main() -> None:
                     "adaptation_prediction_sha256": data["adapt_pred"]["sha256"],
                     "adaptation_embedding_sha256": data["adapt_emb"]["sha256"],
                     "adaptation_embedding_manifest_sha256": data["adapt_emb"]["manifest_sha256"],
+                    "test_group_assignment_sha256": data["test_pred"][
+                        "group_assignment_sha256"
+                    ],
+                    "adaptation_group_assignment_sha256": data["adapt_pred"][
+                        "group_assignment_sha256"
+                    ],
                 }
                 for model, data in model_data.items()
             },

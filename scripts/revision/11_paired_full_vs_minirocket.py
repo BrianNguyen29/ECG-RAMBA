@@ -1,4 +1,4 @@
-"""Paired bootstrap comparison between Full ECG-RAMBA and MiniRocket-only.
+"""Paired bootstrap comparison with a fixed-seed ROCKET-family linear head.
 
 The comparison uses record-level paired resampling: each bootstrap replicate
 draws one index vector and applies it to both prediction matrices. This is the
@@ -24,6 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
@@ -40,7 +43,7 @@ from scripts.revision.common import (  # noqa: E402
 
 
 FULL_LABEL = "Full ECG-RAMBA frozen OOF"
-COMPARATOR_LABEL = "MiniRocket-only"
+COMPARATOR_LABEL = "Fixed-seed ROCKET-family MAX+PPV linear head"
 EXPECTED_MINIROCKET_PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 
 
@@ -156,14 +159,14 @@ def load_prediction_set(path: Path, label: str) -> PredictionSet:
     if not path.exists():
         raise FileNotFoundError(f"Missing prediction NPZ for {label}: {path}")
     with np.load(path, allow_pickle=False) as data:
-        required = {"y_true", "y_prob", "record_id", "class_names"}
+        required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"{path} is missing required keys: {sorted(missing)}")
         y_true = np.asarray(data["y_true"], dtype=np.float32)
         y_prob = np.asarray(data["y_prob"], dtype=np.float32)
         record_id = np.asarray(data["record_id"], dtype=np.int64)
-        fold_id = np.asarray(data["fold_id"], dtype=np.int16) if "fold_id" in data.files else None
+        fold_id = np.asarray(data["fold_id"], dtype=np.int16)
         class_names = np.asarray(data["class_names"]).astype(str).tolist()
         metadata = {
             key: json_safe(scalar_from_npz(data, key))
@@ -188,7 +191,7 @@ def load_prediction_set(path: Path, label: str) -> PredictionSet:
         raise ValueError(f"{label} prediction shape mismatch: y_true={y_true.shape}, y_prob={y_prob.shape}")
     if len(record_id) != len(y_true):
         raise ValueError(f"{label} record_id length mismatch: {len(record_id)} vs {len(y_true)}")
-    if fold_id is not None and len(fold_id) != len(y_true):
+    if len(fold_id) != len(y_true):
         raise ValueError(f"{label} fold_id length mismatch: {len(fold_id)} vs {len(y_true)}")
     if not np.all(np.isfinite(y_prob)):
         raise ValueError(f"{label} probabilities contain non-finite values.")
@@ -225,6 +228,33 @@ def validate_freeze_manifest(path: Path, full: PredictionSet, expected_checkpoin
     expected_sha = artifacts[rel].get("sha256")
     if full.sha256 != expected_sha:
         raise RuntimeError(f"Full OOF SHA mismatch: {full.sha256} != {expected_sha}")
+    group = payload.get("group_contract") or {}
+    group_errors = []
+    if group.get("status") != "verified":
+        group_errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        group_errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        group_errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        group_errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        group_errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != len(full.y_true) or int(group.get("n_groups", -1)) != len(full.y_true):
+        group_errors.append("group_counts")
+    sidecar = group.get("sidecar") or {}
+    sidecar_path = Path(str(sidecar.get("path", "")))
+    if sidecar_path and not sidecar_path.is_absolute():
+        sidecar_path = PROJECT_ROOT / sidecar_path
+    if not sidecar_path.is_file():
+        group_errors.append("sidecar_missing")
+    elif sha256_file(sidecar_path) != sidecar.get("sha256"):
+        group_errors.append("sidecar_sha256")
+    if group_errors:
+        raise RuntimeError(
+            "Paired OOF comparison lacks an authenticated patient/group bootstrap contract: "
+            + ", ".join(group_errors)
+        )
     return {
         "path": str(path),
         "relative_path": project_relative(path),
@@ -233,6 +263,7 @@ def validate_freeze_manifest(path: Path, full: PredictionSet, expected_checkpoin
         "validated_records": payload.get("validated_records"),
         "n_classes": payload.get("n_classes"),
         "dataset_record_order_fingerprint": payload.get("dataset_record_order_fingerprint"),
+        "group_contract": group,
     }
 
 
@@ -302,13 +333,13 @@ def validate_pair(full: PredictionSet, comparator: PredictionSet, expected_recor
         raise ValueError("Full and MiniRocket record_id arrays differ; record-level pairing is invalid.")
     if full.class_names != comparator.class_names:
         raise ValueError("Full and MiniRocket class_names differ.")
-    if full.fold_id is not None and comparator.fold_id is not None and not np.array_equal(full.fold_id, comparator.fold_id):
+    if full.fold_id is None or comparator.fold_id is None:
+        raise ValueError("Full and comparator predictions must both declare fold_id for a paired OOF comparison.")
+    if not np.array_equal(full.fold_id, comparator.fold_id):
         raise ValueError("Full and MiniRocket fold_id arrays differ.")
-    fold_id = full.fold_id if full.fold_id is not None else comparator.fold_id
-    if fold_id is not None:
-        folds = sorted(int(x) for x in np.unique(fold_id) if int(x) > 0)
-        if folds != [1, 2, 3, 4, 5]:
-            raise ValueError(f"Expected five OOF folds [1..5], got {folds}")
+    folds = sorted(int(x) for x in np.unique(full.fold_id) if int(x) > 0)
+    if folds != [1, 2, 3, 4, 5]:
+        raise ValueError(f"Expected five OOF folds [1..5], got {folds}")
 
 
 def metric_specs(threshold: float, n_bins: int) -> list[MetricSpec]:
@@ -386,39 +417,31 @@ def paired_bootstrap_difference(
     raw_diffs = np.asarray([row["raw_difference_full_minus_comparator"] for row in samples], dtype=np.float64)
     ci_low, ci_high = np.quantile(improvements, [0.025, 0.975])
     raw_low, raw_high = np.quantile(raw_diffs, [0.025, 0.975])
-    p_lower = (float(np.sum(improvements <= 0.0)) + 1.0) / (len(improvements) + 1.0)
-    p_upper = (float(np.sum(improvements >= 0.0)) + 1.0) / (len(improvements) + 1.0)
-    p_two_sided = min(1.0, 2.0 * min(p_lower, p_upper))
     return {
         "bootstrap_mean": float(np.mean(improvements)),
         "ci_low": float(ci_low),
         "ci_high": float(ci_high),
         "raw_diff_ci_low": float(raw_low),
         "raw_diff_ci_high": float(raw_high),
-        "p_value_two_sided": float(p_two_sided),
+        # A percentile bootstrap is an effect-size interval, not a
+        # null-centered randomization test. Do not manufacture a p-value from
+        # the fraction of bootstrap effects crossing zero.
+        "p_value_two_sided": math.nan,
         "n_boot_valid": int(len(improvements)),
     }, samples
 
 
-def add_holm_adjustment(rows: list[dict]) -> None:
-    finite = [(idx, row["p_value_two_sided"]) for idx, row in enumerate(rows) if np.isfinite(row["p_value_two_sided"])]
-    finite.sort(key=lambda item: item[1])
-    m = len(finite)
-    running = 0.0
-    adjusted = {}
-    for rank, (idx, p_value) in enumerate(finite):
-        candidate = min(1.0, (m - rank) * float(p_value))
-        running = max(running, candidate)
-        adjusted[idx] = running
-    for idx, row in enumerate(rows):
-        row["holm_p_value_two_sided"] = float(adjusted[idx]) if idx in adjusted else math.nan
+def mark_pointwise_inference(rows: list[dict]) -> None:
+    for row in rows:
+        row["holm_p_value_two_sided"] = math.nan
+        row["multiplicity_adjustment"] = "not_applicable_no_null_test"
 
 
 def interpretation_from_ci(ci_low: float, ci_high: float) -> str:
     if ci_low > 0.0:
-        return "full_significantly_better"
+        return "full_nominal_95ci_better"
     if ci_high < 0.0:
-        return "comparator_significantly_better"
+        return "comparator_nominal_95ci_better"
     return "inconclusive"
 
 
@@ -437,18 +460,18 @@ def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
     print("=" * 80, flush=True)
-    print("PAIRED FULL ECG-RAMBA VS MINIROCKET-ONLY COMPARISON", flush=True)
+    print("PAIRED FULL ECG-RAMBA VS FIXED-SEED ROCKET-FAMILY LINEAR HEAD", flush=True)
     print("=" * 80, flush=True)
     print(f"Full predictions      : {resolve_path(args.full_predictions)}", flush=True)
     print(f"Comparator predictions: {resolve_path(args.comparator_predictions)}", flush=True)
     print(f"Freeze manifest       : {resolve_path(args.freeze_manifest)}", flush=True)
-    print(f"MiniRocket manifest   : {resolve_path(args.comparator_manifest)}", flush=True)
+    print(f"Comparator manifest   : {resolve_path(args.comparator_manifest)}", flush=True)
     print(f"n_boot={args.n_boot} seed={args.seed} threshold={args.threshold} n_bins={args.n_bins}", flush=True)
 
     full = load_prediction_set(args.full_predictions, FULL_LABEL)
     comparator = load_prediction_set(args.comparator_predictions, COMPARATOR_LABEL)
     print(f"Loaded Full: shape={full.y_true.shape} sha256={full.sha256}", flush=True)
-    print(f"Loaded MiniRocket: shape={comparator.y_true.shape} sha256={comparator.sha256}", flush=True)
+    print(f"Loaded comparator: shape={comparator.y_true.shape} sha256={comparator.sha256}", flush=True)
 
     freeze_info = validate_freeze_manifest(args.freeze_manifest, full, args.expected_checkpoint_kind)
     mini_info = validate_minirocket_artifacts(
@@ -506,15 +529,20 @@ def main() -> None:
         rows.append(row)
         sample_rows.extend(samples)
 
-    add_holm_adjustment(rows)
+    mark_pointwise_inference(rows)
     for row in rows:
-        if row["metric_family"] == "ranking" and row["interpretation"] == "comparator_significantly_better":
+        row["inference_scope"] = "pointwise_percentile_ci_effect_size_only"
+        if row["metric_family"] == "ranking" and row["interpretation"] == "comparator_nominal_95ci_better":
             row["safe_wording"] = (
-                "MiniRocket-only is stronger for rank-based discrimination on frozen Chapman OOF."
+                "The nominal pointwise 95% interval favored the fixed-seed ROCKET-family "
+                "MAX+PPV linear head for rank-based discrimination on frozen Chapman OOF; "
+                "no multiplicity-adjusted superiority test was performed."
             )
-        elif row["metric_family"] in {"fixed_threshold", "calibration"} and row["interpretation"] == "full_significantly_better":
+        elif row["metric_family"] in {"fixed_threshold", "calibration"} and row["interpretation"] == "full_nominal_95ci_better":
             row["safe_wording"] = (
-                "Full ECG-RAMBA is stronger for the fixed-threshold/calibrated operating point."
+                "The nominal pointwise 95% interval favored Full ECG-RAMBA for this "
+                "fixed-threshold/calibration endpoint; no multiplicity-adjusted superiority "
+                "test was performed."
             )
         else:
             row["safe_wording"] = "Do not claim a paired difference for this metric without qualification."
@@ -539,7 +567,9 @@ def main() -> None:
             "n_boot": int(args.n_boot),
             "seed": int(args.seed),
             "alpha": 0.05,
-            "p_value": "two-sided sign bootstrap with +1 finite-sample smoothing; Holm-adjusted across metrics",
+            "p_value": "not_reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
         },
         "threshold": float(args.threshold),
         "n_bins": int(args.n_bins),
@@ -571,7 +601,7 @@ def main() -> None:
             "manifest": str(args.out_manifest),
         },
         "claim_guidance": {
-            "ranking": "Do not claim Full ECG-RAMBA is superior to MiniRocket-only on AUROC/AUPRC if paired CIs favor MiniRocket-only.",
+            "ranking": "Do not claim Full ECG-RAMBA is superior to the fixed-seed ROCKET-family linear head on AUROC/AUPRC when paired intervals favor the comparator.",
             "operating_point": "It is acceptable to state that Full ECG-RAMBA has a better fixed-threshold/calibrated operating point when F1/Brier/ECE paired CIs favor Full.",
         },
     }

@@ -1,9 +1,10 @@
 """Representation probe/CKA runner for branch-specific evidence.
 
-This script consumes a frozen embedding NPZ artifact. It does not extract
-embeddings from the model by itself; that extraction must be produced by a
-separate, checkpoint-fingerprinted hook if stronger representation evidence is
-needed. When no embedding artifact is provided, the script writes a blocked
+This script consumes a frozen embedding NPZ plus its checkpoint-local fold
+caches. Each probe scaler/classifier is fit on train embeddings produced by one
+fold checkpoint and evaluated on validation embeddings from that same
+checkpoint. Global OOF embeddings are retained only for descriptive projection.
+When the provenance package is absent or stale, the script writes a blocked
 manifest so the evidence matrix can record the gap without overclaiming.
 
 Expected NPZ keys:
@@ -14,11 +15,13 @@ Expected NPZ keys:
 - ``class_names``: (C,) class names.
 - one or more embedding arrays named ``morphology_embedding``,
   ``rhythm_embedding``, ``context_embedding``, or ``fused_embedding``.
+- ``local_fold_cache_index_json``: authenticated train/validation cache index.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import warnings
@@ -37,6 +40,7 @@ from scripts.revision.common import (  # noqa: E402
     FIGURE_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
+    PREDICTION_DIR,
     TABLE_DIR,
     ensure_revision_dirs,
     git_commit,
@@ -50,6 +54,8 @@ from scripts.revision.common import (  # noqa: E402
 
 
 PROTOCOL = "representation_probe_fold_safe_v3_projection_and_fold_audit"
+LOCAL_COORDINATE_PROTOCOL = "checkpoint_local_train_validation_embeddings_v1"
+LOCAL_COORDINATE_SCHEMA_VERSION = 1
 VIEW_KEYS = {
     "morphology": ("morphology_embedding", "morphology", "rocket_embedding"),
     "rhythm": ("rhythm_embedding", "rhythm", "hrv_embedding"),
@@ -63,6 +69,16 @@ DEFAULT_RHYTHM_LABELS = "AF,AFL,Brady,SA,SB,SNR,STach,PAC,PVC,SVPB,VPB,PR,LPR,LQ
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--embedding-npz", type=Path, default=None)
+    parser.add_argument(
+        "--oof-predictions",
+        type=Path,
+        default=PREDICTION_DIR / "oof_final_ema_predictions.npz",
+    )
+    parser.add_argument(
+        "--freeze-manifest",
+        type=Path,
+        default=MANIFEST_DIR / "oof_final_ema_freeze_manifest.json",
+    )
     parser.add_argument("--morphology-labels", default=DEFAULT_MORPHOLOGY_LABELS)
     parser.add_argument("--rhythm-labels", default=DEFAULT_RHYTHM_LABELS)
     parser.add_argument("--max-cka-records", type=int, default=6000)
@@ -102,6 +118,31 @@ def project_relative(path: Path) -> str:
         return path.relative_to(PROJECT_ROOT.resolve()).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def array_sha256(array: np.ndarray, dtype: np.dtype | type | None = None) -> str:
+    values = np.asarray(array, dtype=dtype)
+    return hashlib.sha256(np.ascontiguousarray(values).tobytes()).hexdigest()
+
+
+def current_extraction_source_bundle_sha256() -> str:
+    paths = [
+        PROJECT_ROOT / "scripts" / "revision" / "22_extract_representations.py",
+        PROJECT_ROOT / "scripts" / "revision" / "01_generate_predictions.py",
+        PROJECT_ROOT / "configs" / "config.py",
+        PROJECT_ROOT / "src" / "data_loader.py",
+        PROJECT_ROOT / "src" / "features.py",
+        PROJECT_ROOT / "src" / "layers.py",
+        PROJECT_ROOT / "src" / "model.py",
+    ]
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(PROJECT_ROOT).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sha256_file(path).encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
 
 
 def parse_label_list(value: str) -> list[str]:
@@ -162,6 +203,14 @@ def load_embeddings(path: Path) -> dict[str, Any]:
             "source_protocol": source_scalar("protocol"),
             "source_oof_sha256": source_scalar("oof_predictions_sha256"),
             "source_freeze_sha256": source_scalar("freeze_manifest_sha256"),
+            "source_bundle_sha256": source_scalar("source_bundle_sha256"),
+            "coordinate_protocol": source_scalar("coordinate_protocol"),
+            "checkpoint_kind": source_scalar("checkpoint_kind"),
+            "local_fold_cache_index": (
+                json.loads(source_scalar("local_fold_cache_index_json", "[]"))
+                if "local_fold_cache_index_json" in data.files
+                else []
+            ),
         }
         n = len(payload["record_id"])
         for view, candidates in VIEW_KEYS.items():
@@ -190,9 +239,252 @@ def load_embeddings(path: Path) -> dict[str, Any]:
         raise RuntimeError("Embedding artifact uses an unsupported or missing extraction protocol")
     if not payload.get("source_oof_sha256") or not payload.get("source_freeze_sha256"):
         raise RuntimeError("Embedding artifact lacks canonical OOF/freeze provenance")
+    if payload.get("coordinate_protocol") != LOCAL_COORDINATE_PROTOCOL:
+        raise RuntimeError(
+            "Embedding artifact lacks checkpoint-local train/validation coordinates"
+        )
+    if not payload.get("source_bundle_sha256"):
+        raise RuntimeError("Embedding artifact lacks extraction source-bundle provenance")
+    if not isinstance(payload.get("local_fold_cache_index"), list):
+        raise RuntimeError("Embedding artifact has an invalid local fold cache index")
     if not np.isfinite(payload["y_true"]).all() or not np.isin(payload["y_true"], [0.0, 1.0]).all():
         raise ValueError("y_true must contain finite binary labels")
     return payload
+
+
+def load_current_canonical_contract(
+    oof_path: Path,
+    freeze_manifest_path: Path,
+) -> dict[str, Any]:
+    oof_path = resolve(oof_path)
+    freeze_manifest_path = resolve(freeze_manifest_path)
+    if not oof_path.exists() or oof_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing canonical OOF predictions: {oof_path}")
+    if not freeze_manifest_path.exists() or freeze_manifest_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing canonical freeze manifest: {freeze_manifest_path}")
+    with np.load(oof_path, allow_pickle=False) as data:
+        required = {"y_true", "record_id", "fold_id", "class_names"}
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise KeyError(f"Canonical OOF artifact missing keys: {missing}")
+        payload = {
+            "y_true": np.asarray(data["y_true"], dtype=np.float32),
+            "record_id": np.asarray(data["record_id"]).astype(str),
+            "fold_id": np.asarray(data["fold_id"], dtype=np.int16),
+            "class_names": np.asarray(data["class_names"]).astype(str),
+        }
+    payload.update(
+        {
+            "oof_path": oof_path,
+            "freeze_manifest_path": freeze_manifest_path,
+            "oof_sha256": sha256_file(oof_path),
+            "freeze_sha256": sha256_file(freeze_manifest_path),
+        }
+    )
+    freeze_payload = json.loads(freeze_manifest_path.read_text(encoding="utf-8"))
+    expected_oof_sha = freeze_payload.get("record_file_sha256") or freeze_payload.get(
+        "predictions_sha256"
+    )
+    if expected_oof_sha is None:
+        for artifact in freeze_payload.get("artifacts", []):
+            if str(artifact.get("path", "")).endswith(oof_path.name):
+                expected_oof_sha = artifact.get("sha256")
+                break
+    if not expected_oof_sha:
+        raise RuntimeError("Canonical freeze manifest does not declare the OOF artifact SHA256")
+    if str(expected_oof_sha) != payload["oof_sha256"]:
+        raise RuntimeError(
+            "Canonical freeze manifest does not authenticate the current OOF artifact"
+        )
+    if (
+        not np.isfinite(payload["y_true"]).all()
+        or not np.isin(payload["y_true"], [0.0, 1.0]).all()
+    ):
+        raise ValueError("Canonical OOF y_true must contain finite binary labels")
+    if len(np.unique(payload["record_id"])) != len(payload["record_id"]):
+        raise ValueError("Canonical OOF record_id values are not unique")
+    return payload
+
+
+def validate_embedding_against_canonical(
+    emb: dict[str, Any],
+    canonical: dict[str, Any],
+) -> None:
+    errors: list[str] = []
+    if emb.get("source_oof_sha256") != canonical["oof_sha256"]:
+        errors.append("oof_predictions_sha256")
+    if emb.get("source_freeze_sha256") != canonical["freeze_sha256"]:
+        errors.append("freeze_manifest_sha256")
+    if emb.get("source_bundle_sha256") != current_extraction_source_bundle_sha256():
+        errors.append("source_bundle_sha256")
+    for key in ("y_true", "record_id", "fold_id", "class_names"):
+        if not np.array_equal(np.asarray(emb[key]), np.asarray(canonical[key])):
+            errors.append(f"semantic:{key}")
+    if errors:
+        raise RuntimeError(
+            "Embedding artifact does not match the current canonical OOF/freeze contract: "
+            + ", ".join(errors)
+        )
+
+
+def _resolve_cache_path(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def load_checkpoint_local_folds(
+    emb: dict[str, Any],
+    canonical: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if emb.get("source_oof_sha256") != canonical["oof_sha256"] or emb.get(
+        "source_freeze_sha256"
+    ) != canonical["freeze_sha256"]:
+        raise RuntimeError(
+            "Embedding source hashes do not match the current canonical OOF/freeze contract"
+        )
+    index_rows = emb.get("local_fold_cache_index", [])
+    index_by_fold = {
+        int(row.get("fold", -1)): row
+        for row in index_rows
+        if int(row.get("fold", -1)) > 0
+    }
+    expected_folds = sorted(int(value) for value in np.unique(canonical["fold_id"]))
+    if sorted(index_by_fold) != expected_folds:
+        raise RuntimeError(
+            "Checkpoint-local fold cache index is incomplete: "
+            f"observed={sorted(index_by_fold)} expected={expected_folds}"
+        )
+
+    local_folds: list[dict[str, Any]] = []
+    validation_coverage = np.zeros(len(canonical["record_id"]), dtype=np.int16)
+    for fold in expected_folds:
+        row = index_by_fold[fold]
+        path = _resolve_cache_path(str(row.get("path") or ""))
+        expected_sha = str(row.get("sha256") or "")
+        if not path.exists() or not expected_sha or sha256_file(path) != expected_sha:
+            raise RuntimeError(f"Checkpoint-local cache SHA mismatch for fold {fold}: {path}")
+        with np.load(path, allow_pickle=False) as data:
+            required = {
+                "fold",
+                "coordinate_protocol",
+                "local_coordinate_schema_version",
+                "checkpoint_sha256",
+                "oof_predictions_sha256",
+                "freeze_manifest_sha256",
+                "source_bundle_sha256",
+                "train_record_id",
+                "validation_record_id",
+                "train_index_sha256",
+                "validation_index_sha256",
+                *{f"train_{candidates[0]}" for candidates in VIEW_KEYS.values()},
+                *{f"validation_{candidates[0]}" for candidates in VIEW_KEYS.values()},
+            }
+            missing = sorted(required - set(data.files))
+            if missing:
+                raise RuntimeError(f"Fold {fold} local cache missing keys: {missing}")
+            train_ids = np.asarray(data["train_record_id"], dtype=np.int64)
+            validation_ids = np.asarray(data["validation_record_id"], dtype=np.int64)
+            if int(data["fold"]) != fold:
+                raise RuntimeError(f"Fold identity mismatch in local cache {path}")
+            scalar_contract = {
+                "coordinate_protocol": str(data["coordinate_protocol"].item()),
+                "local_coordinate_schema_version": int(data["local_coordinate_schema_version"]),
+                "checkpoint_sha256": str(data["checkpoint_sha256"].item()),
+                "oof_predictions_sha256": str(data["oof_predictions_sha256"].item()),
+                "freeze_manifest_sha256": str(data["freeze_manifest_sha256"].item()),
+                "source_bundle_sha256": str(data["source_bundle_sha256"].item()),
+                "train_index_sha256": str(data["train_index_sha256"].item()),
+                "validation_index_sha256": str(data["validation_index_sha256"].item()),
+            }
+            views = {
+                view: {
+                    "train": np.asarray(data[f"train_{key_candidates[0]}"], dtype=np.float32),
+                    "validation": np.asarray(
+                        data[f"validation_{key_candidates[0]}"], dtype=np.float32
+                    ),
+                }
+                for view, key_candidates in VIEW_KEYS.items()
+            }
+
+        expected_train = np.flatnonzero(canonical["fold_id"] != fold).astype(np.int64)
+        expected_validation = np.flatnonzero(canonical["fold_id"] == fold).astype(np.int64)
+        if not np.array_equal(train_ids, expected_train) or not np.array_equal(
+            validation_ids, expected_validation
+        ):
+            raise RuntimeError(f"Fold {fold} local cache membership differs from canonical OOF")
+        if np.intersect1d(train_ids, validation_ids).size:
+            raise RuntimeError(f"Fold {fold} local train/validation records overlap")
+        if scalar_contract["coordinate_protocol"] != LOCAL_COORDINATE_PROTOCOL:
+            raise RuntimeError(f"Fold {fold} local coordinate protocol mismatch")
+        if scalar_contract["local_coordinate_schema_version"] != LOCAL_COORDINATE_SCHEMA_VERSION:
+            raise RuntimeError(f"Fold {fold} local coordinate schema mismatch")
+        if scalar_contract["oof_predictions_sha256"] != canonical["oof_sha256"]:
+            raise RuntimeError(f"Fold {fold} cache is stale for canonical OOF")
+        if scalar_contract["freeze_manifest_sha256"] != canonical["freeze_sha256"]:
+            raise RuntimeError(f"Fold {fold} cache is stale for canonical freeze manifest")
+        if scalar_contract["source_bundle_sha256"] != emb["source_bundle_sha256"]:
+            raise RuntimeError(f"Fold {fold} extraction source bundle mismatch")
+        if scalar_contract["checkpoint_sha256"] != str(row.get("checkpoint_sha256") or ""):
+            raise RuntimeError(f"Fold {fold} checkpoint SHA mismatch")
+        expected_coordinate_id = f"fold{fold}:{scalar_contract['checkpoint_sha256']}"
+        if str(row.get("coordinate_system_id") or "") != expected_coordinate_id:
+            raise RuntimeError(f"Fold {fold} coordinate-system identity mismatch")
+        if scalar_contract["train_index_sha256"] != array_sha256(train_ids, np.int64):
+            raise RuntimeError(f"Fold {fold} train index hash mismatch")
+        if scalar_contract["validation_index_sha256"] != array_sha256(
+            validation_ids, np.int64
+        ):
+            raise RuntimeError(f"Fold {fold} validation index hash mismatch")
+        if str(row.get("train_index_sha256") or "") != scalar_contract[
+            "train_index_sha256"
+        ]:
+            raise RuntimeError(f"Fold {fold} cache-index train hash mismatch")
+        if str(row.get("validation_index_sha256") or "") != scalar_contract[
+            "validation_index_sha256"
+        ]:
+            raise RuntimeError(f"Fold {fold} cache-index validation hash mismatch")
+        for view, split_views in views.items():
+            if split_views["train"].shape[0] != len(train_ids):
+                raise RuntimeError(f"Fold {fold} {view} train row count mismatch")
+            if split_views["validation"].shape[0] != len(validation_ids):
+                raise RuntimeError(f"Fold {fold} {view} validation row count mismatch")
+            if not all(np.isfinite(values).all() for values in split_views.values()):
+                raise RuntimeError(f"Fold {fold} {view} contains non-finite embeddings")
+        validation_coverage[validation_ids] += 1
+        local_folds.append(
+            {
+                "fold_id": fold,
+                "coordinate_system_id": str(
+                    row.get("coordinate_system_id")
+                    or f"fold{fold}:{scalar_contract['checkpoint_sha256']}"
+                ),
+                "checkpoint_sha256": scalar_contract["checkpoint_sha256"],
+                "train_record_id": train_ids,
+                "validation_record_id": validation_ids,
+                "views": views,
+            }
+        )
+    if not np.all(validation_coverage == 1):
+        raise RuntimeError("Checkpoint-local validation partitions do not cover each record once")
+    return local_folds
+
+
+def validate_global_embedding_projection(
+    emb: dict[str, Any],
+    local_folds: list[dict[str, Any]],
+) -> None:
+    for local_fold in local_folds:
+        fold = int(local_fold["fold_id"])
+        validation_ids = np.asarray(local_fold["validation_record_id"], dtype=np.int64)
+        for view, global_values in emb["views"].items():
+            if not np.array_equal(
+                np.asarray(global_values, dtype=np.float32)[validation_ids],
+                local_fold["views"][view]["validation"],
+            ):
+                raise RuntimeError(
+                    f"Global OOF projection differs from checkpoint-local validation "
+                    f"embeddings for fold {fold}/{view}"
+                )
 
 
 def label_indices(class_names: np.ndarray, requested: list[str]) -> list[int]:
@@ -222,17 +514,15 @@ def linear_cka(x: np.ndarray, y: np.ndarray, max_records: int, seed: int) -> flo
 
 
 def probe_one_view(
-    x: np.ndarray,
+    local_folds: list[dict[str, Any]],
+    view: str,
     y: np.ndarray,
-    fold_id: np.ndarray,
     threshold: float,
     seed: int,
     max_iter: int,
 ) -> dict[str, Any]:
     from sklearn.exceptions import ConvergenceWarning
     from sklearn.linear_model import LogisticRegression
-    from sklearn.multiclass import OneVsRestClassifier
-    from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
 
     valid_cols = [c for c in range(y.shape[1]) if len(np.unique(y[:, c])) >= 2]
@@ -244,54 +534,66 @@ def probe_one_view(
     convergence_limited_estimators = 0
     solver_iter_max = 0
     fold_rows: list[dict[str, Any]] = []
-    for fold in sorted(np.unique(fold_id)):
-        train = fold_id != fold
-        test = fold_id == fold
-        if not np.any(test) or not np.any(train):
-            continue
-        usable_cols = [c for c in range(yv.shape[1]) if len(np.unique(yv[train, c])) >= 2]
-        if not usable_cols:
-            continue
-        model = make_pipeline(
-            StandardScaler(),
-            OneVsRestClassifier(
-                LogisticRegression(
-                    solver="lbfgs",
-                    class_weight="balanced",
-                    max_iter=max_iter,
-                    random_state=seed,
-                )
-            ),
+    for local_fold in local_folds:
+        fold = int(local_fold["fold_id"])
+        train_ids = np.asarray(local_fold["train_record_id"], dtype=np.int64)
+        validation_ids = np.asarray(local_fold["validation_record_id"], dtype=np.int64)
+        x_train = np.asarray(local_fold["views"][view]["train"], dtype=np.float32)
+        x_validation = np.asarray(
+            local_fold["views"][view]["validation"], dtype=np.float32
         )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", ConvergenceWarning)
-            model.fit(x[train], yv[train][:, usable_cols])
-        convergence_warning_count += sum(
-            1 for warning in caught if issubclass(warning.category, ConvergenceWarning)
-        )
-        classifier = model.named_steps["onevsrestclassifier"]
-        for estimator in getattr(classifier, "estimators_", []):
-            n_iter = getattr(estimator, "n_iter_", np.asarray([], dtype=np.int32))
-            if len(n_iter):
-                estimator_iter = int(np.max(n_iter))
-                solver_iter_max = max(solver_iter_max, estimator_iter)
-                if estimator_iter >= max_iter:
-                    convergence_limited_estimators += 1
-        fold_prob = np.zeros((int(np.sum(test)), yv.shape[1]), dtype=np.float32)
-        fold_prob[:] = np.mean(yv[train], axis=0, keepdims=True)
-        predicted = model.predict_proba(x[test])
-        if isinstance(predicted, list):
-            predicted = np.stack([p[:, 1] for p in predicted], axis=1)
-        fold_prob[:, usable_cols] = np.asarray(predicted, dtype=np.float32)
-        pred[test] = fold_prob
-        fold_metrics = multilabel_metrics(yv[test], fold_prob, threshold=threshold)
-        fold_metrics["macro_pr_auc"] = macro_pr_auc(yv[test], fold_prob)
-        fold_metrics["macro_roc_auc"] = macro_roc_auc(yv[test], fold_prob)
+        if x_train.shape[0] != len(train_ids) or x_validation.shape[0] != len(
+            validation_ids
+        ):
+            raise RuntimeError(f"Fold {fold} {view} local embedding rows are misaligned")
+        if x_train.shape[1] != x_validation.shape[1]:
+            raise RuntimeError(f"Fold {fold} {view} train/validation dimensions differ")
+
+        scaler = StandardScaler()
+        x_train_scaled = scaler.fit_transform(x_train)
+        x_validation_scaled = scaler.transform(x_validation)
+        y_train = yv[train_ids]
+        y_validation = yv[validation_ids]
+        fold_prob = np.tile(
+            np.mean(y_train, axis=0, keepdims=True),
+            (len(validation_ids), 1),
+        ).astype(np.float32)
+        usable_cols: list[int] = []
+        for column in range(yv.shape[1]):
+            if len(np.unique(y_train[:, column])) < 2:
+                continue
+            estimator = LogisticRegression(
+                solver="lbfgs",
+                class_weight="balanced",
+                max_iter=max_iter,
+                random_state=seed + fold,
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ConvergenceWarning)
+                estimator.fit(x_train_scaled, y_train[:, column])
+            convergence_warning_count += sum(
+                1 for warning in caught if issubclass(warning.category, ConvergenceWarning)
+            )
+            estimator_iter = int(np.max(estimator.n_iter_))
+            solver_iter_max = max(solver_iter_max, estimator_iter)
+            if estimator_iter >= max_iter:
+                convergence_limited_estimators += 1
+            fold_prob[:, column] = estimator.predict_proba(x_validation_scaled)[:, 1]
+            usable_cols.append(column)
+
+        pred[validation_ids] = fold_prob
+        fold_metrics = multilabel_metrics(y_validation, fold_prob, threshold=threshold)
+        fold_metrics["macro_pr_auc"] = macro_pr_auc(y_validation, fold_prob)
+        fold_metrics["macro_roc_auc"] = macro_roc_auc(y_validation, fold_prob)
         fold_rows.append(
             {
                 "fold_id": int(fold),
-                "n_records_evaluated": int(np.sum(test)),
+                "coordinate_system_id": local_fold["coordinate_system_id"],
+                "checkpoint_sha256": local_fold["checkpoint_sha256"],
+                "n_train_records": int(len(train_ids)),
+                "n_records_evaluated": int(len(validation_ids)),
                 "n_labels_evaluated": int(len(valid_cols)),
+                "n_labels_fit": int(len(usable_cols)),
                 **fold_metrics,
             }
         )
@@ -307,6 +609,7 @@ def probe_one_view(
     metrics["solver_iter_max"] = int(solver_iter_max)
     metrics["convergence_warning_count"] = int(convergence_warning_count)
     metrics["convergence_limited_estimators"] = int(convergence_limited_estimators)
+    metrics["coordinate_design"] = LOCAL_COORDINATE_PROTOCOL
     metrics["_fold_rows"] = fold_rows
     metrics["status"] = "complete"
     return metrics
@@ -474,6 +777,13 @@ def main() -> None:
         if args.embedding_npz is None:
             raise FileNotFoundError("No --embedding-npz was provided.")
         emb = load_embeddings(args.embedding_npz)
+        canonical = load_current_canonical_contract(
+            args.oof_predictions,
+            args.freeze_manifest,
+        )
+        validate_embedding_against_canonical(emb, canonical)
+        local_folds = load_checkpoint_local_folds(emb, canonical)
+        validate_global_embedding_projection(emb, local_folds)
     except Exception as exc:
         payload = blocked_payload(args, str(exc))
         save_json(args.out_summary, payload)
@@ -516,9 +826,9 @@ def main() -> None:
                 )
                 continue
             result = probe_one_view(
-                x,
+                local_folds,
+                view,
                 y_true[:, idx],
-                fold_id,
                 args.threshold,
                 args.seed,
                 args.probe_max_iter,
@@ -554,32 +864,36 @@ def main() -> None:
     )
 
     cka_rows: list[dict[str, Any]] = []
-    for left, right in combinations(sorted(emb["views"]), 2):
-        scopes = [("all_oof", 0, np.ones(len(fold_id), dtype=bool))]
-        scopes.extend(
-            ("held_out_fold", int(fold), fold_id == fold)
-            for fold in sorted(np.unique(fold_id))
-        )
-        for scope, fold, mask in scopes:
+    for local_fold in local_folds:
+        fold = int(local_fold["fold_id"])
+        for left, right in combinations(sorted(emb["views"]), 2):
+            left_values = local_fold["views"][left]["validation"]
+            right_values = local_fold["views"][right]["validation"]
             value = linear_cka(
-                emb["views"][left][mask],
-                emb["views"][right][mask],
+                left_values,
+                right_values,
                 args.max_cka_records,
                 args.seed + int(fold),
             )
             cka_rows.append(
                 {
-                    "scope": scope,
+                    "scope": "checkpoint_local_validation",
                     "fold_id": int(fold),
+                    "coordinate_system_id": local_fold["coordinate_system_id"],
+                    "checkpoint_sha256": local_fold["checkpoint_sha256"],
                     "left_view": left,
                     "right_view": right,
                     "linear_cka": float(value),
-                    "n_records": int(np.sum(mask)),
+                    "n_records": int(len(local_fold["validation_record_id"])),
                     "max_records": int(args.max_cka_records),
                     "status": "complete" if np.isfinite(value) else "blocked_nonfinite",
                 }
             )
-            print(f"cka {scope}/fold{fold} {left}/{right}: {value:.6f}", flush=True)
+            print(
+                f"cka checkpoint_local_validation/fold{fold} {left}/{right}: "
+                f"{value:.6f}",
+                flush=True,
+            )
 
     payload = {
         "status": "complete",
@@ -587,8 +901,8 @@ def main() -> None:
         "created_utc": now_utc(),
         "runner_sha256": sha256_file(Path(__file__).resolve()),
         "canonical_contract": {
-            "oof_sha256": emb.get("source_oof_sha256", ""),
-            "freeze_sha256": emb.get("source_freeze_sha256", ""),
+            "oof_sha256": canonical["oof_sha256"],
+            "freeze_sha256": canonical["freeze_sha256"],
         },
         "safe_wording": (
             "Representation probes provide suggestive branch-specific evidence only; "
@@ -600,6 +914,11 @@ def main() -> None:
         },
         "n_records": int(len(emb["record_id"])),
         "n_classes": int(y_true.shape[1]),
+        "coordinate_design": LOCAL_COORDINATE_PROTOCOL,
+        "n_checkpoint_local_folds": int(len(local_folds)),
+        "projection_role": (
+            "descriptive_only; global OOF projections mix checkpoint coordinate systems"
+        ),
         "probe_max_iter": int(args.probe_max_iter),
         "views": {name: list(arr.shape) for name, arr in emb["views"].items()},
         "label_groups": {

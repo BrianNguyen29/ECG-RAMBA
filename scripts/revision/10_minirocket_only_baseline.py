@@ -1,9 +1,10 @@
-"""Run a fold-safe MiniRocket-only baseline under the frozen OOF protocol.
+"""Run a fold-safe fixed-seed ROCKET-family baseline under frozen OOF.
 
 This runner is intentionally separate from the full ECG-RAMBA model. It uses
-the cached deterministic RAW MiniRocket feature matrix, the exact frozen OOF
-fold split/labels, and a lightweight linear logistic head. The goal is
-reviewer-facing baseline evidence, not checkpoint inference.
+the cached fixed-seed random-convolution MAX+PPV feature matrix, the exact
+frozen OOF fold split/labels, and a lightweight linear logistic head. The
+transform is not canonical MiniRocket. The goal is reviewer-facing baseline
+evidence, not checkpoint inference.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from scripts.revision.common import (  # noqa: E402
     PREDICTION_DIR,
     TABLE_DIR,
     bootstrap_ci,
+    build_comparator_training_contract,
     calibration_summary,
     ensure_revision_dirs,
     macro_pr_auc,
@@ -43,7 +45,9 @@ from scripts.revision.common import (  # noqa: E402
 
 PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
 EVALUATED_TRANSFORM_NAME = "fixed_seed_rocket_family_random_convolution_max_ppv"
+FEATURE_CONTRACT = "fixed_seed_rocket_family_max_ppv_20000"
 CANONICAL_MINIROCKET = False
+BASELINE_DISPLAY_NAME = "Fixed-seed ROCKET-family MAX+PPV linear head"
 REUSABLE_PREDICTION_MISMATCH_POLICY = "reject_and_recompute"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
@@ -92,7 +96,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Optional explicit RAW MiniRocket NPZ. Default requires a "
+            "Optional explicit legacy-named random-convolution MAX+PPV NPZ. Default requires a "
             "record-fingerprinted cache matching the frozen OOF record order."
         ),
     )
@@ -170,7 +174,7 @@ def _prediction_metadata(
     return {
         "dataset": np.asarray("chapman_oof"),
         "protocol": np.asarray(PROTOCOL),
-        "feature_contract": np.asarray("minirocket_raw"),
+        "feature_contract": np.asarray(FEATURE_CONTRACT),
         "feature_preprocessing": np.asarray(
             "fold_train_standardization" if args.standardize == "train_fold" else "none"
         ),
@@ -204,7 +208,7 @@ def write_prediction_npz(
     model_name: str,
     classifier_params: dict,
 ) -> None:
-    print(f"Writing MiniRocket-only predictions: {path}", flush=True)
+    print(f"Writing {BASELINE_DISPLAY_NAME} predictions: {path}", flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         path,
@@ -236,7 +240,7 @@ def load_existing_prediction_npz(
 ) -> tuple[np.ndarray, np.ndarray] | None:
     def reject(reason: str) -> None:
         print(
-            "Reusable MiniRocket-only prediction NPZ rejected; "
+            "Reusable fixed-seed ROCKET-family prediction NPZ rejected; "
             f"the fold-safe heads will be refit: {reason}",
             flush=True,
         )
@@ -244,7 +248,7 @@ def load_existing_prediction_npz(
 
     if not path.exists():
         return None
-    print(f"Checking reusable MiniRocket-only prediction NPZ: {path}", flush=True)
+    print(f"Checking reusable {BASELINE_DISPLAY_NAME} prediction NPZ: {path}", flush=True)
     with np.load(path, allow_pickle=False) as data:
         required = {"y_true", "y_prob", "record_id", "fold_id", "class_names"}
         missing = required - set(data.files)
@@ -293,7 +297,7 @@ def load_existing_prediction_npz(
         return reject("canonical predictions do not cover all five folds")
     if not np.all(np.isfinite(y_prob)):
         return reject("probabilities contain non-finite values")
-    print("Reusable MiniRocket-only prediction NPZ passed contract checks.", flush=True)
+    print(f"Reusable {BASELINE_DISPLAY_NAME} prediction NPZ passed contract checks.", flush=True)
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id
 
 
@@ -490,15 +494,15 @@ def load_minirocket_cache(
             quantization_contract = str(npz_scalar(payload, "quantization_contract", "unknown"))
 
         if X.ndim != 2 or X.shape != (n_records, 20000):
-            raise ValueError(f"RAW MiniRocket cache expected {(n_records, 20000)}, got {X.shape}: {path}")
+            raise ValueError(f"Fixed-seed ROCKET-family cache expected {(n_records, 20000)}, got {X.shape}: {path}")
         if not np.isfinite(X).all():
-            raise ValueError(f"RAW MiniRocket cache contains non-finite values: {path}")
+            raise ValueError(f"Fixed-seed ROCKET-family cache contains non-finite values: {path}")
 
         cache_kind = "record_fingerprinted" if cached_fingerprint else "legacy_shape_only"
         if record_fingerprint and cached_fingerprint != record_fingerprint:
             if cached_fingerprint:
                 raise ValueError(
-                    "RAW MiniRocket cache fingerprint mismatch: "
+                    "Fixed-seed ROCKET-family cache fingerprint mismatch: "
                     f"{cached_fingerprint} != {record_fingerprint} ({path})"
                 )
             if not allow_legacy_shape_cache:
@@ -522,7 +526,7 @@ def load_minirocket_cache(
         }
 
     raise FileNotFoundError(
-        "Missing manuscript-safe RAW MiniRocket cache. Expected a record-fingerprinted "
+        "Missing manuscript-safe fixed-seed ROCKET-family cache. Expected a record-fingerprinted "
         f"cache for fingerprint {record_fingerprint or '<missing>'}. Checked: "
         + "; ".join(checked)
     )
@@ -807,7 +811,7 @@ def fit_predict_minirocket_torch_oof(
         raise RuntimeError(f"OOF prediction coverage is incomplete; missing records: {len(missing)}")
     if not np.all(np.isfinite(y_prob)):
         raise RuntimeError("OOF probabilities contain non-finite values.")
-    print("All MiniRocket-only folds produced finite OOF probabilities.", flush=True)
+    print(f"All {BASELINE_DISPLAY_NAME} folds produced finite OOF probabilities.", flush=True)
     return np.clip(y_prob, 0.0, 1.0).astype(np.float32), fold_id_out, fold_rows
 
 
@@ -863,7 +867,7 @@ def main() -> None:
             f"{oof_info['oof_records_total']} != {freeze_contract['validated_records']}"
         )
     if int(args.limit_records) == 0 and oof_info["fold_count"] != 5:
-        raise ValueError(f"Canonical MiniRocket-only baseline requires five folds, got {oof_info['fold_count']}")
+        raise ValueError(f"Canonical fixed-seed ROCKET-family baseline requires five folds, got {oof_info['fold_count']}")
     record_fingerprint = (
         oof_info.get("dataset_record_order_fingerprint")
         or freeze_contract.get("dataset_record_order_fingerprint")
@@ -905,6 +909,11 @@ def main() -> None:
         "device": args.device,
         "standardize": args.standardize,
         "allow_tf32": bool(args.allow_tf32),
+        "amp": False,
+        "seed": int(args.seed),
+        "fold_seed_formula": "seed + fold",
+        "selection_rule": "fixed_final_epoch_predictions_only",
+        "tuning_provenance": "explicit CLI configuration; no validation-driven tuning in this runner",
     }
     if args.backend == "sgd":
         model_name = "fold_safe_one_vs_rest_sgd_logistic_regression"
@@ -916,6 +925,10 @@ def main() -> None:
             "max_iter": int(args.max_iter),
             "tol": float(args.tol),
             "class_weight": "balanced",
+            "seed": int(args.seed),
+            "fold_seed_formula": "seed + fold",
+            "selection_rule": "fixed_solver_termination_predictions_only",
+            "tuning_provenance": "explicit CLI configuration; no validation-driven tuning in this runner",
         }
 
     if args.reuse_predictions:
@@ -1019,12 +1032,46 @@ def main() -> None:
     _save_csv(per_class_path, per_class_rows(y, y_prob, class_names, args.threshold))
     _save_csv(fold_path, fold_rows)
 
+    training_units_per_fold = {
+        int(split["fold"]): int(len(split["tr_idx"])) for split in folds
+    }
+    comparator_contract = build_comparator_training_contract(
+        display_name=BASELINE_DISPLAY_NAME,
+        n_records=len(y),
+        folds=sorted(training_units_per_fold),
+        preprocessing={
+            "feature_transform": EVALUATED_TRANSFORM_NAME,
+            "statistics": ["MAX", "PPV"],
+            "standardization": (
+                "fit_on_training_fold_only" if args.standardize == "train_fold" else "none"
+            ),
+            "canonical_minirocket": False,
+        },
+        training_unit="record_feature_vector",
+        training_units_per_fold=training_units_per_fold,
+        batch_size=(int(args.batch_size) if args.backend == "torch_linear" else "full_matrix_one_vs_rest"),
+        epochs=(int(args.torch_epochs) if args.backend == "torch_linear" else "solver_max_iter"),
+        loss=classifier_params["loss"],
+        regularization={
+            "weight_decay": classifier_params.get("weight_decay", "not_applicable"),
+            "penalty": classifier_params.get("penalty", "none_beyond_weight_decay"),
+            "positive_class_weight": classifier_params.get("pos_weight", classifier_params.get("class_weight")),
+        },
+        amp=False,
+        seed=int(args.seed),
+        fold_seed_formula="seed + fold",
+        checkpoint_rule=classifier_params["selection_rule"],
+        tuning_provenance=classifier_params["tuning_provenance"],
+        protocol=PROTOCOL,
+    )
+
     summary = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
-        "feature_contract": "minirocket_raw",
+        "baseline_name": BASELINE_DISPLAY_NAME,
+        "feature_contract": FEATURE_CONTRACT,
         "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
         "canonical_minirocket": CANONICAL_MINIROCKET,
         "transform_contract": {
@@ -1036,6 +1083,7 @@ def main() -> None:
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
         "model": model_name,
         "classifier_params": classifier_params,
+        "comparator_contract": comparator_contract,
         "n_records": int(len(y)),
         "n_classes": int(y.shape[1]),
         "threshold": float(args.threshold),
@@ -1059,10 +1107,12 @@ def main() -> None:
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
         "protocol": PROTOCOL,
-        "feature_contract": "minirocket_raw",
+        "baseline_name": BASELINE_DISPLAY_NAME,
+        "feature_contract": FEATURE_CONTRACT,
         "evaluated_transform_name": EVALUATED_TRANSFORM_NAME,
         "canonical_minirocket": CANONICAL_MINIROCKET,
         "feature_preprocessing": "fold_train_standardization" if args.standardize == "train_fold" else "none",
+        "comparator_contract": comparator_contract,
         "freeze_contract": freeze_contract,
         "load_info": load_info,
         "artifacts": {

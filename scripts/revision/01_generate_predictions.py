@@ -52,6 +52,9 @@ from configs.config import (  # noqa: E402
     PATHS,
 )
 from scripts.revision.common import (  # noqa: E402
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_REFERENCE_COUNTS,
+    CHAPMAN_GROUP_SEMANTICS,
     CACHE_SCHEMA_VERSION,
     LOG_DIR,
     MANIFEST_DIR,
@@ -59,14 +62,22 @@ from scripts.revision.common import (  # noqa: E402
     PREDICTION_DIR,
     POWER_MEAN_IMPLEMENTATION,
     TABLE_DIR,
+    build_comparator_training_contract,
     ensure_revision_dirs,
     multilabel_metrics,
     power_mean,
     save_csv,
     save_json,
+    save_npz_compressed_atomic,
     sha256_file,
 )
-from src.provenance import record_order_fingerprint  # noqa: E402
+from src.provenance import (  # noqa: E402
+    canonical_json_sha256,
+    exclusive_cache_writer,
+    record_order_fingerprint,
+    save_npz_atomic,
+    source_bundle_sha256,
+)
 from src.features import (  # noqa: E402
     HRV36_CHECKPOINT_SEMANTICS,
     checkpoint_compatible_hrv36_contract,
@@ -83,6 +94,96 @@ AMP_DTYPE_NAME = (
     if DEVICE == "cuda"
     else "float32"
 )
+SUBJECT_GROUP_SEMANTICS = CHAPMAN_GROUP_SEMANTICS
+SUBJECT_GROUP_REFERENCE = CHAPMAN_GROUP_REFERENCE
+SUBJECT_GROUP_REFERENCE_COUNTS = CHAPMAN_GROUP_REFERENCE_COUNTS
+OOF_CACHE_PROVENANCE_SCHEMA_VERSION = 1
+
+
+def build_oof_cache_provenance(
+    *,
+    rocket_contract: dict,
+    dataset_record_fingerprint: str,
+) -> dict:
+    """Bind resumable feature/prediction caches to data, code, and ordering."""
+
+    archive_path = Path(PATHS["zip_path"]).resolve()
+    if not archive_path.is_file():
+        raise FileNotFoundError(
+            f"Canonical Chapman archive is required for cache provenance: {archive_path}"
+        )
+    source_paths = [
+        Path(__file__),
+        PROJECT_ROOT / "src" / "data_loader.py",
+        PROJECT_ROOT / "src" / "features.py",
+        PROJECT_ROOT / "src" / "provenance.py",
+        PROJECT_ROOT / "configs" / "config.py",
+    ]
+    contract = {
+        "schema_version": OOF_CACHE_PROVENANCE_SCHEMA_VERSION,
+        "source_archive_path": str(archive_path),
+        "source_archive_sha256": sha256_file(archive_path),
+        "input_signal_sha256": str(rocket_contract["input_signal_sha256"]),
+        "preprocessing_extractor_source_sha256": source_bundle_sha256(source_paths),
+        "rocket_extractor_source_sha256": str(
+            rocket_contract["extractor_source_sha256"]
+        ),
+        "rocket_transform_config_sha256": str(
+            rocket_contract["transform_config_sha256"]
+        ),
+        "dataset_record_order_fingerprint": dataset_record_fingerprint,
+        "evaluation_config_hash": EVALUATION_CONFIG_HASH,
+    }
+    contract["contract_sha256"] = canonical_json_sha256(contract)
+    return contract
+
+
+def scoped_cache_contract(
+    base_contract: dict,
+    *,
+    artifact_kind: str,
+    fold_num: int,
+    tr_idx: np.ndarray,
+    va_idx: np.ndarray | None,
+    source_config_hash: str,
+    checkpoint_sha256: str | None = None,
+) -> dict:
+    contract = {
+        "schema_version": OOF_CACHE_PROVENANCE_SCHEMA_VERSION,
+        "artifact_kind": artifact_kind,
+        "base_contract_sha256": base_contract["contract_sha256"],
+        "base_contract": base_contract,
+        "fold": int(fold_num),
+        "train_index_hash": index_fingerprint(tr_idx),
+        "validation_index_hash": (
+            index_fingerprint(va_idx) if va_idx is not None else None
+        ),
+        "source_config_hash": str(source_config_hash),
+        "checkpoint_sha256": checkpoint_sha256,
+    }
+    contract["contract_sha256"] = canonical_json_sha256(contract)
+    return contract
+
+
+def _pca_contract_path(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".contract.json")
+
+
+def _atomic_joblib_dump(payload: object, destination: Path, contract: dict) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    run_id = f"{os.getpid()}-{os.urandom(6).hex()}"
+    temporary = destination.with_name(
+        f".{destination.name}.partial.{run_id}"
+    )
+    with exclusive_cache_writer(destination):
+        try:
+            joblib.dump(payload, temporary)
+            with temporary.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            save_json(_pca_contract_path(destination), contract)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def oof_protocol_names(
@@ -267,6 +368,7 @@ def hydra_fold_cache_path(
     tr_idx: np.ndarray,
     va_idx: np.ndarray,
     source_config_hash: str,
+    cache_contract: dict,
 ) -> Path:
     cache_dir = Path(PATHS["cache_dir"]) / "revision_feature_cache"
     train_hash = index_fingerprint(tr_idx)
@@ -274,7 +376,7 @@ def hydra_fold_cache_path(
     name = (
         f"hydra_oof_v{CACHE_SCHEMA_VERSION}_{source_config_hash}_fold{fold_num}_"
         f"train{len(tr_idx)}_{train_hash}_val{len(va_idx)}_{val_hash}_"
-        f"D{CONFIG['hydra_dim']}.npz"
+        f"D{CONFIG['hydra_dim']}_P{cache_contract['contract_sha256'][:16]}.npz"
     )
     return cache_dir / name
 
@@ -283,6 +385,7 @@ def fold_pca_model_path(
     fold_num: int,
     tr_idx: np.ndarray,
     source_config_hash: str,
+    cache_contract: dict,
 ) -> Path:
     cache_dir = Path(
         os.environ.get("ECG_RAMBA_PCA_CACHE_DIR")
@@ -291,7 +394,8 @@ def fold_pca_model_path(
     train_hash = index_fingerprint(tr_idx)
     return cache_dir / (
         f"fold{fold_num}_pca_v{CACHE_SCHEMA_VERSION}_{source_config_hash}_"
-        f"train{len(tr_idx)}_{train_hash}_D{CONFIG['hydra_dim']}.joblib"
+        f"train{len(tr_idx)}_{train_hash}_D{CONFIG['hydra_dim']}_"
+        f"P{cache_contract['contract_sha256'][:16]}.joblib"
     )
 
 
@@ -302,14 +406,32 @@ def load_or_compute_fold_hydra(
     tr_idx: np.ndarray,
     va_idx: np.ndarray,
     source_config_hash: str,
+    cache_provenance: dict,
 ) -> tuple[np.ndarray, float, Path, bool]:
     from src.features import apply_pca, fit_pca_on_train
 
+    hydra_contract = scoped_cache_contract(
+        cache_provenance,
+        artifact_kind="fold_hydra_validation_features",
+        fold_num=fold_num,
+        tr_idx=tr_idx,
+        va_idx=va_idx,
+        source_config_hash=source_config_hash,
+    )
+    pca_contract = scoped_cache_contract(
+        cache_provenance,
+        artifact_kind="fold_train_pca",
+        fold_num=fold_num,
+        tr_idx=tr_idx,
+        va_idx=None,
+        source_config_hash=source_config_hash,
+    )
     cache_path = hydra_fold_cache_path(
         fold_num,
         tr_idx,
         va_idx,
         source_config_hash,
+        hydra_contract,
     )
     expected_shape = (len(va_idx), int(CONFIG["hydra_dim"]))
     if cache_path.exists():
@@ -318,10 +440,16 @@ def load_or_compute_fold_hydra(
             hydra_va = cached["hydra_va"]
             pca_var = float(cached["pca_explained_variance"])
             schema_version = int(cached["cache_schema_version"]) if "cache_schema_version" in cached.files else 0
+            cached_contract_sha = (
+                str(cached["cache_contract_sha256"].item())
+                if "cache_contract_sha256" in cached.files
+                else ""
+            )
             if (
                 hydra_va.shape == expected_shape
                 and hydra_va.dtype == np.float32
                 and schema_version == CACHE_SCHEMA_VERSION
+                and cached_contract_sha == hydra_contract["contract_sha256"]
             ):
                 print(f"✅ Loaded fold-aware Hydra/PCA cache for fold {fold_num}: {cache_path}", flush=True)
                 return hydra_va, pca_var, cache_path, True
@@ -340,10 +468,24 @@ def load_or_compute_fold_hydra(
         fold_num,
         tr_idx,
         source_config_hash,
+        pca_contract,
     )
     if pca_model_path.exists():
-        print(f"Loading training-fold PCA object: {pca_model_path}", flush=True)
-        pca = joblib.load(pca_model_path)
+        contract_path = _pca_contract_path(pca_model_path)
+        try:
+            cached_pca_contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached_pca_contract = {}
+        if cached_pca_contract == pca_contract:
+            print(f"Loading training-fold PCA object: {pca_model_path}", flush=True)
+            pca = joblib.load(pca_model_path)
+        else:
+            print(
+                f"PCA provenance mismatch for fold {fold_num}; refitting: {pca_model_path}",
+                flush=True,
+            )
+            pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
+            _atomic_joblib_dump(pca, pca_model_path, pca_contract)
     else:
         print(
             f"Fitting fold-aware PCA for fold {fold_num}: "
@@ -352,7 +494,7 @@ def load_or_compute_fold_hydra(
         )
         pca = fit_pca_on_train(X_rocket_raw[tr_idx], CONFIG["hydra_dim"])
         pca_model_path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(pca, pca_model_path)
+        _atomic_joblib_dump(pca, pca_model_path, pca_contract)
         print(f"Saved fold-aware PCA object: {pca_model_path}", flush=True)
     print(f"Transforming validation Hydra features for fold {fold_num}: val={len(va_idx)}", flush=True)
     hydra_va = apply_pca(pca, X_rocket_raw[va_idx])
@@ -360,7 +502,7 @@ def load_or_compute_fold_hydra(
     elapsed = time.time() - start
     print(f"PCA fold {fold_num} finished in {elapsed / 60:.1f} min | variance={pca_var:.6f}", flush=True)
     print(f"Saving fold-aware Hydra/PCA cache: {cache_path}", flush=True)
-    np.savez_compressed(
+    save_npz_atomic(
         cache_path,
         hydra_va=hydra_va.astype(np.float32),
         pca_explained_variance=np.asarray(pca_var, dtype=np.float32),
@@ -370,6 +512,8 @@ def load_or_compute_fold_hydra(
         evaluation_config_hash=np.asarray(EVALUATION_CONFIG_HASH),
         train_index_hash=np.asarray(index_fingerprint(tr_idx)),
         val_index_hash=np.asarray(index_fingerprint(va_idx)),
+        cache_contract_sha256=np.asarray(hydra_contract["contract_sha256"]),
+        cache_contract_json=np.asarray(json.dumps(hydra_contract, sort_keys=True)),
     )
     return hydra_va.astype(np.float32), pca_var, cache_path, False
 
@@ -379,12 +523,14 @@ def fold_prediction_cache_path(
     checkpoint_kind: str,
     checkpoint_sha256: str,
     fold_cache_dir: Path,
+    cache_contract: dict,
 ) -> Path:
     return (
         fold_cache_dir
         / (
             f"oof_fold{fold_num}_{checkpoint_kind}_{EVALUATION_CONFIG_HASH}_"
-            f"{checkpoint_sha256[:12]}_v{CACHE_SCHEMA_VERSION}.npz"
+            f"{checkpoint_sha256[:12]}_P{cache_contract['contract_sha256'][:16]}_"
+            f"v{CACHE_SCHEMA_VERSION}.npz"
         )
     )
 
@@ -410,6 +556,7 @@ def load_fold_prediction_cache(
     slice_index_all: list[np.ndarray],
     slice_fold_id_all: list[np.ndarray],
     checkpoint_sha256: str,
+    cache_contract: dict,
 ) -> dict | None:
     if not path.exists():
         return None
@@ -433,6 +580,11 @@ def load_fold_prediction_cache(
             if "aggregation_implementation" in data
             else ""
         )
+        cached_contract_sha = (
+            str(data["cache_contract_sha256"].item())
+            if "cache_contract_sha256" in data
+            else ""
+        )
         if (
             record_id.shape != va_idx.shape
             or not np.array_equal(record_id, va_idx.astype(np.int64))
@@ -442,6 +594,7 @@ def load_fold_prediction_cache(
             or schema_version != CACHE_SCHEMA_VERSION
             or cached_checkpoint_sha != checkpoint_sha256
             or aggregation_implementation != POWER_MEAN_IMPLEMENTATION
+            or cached_contract_sha != cache_contract["contract_sha256"]
         ):
             print(
                     f"WARNING: Fold cache contract/fingerprint mismatch; recomputing fold {fold_num}: {path}",
@@ -520,6 +673,7 @@ def save_fold_prediction_cache(
     slice_probs: np.ndarray | None,
     slice_rids: np.ndarray | None,
     checkpoint_sha256: str,
+    cache_contract: dict,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     valid_mask = fold_id[va_idx] >= 0
@@ -533,6 +687,8 @@ def save_fold_prediction_cache(
         "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         "checkpoint_sha256": np.asarray(checkpoint_sha256),
         "aggregation_implementation": np.asarray(POWER_MEAN_IMPLEMENTATION),
+        "cache_contract_sha256": np.asarray(cache_contract["contract_sha256"]),
+        "cache_contract_json": np.asarray(json.dumps(cache_contract, sort_keys=True)),
         "fold_summary_json": np.asarray(json.dumps(fold_summary, sort_keys=True)),
     }
     if slice_probs is not None and slice_rids is not None:
@@ -553,9 +709,7 @@ def save_fold_prediction_cache(
                 "slice_fold_id": np.empty((0,), dtype=np.int16),
             }
         )
-    tmp_path = path.with_name(path.name + ".partial.npz")
-    np.savez_compressed(tmp_path, **payload)
-    os.replace(tmp_path, path)
+    save_npz_atomic(path, **payload)
     print(f"💾 Saved fold prediction cache for fold {fold_num}: {path}", flush=True)
 
 
@@ -1050,7 +1204,15 @@ def generate_oof(args: argparse.Namespace) -> None:
     n_records, n_classes = y.shape
     dataset_record_fingerprint = record_order_fingerprint(subjects)
 
-    X_rocket_raw = generate_raw_rocket_cache(X, subjects)
+    X_rocket_raw, rocket_contract = generate_raw_rocket_cache(
+        X,
+        subjects,
+        return_contract=True,
+    )
+    cache_provenance = build_oof_cache_provenance(
+        rocket_contract=rocket_contract,
+        dataset_record_fingerprint=dataset_record_fingerprint,
+    )
     X_hrv = generate_hrv_cache(X, X_raw_amp, subjects) if CONFIG["use_hrv"] else np.zeros(
         (n_records, CONFIG["hrv_dim"]), dtype=np.float32
     )
@@ -1118,11 +1280,21 @@ def generate_oof(args: argparse.Namespace) -> None:
         source_config_hashes.add(source_config_hash)
         checkpoint_sha256 = ckpt_info["sha256"]
         checkpoint_infos.append(ckpt_info)
+        prediction_cache_contract = scoped_cache_contract(
+            cache_provenance,
+            artifact_kind="oof_fold_prediction",
+            fold_num=fold_num,
+            tr_idx=tr_idx,
+            va_idx=va_idx,
+            source_config_hash=source_config_hash,
+            checkpoint_sha256=checkpoint_sha256,
+        )
         fold_cache_path = fold_prediction_cache_path(
             fold_num,
             args.checkpoint_kind,
             checkpoint_sha256,
             args.fold_cache_dir,
+            prediction_cache_contract,
         )
         if args.resume_fold_cache and not args.force_rerun_folds:
             cached_summary = load_fold_prediction_cache(
@@ -1139,6 +1311,7 @@ def generate_oof(args: argparse.Namespace) -> None:
                 slice_index_all=slice_index_all,
                 slice_fold_id_all=slice_fold_id_all,
                 checkpoint_sha256=checkpoint_sha256,
+                cache_contract=prediction_cache_contract,
             )
             if cached_summary is not None:
                 del checkpoint_payload
@@ -1161,11 +1334,21 @@ def generate_oof(args: argparse.Namespace) -> None:
             tr_idx=tr_idx,
             va_idx=va_idx,
             source_config_hash=source_config_hash,
+            cache_provenance=cache_provenance,
+        )
+        pca_contract = scoped_cache_contract(
+            cache_provenance,
+            artifact_kind="fold_train_pca",
+            fold_num=fold_num,
+            tr_idx=tr_idx,
+            va_idx=None,
+            source_config_hash=source_config_hash,
         )
         pca_object_path = fold_pca_model_path(
             fold_num,
             tr_idx,
             source_config_hash,
+            pca_contract,
         )
         pca_variance.append(
             {
@@ -1223,6 +1406,7 @@ def generate_oof(args: argparse.Namespace) -> None:
                 slice_probs=None,
                 slice_rids=None,
                 checkpoint_sha256=checkpoint_sha256,
+                cache_contract=prediction_cache_contract,
             )
             continue
 
@@ -1286,6 +1470,7 @@ def generate_oof(args: argparse.Namespace) -> None:
             slice_probs=slice_probs if args.save_slice_probs else None,
             slice_rids=slice_rids if args.save_slice_probs else None,
             checkpoint_sha256=checkpoint_sha256,
+            cache_contract=prediction_cache_contract,
         )
 
         del model
@@ -1328,7 +1513,7 @@ def generate_oof(args: argparse.Namespace) -> None:
 
     artifact_stem = args.artifact_stem or oof_artifact_stem(args.checkpoint_kind)
     out_path = PREDICTION_DIR / f"{artifact_stem}_predictions.npz"
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         out_path,
         y_true=y,
         y_prob=oof_probs,
@@ -1363,7 +1548,7 @@ def generate_oof(args: argparse.Namespace) -> None:
     slice_out_path = None
     if args.save_slice_probs and slice_probs_all:
         slice_out_path = PREDICTION_DIR / f"{artifact_stem}_slice_predictions.npz"
-        np.savez_compressed(
+        save_npz_compressed_atomic(
             slice_out_path,
             slice_prob=np.concatenate(slice_probs_all, axis=0),
             record_id=np.concatenate(slice_record_index_all, axis=0),
@@ -1384,6 +1569,36 @@ def generate_oof(args: argparse.Namespace) -> None:
         )
         print(f"Wrote: {slice_out_path}")
 
+    group_sidecar_path = MANIFEST_DIR / f"{artifact_stem}_group_sidecar.npz"
+    if len(np.unique(subjects.astype(str))) != n_records:
+        raise RuntimeError(
+            "Cannot authenticate one-record-per-subject independence: "
+            f"records={n_records}, unique_subjects={len(np.unique(subjects.astype(str)))}"
+        )
+    save_npz_compressed_atomic(
+        group_sidecar_path,
+        record_id=np.arange(n_records, dtype=np.int64),
+        subject_id=np.asarray(subjects).astype(str),
+        group_id=np.asarray(subjects).astype(str),
+        group_unit=np.asarray("Chapman-Shaoxing/Ningbo source patient-record"),
+        group_semantics=np.asarray(SUBJECT_GROUP_SEMANTICS),
+        group_semantics_reference=np.asarray(SUBJECT_GROUP_REFERENCE),
+        source_patient_record_counts_json=np.asarray(
+            json.dumps(SUBJECT_GROUP_REFERENCE_COUNTS, sort_keys=True)
+        ),
+        one_record_per_group=np.asarray(True, dtype=np.bool_),
+        dataset_record_order_fingerprint=np.asarray(dataset_record_fingerprint),
+        record_file_sha256=np.asarray(sha256_file(out_path)),
+        source_archive_sha256=np.asarray(
+            sha256_file(Path(PATHS["zip_path"]))
+            if Path(PATHS["zip_path"]).is_file()
+            else ""
+        ),
+        producer_git_commit=np.asarray(git_commit),
+        created_utc=np.asarray(created_utc),
+    )
+    print(f"Wrote: {group_sidecar_path}")
+
     metrics = multilabel_metrics(y[valid_records], oof_probs[valid_records], threshold=threshold)
     class_summary_path = TABLE_DIR / f"{artifact_stem}_class_summary.csv"
     class_rows = per_class_summary_rows(
@@ -1403,7 +1618,74 @@ def generate_oof(args: argparse.Namespace) -> None:
         "slice_prediction_file": slice_out_path,
         "prediction_summary_json": summary_path,
         "class_summary_csv": class_summary_path,
+        "group_sidecar": group_sidecar_path,
     }
+
+    training_protocols = [
+        checkpoint.get("training_protocol") for checkpoint in checkpoint_infos
+    ]
+    if any(not isinstance(item, dict) for item in training_protocols):
+        raise RuntimeError(
+            "Canonical Full ECG-RAMBA checkpoints must declare training_protocol metadata"
+        )
+    unique_training_protocols = {
+        json.dumps(item, sort_keys=True, separators=(",", ":"))
+        for item in training_protocols
+    }
+    if len(unique_training_protocols) != 1:
+        raise RuntimeError("Full ECG-RAMBA fold checkpoints disagree on training_protocol")
+    training_protocol = dict(training_protocols[0])
+    selection_rules = {
+        str(checkpoint.get("selection_rule") or "") for checkpoint in checkpoint_infos
+    }
+    if len(selection_rules) != 1 or "" in selection_rules:
+        raise RuntimeError("Full ECG-RAMBA fold checkpoints disagree on selection_rule")
+    contract_display_name = (
+        "Full ECG-RAMBA"
+        if args.ablation_variant == "full"
+        else f"Structured ablation: {args.ablation_variant}"
+    )
+    comparator_contract = build_comparator_training_contract(
+        display_name=contract_display_name,
+        n_records=n_records,
+        folds=[int(checkpoint["fold"]) for checkpoint in checkpoint_infos],
+        preprocessing={
+            "raw_ecg": "12_lead_event_centric_slices",
+            "morphology": "fixed_seed_rocket_family_max_ppv_then_fold_train_pca",
+            "rhythm": checkpoint_compatible_hrv36_contract(),
+            "record_aggregation": f"power_mean_q{aggregation_q:g}",
+        },
+        training_unit="slice_count_not_recorded_in_legacy_checkpoint",
+        training_units_per_fold=None,
+        batch_size="not_recorded_in_legacy_checkpoint",
+        epochs=int(training_protocol["epochs"]),
+        loss={
+            "schedule": "bce_then_asymmetric",
+            "switch_epoch": int(training_protocol["loss_switch_epoch"]),
+            "bce_reduction": training_protocol["bce_reduction"],
+            "asymmetric_reduction": training_protocol["asymmetric_reduction"],
+        },
+        regularization={
+            "ema_decay": float(training_protocol["ema_decay"]),
+            "ema_scope": training_protocol["ema_scope"],
+            "weight_decay": "not_recorded_in_legacy_checkpoint",
+            "dropout": "not_recorded_in_legacy_checkpoint",
+        },
+        amp=str(training_protocol.get("amp_dtype", "disabled")).lower() != "disabled",
+        seed="not_recorded_in_legacy_checkpoint",
+        fold_seed_formula="not_recorded_in_legacy_checkpoint",
+        checkpoint_rule=next(iter(selection_rules)),
+        tuning_provenance=(
+            "legacy trained checkpoints; hyperparameter-search provenance is not "
+            "fully recorded, so learned-model comparisons remain same-fold only"
+        ),
+        protocol=protocol,
+        comparison_scope=(
+            "primary_model_reference"
+            if args.ablation_variant == "full"
+            else "same_folds_internal_ablation_not_budget_matched"
+        ),
+    )
 
     summary = {
         "dataset": "chapman_oof",
@@ -1412,6 +1694,17 @@ def generate_oof(args: argparse.Namespace) -> None:
         "source_config_hash": source_config_hash,
         "evaluation_config_hash": EVALUATION_CONFIG_HASH,
         "dataset_record_order_fingerprint": dataset_record_fingerprint,
+        "group_sidecar": str(group_sidecar_path),
+        "group_sidecar_sha256": sha256_file(group_sidecar_path),
+        "bootstrap_independence_contract": {
+            "unit": "Chapman-Shaoxing/Ningbo source patient-record",
+            "semantics": SUBJECT_GROUP_SEMANTICS,
+            "reference": SUBJECT_GROUP_REFERENCE,
+            "reference_patient_record_counts": SUBJECT_GROUP_REFERENCE_COUNTS,
+            "records": int(n_records),
+            "unique_groups": int(len(np.unique(subjects.astype(str)))),
+            "one_record_per_group": True,
+        },
         "prediction_file": str(out_path),
         "slice_prediction_file": str(slice_out_path) if slice_out_path else None,
         "class_summary_csv": str(class_summary_path),
@@ -1439,6 +1732,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         "pca_variance": pca_variance,
         "fold_summaries": fold_summaries,
         "checkpoints": checkpoint_infos,
+        "comparator_contract": comparator_contract,
         "metrics": metrics,
     }
     save_json(summary_path, summary)
@@ -1468,6 +1762,7 @@ def generate_oof(args: argparse.Namespace) -> None:
         },
         "outputs": output_info,
         "fold_summaries": fold_summaries,
+        "comparator_contract": comparator_contract,
         "slice_count_summary": summarize_slice_counts(record_slice_count),
         "prediction_quality": {
             "y_prob_shape": list(oof_probs.shape),

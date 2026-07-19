@@ -6,7 +6,7 @@ Design goals:
 - Always count RAW records from filesystem (~45k)
 - Never silently load stale / partial cache
 - Robust to corrupt .mat files
-- Subject-aware (record-id based)
+- Source-patient-aware under the reviewed PhysioNet one-patient-per-record contract
 - Reviewer-safe logging
 """
 
@@ -14,6 +14,7 @@ import os
 import tempfile
 import time
 import zipfile
+from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -27,7 +28,56 @@ from configs.config import (
     SNOMED_MAPPING
 )
 from src.features import extract_amplitude_features
-from src.provenance import record_order_fingerprint
+from src.provenance import (
+    canonical_json_sha256,
+    file_sha256,
+    record_order_fingerprint,
+    save_npz_atomic,
+    source_bundle_sha256,
+)
+
+
+CLEAN_CACHE_SCHEMA_VERSION = 3
+
+
+def clean_cache_source_contract(zip_path: str) -> dict:
+    """Bind a clean cache to the archive, preprocessing code, and parameters."""
+
+    explicit_archive_sha = os.environ.get("ECG_RAMBA_CHAPMAN_ARCHIVE_SHA256", "").strip()
+    archive_path = Path(zip_path)
+    archive_sha = explicit_archive_sha or (
+        file_sha256(archive_path) if archive_path.is_file() else ""
+    )
+    if len(archive_sha) != 64:
+        raise FileNotFoundError(
+            "A full Chapman archive SHA256 is required to authenticate the clean cache. "
+            f"Archive not available at {archive_path}; provide the archive or set "
+            "ECG_RAMBA_CHAPMAN_ARCHIVE_SHA256 to its reviewed 64-character digest."
+        )
+    source_sha = source_bundle_sha256(
+        [
+            Path(__file__),
+            Path(__file__).with_name("features.py"),
+            Path(__file__).resolve().parents[1] / "configs" / "config.py",
+        ]
+    )
+    preprocessing = {
+        "fs_hz": int(FS),
+        "sequence_length": int(SEQ_LEN),
+        "n_leads": 12,
+        "bandpass_hz": [0.5, 40.0],
+        "bandpass_order": 4,
+        "normalization": "per_lead_zscore_eps_1e-8",
+        "padding": "right_zero_or_head_truncate",
+        "label_mapping": sorted((str(code), int(index)) for code, index in SNOMED_MAPPING.items()),
+    }
+    return {
+        "cache_schema_version": CLEAN_CACHE_SCHEMA_VERSION,
+        "archive_sha256": archive_sha,
+        "preprocessing_source_sha256": source_sha,
+        "preprocessing_config_sha256": canonical_json_sha256(preprocessing),
+        "preprocessing_config": preprocessing,
+    }
 
 
 def env_flag(name: str, default: bool = True) -> bool:
@@ -112,7 +162,8 @@ def reset_or_relocate_extract_dir(extract_dir: str) -> str:
 # SUBJECT / RECORD ID
 # ============================================================
 def extract_record_id(hea_path: str) -> str:
-    # Chapman–Shaoxing: 1 record = 1 subject
+    # The combined Chapman-Shaoxing/Ningbo source reports one ECG record per patient.
+    # Freeze-time sidecars bind this identifier to the reviewed PhysioNet source contract.
     return os.path.basename(hea_path).replace('.hea', '')
 
 
@@ -189,6 +240,9 @@ def load_chapman_multilabel(paths: dict = None):
     print("=" * 80)
 
     cache_path = paths['data_cache']
+    extract_dir = paths['extract_dir']
+    zip_path = paths['zip_path']
+    clean_contract = clean_cache_source_contract(zip_path)
 
     # --------------------------------------------------------
     # 1️⃣ LOAD CACHE (ONLY IF VALID & COMPLETE)
@@ -207,6 +261,20 @@ def load_chapman_multilabel(paths: dict = None):
                         if "record_order_fingerprint" in d.files
                         else None
                     )
+                    stored_contract = {
+                        key: (
+                            d[key].item()
+                            if np.ndim(d[key]) == 0
+                            else d[key].tolist()
+                        )
+                        for key in [
+                            "cache_schema_version",
+                            "archive_sha256",
+                            "preprocessing_source_sha256",
+                            "preprocessing_config_sha256",
+                        ]
+                        if key in d.files
+                    }
                 record_fingerprint = validate_clean_cache_arrays(
                     X_cached,
                     y_cached,
@@ -220,6 +288,20 @@ def load_chapman_multilabel(paths: dict = None):
                     raise ValueError(
                         "Clean cache record-order fingerprint does not match its subjects array"
                     )
+                expected_contract = {
+                    key: clean_contract[key]
+                    for key in [
+                        "cache_schema_version",
+                        "archive_sha256",
+                        "preprocessing_source_sha256",
+                        "preprocessing_config_sha256",
+                    ]
+                }
+                if stored_contract != expected_contract:
+                    raise ValueError(
+                        "Clean cache provenance contract mismatch: "
+                        f"stored={stored_contract}, expected={expected_contract}"
+                    )
                 print(f"✅ Loaded cleaned data cache: {X_cached.shape}")
                 print(f"🔐 Record-order fingerprint: {record_fingerprint}")
                 return X_cached, y_cached, X_raw_amp_cached, subjects_cached
@@ -228,9 +310,6 @@ def load_chapman_multilabel(paths: dict = None):
                 print("⚠️  Cache load failed. Rebuilding from ZIP/raw files.")
         else:
             print(f"⏭️  Ignoring cleaned data cache because ECG_RAMBA_USE_CLEAN_CACHE=0: {cache_path}")
-
-    extract_dir = paths['extract_dir']
-    zip_path = paths['zip_path']
 
     # --------------------------------------------------------
     # 2️⃣ EXTRACTION SAFETY CHECK
@@ -351,13 +430,21 @@ def load_chapman_multilabel(paths: dict = None):
             flush=True,
         )
         print("   This can take a long time on Google Drive.", flush=True)
-        np.savez_compressed(
+        save_npz_atomic(
             cache_path,
             X=X,
             y=y,
             X_raw_amp=X_raw_amp,
             subjects=subjects,
             record_order_fingerprint=np.asarray(record_fingerprint),
+            cache_schema_version=np.asarray(CLEAN_CACHE_SCHEMA_VERSION, dtype=np.int16),
+            archive_sha256=np.asarray(clean_contract["archive_sha256"]),
+            preprocessing_source_sha256=np.asarray(
+                clean_contract["preprocessing_source_sha256"]
+            ),
+            preprocessing_config_sha256=np.asarray(
+                clean_contract["preprocessing_config_sha256"]
+            ),
         )
         print(f"💾 Cached cleaned dataset to: {cache_path}")
     else:

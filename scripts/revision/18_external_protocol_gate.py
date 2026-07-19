@@ -47,12 +47,12 @@ from scripts.revision.common import (  # noqa: E402
 
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
-GATE_SCHEMA_VERSION = 4
+GATE_SCHEMA_VERSION = 5
 METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
 EXPECTED_EXTERNAL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
-    "cpsc2021": "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
+    "cpsc2021": "annotation_aligned_full_10s_windows_strict_majority_af_or_normal_v2",
 }
 EXPECTED_CLASS_NAMES = {
     "ptbxl": tuple(PTB_SUPERCLASS_MAPPING.keys()),
@@ -420,6 +420,7 @@ def validate_dataset(
         manuscript_ready = bool(as_scalar(data, "manuscript_ready", False))
         aggregation_method = str(as_scalar(data, "aggregation_method", ""))
         aggregation_q = float(as_scalar(data, "aggregation_q", math.nan))
+        prediction_threshold = float(as_scalar(data, "threshold", math.nan))
         cache_schema = int(as_scalar(data, "cache_schema_version", 0))
         checkpoint_fingerprints = json_scalar(data, "checkpoint_fingerprints_json", [])
         pca_fingerprints = json_scalar(data, "pca_fingerprints_json", [])
@@ -466,6 +467,9 @@ def validate_dataset(
     checks["dataset_matches"] = npz_dataset == dataset and summary.get("dataset") == dataset
     checks["shape_matches"] = y_true.shape == y_prob.shape and y_true.ndim == 2
     checks["record_id_count_matches"] = len(record_id) == y_true.shape[0]
+    checks["record_ids_unique"] = bool(
+        checks["record_id_count_matches"] and len(np.unique(record_id.astype(str))) == len(record_id)
+    )
     checks["group_id_present"] = "group_id" in prediction_keys and len(group_id) == y_true.shape[0]
     checks["split_id_present"] = "split_id" in prediction_keys and len(split_id) == y_true.shape[0]
     checks["group_ids_nonempty"] = bool(
@@ -494,6 +498,14 @@ def validate_dataset(
         aggregation_q,
         float(CONFIG["power_mean_q"]),
         rel_tol=1e-6,
+    )
+    summary_threshold = float(summary.get("threshold", math.nan))
+    checks["fixed_threshold_0p5"] = math.isclose(float(args.threshold), 0.5, rel_tol=0.0, abs_tol=0.0)
+    checks["prediction_threshold_matches"] = math.isclose(
+        prediction_threshold, float(args.threshold), rel_tol=0.0, abs_tol=1e-7
+    )
+    checks["summary_threshold_matches"] = math.isclose(
+        summary_threshold, float(args.threshold), rel_tol=0.0, abs_tol=1e-7
     )
     checks["cache_schema_current"] = cache_schema == CACHE_SCHEMA_VERSION
     checks["oof_run_manifest_exists"] = bool(args.oof_run_manifest.exists() and args.oof_run_manifest.stat().st_size > 0)
@@ -548,6 +560,32 @@ def validate_dataset(
     checks["slice_source_marked_experimental"] = (
         slice_evidence_status == "experimental" and slice_manuscript_ready is False
     )
+    reconstructed = np.full_like(y_prob, np.nan, dtype=np.float64)
+    if slice_record_index_valid and slice_prob.ndim == 2 and slice_prob.shape[1] == y_prob.shape[1]:
+        counts = np.bincount(slice_record_index_int, minlength=len(record_id)).astype(np.int64)
+        sums = np.zeros_like(y_prob, dtype=np.float64)
+        np.add.at(
+            sums,
+            slice_record_index_int,
+            np.power(np.asarray(slice_prob, dtype=np.float64), float(CONFIG["power_mean_q"])),
+        )
+        valid_counts = counts > 0
+        reconstructed[valid_counts] = np.power(
+            sums[valid_counts] / counts[valid_counts, None],
+            1.0 / float(CONFIG["power_mean_q"]),
+        )
+        reconstruction_error = (
+            float(np.max(np.abs(reconstructed[valid_counts] - y_prob[valid_counts])))
+            if np.any(valid_counts)
+            else math.inf
+        )
+    else:
+        counts = np.zeros(len(record_id), dtype=np.int64)
+        reconstruction_error = math.inf
+    checks["all_records_have_slices"] = bool(len(counts) == len(record_id) and np.all(counts > 0))
+    checks["q3_reconstruction_within_tolerance"] = bool(
+        checks["all_records_have_slices"] and reconstruction_error <= 1e-6
+    )
 
     if not checks["dataset_matches"]:
         issues.append("dataset metadata mismatch")
@@ -555,6 +593,8 @@ def validate_dataset(
         issues.append(f"label/prediction shape mismatch: {y_true.shape} vs {y_prob.shape}")
     if not checks["record_id_count_matches"]:
         issues.append("record_id count does not match y_true rows")
+    if not checks["record_ids_unique"]:
+        issues.append("external record_id values must be unique")
     if not checks["group_id_present"] or not checks["group_ids_nonempty"]:
         issues.append("group_id is missing, empty, or does not match prediction rows")
     if not checks["split_id_present"] or not checks["split_ids_nonempty"]:
@@ -577,6 +617,10 @@ def validate_dataset(
         issues.append("manifest artifact must remain evidence_status=experimental/manuscript_ready=false")
     if not checks["aggregation_power_mean_q"]:
         issues.append("external predictions must use shared Power Mean Q protocol")
+    if not checks["fixed_threshold_0p5"]:
+        issues.append("manuscript-ready external gate requires the frozen threshold 0.5")
+    if not checks["prediction_threshold_matches"] or not checks["summary_threshold_matches"]:
+        issues.append("prediction/summary threshold metadata does not match the frozen threshold")
     if not checks["cache_schema_current"]:
         issues.append("external prediction cache schema is stale")
     if not checks["oof_run_manifest_exists"]:
@@ -608,6 +652,8 @@ def validate_dataset(
         issues.append("slice prediction cache schema is stale")
     if not checks["slice_source_marked_experimental"]:
         issues.append("slice artifact must remain evidence_status=experimental/manuscript_ready=false")
+    if not checks["all_records_have_slices"] or not checks["q3_reconstruction_within_tolerance"]:
+        issues.append(f"record probabilities do not reconstruct from slices with Q=3 (max_abs={reconstruction_error})")
 
     load_summary = summary.get("load_summary", {})
     expected_label_protocol = EXPECTED_EXTERNAL_PROTOCOLS[dataset]
@@ -669,6 +715,19 @@ def validate_dataset(
         checks["cpsc_windows_loaded"] = int(load_summary.get("loaded_windows", 0)) == int(y_true.shape[0])
         checks["cpsc_reports_negative_windows"] = int(load_summary.get("negative_windows", 0)) > 0
         checks["cpsc_reports_ambiguous_windows"] = "ambiguous_windows" in load_summary
+        checks["cpsc_full_10s_primary"] = bool(
+            load_summary.get("primary_requires_full_window") is True
+            and int(load_summary.get("primary_window_length_samples", -1)) == 5000
+            and math.isclose(float(load_summary.get("primary_window_length_seconds", math.nan)), 10.0)
+        )
+        checks["cpsc_strict_majority_primary"] = bool(
+            load_summary.get("primary_requires_strict_majority") is True
+            and load_summary.get("primary_excludes_transition_windows") is True
+        )
+        checks["cpsc_exclusion_counts_present"] = all(
+            key in load_summary
+            for key in ("partial_windows_excluded", "tie_windows_excluded", "transition_windows_excluded")
+        )
         audit_path = resolve_payload_path(load_summary.get("annotation_audit_csv"))
         checks["cpsc_annotation_audit_exists"] = bool(
             load_summary.get("annotation_audit_csv")
@@ -690,6 +749,12 @@ def validate_dataset(
             issues.append("CPSC gate requires explicitly counted normal/negative windows")
         if not checks["cpsc_reports_ambiguous_windows"]:
             issues.append("CPSC gate requires ambiguous_windows audit count")
+        if not checks["cpsc_full_10s_primary"]:
+            issues.append("CPSC primary gate requires complete 10-second windows only")
+        if not checks["cpsc_strict_majority_primary"]:
+            issues.append("CPSC primary gate requires strict-majority non-transition windows")
+        if not checks["cpsc_exclusion_counts_present"]:
+            issues.append("CPSC gate requires explicit partial/tie/transition exclusion counts")
         if not checks["cpsc_annotation_audit_exists"]:
             issues.append("CPSC gate requires a non-empty per-record annotation audit table")
         if not checks["cpsc_group_unit_source_record"]:
@@ -703,8 +768,13 @@ def validate_dataset(
         manifest_archive = manifest.get("archive", {})
         checks["archive_fingerprint_matches"] = manifest_archive.get("fingerprint") == file_fingerprint(archive)
         checks["archive_size_matches"] = int(manifest_archive.get("size_bytes", -1)) == archive.stat().st_size
-        if not checks["archive_fingerprint_matches"] or not checks["archive_size_matches"]:
-            issues.append("archive fingerprint/size mismatch")
+        checks["archive_sha256_matches"] = manifest_archive.get("sha256") == sha256_file(archive)
+        if (
+            not checks["archive_fingerprint_matches"]
+            or not checks["archive_size_matches"]
+            or not checks["archive_sha256_matches"]
+        ):
+            issues.append("archive SHA256/fingerprint/size mismatch")
     else:
         checks["archive_exists"] = False
         issues.append(f"archive missing: {archive}")

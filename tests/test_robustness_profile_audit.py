@@ -4,7 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.revision.common import sha256_file
+from scripts.revision.common import (
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
+    sha256_file,
+)
 from scripts.revision.robustness_profile_audit import (
     BOOTSTRAP_UNIT,
     CI_SCOPE,
@@ -43,8 +48,11 @@ class RobustnessProfileAuditTests(unittest.TestCase):
             json.dumps(
                 {
                     "bootstrap": {
-                        "unit": "chapman_record_subject",
-                        "independence_contract": "one_chapman_record_per_subject",
+                        "unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                        "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+                        "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+                        "group_sidecar": "manifests/test_group_sidecar.npz",
+                        "group_sidecar_sha256": "1" * 64,
                     }
                 }
             ),
@@ -52,7 +60,10 @@ class RobustnessProfileAuditTests(unittest.TestCase):
         )
         bootstrap_contract = {
             "unit": BOOTSTRAP_UNIT,
-            "independence_contract": "one_chapman_record_per_subject",
+            "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+            "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+            "group_sidecar": "manifests/test_group_sidecar.npz",
+            "group_sidecar_sha256": "1" * 64,
             "source": bootstrap_source.relative_to(PROJECT_ROOT).as_posix(),
             "source_sha256": sha256_file(bootstrap_source),
             "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
