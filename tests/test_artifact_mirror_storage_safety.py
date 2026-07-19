@@ -51,6 +51,36 @@ class ArtifactMirrorStorageSafetyTests(unittest.TestCase):
                 )
             )
 
+    def test_source_conflict_override_is_limited_to_selected_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            selected = revision / "metrics" / "selected.json"
+            unselected = revision / "tables" / "unselected.csv"
+            selected.parent.mkdir(parents=True)
+            unselected.parent.mkdir(parents=True)
+            selected.write_bytes(b"selected-old")
+            unselected.write_bytes(b"unselected-old")
+            self._publish(revision, mirror)
+
+            selected.write_bytes(b"selected-new")
+            unselected.write_bytes(b"unselected-new")
+            manifest_path = self._publish(
+                revision,
+                mirror,
+                source_conflict_policy="source",
+                include_paths=["metrics/selected.json"],
+            )
+
+            self.assertEqual((mirror / "metrics" / "selected.json").read_bytes(), b"selected-new")
+            self.assertEqual((mirror / "tables" / "unselected.csv").read_bytes(), b"unselected-old")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["source_selection"]["include_paths"],
+                ["metrics/selected.json"],
+            )
+
     def test_truncated_staging_never_replaces_complete_artifact_or_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             revision, mirror, source, destination = self._seed_published_artifact(

@@ -239,7 +239,14 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("EXTERNAL_GATE_INPUT_PATHS", source)
         self.assertIn("external_gate_input_restore.log", source)
         self.assertIn("external_protocol_gate_immediate_mirror_publish.log", source)
-        self.assertIn("External gate input contract: all 15 artifacts are present", source)
+        self.assertIn(
+            "External gate input contract: all {len(EXTERNAL_GATE_INPUT_PATHS)} artifacts are present",
+            source,
+        )
+        self.assertIn("table_georgia_snomed_code_inventory.csv", source)
+        self.assertIn("table_cpsc2021_annotation_audit.csv", source)
+        self.assertIn("external source-bound reuse contract ready", source)
+        self.assertIn("--source-conflict-policy source", source)
         self.assertIn("RUN_LEGACY_ROW_SPLIT_SCORE_CALIBRATION = False", source)
         self.assertIn("revision_artifacts' / 'reports' / 'revision", source)
         self.assertIn("def require_gpu_inference_runtime", source)
@@ -270,8 +277,15 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("external_reuse_diagnostics", source)
         self.assertIn("semantic contract invalid", source)
         self.assertIn("Pending external re-export datasets", source)
-        self.assertIn("slice_data['slice_prob']", source)
-        self.assertNotIn("slice_data['y_prob']", source)
+        self.assertIn("validate_external_prediction_reuse", source)
+        reuse_contract = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "revision"
+            / "external_reuse_contract.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('slice_data["slice_prob"]', reuse_contract)
+        self.assertNotIn('slice_data["y_prob"]', reuse_contract)
         self.assertIn("BATCH_SIZE = 256", source)
         self.assertIn("NUM_WORKERS = 2", source)
         self.assertIn("INSTALL_MODEL_DEPS = 'auto'", source)

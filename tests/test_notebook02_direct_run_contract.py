@@ -35,6 +35,19 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         )
         self.assertIn("'status': 'removed_unpublished_active'", self.source)
 
+    def test_external_reuse_and_gate_handoff_are_source_bound(self):
+        self.assertIn("validate_external_prediction_reuse", self.source)
+        self.assertIn("external source-bound reuse contract ready", self.source)
+        self.assertIn("external_archive_hash_cache", self.source)
+        self.assertIn("table_georgia_snomed_code_inventory.csv", self.source)
+        self.assertIn("table_cpsc2021_annotation_audit.csv", self.source)
+        self.assertIn("External gate source-bound preflight:", self.source)
+        self.assertIn("stopped before bootstrap because restored prediction artifacts are stale", self.source)
+        self.assertIn("reports/revision/predictions/oof_final_ema_predictions.npz", self.source)
+        self.assertIn("reports/revision/manifests/oof_final_ema_freeze_manifest.json", self.source)
+        self.assertIn("--source-conflict-policy source", self.source)
+        self.assertIn("--include-path", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

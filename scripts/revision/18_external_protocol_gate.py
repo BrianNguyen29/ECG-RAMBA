@@ -44,13 +44,15 @@ from scripts.revision.common import (  # noqa: E402
     save_json,
     sha256_file,
 )
+from src.aggregation import aggregate_record_probabilities  # noqa: E402
 
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
 NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"
 NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1
-GATE_SCHEMA_VERSION = 5
+GATE_SCHEMA_VERSION = 6
 METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
+AGGREGATION_IMPLEMENTATION_PATH = PROJECT_ROOT / "src" / "aggregation.py"
 EXPECTED_EXTERNAL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
@@ -201,6 +203,7 @@ def gate_cache_key(
         "n_boot": int(args.n_boot),
         "seed": int(args.seed),
         "metric_implementation_sha256": sha256_file(METRIC_IMPLEMENTATION_PATH),
+        "aggregation_implementation_sha256": sha256_file(AGGREGATION_IMPLEMENTATION_PATH),
         "external_root": project_relative(args.external_root),
         "oof_run_manifest": artifact(args.oof_run_manifest),
         "source_artifacts": {name: artifact(path) for name, path in sorted(required_paths.items())},
@@ -562,26 +565,25 @@ def validate_dataset(
     checks["slice_source_marked_experimental"] = (
         slice_evidence_status == "experimental" and slice_manuscript_ready is False
     )
-    reconstructed = np.full_like(y_prob, np.nan, dtype=np.float64)
     if slice_record_index_valid and slice_prob.ndim == 2 and slice_prob.shape[1] == y_prob.shape[1]:
-        counts = np.bincount(slice_record_index_int, minlength=len(record_id)).astype(np.int64)
-        sums = np.zeros_like(y_prob, dtype=np.float64)
-        np.add.at(
-            sums,
-            slice_record_index_int,
-            np.power(np.asarray(slice_prob, dtype=np.float64), float(CONFIG["power_mean_q"])),
-        )
-        valid_counts = counts > 0
-        reconstructed[valid_counts] = np.power(
-            sums[valid_counts] / counts[valid_counts, None],
-            1.0 / float(CONFIG["power_mean_q"]),
-        )
-        reconstruction_error = (
-            float(np.max(np.abs(reconstructed[valid_counts] - y_prob[valid_counts])))
-            if np.any(valid_counts)
-            else math.inf
-        )
+        try:
+            reconstructed, reconstructed_valid, counts = aggregate_record_probabilities(
+                np.asarray(slice_prob, dtype=np.float32),
+                slice_record_index_int,
+                len(record_id),
+                q=float(CONFIG["power_mean_q"]),
+            )
+            reconstruction_error = (
+                float(np.max(np.abs(reconstructed[reconstructed_valid] - y_prob[reconstructed_valid])))
+                if np.any(reconstructed_valid)
+                else math.inf
+            )
+        except (TypeError, ValueError, FloatingPointError):
+            reconstructed_valid = np.zeros(len(record_id), dtype=bool)
+            counts = np.zeros(len(record_id), dtype=np.int64)
+            reconstruction_error = math.inf
     else:
+        reconstructed_valid = np.zeros(len(record_id), dtype=bool)
         counts = np.zeros(len(record_id), dtype=np.int64)
         reconstruction_error = math.inf
     checks["all_records_have_slices"] = bool(len(counts) == len(record_id) and np.all(counts > 0))
@@ -771,12 +773,13 @@ def validate_dataset(
         checks["archive_fingerprint_matches"] = manifest_archive.get("fingerprint") == file_fingerprint(archive)
         checks["archive_size_matches"] = int(manifest_archive.get("size_bytes", -1)) == archive.stat().st_size
         checks["archive_sha256_matches"] = manifest_archive.get("sha256") == sha256_file(archive)
-        if (
-            not checks["archive_fingerprint_matches"]
-            or not checks["archive_size_matches"]
-            or not checks["archive_sha256_matches"]
-        ):
-            issues.append("archive SHA256/fingerprint/size mismatch")
+        if not checks["archive_size_matches"] or not checks["archive_sha256_matches"]:
+            issues.append("archive content SHA256/size mismatch")
+        elif not checks["archive_fingerprint_matches"]:
+            warnings.append(
+                "Archive path/mtime fingerprint differs, but content SHA256 and size match; "
+                "content identity remains valid."
+            )
     else:
         checks["archive_exists"] = False
         issues.append(f"archive missing: {archive}")

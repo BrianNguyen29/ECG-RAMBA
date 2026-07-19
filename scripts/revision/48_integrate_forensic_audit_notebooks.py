@@ -41,6 +41,10 @@ REVISION_CAPABILITY_REQUIREMENTS = {
         'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
         'NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION': 1,
     },
+    'scripts/revision/external_reuse_contract.py': {
+        'EXTERNAL_REUSE_CAPABILITY': 'source_bound_external_reuse_v1',
+        'EXTERNAL_REUSE_SCHEMA_VERSION': 1,
+    },
 }
 REVISION_TOKEN_REQUIREMENTS = {
     'scripts/revision/common.py': [
@@ -75,6 +79,7 @@ REVISION_TOKEN_REQUIREMENTS = {
         'georgia_mapping_inventory',
         'cpsc_annotation_audit',
         'metric_implementation_sha256',
+        'aggregation_implementation_sha256',
         'positive_label_multilabel_reduction',
     ],
     'scripts/revision/31_generate_external_comparator_predictions.py': [
@@ -172,6 +177,38 @@ if compatibility_failures:
     )
 print('Revision capability preflight: OK')
 # END FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT
+'''
+
+
+NOTEBOOK02_EXTERNAL_REUSE_FUNCTION = r'''def external_prediction_ready(dataset):
+    from scripts.revision.external_reuse_contract import validate_external_prediction_reuse
+
+    mirror_root = Path(globals().get(
+        'MIRROR_REVISION_ROOT',
+        DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision',
+    ))
+    result = validate_external_prediction_reuse(
+        dataset,
+        revision_root=Path('reports/revision'),
+        archive_path=external_archives.get(dataset),
+        exporter_path=Path('scripts/revision/03_generate_external_predictions.py'),
+        oof_path=Path('reports/revision/predictions/oof_final_ema_predictions.npz'),
+        freeze_path=Path('reports/revision/manifests/oof_final_ema_freeze_manifest.json'),
+        archive_hash_cache_dir=mirror_root / 'manifests' / 'external_archive_hash_cache',
+        threshold=0.5,
+        q=3.0,
+    )
+    reasons = list(result.get('reasons', []))
+    external_reuse_diagnostics[dataset] = reasons
+    print(f'{dataset} external source-bound reuse contract ready={result.get("ready", False)}')
+    for path in external_required_artifacts(dataset):
+        print(f'  {path}: exists={path.exists()} size={path.stat().st_size if path.exists() else None}')
+    if reasons:
+        print('  reuse rejected:', '; '.join(reasons))
+    diagnostics = result.get('diagnostics', {})
+    if diagnostics.get('q3_reconstruction_max_abs') is not None:
+        print('  Q=3 reconstruction max_abs:', diagnostics['q3_reconstruction_max_abs'])
+    return bool(result.get('ready', False))
 '''
 
 
@@ -672,6 +709,195 @@ def integrate_notebook02() -> None:
                 "    Path('reports/revision/manifests/oof_final_ema_group_sidecar.npz'),\n",
                 1,
             )
+        if "def external_prediction_ready(dataset):" in text:
+            pattern = re.compile(
+                r"def external_prediction_ready\(dataset\):\n.*?(?=\n\ndef resolve_auto_flag)",
+                flags=re.DOTALL,
+            )
+            text, replacement_count = pattern.subn(
+                NOTEBOOK02_EXTERNAL_REUSE_FUNCTION.rstrip(),
+                text,
+            )
+            if replacement_count != 1:
+                raise RuntimeError(
+                    f"Notebook 02 external reuse function replacement_count={replacement_count}"
+                )
+            text = text.replace(
+                "artifact_mirror.py publish --verify-existing size --mirror-root",
+                "artifact_mirror.py publish --verify-existing size --source-conflict-policy source --mirror-root",
+            )
+            broad_dataset_publish = """            run(
+                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size --source-conflict-policy source --mirror-root "{mirror_root}"',
+                log_path=f'reports/revision/logs/{dataset}_external_export_mirror_publish.log',
+            )"""
+            selected_dataset_publish = """            external_publish_paths = [
+                *external_required_artifacts(dataset),
+                Path('reports/revision/experimental/external/external_summary_experimental.csv'),
+            ]
+            if dataset == 'georgia':
+                external_publish_paths.append(GEORGIA_CODE_INVENTORY_OUT)
+            elif dataset == 'cpsc2021':
+                external_publish_paths.append(CPSC_ANNOTATION_AUDIT_OUT)
+            external_publish_args = ' '.join(
+                f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+                for path in external_publish_paths
+            )
+            run(
+                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',
+                log_path=f'reports/revision/logs/{dataset}_external_export_mirror_publish.log',
+            )"""
+            if broad_dataset_publish in text:
+                text = text.replace(broad_dataset_publish, selected_dataset_publish, 1)
+            broad_final_publish = """if external_export_ran:
+    print('All successful external datasets were already published individually; refreshing the merged manifest.')
+    mirror_root = globals().get('stable_mirror', DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision')
+    run(
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size --source-conflict-policy source --mirror-root "{mirror_root}"',
+        log_path='reports/revision/logs/external_export_immediate_mirror_publish.log',
+    )"""
+            selected_final_publish = """if external_export_ran:
+    print('Successful external exports were published with exact source-path selection; no broad mirror overwrite is needed.')"""
+            if broad_final_publish in text:
+                text = text.replace(broad_final_publish, selected_final_publish, 1)
+        if "EXTERNAL_GATE_INPUT_PATHS = [" in text:
+            gate_list_end = """        Path(f'reports/revision/experimental/external/{dataset}/{dataset}_full_prediction_run_manifest.json'),
+    ]
+]"""
+            gate_list_replacement = gate_list_end + """
+EXTERNAL_GATE_INPUT_PATHS.extend([
+    Path('reports/revision/tables/table_georgia_snomed_code_inventory.csv'),
+    Path('reports/revision/tables/table_cpsc2021_annotation_audit.csv'),
+])"""
+            if "table_georgia_snomed_code_inventory.csv" not in text:
+                if gate_list_end not in text:
+                    raise RuntimeError("Notebook 02 external gate input-list anchor missing")
+                text = text.replace(gate_list_end, gate_list_replacement, 1)
+            gate_contract_extension = """EXTERNAL_GATE_INPUT_PATHS.extend([
+    Path('reports/revision/predictions/oof_final_ema_predictions.npz'),
+    Path('reports/revision/manifests/oof_final_ema_freeze_manifest.json'),
+    Path('reports/revision/manifests/oof_final_ema_prediction_run_manifest.json'),
+])"""
+            if "reports/revision/predictions/oof_final_ema_predictions.npz" not in text:
+                audit_extension = """EXTERNAL_GATE_INPUT_PATHS.extend([
+    Path('reports/revision/tables/table_georgia_snomed_code_inventory.csv'),
+    Path('reports/revision/tables/table_cpsc2021_annotation_audit.csv'),
+])"""
+                if audit_extension not in text:
+                    raise RuntimeError("Notebook 02 external gate audit-input anchor missing")
+                text = text.replace(
+                    audit_extension,
+                    audit_extension + "\n" + gate_contract_extension,
+                    1,
+                )
+            text = text.replace("total=15.", "total={len(EXTERNAL_GATE_INPUT_PATHS)}.")
+            text = text.replace(
+                "External gate input contract: all 15 artifacts are present in the active repo.",
+                "External gate input contract: all {len(EXTERNAL_GATE_INPUT_PATHS)} artifacts are present in the active repo.",
+            )
+            text = text.replace(
+                "print('External gate input contract: all {len(EXTERNAL_GATE_INPUT_PATHS)} artifacts are present in the active repo.')",
+                "print(f'External gate input contract: all {len(EXTERNAL_GATE_INPUT_PATHS)} artifacts are present in the active repo.')",
+            )
+            source_preflight_anchor = (
+                "print(f'External gate input contract: all {len(EXTERNAL_GATE_INPUT_PATHS)} "
+                "artifacts are present in the active repo.')\n\n"
+            )
+            if "External gate source-bound preflight:" not in text:
+                source_preflight = r'''# Fail before the long bootstrap when restored predictions were produced by a
+# stale exporter/protocol/archive. This validator is CPU-only and has no Mamba/WFDB dependency.
+from scripts.revision.external_reuse_contract import validate_external_prediction_reuse
+
+gate_archive_names = {
+    'ptbxl': ['PTB-XL.zip', 'ptb-xl.zip', 'ptbxl.zip'],
+    'georgia': ['Georgia.zip'],
+    'cpsc2021': ['cpsc2021.zip', 'CPSC2021.zip'],
+}
+gate_source_preflight = {}
+for dataset in ['ptbxl', 'georgia', 'cpsc2021']:
+    archive = next(
+        (DRIVE_ROOT / name for name in gate_archive_names[dataset] if (DRIVE_ROOT / name).is_file()),
+        None,
+    )
+    result = validate_external_prediction_reuse(
+        dataset,
+        revision_root=Path('reports/revision'),
+        archive_path=archive,
+        exporter_path=Path('scripts/revision/03_generate_external_predictions.py'),
+        oof_path=Path('reports/revision/predictions/oof_final_ema_predictions.npz'),
+        freeze_path=Path('reports/revision/manifests/oof_final_ema_freeze_manifest.json'),
+        archive_hash_cache_dir=gate_restore_root / 'manifests' / 'external_archive_hash_cache',
+        threshold=0.5,
+        q=3.0,
+    )
+    gate_source_preflight[dataset] = result
+    print(
+        f'External gate source-bound preflight: dataset={dataset} '
+        f'ready={result.get("ready", False)} reasons={result.get("reasons", [])}'
+    )
+stale_gate_inputs = {
+    dataset: result.get('reasons', [])
+    for dataset, result in gate_source_preflight.items()
+    if not result.get('ready', False)
+}
+if stale_gate_inputs:
+    details = ' ; '.join(
+        f'{dataset}=' + ','.join(reasons)
+        for dataset, reasons in stale_gate_inputs.items()
+    )
+    raise RuntimeError(
+        'External protocol gate stopped before bootstrap because restored prediction artifacts are stale: '
+        + details
+        + '. Reconnect an A100 High-RAM runtime and run Experimental External Prediction Commands '
+        'with RUN_PTBXL_EXPORT=RUN_GEORGIA_EXPORT=RUN_CPSC2021_EXPORT="auto". '
+        'Wait for External cache handoff: VERIFIED before returning to this CPU gate cell.'
+    )
+
+'''
+                if source_preflight_anchor not in text:
+                    raise RuntimeError("Notebook 02 gate source-preflight anchor missing")
+                text = text.replace(
+                    source_preflight_anchor,
+                    source_preflight_anchor + source_preflight,
+                    1,
+                )
+            text = text.replace(
+                "artifact_mirror.py publish --verify-existing size --mirror-root",
+                "artifact_mirror.py publish --verify-existing size --source-conflict-policy source --mirror-root",
+            )
+            gate_run_anchor = "if RUN_EXTERNAL_PROTOCOL_GATE:\n"
+            if "gate_publish_args = ' '.join(" not in text:
+                gate_publish_setup = """GATE_OUTPUT_PATHS = [
+    Path('reports/revision/metrics/external_protocol_gate_summary.csv'),
+    *[
+        path
+        for dataset in ['ptbxl', 'georgia', 'cpsc2021']
+        for path in [
+            Path(f'reports/revision/metrics/external_{dataset}_protocol_gate.json'),
+            Path(f'reports/revision/tables/table_external_{dataset}_label_mapping.csv'),
+            Path(f'reports/revision/tables/table_external_{dataset}_metrics.csv'),
+            Path(f'reports/revision/manifests/external_{dataset}_protocol_gate_manifest.json'),
+        ]
+    ],
+]
+gate_publish_args = ' '.join(
+    f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+    for path in GATE_OUTPUT_PATHS
+)
+
+"""
+                if gate_run_anchor not in text:
+                    raise RuntimeError("Notebook 02 external gate run anchor missing")
+                text = text.replace(gate_run_anchor, gate_publish_setup + gate_run_anchor, 1)
+            broad_gate_publish = (
+                "f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size "
+                "--source-conflict-policy source --mirror-root \"{gate_restore_root}\"'"
+            )
+            selected_gate_publish = (
+                "f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size "
+                "--source-conflict-policy source {gate_publish_args} --mirror-root \"{gate_restore_root}\"'"
+            )
+            text = text.replace(broad_gate_publish, selected_gate_publish, 1)
         set_source(cell, text)
     install_run_history(notebook)
     save(name, notebook)

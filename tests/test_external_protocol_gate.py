@@ -94,6 +94,12 @@ class ExternalProtocolGateTests(unittest.TestCase):
                 ],
                 dtype=np.float32,
             )
+            # The shared exporter clips exact zero probabilities to 1e-6 inside
+            # power_mean. The gate must use the same implementation rather than
+            # rejecting a valid export at the numerical tolerance boundary.
+            slice_prob = y_prob.copy()
+            slice_prob[0, 1] = 0.0
+            y_prob[0, 1] = 1e-6
             prediction = output / "ptbxl_full_predictions.npz"
             np.savez_compressed(
                 prediction,
@@ -116,7 +122,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
             )
             np.savez_compressed(
                 output / "ptbxl_full_slice_predictions.npz",
-                slice_prob=y_prob,
+                slice_prob=slice_prob,
                 record_index=np.asarray([0, 1, 2, 3], dtype=np.int64),
                 record_id=np.asarray(["1", "2", "3", "4"]),
                 group_id=np.asarray(["patient_1", "patient_2", "patient_3", "patient_4"]),

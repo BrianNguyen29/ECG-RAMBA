@@ -39,6 +39,7 @@ ARTIFACT_MIRROR_CAPABILITIES = {
     "manifest_path_confinement",
     "stale_orphan_partial_quarantine",
     "recoverable_publish_transaction_v1",
+    "source_selection_v1",
 }
 
 
@@ -88,6 +89,18 @@ def parse_args() -> argparse.Namespace:
             "files directly to the mirror; non-cache evidence and checkpoints retain the "
             "normal conflict checks."
         ),
+    )
+    subparsers.choices["publish"].add_argument(
+        "--include-prefix",
+        action="append",
+        default=[],
+        help="Publish only local rows below this reports/revision prefix. Repeatable.",
+    )
+    subparsers.choices["publish"].add_argument(
+        "--include-path",
+        action="append",
+        default=[],
+        help="Publish only this exact reports/revision relative path. Repeatable.",
     )
     subparsers.choices["publish"].add_argument(
         "--recover-stale-lock",
@@ -828,12 +841,36 @@ def _publish_locked(
     refresh_existing_cache_dirs: bool = False,
     transaction_recovery: dict | None = None,
     quarantined_orphan_partials: list[str] | None = None,
+    include_prefixes: list[str] | tuple[str, ...] = (),
+    include_paths: list[str] | tuple[str, ...] = (),
 ) -> Path:
     if verify_existing not in {"full", "size"}:
         raise ValueError(f"Unsupported existing verification mode: {verify_existing}")
     if source_conflict_policy not in {"newer", "fail", "source"}:
         raise ValueError(f"Unsupported source conflict policy: {source_conflict_policy}")
     refresh_prefixes = normalize_refresh_prefixes(refresh_existing_prefixes)
+    selected_prefixes = tuple(
+        _safe_relative_path(item, REVISION_DIR, label="publish include-prefix")
+        .as_posix()
+        .rstrip("/")
+        for item in include_prefixes
+        if str(item).strip().rstrip("/\\")
+    )
+    selected_paths = {
+        _safe_relative_path(item, REVISION_DIR, label="publish include-path").as_posix()
+        for item in include_paths
+        if str(item).strip()
+    }
+
+    def source_selected(relative: Path) -> bool:
+        if not selected_prefixes and not selected_paths:
+            return True
+        key = relative.as_posix()
+        return key in selected_paths or any(
+            key == prefix or key.startswith(prefix + "/")
+            for prefix in selected_prefixes
+        )
+
     ensure_revision_dirs()
     mirror_root.mkdir(parents=True, exist_ok=True)
     manifest_path = mirror_root / "manifests" / "mirror_manifest.json"
@@ -914,7 +951,7 @@ def _publish_locked(
         if not source.is_file() or source.name == ".gitkeep":
             continue
         relative = source.relative_to(REVISION_DIR)
-        if skip_artifact(relative):
+        if skip_artifact(relative) or not source_selected(relative):
             continue
         destination = mirror_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -1030,6 +1067,10 @@ def _publish_locked(
         "source_conflict_policy": source_conflict_policy,
         "refresh_existing_prefixes": list(refresh_prefixes),
         "refresh_existing_cache_dirs": bool(refresh_existing_cache_dirs),
+        "source_selection": {
+            "include_prefixes": list(selected_prefixes),
+            "include_paths": sorted(selected_paths),
+        },
         "refreshed_existing_count": len(refreshed_existing_paths),
         "refreshed_existing_paths": sorted(refreshed_existing_paths),
         "skipped_stale_source_count": len(skipped_stale_source_paths),
@@ -1069,6 +1110,8 @@ def publish(
     refresh_existing_cache_dirs: bool = False,
     recover_stale_lock: bool = False,
     stale_lock_seconds: float = DEFAULT_STALE_LOCK_SECONDS,
+    include_prefixes: list[str] | tuple[str, ...] = (),
+    include_paths: list[str] | tuple[str, ...] = (),
 ) -> Path:
     """Publish revision artifacts under one crash-safe writer transaction."""
 
@@ -1099,6 +1142,8 @@ def publish(
                 else None
             ),
             quarantined_orphan_partials,
+            include_prefixes,
+            include_paths,
         )
 
 
@@ -1299,12 +1344,14 @@ def main() -> None:
     if args.command == "publish":
         publish(
             args.mirror_root,
-            args.verify_existing,
-            args.source_conflict_policy,
-            args.refresh_existing_prefix,
-            args.refresh_existing_cache_dirs,
-            args.recover_stale_lock,
-            args.stale_lock_seconds,
+            verify_existing=args.verify_existing,
+            source_conflict_policy=args.source_conflict_policy,
+            refresh_existing_prefixes=args.refresh_existing_prefix,
+            refresh_existing_cache_dirs=args.refresh_existing_cache_dirs,
+            recover_stale_lock=args.recover_stale_lock,
+            stale_lock_seconds=args.stale_lock_seconds,
+            include_prefixes=args.include_prefix,
+            include_paths=args.include_path,
         )
     else:
         restore(
