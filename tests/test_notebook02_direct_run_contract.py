@@ -48,6 +48,16 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("--source-conflict-policy source", self.source)
         self.assertIn("--include-path", self.source)
 
+    def test_missing_oof_group_sidecar_is_repaired_without_automatic_gpu_inference(self):
+        self.assertIn("scripts/revision/49_build_oof_group_sidecar.py", self.source)
+        self.assertIn("def ensure_oof_group_sidecar():", self.source)
+        self.assertIn("Refreshing the strict OOF freeze metadata on CPU", self.source)
+        self.assertIn(
+            "oof_inference_required = bool(FORCE_RERUN_OOF or not oof_core_available)",
+            self.source,
+        )
+        self.assertIn("GPU inference was intentionally not started", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

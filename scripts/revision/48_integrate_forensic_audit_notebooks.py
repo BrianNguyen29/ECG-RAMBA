@@ -45,6 +45,10 @@ REVISION_CAPABILITY_REQUIREMENTS = {
         'EXTERNAL_REUSE_CAPABILITY': 'source_bound_external_reuse_v1',
         'EXTERNAL_REUSE_SCHEMA_VERSION': 1,
     },
+    'scripts/revision/49_build_oof_group_sidecar.py': {
+        'GROUP_SIDECAR_CAPABILITY': 'chapman_oof_group_sidecar_v1',
+        'GROUP_SIDECAR_SCHEMA_VERSION': 1,
+    },
 }
 REVISION_TOKEN_REQUIREMENTS = {
     'scripts/revision/common.py': [
@@ -209,6 +213,59 @@ NOTEBOOK02_EXTERNAL_REUSE_FUNCTION = r'''def external_prediction_ready(dataset):
     if diagnostics.get('q3_reconstruction_max_abs') is not None:
         print('  Q=3 reconstruction max_abs:', diagnostics['q3_reconstruction_max_abs'])
     return bool(result.get('ready', False))
+'''
+
+
+NOTEBOOK02_OOF_SIDECAR_PREFLIGHT = r'''
+# CPU-only OOF provenance restore. A missing group sidecar is a metadata-contract
+# gap, not evidence that model inference must be repeated.
+CANONICAL_GROUP_SIDECAR = Path('reports/revision/manifests/oof_final_ema_group_sidecar.npz')
+OOF_CORE_ARTIFACTS = [
+    Path(f'reports/revision/predictions/{CANONICAL_OOF_STEM}_predictions.npz'),
+    Path(f'reports/revision/predictions/{CANONICAL_OOF_STEM}_slice_predictions.npz'),
+    Path(f'reports/revision/metrics/{CANONICAL_OOF_STEM}_prediction_summary.json'),
+    Path(f'reports/revision/tables/{CANONICAL_OOF_STEM}_class_summary.csv'),
+    Path(f'reports/revision/manifests/{CANONICAL_OOF_STEM}_prediction_run_manifest.json'),
+]
+OOF_CONTRACT_RESTORE_PATHS = [
+    *OOF_CORE_ARTIFACTS,
+    CANONICAL_FREEZE_MANIFEST,
+    CANONICAL_GROUP_SIDECAR,
+    Path('reports/revision/logs/oof_final_ema_generate_predictions.log'),
+]
+oof_restore_args = ' '.join(
+    f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+    for path in OOF_CONTRACT_RESTORE_PATHS
+)
+run(
+    f'python -u scripts/revision/artifact_mirror.py restore --mirror-root "{stable_mirror}" '
+    f'--replace-mismatched {oof_restore_args}',
+    log_path='reports/revision/logs/oof_contract_targeted_restore.log',
+)
+
+
+def ensure_oof_group_sidecar():
+    record_path = OOF_CORE_ARTIFACTS[0]
+    if not record_path.is_file() or record_path.stat().st_size == 0:
+        print('OOF group sidecar build deferred because canonical OOF predictions are absent.')
+        return False
+    run(
+        'python -u scripts/revision/49_build_oof_group_sidecar.py '
+        f'--oof-predictions "{record_path}" --source-archive "{chapman_zip}" '
+        f'--out "{CANONICAL_GROUP_SIDECAR}" --expected-records 44186 --reuse-existing',
+        log_path='reports/revision/logs/oof_group_sidecar.log',
+    )
+    run(
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+        f'--source-conflict-policy source '
+        f'--include-path "manifests/oof_final_ema_group_sidecar.npz" '
+        f'--mirror-root "{stable_mirror}"',
+        log_path='reports/revision/logs/oof_group_sidecar_immediate_mirror_publish.log',
+    )
+    return True
+
+
+ensure_oof_group_sidecar()
 '''
 
 
@@ -698,6 +755,81 @@ def integrate_notebook02() -> None:
                 "--expected-checkpoint-kind final_ema",
                 strict_oof_flags,
             )
+        if "RUN_OOF_EXPORT = True" in text and "def freeze_oof(label):" in text:
+            sidecar_anchor = "OOF_FOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)\n"
+            if "def ensure_oof_group_sidecar():" not in text:
+                if sidecar_anchor not in text:
+                    raise RuntimeError("Notebook 02 OOF sidecar-preflight anchor missing")
+                text = text.replace(
+                    sidecar_anchor,
+                    sidecar_anchor + NOTEBOOK02_OOF_SIDECAR_PREFLIGHT,
+                    1,
+                )
+            text = text.replace(
+                "    print('final_ema OOF freeze contract is not ready yet; inference may be required.')",
+                "    print('final_ema OOF strict contract is not ready; attempting CPU metadata refresh before any inference decision.')",
+            )
+            refreshed_ready = r'''oof_ready = False if FORCE_RERUN_OOF else freeze_oof('existing artifacts')
+oof_core_available = all(path.is_file() and path.stat().st_size > 0 for path in OOF_CORE_ARTIFACTS)
+if not FORCE_RERUN_OOF and not oof_ready and oof_core_available and CANONICAL_GROUP_SIDECAR.is_file():
+    print('Refreshing the strict OOF freeze metadata on CPU; existing predictions remain unchanged.')
+    refresh_result = run(
+        freeze_command,
+        check=False,
+        log_path='reports/revision/logs/oof_final_ema_freeze_refresh.log',
+    )
+    if refresh_result.returncode == 0:
+        freeze_publish_args = ' '.join([
+            '--include-path "manifests/oof_final_ema_group_sidecar.npz"',
+            '--include-path "manifests/oof_final_ema_freeze_manifest.json"',
+        ])
+        run(
+            f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+            f'--source-conflict-policy source {freeze_publish_args} --mirror-root "{stable_mirror}"',
+            log_path='reports/revision/logs/oof_freeze_refresh_immediate_mirror_publish.log',
+        )
+        oof_ready = freeze_oof('after CPU metadata refresh')
+    else:
+        print('CPU freeze metadata refresh failed; model inference will not be started automatically while complete OOF artifacts exist.')
+'''
+            ready_pattern = re.compile(
+                r"oof_ready = False if FORCE_RERUN_OOF else freeze_oof\('existing artifacts'\)\n"
+                r".*?(?=\ncommand = \()",
+                flags=re.DOTALL,
+            )
+            text, ready_replacements = ready_pattern.subn(refreshed_ready.rstrip(), text, count=1)
+            if ready_replacements != 1:
+                raise RuntimeError(
+                    f"Notebook 02 OOF metadata-refresh replacement_count={ready_replacements}"
+                )
+            legacy_branch = """if RUN_OOF_EXPORT and (FORCE_RERUN_OOF or not oof_ready):
+    require_gpu_inference_runtime('Canonical final_ema OOF export')"""
+            guarded_branch = """oof_inference_required = bool(FORCE_RERUN_OOF or not oof_core_available)
+if RUN_OOF_EXPORT and oof_inference_required:
+    require_gpu_inference_runtime('Canonical final_ema OOF export')"""
+            if legacy_branch in text:
+                text = text.replace(legacy_branch, guarded_branch, 1)
+            generation_anchor = "    run(command, log_path='reports/revision/logs/oof_final_ema_generate_predictions.log')\n    run(freeze_command, log_path='reports/revision/logs/oof_final_ema_freeze_validation.log')"
+            generation_with_sidecar = "    run(command, log_path='reports/revision/logs/oof_final_ema_generate_predictions.log')\n    ensure_oof_group_sidecar()\n    run(freeze_command, log_path='reports/revision/logs/oof_final_ema_freeze_validation.log')"
+            if generation_anchor in text:
+                text = text.replace(generation_anchor, generation_with_sidecar, 1)
+            legacy_tail = """elif oof_ready and not FORCE_RERUN_OOF:
+    print('Skipping final_ema OOF inference because the frozen artifact contract passed.')
+else:
+    print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')"""
+            guarded_tail = """elif oof_ready and not FORCE_RERUN_OOF:
+    print('Skipping final_ema OOF inference because the frozen artifact contract passed.')
+elif oof_core_available:
+    raise RuntimeError(
+        'Complete OOF prediction artifacts are present, but their strict provenance/freeze contract failed. '
+        'GPU inference was intentionally not started. Review oof_final_ema_freeze_refresh.log and repair the '
+        'specific sidecar, split-membership, or freeze metadata blocker; set FORCE_RERUN_OOF=True only when the '
+        'prediction artifact itself is proven invalid.'
+    )
+else:
+    print(f'OOF export disabled. Set RUN_OOF_EXPORT=True to execute: {command}')"""
+            if legacy_tail in text:
+                text = text.replace(legacy_tail, guarded_tail, 1)
         if (
             "oof_final_ema_freeze_manifest.json" in text
             and "expected = [" in text
