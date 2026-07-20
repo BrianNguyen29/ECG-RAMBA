@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -53,6 +54,10 @@ ROBUSTNESS_INTERPRETATIONS = {
     "nominal_95ci_inconclusive_change_difference",
 }
 FEWSHOT_SEEDS = (42, 43, 44, 45, 46)
+ADAPTATION_PRIMARY_FRACTION_POLICY = (
+    "fixed_by_post_initial_review_analysis_lock_before_current_rerun"
+)
+PTBXL_ADAPTATION_LOCK_NAME = "ptbxl_adaptation_analysis_lock.json"
 ROBUSTNESS_STRESSES = [
     "snr20db",
     "snr10db",
@@ -215,6 +220,47 @@ def manifest_contract_issues(
     for key, expected in (expected_fields or {}).items():
         if payload.get(key) != expected:
             issues.append(f"manifest.{key}={payload.get(key)!r}")
+    return issues
+
+
+def adaptation_analysis_lock_issues(manifest_path: Path) -> list[str]:
+    manifest = read_json_if_present(manifest_path)
+    if not manifest or manifest.get("_read_error"):
+        return []
+    metadata = manifest.get("analysis_lock") or {}
+    declared_path = Path(str(metadata.get("path") or ""))
+    lock_path = MANIFEST_DIR / PTBXL_ADAPTATION_LOCK_NAME
+    issues: list[str] = []
+    if declared_path.name != PTBXL_ADAPTATION_LOCK_NAME:
+        issues.append("manifest.analysis_lock.path_invalid")
+    if not lock_path.is_file() or lock_path.stat().st_size == 0:
+        return issues + ["analysis_lock_missing"]
+    if metadata.get("sha256") != sha256_file(lock_path):
+        issues.append("manifest.analysis_lock.sha256_mismatch")
+    lock = read_json_if_present(lock_path)
+    if not lock or lock.get("_read_error"):
+        return issues + ["analysis_lock_unreadable"]
+    protocol = lock.get("protocol") or {}
+    protocol_sha256 = hashlib.sha256(
+        json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    expected = {
+        "status": lock.get("status") == "locked",
+        "capability": lock.get("capability") == "ptbxl_fold9_fold10_analysis_lock_v1",
+        "schema_version": int(lock.get("schema_version", 0)) == 1,
+        "protocol_sha256": lock.get("protocol_sha256") == protocol_sha256,
+        "manifest_protocol_sha256": metadata.get("protocol_sha256") == protocol_sha256,
+        "adaptation_split": protocol.get("adaptation_split") == "official_ptbxl_fold9",
+        "test_split": protocol.get("test_split") == "official_ptbxl_fold10",
+        "group_unit": protocol.get("group_unit") == "patient_id",
+        "test_access_policy": protocol.get("primary_test_access_policy")
+        == "evaluate_fold10_only_after_configuration_lock_validation",
+        "post_initial_result_review": "post_initial_result_review"
+        in str(lock.get("temporal_qualification", "")),
+        "not_preregistration": "not a preregistration"
+        in str(lock.get("temporal_qualification", "")),
+    }
+    issues.extend(f"analysis_lock.{key}" for key, valid in expected.items() if not valid)
     return issues
 
 
@@ -952,14 +998,15 @@ def main() -> None:
             canonical=canonical,
             expected_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                 "primary_fraction": 0.10,
-                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+                "primary_fraction_policy": ADAPTATION_PRIMARY_FRACTION_POLICY,
             },
         )
         + manifest_runner_issues(
             group_safe_calibration_required[-1], "33_group_safe_score_calibration.py"
         )
+        + adaptation_analysis_lock_issues(group_safe_calibration_required[-1])
         + manifest_output_issues(
             group_safe_calibration_required[-1], group_safe_calibration_required[:-1]
         )
@@ -967,7 +1014,7 @@ def main() -> None:
             group_safe_calibration_required[0],
             {
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
             },
         )
         + adaptation_grid_issues(group_safe_calibration_required[0]),
@@ -994,14 +1041,15 @@ def main() -> None:
             canonical=canonical,
             expected_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                 "primary_fraction": 0.10,
-                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+                "primary_fraction_policy": ADAPTATION_PRIMARY_FRACTION_POLICY,
             },
         )
         + manifest_runner_issues(
             true_fewshot_required[-1], "35_true_fewshot_head_adaptation.py"
         )
+        + adaptation_analysis_lock_issues(true_fewshot_required[-1])
         + manifest_output_issues(
             true_fewshot_required[-1], true_fewshot_required[:-1]
         )
@@ -1227,7 +1275,7 @@ def main() -> None:
             missing_artifacts=group_safe_calibration_missing,
             safe_wording=(
                 "If complete, describe this only as group-safe, dataset-specific score calibration of "
-                "frozen predictions, with 10% pre-specified as the primary target-group budget and 1%/5% as "
+                "frozen predictions, with 10% analysis-locked for the current rerun as the primary target-group budget and 1%/5% as "
                 "sensitivity points. It changes decision scores/threshold behavior, not encoder or classifier weights."
             ),
             blocker=(
@@ -1251,7 +1299,7 @@ def main() -> None:
             safe_wording=(
                 "If complete, report PTB-XL results as group-safe adaptation of new linear classifier heads on "
                 "mean-pooled record representations from frozen Chapman-trained encoders. Fractions are nested "
-                "fractions of independent target groups and 10% is the pre-specified primary budget. This is "
+                "fractions of independent target groups and 10% is the analysis-locked primary budget for the current rerun. This is "
                 "parameter adaptation, but not end-to-end fine-tuning or general few-shot superiority."
             ),
             blocker=(

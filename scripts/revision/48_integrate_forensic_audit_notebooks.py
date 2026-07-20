@@ -99,7 +99,8 @@ REVISION_TOKEN_REQUIREMENTS = {
     ],
     'scripts/revision/33_group_safe_score_calibration.py': [
         '--primary-fraction',
-        'pre_specified_before_test_metric_evaluation',
+        'fixed_by_post_initial_review_analysis_lock_before_current_rerun',
+        'validate_ptbxl_analysis_lock',
         'independent_target_groups_from_adaptation_pool',
     ],
     'scripts/revision/34_extract_external_representations.py': [
@@ -114,7 +115,8 @@ REVISION_TOKEN_REQUIREMENTS = {
         'Embedding manifest is stale or incomplete',
         'independent_target_groups_from_adaptation_pool',
         'REPRESENTATION_PROTOCOL_VERSION = 2',
-        'pre_specified_before_test_metric_evaluation',
+        'fixed_by_post_initial_review_analysis_lock_before_current_rerun',
+        'validate_ptbxl_analysis_lock',
         'primary_endpoint_rows',
     ],
     'scripts/revision/50_refresh_in_domain_paired_contracts.py': [
@@ -1321,6 +1323,18 @@ def integrate_notebook00() -> None:
     notebook = load(name)
     for cell in notebook["cells"]:
         text = source(cell)
+        if "pre_specified_before_test_metric_evaluation" in text:
+            text = text.replace(
+                "pre_specified_before_test_metric_evaluation",
+                "fixed_by_post_initial_review_analysis_lock_before_current_rerun",
+            )
+            set_source(cell, text)
+        if "pre_specified_0.10_no_test_set_budget_selection" in text:
+            text = text.replace(
+                "pre_specified_0.10_no_test_set_budget_selection",
+                "ADAPTATION_PRIMARY_FRACTION_POLICY",
+            )
+            set_source(cell, text)
         if "INSTALL_MAMBA_IN_NOTEBOOK00" in text and "installer_text" in text:
             text = text.replace(
                 f"if {MAMBA_MARKER!r} in installer_text:",
@@ -1641,6 +1655,24 @@ def normalize_bootstrap_contracts() -> None:
 def integrate_notebook07_final_gate() -> None:
     name = "07_results_freeze.ipynb"
     notebook = load(name)
+    for cell in notebook["cells"]:
+        text = source(cell)
+        updated = text.replace(
+            "pre_specified_before_test_metric_evaluation",
+            "ADAPTATION_PRIMARY_FRACTION_POLICY",
+        ).replace(
+            "required_generator_schema = 10",
+            "required_generator_schema = 11",
+        )
+        capability = "    'post_initial_review_adaptation_analysis_lock',\n"
+        if "required_generator_capabilities = {" in updated and capability not in updated:
+            updated = updated.replace(
+                "    'matched_structured_ablation_fresh_full',\n",
+                "    'matched_structured_ablation_fresh_full',\n" + capability,
+                1,
+            )
+        if updated != text:
+            set_source(cell, updated)
     gate_marker = "FORENSIC_NOTEBOOK07_FINAL_GATE = 'strict_full_sha_authority_update_v3'"
     target = None
     for cell in notebook["cells"]:
@@ -1782,6 +1814,7 @@ def validate() -> None:
         "raw.githubusercontent.com/BrianNguyen29/ECG-RAMBA",
         "annotation_aligned_nonoverlapping_10s_windows_majority_af_or_normal",
         "GATE_SCHEMA_VERSION = 4",
+        "pre_specified_before_test_metric_evaluation",
     ):
         if forbidden in notebook02_text:
             raise RuntimeError(f"Notebook 02 stale/mutable compatibility token remains: {forbidden}")
@@ -1836,6 +1869,9 @@ def validate() -> None:
         "strict_full_sha_authority_update_v3",
         "--source-conflict-policy newer",
         "final_pipeline_storage_audit_post_publish_strict_full_sha.log",
+        "required_generator_schema = 11",
+        "post_initial_review_adaptation_analysis_lock",
+        "ADAPTATION_PRIMARY_FRACTION_POLICY",
     ):
         if token not in final_text:
             raise RuntimeError(f"Notebook 07 final gate token missing: {token}")

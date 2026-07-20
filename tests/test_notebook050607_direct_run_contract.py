@@ -40,6 +40,23 @@ def notebook_payload(name: str) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def literal_notebook_assignment(name: str, assignment_name: str):
+    cells, _ = notebook_source(name)
+    for source in cells:
+        if assignment_name not in source:
+            continue
+        tree = ast.parse(source)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == assignment_name
+                for target in node.targets
+            ):
+                return ast.literal_eval(node.value)
+    raise AssertionError(f"Notebook assignment not found: {name}:{assignment_name}")
+
+
 def compilable_notebook_source(source: str) -> str:
     """Replace IPython line magics with Python no-ops before syntax validation."""
     lines = []
@@ -69,6 +86,24 @@ def authority_block_source(name: str, *, occurrence: int = 0) -> str:
 
 
 class Notebook050607DirectRunContractTests(unittest.TestCase):
+    def test_notebook_source_token_preflights_match_the_pinned_repository(self):
+        checks = (
+            ("00_colab_bootstrap.ipynb", "required_source_tokens"),
+            ("02_predictions_and_external_eval.ipynb", "REVISION_TOKEN_REQUIREMENTS"),
+        )
+        for notebook, assignment in checks:
+            requirements = literal_notebook_assignment(notebook, assignment)
+            for relative, tokens in requirements.items():
+                path = PROJECT_ROOT / relative
+                self.assertTrue(path.is_file(), f"{notebook}: missing {relative}")
+                source = path.read_text(encoding="utf-8", errors="replace")
+                missing = [token for token in tokens if token not in source]
+                self.assertEqual(missing, [], f"{notebook}: stale requirements for {relative}")
+        for notebook in ("00_colab_bootstrap.ipynb", "02_predictions_and_external_eval.ipynb"):
+            _, source = notebook_source(notebook)
+            self.assertNotIn("pre_specified_before_test_metric_evaluation", source)
+            self.assertNotIn("pre_specified_0.10_no_test_set_budget_selection", source)
+
     def test_notebook_v4_structure_is_complete(self):
         for notebook in (
             "03_calibration_and_ci.ipynb",
@@ -562,6 +597,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "matched_monotone_calibration_v3",
             "matched_structured_ablation_5fold",
             "matched_structured_ablation_fresh_full",
+            "post_initial_review_adaptation_analysis_lock",
             "physiological_interval_probe_gate",
             "physiological_interval_probe_v3",
             "true_fewshot_frozen_encoder_head_v2",
@@ -574,8 +610,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
-        self.assertIn("required_generator_schema = 10", source)
-        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 10", generator_source)
+        self.assertIn("required_generator_schema = 11", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 11", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 

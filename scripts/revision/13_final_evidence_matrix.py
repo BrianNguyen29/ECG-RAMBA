@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
@@ -52,11 +53,15 @@ REQUIRED_ROBUSTNESS_METRICS = {
     "ece_macro",
 }
 EXPECTED_EXTERNAL_DATASETS = ("ptbxl", "georgia", "cpsc2021")
+ADAPTATION_PRIMARY_FRACTION_POLICY = (
+    "fixed_by_post_initial_review_analysis_lock_before_current_rerun"
+)
+PTBXL_ADAPTATION_LOCK_NAME = "ptbxl_adaptation_analysis_lock.json"
 
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 10
+FINAL_EVIDENCE_SCHEMA_VERSION = 11
 FINAL_EVIDENCE_CAPABILITIES = (
     "adaptation_learning_curve",
     "claim_readiness_gates",
@@ -68,6 +73,7 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "matched_monotone_calibration_v3",
     "matched_structured_ablation_5fold",
     "matched_structured_ablation_fresh_full",
+    "post_initial_review_adaptation_analysis_lock",
     "physiological_interval_probe_gate",
     "physiological_interval_probe_v3",
     "representation_probe_v3",
@@ -136,6 +142,39 @@ def read_json(path: Path, *, required: bool = True) -> dict[str, Any]:
             raise FileNotFoundError(path)
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def adaptation_analysis_lock_valid(manifest: dict[str, Any]) -> bool:
+    """Bind an adaptation package to the immutable, temporally qualified lock."""
+    metadata = manifest.get("analysis_lock") or {}
+    declared_path = Path(str(metadata.get("path") or ""))
+    lock_path = MANIFEST_DIR / PTBXL_ADAPTATION_LOCK_NAME
+    if declared_path.name != PTBXL_ADAPTATION_LOCK_NAME or not lock_path.is_file():
+        return False
+    if metadata.get("sha256") != sha256_file(lock_path):
+        return False
+    try:
+        lock = read_json(lock_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+    protocol = lock.get("protocol") or {}
+    protocol_sha256 = hashlib.sha256(
+        json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return (
+        lock.get("status") == "locked"
+        and lock.get("capability") == "ptbxl_fold9_fold10_analysis_lock_v1"
+        and int(lock.get("schema_version", 0)) == 1
+        and lock.get("protocol_sha256") == protocol_sha256
+        and metadata.get("protocol_sha256") == protocol_sha256
+        and protocol.get("adaptation_split") == "official_ptbxl_fold9"
+        and protocol.get("test_split") == "official_ptbxl_fold10"
+        and protocol.get("group_unit") == "patient_id"
+        and protocol.get("primary_test_access_policy")
+        == "evaluate_fold10_only_after_configuration_lock_validation"
+        and "post_initial_result_review" in str(lock.get("temporal_qualification", ""))
+        and "not a preregistration" in str(lock.get("temporal_qualification", ""))
+    )
 
 
 def read_csv_rows(path: Path, *, required: bool = True) -> list[dict[str, str]]:
@@ -796,6 +835,7 @@ def summarize_external_adaptation(
     expected_fractions: tuple[float, ...] = (0.0, 0.01, 0.05, 0.10),
     required_output_paths: tuple[Path, ...] = (),
     primary_rows: list[dict[str, str]] | None = None,
+    require_analysis_lock: bool = False,
 ) -> dict[str, Any]:
     """Summarize only an explicitly versioned, protocol-valid adaptation package."""
     if model_filter is not None:
@@ -891,6 +931,7 @@ def summarize_external_adaptation(
         and len(rows) == len(expected_fractions) * len(expected_seed_set)
         and output_contract_complete
         and primary_contract_complete
+        and (not require_analysis_lock or adaptation_analysis_lock_valid(manifest))
     )
     if not complete:
         return {
@@ -974,7 +1015,7 @@ def summarize_external_adaptation(
         f"protocol={expected_protocol}; "
         f"zero-shot PR-AUC={fmt(zero_fraction.get('pr_auc_macro_mean'))}, "
         f"F1={fmt(zero_fraction.get('f1_macro_mean'))}; "
-        f"pre-specified primary fraction={fmt(primary.get('fraction'), digits=2)}, "
+        f"analysis-locked primary fraction={fmt(primary.get('fraction'), digits=2)}, "
         f"train_units_mean={fmt(primary.get('train_records_or_windows_mean'), digits=1)}, "
         f"F1={fmt(primary.get('f1_macro_mean'))}{f1_ci_text}, "
         f"F1_gain_vs_zero={fmt(f1_gain)}; "
@@ -989,7 +1030,7 @@ def summarize_external_adaptation(
         "safe_wording": safe_wording,
         "blocker": "",
         "primary_fraction": primary,
-        "primary_fraction_policy": "pre_specified_0.10_no_test_set_budget_selection",
+        "primary_fraction_policy": ADAPTATION_PRIMARY_FRACTION_POLICY,
         "primary_endpoint_rows": primary_rows or [],
         "best_fraction": primary,
         "best_f1_fraction": primary,
@@ -1431,20 +1472,22 @@ def main() -> None:
             ),
             required_manifest_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                 "primary_fraction": 0.10,
-                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+                "primary_fraction_policy": ADAPTATION_PRIMARY_FRACTION_POLICY,
             },
             required_row_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
             },
             safe_wording=(
                 "Report PTB-XL only as group-safe, dataset-specific score calibration of frozen predictions, "
-                "using the pre-specified 10% target-group budget as primary and 1%/5% as sensitivity points. "
+                "using the analysis-locked 10% target-group budget as primary and 1%/5% as sensitivity points. "
+                "The lock was introduced after initial result review and is not a preregistration. "
                 "It can change fixed-threshold F1/calibration but cannot establish model-weight adaptation, "
                 "few-shot fine-tuning, or broad transfer superiority."
             ),
+            require_analysis_lock=True,
         )
     }
     score_calibration_summary = combine_adaptation_summaries(
@@ -1483,9 +1526,9 @@ def main() -> None:
             ),
             required_manifest_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_random_group_prefix_per_seed",
+                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                 "primary_fraction": 0.10,
-                "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+                "primary_fraction_policy": ADAPTATION_PRIMARY_FRACTION_POLICY,
             },
             required_row_fields={
                 "fraction_unit": "independent_target_groups_from_adaptation_pool",
@@ -1496,6 +1539,7 @@ def main() -> None:
                 "mean-pooled record representations. Fractions are nested fractions of independent target groups. "
                 "This is true parameter adaptation, but not end-to-end encoder fine-tuning or general superiority."
             ),
+            require_analysis_lock=True,
         )
     }
     true_fewshot_summary = combine_adaptation_summaries(

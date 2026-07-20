@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -13,9 +14,53 @@ fewshot = importlib.import_module("scripts.revision.35_true_fewshot_head_adaptat
 representations = importlib.import_module("scripts.revision.34_extract_external_representations")
 final_evidence = importlib.import_module("scripts.revision.13_final_evidence_matrix")
 claim_readiness = importlib.import_module("scripts.revision.28_claim_readiness_gates")
+analysis_lock_runner = importlib.import_module("scripts.revision.51_ptbxl_adaptation_analysis_lock")
 
 
 class GroupSafeExternalStatisticsTests(unittest.TestCase):
+    def test_adaptation_manifests_are_bound_to_temporally_qualified_analysis_lock(self):
+        args = SimpleNamespace(
+            models="full,resnet,raw_mamba,transformer",
+            fractions="0,0.01,0.05,0.10",
+            primary_fraction=0.10,
+            seeds="42,43,44,45,46",
+            threshold=0.5,
+            n_bins=15,
+            n_boot=1000,
+            head_c=1.0,
+            max_iter=5000,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_dir = Path(temporary)
+            lock_path = manifest_dir / final_evidence.PTBXL_ADAPTATION_LOCK_NAME
+            lock = {**analysis_lock_runner.expected_lock(args), "created_utc": "test"}
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+            adaptation_manifest = {
+                "analysis_lock": {
+                    "path": str(lock_path),
+                    "sha256": final_evidence.sha256_file(lock_path),
+                    "protocol_sha256": lock["protocol_sha256"],
+                }
+            }
+            adaptation_manifest_path = manifest_dir / "adaptation_manifest.json"
+            adaptation_manifest_path.write_text(json.dumps(adaptation_manifest), encoding="utf-8")
+            with mock.patch.object(final_evidence, "MANIFEST_DIR", manifest_dir), mock.patch.object(
+                claim_readiness, "MANIFEST_DIR", manifest_dir
+            ):
+                self.assertTrue(final_evidence.adaptation_analysis_lock_valid(adaptation_manifest))
+                self.assertEqual(
+                    claim_readiness.adaptation_analysis_lock_issues(adaptation_manifest_path), []
+                )
+
+                lock["temporal_qualification"] = "historical preregistration"
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+                adaptation_manifest["analysis_lock"]["sha256"] = final_evidence.sha256_file(lock_path)
+                adaptation_manifest_path.write_text(json.dumps(adaptation_manifest), encoding="utf-8")
+                self.assertFalse(final_evidence.adaptation_analysis_lock_valid(adaptation_manifest))
+                issues = claim_readiness.adaptation_analysis_lock_issues(adaptation_manifest_path)
+                self.assertIn("analysis_lock.post_initial_result_review", issues)
+                self.assertIn("analysis_lock.not_preregistration", issues)
+
     def test_balanced_group_split_is_deterministic_disjoint_and_group_complete(self):
         groups = np.repeat(np.asarray([f"g{idx:02d}" for idx in range(12)]), 2)
         y_true = np.tile(np.asarray([[1, 0], [0, 1]], dtype=np.float32), (12, 1))
@@ -181,7 +226,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
                     canonical,
                 )
 
-    def test_final_adaptation_summary_filters_model_and_uses_prespecified_budget(self):
+    def test_final_adaptation_summary_filters_model_and_uses_analysis_locked_budget(self):
         fractions = [0.0, 0.01, 0.05, 0.10]
         full_f1 = {0.0: 0.2, 0.01: 0.3, 0.05: 0.9, 0.10: 0.4}
         rows = []
@@ -232,7 +277,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
         self.assertTrue(summary["complete"])
         self.assertAlmostEqual(summary["primary_fraction"]["f1_macro_mean"], 0.4)
         self.assertEqual(summary["primary_fraction"]["n_seeds"], 2)
-        self.assertIn("pre-specified primary fraction=0.10", summary["key_numbers"])
+        self.assertIn("analysis-locked primary fraction=0.10", summary["key_numbers"])
         self.assertNotIn("F1-best", summary["key_numbers"])
 
     def test_claim_gate_requires_exact_adaptation_grid_and_output_hashes(self):
@@ -272,7 +317,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
             issues = claim_readiness.manifest_output_issues(manifest, [output])
             self.assertTrue(any("sha256_mismatch" in issue for issue in issues))
 
-    def test_score_calibration_requires_prespecified_group_budget_contract(self):
+    def test_score_calibration_requires_analysis_locked_group_budget_contract(self):
         rows = []
         for seed in (1, 2):
             for fraction in (0.0, 0.01, 0.05, 0.10):
@@ -282,7 +327,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
                         "fraction": str(fraction),
                         "mode": "zero" if fraction == 0 else "calibrated",
                         "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                        "fraction_sampling": "nested_random_group_prefix_per_seed",
+                        "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                         "f1_macro": "0.4",
                         "pr_auc_macro": "0.5",
                         "roc_auc_macro": "0.6",
@@ -300,19 +345,19 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
             "runner_sha256": final_evidence.sha256_file(runner),
             "seeds": [1, 2],
             "primary_fraction": 0.10,
-            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "primary_fraction_policy": final_evidence.ADAPTATION_PRIMARY_FRACTION_POLICY,
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-            "fraction_sampling": "nested_random_group_prefix_per_seed",
+            "fraction_sampling": "nested_seeded_label_independent_group_prefix",
         }
         required_manifest = {
             "primary_fraction": 0.10,
-            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "primary_fraction_policy": final_evidence.ADAPTATION_PRIMARY_FRACTION_POLICY,
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-            "fraction_sampling": "nested_random_group_prefix_per_seed",
+            "fraction_sampling": "nested_seeded_label_independent_group_prefix",
         }
         required_rows = {
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-            "fraction_sampling": "nested_random_group_prefix_per_seed",
+            "fraction_sampling": "nested_seeded_label_independent_group_prefix",
         }
         summary = final_evidence.summarize_external_adaptation(
             rows,
