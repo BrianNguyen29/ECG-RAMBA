@@ -397,13 +397,13 @@ def reviewer_traceability_rows(
         ("R1-C2", "Determinism versus learned morphology", "04", "04_baselines_and_component_checks.ipynb::cells 20,36", "39_morphology_learnability_control.py;40_paired_morphology_learnability.py", "same-fold reduced-bank controls", "paired control table", "record/subject", "Reduced-control endpoint only; no causal explanation of full branch"),
         ("R1-C3", "HRV domain bias", "05", "05_hrv_domain_and_robustness.ipynb::cell 8", "09_hrv_domain_analysis.py", "record-fingerprinted HRV caches", "HRV-only and domain tables", "record/subject", "Domain sensitivity as limitation; no invariance"),
         ("R1-C4", "CNN, Mamba and Transformer comparators", "04", "04_baselines_and_component_checks.ipynb::cells 12,14,16,28,30,32", "14_resnet1d_cnn_baseline.py;16_raw_mamba_baseline.py;24_transformer_ecg_baseline.py", "same folds and raw ECG", "OOF and paired tables", "record/subject", "Same-fold comparators, not budget-matched unless contract proves parity"),
-        ("R1-C5", "Confidence intervals and significance", "02,03,04,05", "02_predictions_and_external_eval.ipynb::cells 32,34,38; 03_calibration_and_ci.ipynb::cells 8,10; 04_baselines_and_component_checks.ipynb::cells 26-36; 05_hrv_domain_and_robustness.ipynb::cells 10,14", "11_paired_full_vs_minirocket.py;15_paired_full_vs_resnet.py;17_paired_full_vs_raw_mamba.py;21_robustness_multicomparator.py;25_paired_full_vs_transformer.py;27_paired_full_vs_hybrid_morphology.py;32_paired_external_comparators.py;35_true_fewshot_head_adaptation.py;40_paired_morphology_learnability.py", "paired predictions and authenticated group IDs", "pointwise effect-size estimates and percentile CIs", "authenticated patient/group", "No significance or p-value claim without a separate 10,000-permutation paired null test and a pre-declared multiplicity family"),
+        ("R1-C5", "Confidence intervals and significance", "02,03,04,05", "02_predictions_and_external_eval.ipynb::cells 32,34,36,42; 03_calibration_and_ci.ipynb::cells 8,10; 04_baselines_and_component_checks.ipynb::cells 26-36; 05_hrv_domain_and_robustness.ipynb::cells 10,14", "11_paired_full_vs_minirocket.py;15_paired_full_vs_resnet.py;17_paired_full_vs_raw_mamba.py;21_robustness_multicomparator.py;25_paired_full_vs_transformer.py;27_paired_full_vs_hybrid_morphology.py;32_paired_external_comparators.py;35_true_fewshot_head_adaptation.py;40_paired_morphology_learnability.py;50_refresh_in_domain_paired_contracts.py;52_ptbxl_fold_protocol_audit.py", "paired predictions and authenticated group IDs", "pointwise effect-size estimates and percentile CIs", "authenticated patient/group", "No significance or p-value claim without a separate 10,000-permutation paired null test and a pre-declared multiplicity family"),
         ("R1-C6", "Power Mean Q=3 sensitivity", "06", "06_pooling_and_representation.ipynb::cells 8,10,12", "07_pooling_sensitivity.py;30_pooling_sensitivity_external.py", "slice probabilities", "within/external sensitivity table", "record/group", "Frozen operating point; not globally optimal"),
         ("R1-C7", "HRV/PCA/Mamba implementation detail", "04,07", "04_baselines_and_component_checks.ipynb::cells 4,24; 07_results_freeze.ipynb::cell 6", "29_reviewer_presentation_assets.py", "fold PCA and run manifests", "per-fold provenance table", "fold", "Only implemented HRV slots; exact fold variance"),
         ("R2-C1", "Stepwise mathematical pipeline", "07/manuscript", "07_results_freeze.ipynb::cells 6,8,10", "29_reviewer_presentation_assets.py", "frozen protocol", "algorithm and notation audit", "protocol", "Definition and reproducibility claim only"),
         ("R2-C2", "Morphology/rhythm representation evidence", "06", "06_pooling_and_representation.ipynb::cell 16", "22_extract_representations.py;20_representation_probe.py", "checkpoint-local train/validation embeddings", "fold probes, fold CKA, descriptive UMAP", "held-out fold", "Selectivity audit; no proven disentanglement"),
         ("R2-C3", "Noise, leads and sampling robustness", "05", "05_hrv_domain_and_robustness.ipynb::cells 12,14", "23_generate_comparator_stress_predictions.py;21_robustness_multicomparator.py", "clean and six stress predictions", "paired degradation ledger", "record/subject", "Named stress/metric/comparator only"),
-        ("R2-C4", "Zero-target-label versus few-shot", "02,02a", "02_predictions_and_external_eval.ipynb::cells 28,34,36,38", "33_group_safe_score_calibration.py;35_true_fewshot_head_adaptation.py", "PTB-XL official fold 9 adaptation/fold 10 test; Georgia/CPSC label-independent hash splits; CPSC primary units are complete non-transition 10-second mapped windows", "dataset-specific learning curves with CI", "patient/group or audited CPSC window parent", "Score calibration is separate from frozen-encoder head adaptation; Georgia/CPSC are dataset-specific sensitivity analyses; CPSC is not record-level 27-class or official episode-boundary scoring"),
+        ("R2-C4", "Zero-target-label versus few-shot", "02,02a", "02_predictions_and_external_eval.ipynb::cells 28,30,32,34,38,42", "33_group_safe_score_calibration.py;35_true_fewshot_head_adaptation.py;51_ptbxl_adaptation_analysis_lock.py;52_ptbxl_fold_protocol_audit.py", "PTB-XL official fold 9 adaptation/fold 10 test with zero patient overlap; Georgia/CPSC label-independent hash splits; CPSC primary units are complete non-transition 10-second mapped windows", "dataset-specific learning curves with CI plus an unsupported-only exclusion sensitivity", "patient/group or audited CPSC window parent", "Score calibration is separate from frozen-encoder head adaptation; the analysis lock is post-initial-review and is not preregistration; Georgia/CPSC are dataset-specific sensitivity analyses; CPSC is not record-level 27-class or official episode-boundary scoring"),
     ]
     required_artifacts = {
         "AE": ["tables/table_final_evidence_matrix.csv", "tables/table_final_safe_wording.csv"],
@@ -419,13 +419,21 @@ def reviewer_traceability_rows(
             "metrics/external_comparator_paired_summary.json",
             "metrics/robustness_multicomparator_pairwise.json",
             "metrics/true_fewshot_head_ptbxl_summary.csv",
+            "metrics/ptbxl_fold_protocol_audit.json",
+            "tables/table_ptbxl_unsupported_only_sensitivity.csv",
         ],
         "R1-C6": ["metrics/pooling_sensitivity.json", "metrics/pooling_sensitivity_external.csv"],
         "R1-C7": ["tables/table_fold_pca_provenance.csv"],
         "R2-C1": ["tables/table_hypothesis_control_claim_boundary.csv"],
         "R2-C2": ["metrics/representation_probe_summary.json", "figures/figure_representation_audit.png"],
         "R2-C3": ["metrics/robustness_multicomparator_pairwise.json"],
-        "R2-C4": ["metrics/true_fewshot_head_ptbxl_summary.csv", "metrics/group_safe_score_calibration_ptbxl_summary.csv"],
+        "R2-C4": [
+            "manifests/ptbxl_adaptation_analysis_lock.json",
+            "metrics/ptbxl_fold_protocol_audit.json",
+            "tables/table_ptbxl_unsupported_only_sensitivity.csv",
+            "metrics/true_fewshot_head_ptbxl_summary.csv",
+            "metrics/group_safe_score_calibration_ptbxl_summary.csv",
+        ],
     }
     rows = []
     for item, requirement, notebook, notebook_cell, runner, inputs, outputs, unit, boundary in specifications:

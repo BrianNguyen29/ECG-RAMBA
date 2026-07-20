@@ -480,6 +480,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "canonical_gate_ready",
             "final_evidence_tables",
             "--refresh-existing-cache-dirs",
+            "ptbxl_adaptation_analysis_lock.json",
+            "ptbxl_fold_protocol_audit.json",
+            "table_ptbxl_unsupported_only_sensitivity.csv",
         ):
             self.assertIn(token, source)
 

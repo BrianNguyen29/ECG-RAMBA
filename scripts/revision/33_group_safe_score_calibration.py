@@ -74,6 +74,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--force-rerun", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--analysis-lock",
+        type=Path,
+        default=MANIFEST_DIR / "ptbxl_adaptation_analysis_lock.json",
+    )
     parser.add_argument("--out-summary", type=Path, default=None)
     parser.add_argument("--out-table", type=Path, default=None)
     parser.add_argument("--out-bootstrap", type=Path, default=None)
@@ -95,7 +100,7 @@ def budget_role(fraction: float, primary_fraction: float) -> str:
     if fraction == 0:
         return "zero_target_label_reference"
     if np.isclose(fraction, primary_fraction, atol=1e-12):
-        return "pre_specified_primary"
+        return "analysis_locked_primary"
     return "sensitivity"
 
 
@@ -127,6 +132,45 @@ def parse_float_list(value: str) -> list[float]:
 
 def parse_int_list(value: str) -> list[int]:
     return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def validate_ptbxl_analysis_lock(
+    path: Path,
+    *,
+    fractions: list[float],
+    primary_fraction: float,
+    seeds: list[int],
+    threshold: float,
+    n_bins: int,
+    n_boot: int,
+) -> dict[str, str]:
+    path = resolve(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"PTB-XL adaptation analysis lock is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    protocol = payload.get("protocol") or {}
+    expected = {
+        "status": payload.get("status") == "locked",
+        "adaptation_split": protocol.get("adaptation_split") == "official_ptbxl_fold9",
+        "test_split": protocol.get("test_split") == "official_ptbxl_fold10",
+        "group_unit": protocol.get("group_unit") == "patient_id",
+        "fractions": protocol.get("fractions") == fractions,
+        "primary_fraction": np.isclose(float(protocol.get("primary_fraction", np.nan)), primary_fraction),
+        "seeds": protocol.get("seeds") == seeds,
+        "threshold": np.isclose(float(protocol.get("threshold", np.nan)), threshold),
+        "n_bins": int(protocol.get("n_bins", -1)) == n_bins,
+        "n_boot": int(protocol.get("n_boot", -1)) == n_boot,
+        "calibrator": (protocol.get("score_calibration") or {}).get("fit_split") == "fold9_only",
+    }
+    failed = [key for key, valid in expected.items() if not valid]
+    protocol_sha = hashlib.sha256(
+        json.dumps(protocol, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    if payload.get("protocol_sha256") != protocol_sha:
+        failed.append("protocol_sha256")
+    if failed:
+        raise RuntimeError(f"PTB-XL analysis lock mismatch: {failed}")
+    return {"path": str(path), "sha256": sha256_file(path), "protocol_sha256": protocol_sha}
 
 
 def default_paths(args: argparse.Namespace) -> dict[str, Path]:
@@ -316,6 +360,7 @@ def metric_cache_key(
     train_groups: np.ndarray,
     test_groups: np.ndarray,
     metric_name: str,
+    analysis_lock_sha256: str | None,
 ) -> str:
     payload = {
         "protocol": PROTOCOL,
@@ -331,6 +376,7 @@ def metric_cache_key(
         "threshold": args.threshold,
         "n_bins": args.n_bins,
         "n_boot": args.n_boot,
+        "analysis_lock_sha256": analysis_lock_sha256,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -359,6 +405,30 @@ def main() -> None:
     print("=" * 80, flush=True)
     print(f"dataset={args.dataset} protocol={PROTOCOL}", flush=True)
 
+    fractions = parse_float_list(args.fractions)
+    seeds = parse_int_list(args.seeds)
+    if not fractions or any(value < 0 or value > 1 for value in fractions):
+        raise ValueError(f"Invalid fractions: {fractions}")
+    if not any(np.isclose(value, args.primary_fraction, atol=1e-12) for value in fractions):
+        raise ValueError("--primary-fraction must be included in --fractions")
+    if not seeds:
+        raise ValueError("At least one seed is required")
+    if not 0 < args.test_fraction < 1:
+        raise ValueError("--test-fraction must be in (0,1)")
+    analysis_lock = (
+        validate_ptbxl_analysis_lock(
+            args.analysis_lock,
+            fractions=fractions,
+            primary_fraction=args.primary_fraction,
+            seeds=seeds,
+            threshold=args.threshold,
+            n_bins=args.n_bins,
+            n_boot=args.n_boot,
+        )
+        if args.dataset == "ptbxl"
+        else None
+    )
+
     test = load_prediction(paths["test"], args.dataset)
     gate = load_gate(paths["gate"], test)
     if args.dataset == "ptbxl":
@@ -376,17 +446,6 @@ def main() -> None:
             raise RuntimeError(f"PTB-XL patient leakage between folds 9 and 10: {sorted(overlap)[:10]}")
     else:
         adaptation = test
-
-    fractions = parse_float_list(args.fractions)
-    seeds = parse_int_list(args.seeds)
-    if not fractions or any(value < 0 or value > 1 for value in fractions):
-        raise ValueError(f"Invalid fractions: {fractions}")
-    if not any(np.isclose(value, args.primary_fraction, atol=1e-12) for value in fractions):
-        raise ValueError("--primary-fraction must be included in --fractions")
-    if not seeds:
-        raise ValueError("At least one seed is required")
-    if not 0 < args.test_fraction < 1:
-        raise ValueError("--test-fraction must be in (0,1)")
 
     rows: list[dict[str, Any]] = []
     coefficient_rows: list[dict[str, Any]] = []
@@ -491,6 +550,7 @@ def main() -> None:
                     train_groups=selected_train_groups,
                     test_groups=test_groups,
                     metric_name=metric_name,
+                    analysis_lock_sha256=(analysis_lock or {}).get("sha256"),
                 )
                 cache_path = metric_cache_dir / f"{split_key}_{metric_name}_{cache_key[:16]}.json"
                 if args.reuse_existing and not args.force_rerun and cache_path.exists():
@@ -587,6 +647,7 @@ def main() -> None:
             "protocol": PROTOCOL,
             "runner_sha256": sha256_file(Path(__file__).resolve()),
             "canonical_contract": canonical,
+            "analysis_lock": analysis_lock,
             "dataset": args.dataset,
             "adaptation_kind": "score_calibration_only_model_weights_unchanged",
             "calibrator": {
@@ -604,15 +665,16 @@ def main() -> None:
             "adaptation_predictions": {"path": str(adaptation["path"]), "sha256": adaptation["sha256"]},
             "fractions": fractions,
             "primary_fraction": args.primary_fraction,
-            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "primary_fraction_policy": "fixed_by_post_initial_review_analysis_lock_before_current_rerun",
             "fraction_unit": "independent_target_groups_from_adaptation_pool",
-        "fraction_sampling": "nested_seeded_label_independent_group_prefix",
+            "fraction_sampling": "nested_seeded_label_independent_group_prefix",
             "seeds": seeds,
             "split_audits": split_audits,
             "n_boot": args.n_boot,
             "safe_wording": (
-                "Group-safe target-domain score calibration on frozen predictions with a pre-specified 10% "
-                "primary target-group budget; model weights were not fine-tuned."
+                "Group-safe target-domain score calibration on frozen predictions with a locked 10% "
+                "primary target-group budget; model weights were not fine-tuned. The lock is a "
+                "post-initial-review reproducibility lock, not a preregistration."
             ),
             "outputs": [
                 {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}

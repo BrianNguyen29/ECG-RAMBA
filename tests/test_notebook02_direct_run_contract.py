@@ -63,6 +63,25 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         )
         self.assertIn("GPU inference was intentionally not started", self.source)
 
+    def test_ptbxl_adaptation_is_locked_and_audited_before_metric_runners(self):
+        lock = self.source.index("PTBXL_ADAPTATION_ANALYSIS_LOCK_CELL_V1")
+        refresh = self.source.index("python -u scripts/revision/50_refresh_in_domain_paired_contracts.py")
+        external = self.source.index("python -u scripts/revision/31_generate_external_comparator_predictions.py")
+        audit = self.source.index("PTBXL_FOLD_PROTOCOL_AUDIT_CELL_V1")
+        paired = self.source.index("python -u scripts/revision/32_paired_external_comparators.py")
+        score = self.source.index("python -u scripts/revision/33_group_safe_score_calibration.py")
+        head = self.source.index("python -u scripts/revision/35_true_fewshot_head_adaptation.py")
+        self.assertLess(lock, refresh)
+        self.assertLess(refresh, external)
+        self.assertLess(external, audit)
+        self.assertLess(audit, paired)
+        self.assertLess(audit, score)
+        self.assertLess(audit, head)
+        self.assertIn("--analysis-lock \"{PTBXL_ADAPTATION_LOCK}\"", self.source)
+        self.assertIn("table_ptbxl_unsupported_only_sensitivity.csv", self.source)
+        self.assertIn("paired_refresh_complete_models", self.source)
+        self.assertIn("{'resnet', 'raw_mamba'}.issubset(paired_refresh_complete_models)", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

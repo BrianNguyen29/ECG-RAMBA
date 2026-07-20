@@ -113,9 +113,11 @@ class ExternalComparatorContractTests(unittest.TestCase):
             train_groups=np.asarray(["g1", "g2"]),
             test_groups=np.asarray(["g3", "g4"]),
             canonical=canonical,
+            analysis_lock_sha256="1" * 64,
         )
         self.assertEqual(contract["canonical_group_contract_sha256"], "c" * 64)
         self.assertEqual(contract["canonical_group_sidecar_sha256"], "d" * 64)
+        self.assertEqual(contract["analysis_lock_sha256"], "1" * 64)
         self.assertNotEqual(
             fewshot.metric_cache_key(contract),
             fewshot.metric_cache_key({**contract, "n_boot": 999}),

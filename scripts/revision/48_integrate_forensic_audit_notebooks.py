@@ -117,6 +117,21 @@ REVISION_TOKEN_REQUIREMENTS = {
         'pre_specified_before_test_metric_evaluation',
         'primary_endpoint_rows',
     ],
+    'scripts/revision/50_refresh_in_domain_paired_contracts.py': [
+        'IN_DOMAIN_PAIRED_REFRESH_CAPABILITY',
+        'canonical_freeze_sha256',
+        'regenerated_cpu',
+    ],
+    'scripts/revision/51_ptbxl_adaptation_analysis_lock.py': [
+        'PTBXL_ADAPTATION_LOCK_CAPABILITY',
+        'post_initial_result_review',
+        'evaluate_fold10_only_after_configuration_lock_validation',
+    ],
+    'scripts/revision/52_ptbxl_fold_protocol_audit.py': [
+        'PTBXL_FOLD_PROTOCOL_AUDIT_CAPABILITY',
+        'patient-group percentile bootstrap',
+        'sensitivity_exclude_unsupported_only',
+    ],
 }
 REVISION_REQUIRED_FILES = [
     'docs/revision_plan/georgia_label_mapping_review_20260703.csv',
@@ -706,6 +721,61 @@ def replace_installer_discovery(text: str) -> str:
 def integrate_notebook02() -> None:
     name = "02_predictions_and_external_eval.ipynb"
     notebook = load(name)
+    lock_marker = "PTBXL_ADAPTATION_ANALYSIS_LOCK_CELL_V1"
+    lock_markdown = {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## PTB-XL Adaptation Analysis Lock\n",
+            "\n",
+            "CPU-only reproducibility lock for official fold 9 adaptation and fold 10 evaluation. "
+            "This post-initial-review lock prevents silent changes during reruns; it is not a preregistration.\n",
+        ],
+    }
+    lock_code_text = r'''# PTBXL_ADAPTATION_ANALYSIS_LOCK_CELL_V1
+PTBXL_ADAPTATION_LOCK = Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock.json')
+if '_restore_report_artifact' in globals():
+    lock_restore_roots = globals().get('restore_source_roots', [MIRROR_REVISION_ROOT])
+    print('PTB-XL analysis-lock restore:', _restore_report_artifact(PTBXL_ADAPTATION_LOCK, lock_restore_roots))
+run(
+    'python -u scripts/revision/51_ptbxl_adaptation_analysis_lock.py '
+    '--models full,resnet,raw_mamba,transformer --fractions 0,0.01,0.05,0.10 '
+    '--primary-fraction 0.10 --seeds 42,43,44,45,46 --threshold 0.5 '
+    '--n-bins 15 --n-boot 1000 --head-c 1.0 --max-iter 5000',
+    log_path='reports/revision/logs/ptbxl_adaptation_analysis_lock.log',
+)
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+    f'--source-conflict-policy source --include-path "manifests/ptbxl_adaptation_analysis_lock.json" '
+    f'--mirror-root "{MIRROR_REVISION_ROOT}"',
+    log_path='reports/revision/logs/ptbxl_adaptation_analysis_lock_mirror_publish.log',
+)
+ptbxl_analysis_lock = json.loads(PTBXL_ADAPTATION_LOCK.read_text(encoding='utf-8'))
+print('PTB-XL analysis lock:', ptbxl_analysis_lock['protocol_sha256'])
+print('Temporal qualification:', ptbxl_analysis_lock['temporal_qualification'])
+'''
+    lock_code = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": lock_code_text.splitlines(keepends=True),
+    }
+    existing_lock_indexes = [
+        index for index, cell in enumerate(notebook["cells"])
+        if lock_marker in source(cell)
+    ]
+    if len(existing_lock_indexes) > 1:
+        raise RuntimeError("Notebook 02 contains duplicate PTB-XL analysis-lock cells")
+    external_heading_index = next(
+        index for index, cell in enumerate(notebook["cells"])
+        if cell.get("cell_type") == "markdown"
+        and "## External Learned-Comparator Zero-Target-Label Inference" in source(cell)
+    )
+    if existing_lock_indexes:
+        set_source(notebook["cells"][existing_lock_indexes[0]], lock_code_text)
+    else:
+        notebook["cells"][external_heading_index:external_heading_index] = [lock_markdown, lock_code]
     candidates = [cell for cell in notebook["cells"] if cell.get("cell_type") == "code" and "AUTO_PIN_TORCH_FOR_MAMBA" in source(cell) and "Mamba wheel environment" in source(cell)]
     if len(candidates) != 1:
         raise RuntimeError(f"Notebook 02 Mamba installer candidate_count={len(candidates)}")
@@ -1033,6 +1103,199 @@ gate_publish_args = ' '.join(
                 "--source-conflict-policy source {gate_publish_args} --mirror-root \"{gate_restore_root}\"'"
             )
             text = text.replace(broad_gate_publish, selected_gate_publish, 1)
+        set_source(cell, text)
+
+    comparator_cell = next(
+        cell for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+        and "RUN_EXTERNAL_LEARNED_COMPARATORS" in source(cell)
+        and "RUN_PTBXL_FOLD9_COMPARATORS" in source(cell)
+    )
+    comparator_text = source(comparator_cell)
+    paired_restore_anchor = """    Path('metrics/paired_full_vs_transformer_comparison.json'),
+]"""
+    paired_restore_replacement = """    Path('metrics/paired_full_vs_transformer_comparison.json'),
+    Path('predictions/resnet1d_cnn_oof_predictions.npz'),
+    Path('tables/table_paired_full_vs_resnet.csv'),
+    Path('metrics/paired_full_vs_resnet_bootstrap_samples.csv'),
+    Path('manifests/paired_full_vs_resnet_manifest.json'),
+    Path('predictions/raw_mamba_oof_predictions.npz'),
+    Path('tables/table_paired_full_vs_raw_mamba.csv'),
+    Path('metrics/paired_full_vs_raw_mamba_bootstrap_samples.csv'),
+    Path('manifests/paired_full_vs_raw_mamba_manifest.json'),
+    Path('predictions/transformer_ecg_oof_predictions.npz'),
+    Path('tables/table_paired_full_vs_transformer.csv'),
+    Path('metrics/paired_full_vs_transformer_bootstrap_samples.csv'),
+    Path('manifests/paired_full_vs_transformer_manifest.json'),
+]"""
+    if "predictions/resnet1d_cnn_oof_predictions.npz" not in comparator_text:
+        if paired_restore_anchor not in comparator_text:
+            raise RuntimeError("Notebook 02 comparator restore-list anchor missing")
+        comparator_text = comparator_text.replace(paired_restore_anchor, paired_restore_replacement, 1)
+    restore_terminal = "    print('In-domain comparator contract restore:', comparator_restore_rows)\n"
+    if "50_refresh_in_domain_paired_contracts.py" not in comparator_text:
+        paired_refresh_block = r'''
+
+# CPU-only: a metadata-only freeze refresh changes the exact freeze SHA but does
+# not require baseline retraining. Rebuild only stale paired tables/JSONs from
+# the existing same-record OOF prediction NPZs, then bind them to the strict
+# current freeze contract before any external GPU inference.
+run(
+    'python -u scripts/revision/50_refresh_in_domain_paired_contracts.py '
+    '--models resnet,raw_mamba,transformer --n-boot 1000 --allow-incomplete',
+    log_path='reports/revision/logs/in_domain_paired_contract_refresh.log',
+)
+PAIRED_REFRESH_OUTPUTS = [
+    Path('reports/revision/metrics/in_domain_paired_contract_refresh.json'),
+    Path('reports/revision/metrics/paired_full_vs_resnet_comparison.json'),
+    Path('reports/revision/tables/table_paired_full_vs_resnet.csv'),
+    Path('reports/revision/metrics/paired_full_vs_resnet_bootstrap_samples.csv'),
+    Path('reports/revision/manifests/paired_full_vs_resnet_manifest.json'),
+    Path('reports/revision/metrics/paired_full_vs_raw_mamba_comparison.json'),
+    Path('reports/revision/tables/table_paired_full_vs_raw_mamba.csv'),
+    Path('reports/revision/metrics/paired_full_vs_raw_mamba_bootstrap_samples.csv'),
+    Path('reports/revision/manifests/paired_full_vs_raw_mamba_manifest.json'),
+    Path('reports/revision/metrics/paired_full_vs_transformer_comparison.json'),
+    Path('reports/revision/tables/table_paired_full_vs_transformer.csv'),
+    Path('reports/revision/metrics/paired_full_vs_transformer_bootstrap_samples.csv'),
+    Path('reports/revision/manifests/paired_full_vs_transformer_manifest.json'),
+]
+paired_refresh_publish_args = ' '.join(
+    f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+    for path in PAIRED_REFRESH_OUTPUTS if path.exists() and path.stat().st_size > 0
+)
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+    f'--source-conflict-policy source {paired_refresh_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
+    log_path='reports/revision/logs/in_domain_paired_contract_refresh_mirror_publish.log',
+)
+paired_refresh_status = json.loads(
+    Path('reports/revision/metrics/in_domain_paired_contract_refresh.json').read_text(encoding='utf-8')
+)
+paired_refresh_complete_models = {
+    row['model'] for row in paired_refresh_status.get('models', [])
+    if row.get('status') == 'complete'
+}
+print('Exact current paired models:', sorted(paired_refresh_complete_models))
+'''
+        if restore_terminal not in comparator_text:
+            raise RuntimeError("Notebook 02 paired-refresh insertion anchor missing")
+        comparator_text = comparator_text.replace(
+            restore_terminal,
+            restore_terminal + paired_refresh_block,
+            1,
+        )
+    comparator_text = comparator_text.replace(
+        "if transformer_files_ready and transformer_checkpoint_contract_ready:",
+        "if transformer_files_ready and transformer_checkpoint_contract_ready and 'transformer' in paired_refresh_complete_models:",
+    )
+    comparator_text = comparator_text.replace(
+        "learned_in_domain_ready = learned_in_domain_files_ready and resnet_checkpoint_contract_ready and raw_mamba_checkpoint_contract_ready",
+        "learned_in_domain_ready = (learned_in_domain_files_ready and resnet_checkpoint_contract_ready and raw_mamba_checkpoint_contract_ready and {'resnet', 'raw_mamba'}.issubset(paired_refresh_complete_models))",
+    )
+    set_source(comparator_cell, comparator_text)
+
+    audit_marker = "PTBXL_FOLD_PROTOCOL_AUDIT_CELL_V1"
+    audit_markdown = {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## PTB-XL Fold 9/10 Patient and Unsupported-Only Audit\n",
+            "\n",
+            "CPU-only audit of patient disjointness, common records across all four models, and a label-defined sensitivity analysis excluding records with no supported positive superclass.\n",
+        ],
+    }
+    audit_code_text = r'''# PTBXL_FOLD_PROTOCOL_AUDIT_CELL_V1
+RUN_PTBXL_FOLD_PROTOCOL_AUDIT = 'auto'
+PTBXL_FOLD_PROTOCOL_N_BOOT = 1000
+PTBXL_FOLD_PROTOCOL_CACHE = MIRROR_REVISION_ROOT / 'metrics' / 'ptbxl_fold_protocol_metric_cache'
+PTBXL_FOLD_PROTOCOL_REQUIRED = [
+    Path('reports/revision/metrics/ptbxl_fold_protocol_audit.json'),
+    Path('reports/revision/tables/table_ptbxl_fold_protocol_audit.csv'),
+    Path('reports/revision/tables/table_ptbxl_unsupported_only_sensitivity.csv'),
+    Path('reports/revision/manifests/ptbxl_fold_protocol_audit_manifest.json'),
+]
+if '_restore_report_artifact' in globals():
+    protocol_restore_roots = globals().get('restore_source_roots', [MIRROR_REVISION_ROOT])
+    print('PTB-XL fold-protocol audit restore:', [
+        _restore_report_artifact(path, protocol_restore_roots)
+        for path in PTBXL_FOLD_PROTOCOL_REQUIRED
+    ])
+ptbxl_protocol_inputs = [
+    path for model in ['full', 'resnet', 'raw_mamba', 'transformer']
+    for path in (
+        [Path('reports/revision/experimental/external/ptbxl/ptbxl_full_predictions.npz'), Path('reports/revision/experimental/external/ptbxl/ptbxl_full_fold9_predictions.npz')]
+        if model == 'full'
+        else [_comparator_artifacts('ptbxl', model)[0], _comparator_artifacts('ptbxl', model, 'fold9')[0]]
+    )
+]
+ptbxl_protocol_inputs_ready = all(path.exists() and path.stat().st_size > 0 for path in ptbxl_protocol_inputs)
+ptbxl_protocol_should_run = RUN_PTBXL_FOLD_PROTOCOL_AUDIT is True or (
+    str(RUN_PTBXL_FOLD_PROTOCOL_AUDIT).lower() == 'auto' and ptbxl_protocol_inputs_ready
+)
+if RUN_PTBXL_FOLD_PROTOCOL_AUDIT is True and not ptbxl_protocol_inputs_ready:
+    raise FileNotFoundError('PTB-XL fold-protocol audit was forced but inputs are missing: ' + '; '.join(str(path) for path in ptbxl_protocol_inputs if not path.exists() or path.stat().st_size == 0))
+if ptbxl_protocol_should_run:
+    run(
+        'python -u scripts/revision/52_ptbxl_fold_protocol_audit.py '
+        '--models full,resnet,raw_mamba,transformer --threshold 0.5 --n-bins 15 '
+        f'--n-boot {PTBXL_FOLD_PROTOCOL_N_BOOT} --strict --reuse-existing '
+        f'--analysis-lock "{PTBXL_ADAPTATION_LOCK}" --metric-cache-dir "{PTBXL_FOLD_PROTOCOL_CACHE}"',
+        log_path='reports/revision/logs/ptbxl_fold_protocol_audit.log',
+    )
+    audit_publish_args = ' '.join(
+        f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+        for path in PTBXL_FOLD_PROTOCOL_REQUIRED
+    )
+    run(
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+        f'--source-conflict-policy source {audit_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
+        log_path='reports/revision/logs/ptbxl_fold_protocol_audit_mirror_publish.log',
+    )
+else:
+    print('PTB-XL fold-protocol audit deferred until all Full/ResNet/Raw-Mamba/Transformer fold9 and fold10 predictions exist.')
+for path in PTBXL_FOLD_PROTOCOL_REQUIRED:
+    print(f'{path}: exists={path.exists()} size={path.stat().st_size if path.exists() else None}')
+'''
+    audit_code = {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": audit_code_text.splitlines(keepends=True),
+    }
+    audit_existing = [index for index, cell in enumerate(notebook["cells"]) if audit_marker in source(cell)]
+    if len(audit_existing) > 1:
+        raise RuntimeError("Notebook 02 contains duplicate PTB-XL fold-protocol audit cells")
+    if audit_existing:
+        set_source(notebook["cells"][audit_existing[0]], audit_code_text)
+    else:
+        paired_heading_index = next(
+            index for index, cell in enumerate(notebook["cells"])
+            if cell.get("cell_type") == "markdown"
+            and "## Paired External Comparator Audit" in source(cell)
+        )
+        notebook["cells"][paired_heading_index:paired_heading_index] = [audit_markdown, audit_code]
+
+    for cell in notebook["cells"]:
+        text = source(cell)
+        if "33_group_safe_score_calibration.py" in text and "--analysis-lock" not in text:
+            text = text.replace(
+                "--n-boot {GROUP_SAFE_CALIBRATION_N_BOOT} --strict --reuse-existing ",
+                "--n-boot {GROUP_SAFE_CALIBRATION_N_BOOT} --strict --reuse-existing --analysis-lock \"{PTBXL_ADAPTATION_LOCK}\" ",
+            )
+        if "35_true_fewshot_head_adaptation.py" in text and "--analysis-lock" not in text:
+            text = text.replace(
+                "--n-boot {TRUE_FEWSHOT_N_BOOT} --strict --reuse-existing ",
+                "--n-boot {TRUE_FEWSHOT_N_BOOT} --strict --reuse-existing --analysis-lock \"{PTBXL_ADAPTATION_LOCK}\" ",
+            )
+        if "reviewer_stage_rows = [" in text and "ptbxl_fold_protocol_audit" not in text:
+            anchor = "    _stage_row('paired_external_group_bootstrap',"
+            row = "    _stage_row('ptbxl_fold_protocol_audit', 'R1-C5/R2-C4', globals().get('PTBXL_FOLD_PROTOCOL_REQUIRED', []), 'CPU', 'Run PTB-XL Fold 9/10 Patient and Unsupported-Only Audit.'),\n"
+            position = text.find(anchor)
+            if position < 0:
+                raise RuntimeError("Notebook 02 reviewer-stage audit insertion anchor missing")
+            text = text[:position] + row + text[position:]
         set_source(cell, text)
     install_run_history(notebook)
     save(name, notebook)
@@ -1456,6 +1719,12 @@ run(
         "Path('reports/revision/tables/table_physiological_interval_probe.csv')",
         "Path('reports/revision/tables/table_physiological_interval_probe_contrasts.csv')",
         "Path('reports/revision/tables/table_physiological_interval_probe.tex')",
+        "Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock.json')",
+        "Path('reports/revision/metrics/in_domain_paired_contract_refresh.json')",
+        "Path('reports/revision/metrics/ptbxl_fold_protocol_audit.json')",
+        "Path('reports/revision/tables/table_ptbxl_fold_protocol_audit.csv')",
+        "Path('reports/revision/tables/table_ptbxl_unsupported_only_sensitivity.csv')",
+        "Path('reports/revision/manifests/ptbxl_fold_protocol_audit_manifest.json')",
     ]
     anchor = "optional_sources = [\n"
     missing_forensic_sources = [item for item in forensic_sources if item not in export_text]

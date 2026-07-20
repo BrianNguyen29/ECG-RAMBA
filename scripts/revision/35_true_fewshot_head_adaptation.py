@@ -88,6 +88,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--force-rerun", action="store_true")
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--analysis-lock",
+        type=Path,
+        default=MANIFEST_DIR / "ptbxl_adaptation_analysis_lock.json",
+    )
     parser.add_argument("--external-root", type=Path, default=EXPERIMENTAL_DIR / "external")
     parser.add_argument("--embedding-root", type=Path, default=PREDICTION_DIR)
     parser.add_argument("--full-gate-json", type=Path, default=None)
@@ -131,7 +136,7 @@ def budget_role(fraction: float, primary_fraction: float) -> str:
     if fraction == 0:
         return "zero_target_label_reference"
     if math.isclose(fraction, primary_fraction, abs_tol=1e-12):
-        return "pre_specified_primary"
+        return "analysis_locked_primary"
     return "sensitivity"
 
 
@@ -154,6 +159,50 @@ def canonical_json_sha256(payload: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def validate_ptbxl_analysis_lock(
+    path: Path,
+    *,
+    models: list[str],
+    fractions: list[float],
+    primary_fraction: float,
+    seeds: list[int],
+    threshold: float,
+    n_bins: int,
+    n_boot: int,
+    head_c: float,
+    max_iter: int,
+) -> dict[str, str]:
+    path = resolve(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"PTB-XL adaptation analysis lock is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    protocol = payload.get("protocol") or {}
+    head = protocol.get("frozen_encoder_head") or {}
+    expected = {
+        "status": payload.get("status") == "locked",
+        "adaptation_split": protocol.get("adaptation_split") == "official_ptbxl_fold9",
+        "test_split": protocol.get("test_split") == "official_ptbxl_fold10",
+        "group_unit": protocol.get("group_unit") == "patient_id",
+        "models": protocol.get("models") == models,
+        "fractions": protocol.get("fractions") == fractions,
+        "primary_fraction": math.isclose(float(protocol.get("primary_fraction", math.nan)), primary_fraction, abs_tol=1e-12),
+        "seeds": protocol.get("seeds") == seeds,
+        "threshold": math.isclose(float(protocol.get("threshold", math.nan)), threshold, abs_tol=1e-12),
+        "n_bins": int(protocol.get("n_bins", -1)) == n_bins,
+        "n_boot": int(protocol.get("n_boot", -1)) == n_boot,
+        "head_c": math.isclose(float(head.get("regularization_C", math.nan)), head_c, abs_tol=1e-12),
+        "max_iter": int(head.get("max_iter", -1)) == max_iter,
+        "head_fit_split": head.get("fit_split") == "fold9_only",
+    }
+    protocol_sha = canonical_json_sha256(protocol)
+    if payload.get("protocol_sha256") != protocol_sha:
+        expected["protocol_sha256"] = False
+    failed = [key for key, valid in expected.items() if not valid]
+    if failed:
+        raise RuntimeError(f"PTB-XL analysis lock mismatch: {failed}")
+    return {"path": str(path), "sha256": sha256_file(path), "protocol_sha256": protocol_sha}
 
 
 def resolve_contract_path(value: Any) -> Path:
@@ -589,6 +638,7 @@ def cache_key(
     canonical: dict[str, Any],
     test_group_assignment_sha256: str,
     adaptation_group_assignment_sha256: str,
+    analysis_lock_sha256: str | None,
 ) -> str:
     payload = {
         "protocol": PROTOCOL,
@@ -608,6 +658,7 @@ def cache_key(
         "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
         "test_group_assignment_sha256": test_group_assignment_sha256,
         "adaptation_group_assignment_sha256": adaptation_group_assignment_sha256,
+        "analysis_lock_sha256": analysis_lock_sha256,
         "train_groups_sha256": hashlib.sha256(
             np.asarray(train_groups).astype(str).tobytes()
         ).hexdigest(),
@@ -629,6 +680,7 @@ def metric_cache_contract(
     train_groups: np.ndarray,
     test_groups: np.ndarray,
     canonical: dict[str, Any],
+    analysis_lock_sha256: str | None,
 ) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL,
@@ -648,6 +700,7 @@ def metric_cache_contract(
         "canonical_freeze_sha256": canonical["freeze_sha256"],
         "canonical_group_contract_sha256": canonical["group_contract_sha256"],
         "canonical_group_sidecar_sha256": canonical["group_sidecar_sha256"],
+        "analysis_lock_sha256": analysis_lock_sha256,
     }
 
 
@@ -822,7 +875,7 @@ def primary_endpoint_rows(
                 "bootstrap_unit": "patient/source-record group",
                 "uncertainty_scope": (
                     "shared patient-group bootstrap conditional on the fixed encoder/head fits and "
-                    "the pre-specified adaptation seed grid; training-seed and encoder-refit variability "
+                    "the analysis-locked adaptation seed grid; training-seed and encoder-refit variability "
                     "are not included"
                 ),
                 "interpretation": interval_interpretation(
@@ -886,7 +939,7 @@ def primary_endpoint_rows(
                     "bootstrap_unit": "patient/source-record group",
                     "uncertainty_scope": (
                         "shared patient-group bootstrap conditional on the fixed encoder/head fits and "
-                        "the pre-specified adaptation seed grid; training-seed and encoder-refit variability "
+                        "the analysis-locked adaptation seed grid; training-seed and encoder-refit variability "
                         "are not included"
                     ),
                     "interpretation": interval_interpretation(
@@ -909,7 +962,7 @@ def primary_endpoint_rows(
         "n_seeds": len(next(iter(predictions.values()))),
         "uncertainty_scope": (
             "shared patient-group bootstrap conditional on fixed encoder/head fits and the "
-            "pre-specified adaptation seed grid; no encoder or head refit within bootstrap replicates"
+            "analysis-locked adaptation seed grid; no encoder or head refit within bootstrap replicates"
         ),
         "items": bootstrap_payload,
     }
@@ -989,6 +1042,22 @@ def main() -> None:
     seeds = parse_seeds(args.seeds)
     if not 0 < args.test_fraction < 1:
         raise ValueError("--test-fraction must be in (0,1)")
+    analysis_lock = (
+        validate_ptbxl_analysis_lock(
+            args.analysis_lock,
+            models=models,
+            fractions=fractions,
+            primary_fraction=args.primary_fraction,
+            seeds=seeds,
+            threshold=args.threshold,
+            n_bins=args.n_bins,
+            n_boot=args.n_boot,
+            head_c=args.head_c,
+            max_iter=args.max_iter,
+        )
+        if args.dataset == "ptbxl"
+        else None
+    )
     paths = default_paths(args)
     cache_dir = resolve(args.cache_dir) / args.dataset
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -1109,6 +1178,7 @@ def main() -> None:
                     canonical,
                     data["test_pred"]["group_assignment_sha256"],
                     data["adapt_pred"]["group_assignment_sha256"],
+                    (analysis_lock or {}).get("sha256"),
                 )
                 cache = cache_dir / f"{model}_{split_key}_{key[:16]}.npz"
                 coefficient_cache = cache.with_suffix(".coefficients.json")
@@ -1125,11 +1195,15 @@ def main() -> None:
                         cached_group_sidecar_sha256 = str(
                             saved["canonical_group_sidecar_sha256"].item()
                         )
+                        cached_analysis_lock_sha256 = str(
+                            saved["analysis_lock_sha256"].item()
+                        )
                     if (
                         cached_key != key
                         or cached_runner_sha256 != sha256_file(Path(__file__).resolve())
                         or cached_group_contract_sha256 != canonical["group_contract_sha256"]
                         or cached_group_sidecar_sha256 != canonical["group_sidecar_sha256"]
+                        or cached_analysis_lock_sha256 != str((analysis_lock or {}).get("sha256") or "")
                         or adapted_prob.shape != zero_prob.shape
                         or not np.isfinite(adapted_prob).all()
                         or not np.array_equal(cached_test, test_idx)
@@ -1146,6 +1220,8 @@ def main() -> None:
                         != canonical["group_contract_sha256"]
                         or coefficient_payload.get("canonical_group_sidecar_sha256")
                         != canonical["group_sidecar_sha256"]
+                        or coefficient_payload.get("analysis_lock_sha256")
+                        != str((analysis_lock or {}).get("sha256") or "")
                     ):
                         raise RuntimeError(f"Coefficient cache contract mismatch: {coefficient_cache}")
                     coefficients = (
@@ -1168,6 +1244,7 @@ def main() -> None:
                         canonical_group_sidecar_sha256=np.asarray(
                             canonical["group_sidecar_sha256"]
                         ),
+                        analysis_lock_sha256=np.asarray(str((analysis_lock or {}).get("sha256") or "")),
                     )
                     save_json_atomic(
                         coefficient_cache,
@@ -1180,6 +1257,7 @@ def main() -> None:
                             "canonical_group_sidecar_sha256": canonical[
                                 "group_sidecar_sha256"
                             ],
+                            "analysis_lock_sha256": str((analysis_lock or {}).get("sha256") or ""),
                             "coefficients": [],
                         },
                     )
@@ -1207,6 +1285,7 @@ def main() -> None:
                         canonical_group_sidecar_sha256=np.asarray(
                             canonical["group_sidecar_sha256"]
                         ),
+                        analysis_lock_sha256=np.asarray(str((analysis_lock or {}).get("sha256") or "")),
                     )
                     save_json_atomic(
                         coefficient_cache,
@@ -1219,6 +1298,7 @@ def main() -> None:
                             "canonical_group_sidecar_sha256": canonical[
                                 "group_sidecar_sha256"
                             ],
+                            "analysis_lock_sha256": str((analysis_lock or {}).get("sha256") or ""),
                             "coefficients": coefficients,
                         },
                     )
@@ -1247,7 +1327,7 @@ def main() -> None:
                     "fraction": fraction,
                     "budget_role": budget_role(fraction, args.primary_fraction),
                     "fraction_unit": "independent_target_groups_from_adaptation_pool",
-                "fraction_sampling": "nested_seeded_label_independent_group_prefix",
+                    "fraction_sampling": "nested_seeded_label_independent_group_prefix",
                     "embedding_dimension": int(data["test_emb"]["embedding"].shape[2]),
                     "representation_pooling": "mean_of_preclassifier_slice_embeddings_per_fold",
                     "fold_heads": 0 if len(train_idx) == 0 else 5,
@@ -1272,6 +1352,7 @@ def main() -> None:
                         train_groups=train_groups,
                         test_groups=test_groups,
                         canonical=canonical,
+                        analysis_lock_sha256=(analysis_lock or {}).get("sha256"),
                     )
                     metric_key = metric_cache_key(metric_contract)
                     metric_cache = metric_cache_dir / (
@@ -1394,6 +1475,7 @@ def main() -> None:
                         train_groups=train_groups,
                         test_groups=test_groups,
                         canonical=canonical,
+                        analysis_lock_sha256=(analysis_lock or {}).get("sha256"),
                     )
                     metric_key = metric_cache_key(metric_contract)
                     metric_cache = metric_cache_dir / (
@@ -1567,6 +1649,7 @@ def main() -> None:
             "protocol": PROTOCOL,
             "runner_sha256": sha256_file(Path(__file__).resolve()),
             "canonical_contract": canonical,
+            "analysis_lock": analysis_lock,
             "dataset": args.dataset,
             "models": models,
             "adaptation_kind": "new_linear_classifier_parameters_on_frozen_encoder_representations",
@@ -1584,9 +1667,9 @@ def main() -> None:
             },
             "fractions": fractions,
             "primary_fraction": args.primary_fraction,
-            "primary_fraction_policy": "pre_specified_before_test_metric_evaluation",
+            "primary_fraction_policy": "fixed_by_post_initial_review_analysis_lock_before_current_rerun",
             "primary_endpoint_inference": {
-                "point_estimate": "mean_metric_across_pre_specified_adaptation_seeds",
+                "point_estimate": "mean_metric_across_analysis_locked_adaptation_seeds",
                 "uncertainty": "shared_patient_group_bootstrap_applied_to_all_seeds_and_models",
                 "bootstrap_seed": 20260712,
                 "n_boot": args.n_boot,
@@ -1595,10 +1678,10 @@ def main() -> None:
             },
             "learning_curve_inference": {
                 "fractions": fractions,
-                "point_estimate": "mean_metric_across_pre_specified_adaptation_seeds",
+                "point_estimate": "mean_metric_across_analysis_locked_adaptation_seeds",
                 "uncertainty": "shared_patient_group_bootstrap_within_each_fraction",
                 "uncertainty_scope": (
-                    "Intervals condition on the five pre-specified adaptation seeds and fixed fitted "
+                    "Intervals condition on the five analysis-locked adaptation seeds and fixed fitted "
                     "heads; they do not estimate encoder-retraining or adaptation-seed population variance."
                 ),
                 "claim_boundary": (
