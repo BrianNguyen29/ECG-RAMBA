@@ -81,6 +81,52 @@ class ArtifactMirrorStorageSafetyTests(unittest.TestCase):
                 ["metrics/selected.json"],
             )
 
+    def test_scoped_publish_re_attests_direct_authority_rotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            local_authority = revision / "manifests" / "notebook_code_authority.json"
+            local_authority.parent.mkdir(parents=True)
+            local_authority.write_bytes(b'{"git_commit":"old"}')
+            self._publish(revision, mirror)
+
+            canonical_authority = mirror / "manifests" / "notebook_code_authority.json"
+            canonical_authority.write_bytes(b'{"git_commit":"new-authority-with-new-size"}')
+            audit_json = revision / "manifests" / "artifact_source_audit.json"
+            audit_csv = revision / "tables" / "table_artifact_source_audit.csv"
+            audit_json.write_bytes(b'{"status":true}')
+            audit_csv.parent.mkdir(parents=True)
+            audit_csv.write_bytes(b"status\ncomplete\n")
+
+            manifest_path = self._publish(
+                revision,
+                mirror,
+                verify_existing="size",
+                refresh_existing_prefixes=["manifests/notebook_code_authority.json"],
+                include_paths=[
+                    "manifests/artifact_source_audit.json",
+                    "tables/table_artifact_source_audit.csv",
+                ],
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = {row["relative_path"]: row for row in payload["artifacts"]}
+            self.assertEqual(
+                rows["manifests/notebook_code_authority.json"]["sha256"],
+                artifact_mirror.sha256_file(canonical_authority),
+            )
+            self.assertEqual(
+                canonical_authority.read_bytes(),
+                b'{"git_commit":"new-authority-with-new-size"}',
+            )
+            self.assertEqual(
+                payload["source_selection"]["include_paths"],
+                [
+                    "manifests/artifact_source_audit.json",
+                    "tables/table_artifact_source_audit.csv",
+                ],
+            )
+
     def test_truncated_staging_never_replaces_complete_artifact_or_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             revision, mirror, source, destination = self._seed_published_artifact(

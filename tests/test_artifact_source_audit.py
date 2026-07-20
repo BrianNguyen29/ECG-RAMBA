@@ -15,6 +15,26 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ArtifactSourceAuditTest(unittest.TestCase):
+    def test_notebook00_scopes_publish_and_re_attests_rotated_authority(self):
+        notebook = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "notebooks"
+                / "00_colab_bootstrap.ipynb"
+            ).read_text(encoding="utf-8")
+        )
+        source = "\n".join(
+            "".join(cell.get("source", []))
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+        )
+        for token in (
+            "--refresh-existing-prefix manifests/notebook_code_authority.json",
+            "--include-path manifests/artifact_source_audit.json",
+            "--include-path tables/table_artifact_source_audit.csv",
+        ):
+            self.assertIn(token, source)
+
     def test_notebooks_use_legacy_reports_only_for_bootstrap_audit(self):
         notebook_dir = Path(__file__).resolve().parents[1] / "notebooks"
         legacy_fragment = "ECG-RAMBA' / 'reports' / 'revision'"

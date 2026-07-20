@@ -1799,6 +1799,39 @@ run(
     save(name, notebook)
 
 
+def integrate_notebook00_authority_manifest_publish() -> None:
+    """Re-attest the authority row only in Notebook 00's scoped audit publish."""
+
+    name = "00_colab_bootstrap.ipynb"
+    notebook = load(name)
+    old = (
+        'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+        '--mirror-root "{CANONICAL_REVISION_MIRROR}"\','
+    )
+    new = (
+        'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+        '--refresh-existing-prefix manifests/notebook_code_authority.json '
+        '--include-path manifests/artifact_source_audit.json '
+        '--include-path tables/table_artifact_source_audit.csv '
+        '--mirror-root "{CANONICAL_REVISION_MIRROR}"\','
+    )
+    matched = 0
+    for cell in notebook["cells"]:
+        text = source(cell)
+        if "artifact_source_audit_mirror_publish.log" not in text:
+            continue
+        if new in text:
+            matched += 1
+            continue
+        if old not in text:
+            raise RuntimeError("Notebook 00 artifact-source publish command has an unknown shape")
+        set_source(cell, text.replace(old, new, 1))
+        matched += 1
+    if matched != 1:
+        raise RuntimeError(f"Notebook 00 authority publish count={matched}, expected 1")
+    save(name, notebook)
+
+
 def integrate_shared_contract_versions() -> None:
     replacements = {
         "03_calibration_and_ci.ipynb": {
@@ -1968,6 +2001,7 @@ def main() -> None:
     normalize_bootstrap_contracts()
     integrate_shared_contract_versions()
     integrate_code_authority()
+    integrate_notebook00_authority_manifest_publish()
     integrate_notebook07_final_gate()
     validate()
     print("Forensic notebook integration complete and validated.")
