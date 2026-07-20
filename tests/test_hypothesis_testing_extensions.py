@@ -20,6 +20,13 @@ from src.features import (
     checkpoint_compatible_hrv36_contract,
     validate_checkpoint_compatible_hrv36,
 )
+from scripts.revision.common import (
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
+    MATCHED_CALIBRATION_PROTOCOL,
+    ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
+)
 
 def load_script(name: str, relative: str):
     path = PROJECT_ROOT / relative
@@ -32,6 +39,117 @@ def load_script(name: str, relative: str):
 
 
 class HypothesisTestingExtensionTests(unittest.TestCase):
+    def test_optional_evidence_producers_publish_top_level_runner_sha(self):
+        for relative in (
+            "scripts/revision/43_structured_ablation_5fold.py",
+            "scripts/revision/44_physiological_interval_probe.py",
+        ):
+            source = (PROJECT_ROOT / relative).read_text(encoding="utf-8")
+            self.assertIn('"runner_sha256": sha256_file(', source, relative)
+
+    def test_shared_evidence_contract_versions_match_all_producers_and_readers(self):
+        calibration = load_script(
+            "matched_calibration_contract_test_module",
+            "scripts/revision/42_matched_oof_calibration.py",
+        )
+        robustness = load_script(
+            "robustness_contract_test_module",
+            "scripts/revision/21_robustness_multicomparator.py",
+        )
+        robustness_audit = load_script(
+            "robustness_profile_contract_test_module",
+            "scripts/revision/robustness_profile_audit.py",
+        )
+        claim_gate = load_script(
+            "claim_gate_contract_test_module",
+            "scripts/revision/28_claim_readiness_gates.py",
+        )
+        reviewer_gate = load_script(
+            "reviewer_gate_contract_test_module",
+            "scripts/revision/41_reviewer_gap_closure.py",
+        )
+
+        self.assertEqual(calibration.PROTOCOL, MATCHED_CALIBRATION_PROTOCOL)
+        for observed in (
+            robustness.METRIC_CACHE_SCHEMA_VERSION,
+            robustness_audit.METRIC_CACHE_SCHEMA_VERSION,
+            claim_gate.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
+            reviewer_gate.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
+        ):
+            self.assertEqual(observed, ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION)
+
+    def test_final_generator_requires_authenticated_matched_calibration_group_contract(self):
+        generator = load_script(
+            "final_generator_matched_calibration_test_module",
+            "scripts/revision/13_final_evidence_matrix.py",
+        )
+        models = {name: {} for name in ("full", "minirocket", "resnet", "raw_mamba", "transformer")}
+        table_rows = [
+            {"model": model, "state": state}
+            for model in models
+            for state in ("raw", "cross_fitted_platt")
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            required_paths = tuple(root / f"artifact_{index}.dat" for index in range(8))
+            for path in required_paths:
+                path.write_text("evidence", encoding="utf-8")
+            manifest = {
+                "status": "complete",
+                "runner_sha256": generator.sha256_file(
+                    PROJECT_ROOT / "scripts" / "revision" / "42_matched_oof_calibration.py"
+                ),
+                "outputs": {
+                    str(path): generator.sha256_file(path) for path in required_paths[:-1]
+                },
+                "inputs": {"full": {"sha256": "oof"}},
+            }
+            summary = {
+                "status": "complete",
+                "protocol": MATCHED_CALIBRATION_PROTOCOL,
+                "ranking_contract": "monotone calibrator cannot reverse within-fold score ordering",
+                "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                "bootstrap_scope": "calibrators and base models are not refitted within bootstrap resamples",
+                "reliability_figure_scope": "pools record-class label instances",
+                "freeze_contract": {
+                    "sha256": "freeze",
+                    "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                    "independence_contract": CHAPMAN_GROUP_SEMANTICS,
+                    "group_semantics_reference": CHAPMAN_GROUP_REFERENCE,
+                    "group_sidecar_sha256": "sidecar",
+                },
+                "models": models,
+            }
+            result = generator.summarize_matched_calibration(
+                summary,
+                manifest,
+                table_rows,
+                [{"comparison": "full_vs_resnet"}],
+                required_paths=required_paths,
+                canonical_contract={
+                    "oof_sha256": "oof",
+                    "freeze_sha256": "freeze",
+                    "group_sidecar_sha256": "sidecar",
+                },
+            )
+            self.assertTrue(result["complete"], result["issues"])
+
+            summary["freeze_contract"]["group_sidecar_sha256"] = "stale"
+            rejected = generator.summarize_matched_calibration(
+                summary,
+                manifest,
+                table_rows,
+                [{"comparison": "full_vs_resnet"}],
+                required_paths=required_paths,
+                canonical_contract={
+                    "oof_sha256": "oof",
+                    "freeze_sha256": "freeze",
+                    "group_sidecar_sha256": "sidecar",
+                },
+            )
+            self.assertFalse(rejected["complete"])
+            self.assertIn("freeze group sidecar SHA mismatch", rejected["issues"])
+
     def test_final_generator_accepts_authenticated_physiology_blocker_without_tex(self):
         generator = load_script(
             "final_generator_physiology_blocker_test_module",
@@ -53,6 +171,9 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
             artifacts = (summary_path, table_path, contrast_path, audit_path)
             manifest = {
                 "status": "blocked_missing_reliable_interval_metadata",
+                "runner_sha256": generator.sha256_file(
+                    PROJECT_ROOT / "scripts" / "revision" / "44_physiological_interval_probe.py"
+                ),
                 "outputs": {
                     str(path): generator.sha256_file(path) for path in artifacts
                 },

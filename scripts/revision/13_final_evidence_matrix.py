@@ -23,7 +23,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
+    MATCHED_CALIBRATION_PROTOCOL,
     METRIC_DIR,
     REVISION_DIR,
     TABLE_DIR,
@@ -61,7 +65,7 @@ PTBXL_ADAPTATION_LOCK_NAME = "ptbxl_adaptation_analysis_lock.json"
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 11
+FINAL_EVIDENCE_SCHEMA_VERSION = 12
 FINAL_EVIDENCE_CAPABILITIES = (
     "adaptation_learning_curve",
     "claim_readiness_gates",
@@ -70,7 +74,7 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "hybrid_morphology_paired",
     "learned_comparator_robustness_audit",
     "matched_cross_fitted_calibration",
-    "matched_monotone_calibration_v3",
+    "authenticated_matched_calibration_v5",
     "matched_structured_ablation_5fold",
     "matched_structured_ablation_fresh_full",
     "post_initial_review_adaptation_analysis_lock",
@@ -281,12 +285,12 @@ def summarize_matched_calibration(
     issues: list[str] = []
     if summary.get("status") != "complete":
         issues.append(f"summary status={summary.get('status', 'missing')}")
-    if summary.get("protocol") != "matched_cross_fitted_per_class_monotone_platt_v3":
+    if summary.get("protocol") != MATCHED_CALIBRATION_PROTOCOL:
         issues.append("protocol mismatch")
     if "cannot reverse within-fold score ordering" not in str(summary.get("ranking_contract", "")):
         issues.append("monotone calibration ranking contract is missing")
-    if summary.get("bootstrap_unit") != "Chapman record; one record per subject":
-        issues.append("calibration bootstrap unit/independence contract is missing")
+    if summary.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        issues.append("calibration bootstrap unit is not authenticated")
     if "calibrators and base models are not refitted" not in str(
         summary.get("bootstrap_scope", "")
     ):
@@ -297,6 +301,12 @@ def summarize_matched_calibration(
         issues.append("reliability figure pooling scope is missing")
     if manifest.get("status") != "complete":
         issues.append(f"manifest status={manifest.get('status', 'missing')}")
+    calibration_runner = PROJECT_ROOT / "scripts" / "revision" / "42_matched_oof_calibration.py"
+    if (
+        not calibration_runner.is_file()
+        or manifest.get("runner_sha256") != sha256_file(calibration_runner)
+    ):
+        issues.append("calibration runner SHA mismatch")
     if not nonempty_paths(required_paths):
         issues.append("one or more required calibration outputs are absent/empty")
     elif not manifest_authenticates_paths(manifest, required_paths[:-1]):
@@ -308,6 +318,14 @@ def summarize_matched_calibration(
     freeze_contract = summary.get("freeze_contract") if isinstance(summary.get("freeze_contract"), dict) else {}
     if freeze_contract.get("sha256") != canonical_contract.get("freeze_sha256"):
         issues.append("freeze manifest SHA mismatch")
+    if freeze_contract.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        issues.append("freeze bootstrap unit mismatch")
+    if freeze_contract.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS:
+        issues.append("freeze group semantics mismatch")
+    if freeze_contract.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        issues.append("freeze group semantics reference mismatch")
+    if freeze_contract.get("group_sidecar_sha256") != canonical_contract.get("group_sidecar_sha256"):
+        issues.append("freeze group sidecar SHA mismatch")
     manifest_inputs = manifest.get("inputs") if isinstance(manifest.get("inputs"), dict) else {}
     if (manifest_inputs.get("full") or {}).get("sha256") != canonical_contract.get("oof_sha256"):
         issues.append("Full OOF SHA mismatch")
@@ -381,6 +399,9 @@ def summarize_structured_ablation(
         issues.append("protocol mismatch")
     if manifest.get("status") != "complete":
         issues.append(f"manifest status={manifest.get('status', 'missing')}")
+    ablation_runner = PROJECT_ROOT / "scripts" / "revision" / "43_structured_ablation_5fold.py"
+    if not ablation_runner.is_file() or manifest.get("runner_sha256") != sha256_file(ablation_runner):
+        issues.append("ablation runner SHA mismatch")
     if not nonempty_paths(required_paths):
         issues.append("one or more required ablation outputs are absent/empty")
     elif not manifest_authenticates_paths(manifest, required_paths[:-1]):
@@ -482,6 +503,12 @@ def summarize_physiological_probe(
         issues.append("protocol mismatch")
     if summary and manifest.get("status") != status:
         issues.append("manifest status mismatch")
+    probe_runner = PROJECT_ROOT / "scripts" / "revision" / "44_physiological_interval_probe.py"
+    if summary and (
+        not probe_runner.is_file()
+        or manifest.get("runner_sha256") != sha256_file(probe_runner)
+    ):
+        issues.append("physiological probe runner SHA mismatch")
     manifest_path = required_paths[-1]
     artifact_paths = required_paths[:-1]
     expected_artifact_paths = (
@@ -1318,9 +1345,21 @@ def main() -> None:
     current_freeze_sha256 = (
         sha256_file(paths["freeze_manifest"]) if paths["freeze_manifest"].exists() else ""
     )
+    canonical_freeze = read_json(paths["freeze_manifest"], required=False)
+    canonical_group = (
+        canonical_freeze.get("group_contract")
+        if isinstance(canonical_freeze.get("group_contract"), dict)
+        else {}
+    )
+    canonical_group_sidecar = (
+        canonical_group.get("sidecar")
+        if isinstance(canonical_group.get("sidecar"), dict)
+        else {}
+    )
     canonical_contract = {
         "oof_sha256": current_oof_sha256,
         "freeze_sha256": current_freeze_sha256,
+        "group_sidecar_sha256": str(canonical_group_sidecar.get("sha256") or ""),
     }
     learned_robustness_audit = select_best_profile(
         REVISION_DIR,

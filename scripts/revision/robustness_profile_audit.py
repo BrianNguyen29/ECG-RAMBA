@@ -19,6 +19,7 @@ from scripts.revision.common import (
     AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
     CHAPMAN_GROUP_REFERENCE,
     CHAPMAN_GROUP_SEMANTICS,
+    ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
     sha256_file,
 )
 
@@ -27,7 +28,7 @@ PROTOCOL = "robustness_multicomparator_aggregation_v1"
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
-METRIC_CACHE_SCHEMA_VERSION = 2
+METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION
 MACRO_CLASS_SUPPORT_POLICY = (
     "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
 )

@@ -1662,13 +1662,27 @@ def integrate_notebook07_final_gate() -> None:
             "ADAPTATION_PRIMARY_FRACTION_POLICY",
         ).replace(
             "required_generator_schema = 10",
+            "required_generator_schema = 12",
+        ).replace(
             "required_generator_schema = 11",
+            "required_generator_schema = 12",
         )
+        updated = updated.replace("    'matched_monotone_calibration_v3',\n", "")
         capability = "    'post_initial_review_adaptation_analysis_lock',\n"
         if "required_generator_capabilities = {" in updated and capability not in updated:
             updated = updated.replace(
                 "    'matched_structured_ablation_fresh_full',\n",
                 "    'matched_structured_ablation_fresh_full',\n" + capability,
+                1,
+            )
+        calibration_capability = "    'authenticated_matched_calibration_v5',\n"
+        if (
+            "required_generator_capabilities = {" in updated
+            and calibration_capability not in updated
+        ):
+            updated = updated.replace(
+                "    'matched_cross_fitted_calibration',\n",
+                "    'matched_cross_fitted_calibration',\n" + calibration_capability,
                 1,
             )
         if updated != text:
@@ -1785,6 +1799,32 @@ run(
     save(name, notebook)
 
 
+def integrate_shared_contract_versions() -> None:
+    replacements = {
+        "03_calibration_and_ci.ipynb": {
+            "'matched_cross_fitted_per_class_monotone_platt_v3',": (
+                "'PROTOCOL = MATCHED_CALIBRATION_PROTOCOL',"
+            ),
+            "authenticated monotone-Platt v3 protocol": (
+                "authenticated fold-excluded post-hoc monotone-Platt v5 protocol"
+            ),
+        },
+        "05_hrv_domain_and_robustness.ipynb": {
+            "'METRIC_CACHE_SCHEMA_VERSION = 2',": (
+                "'METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION',"
+            ),
+        },
+    }
+    for name, notebook_replacements in replacements.items():
+        notebook = load(name)
+        for cell in notebook["cells"]:
+            text = source(cell)
+            for old, new in notebook_replacements.items():
+                text = text.replace(old, new)
+            set_source(cell, text)
+        save(name, notebook)
+
+
 def validate() -> None:
     notebook02 = load("02_predictions_and_external_eval.ipynb")
     marker_count = sum(MAMBA_MARKER in source(cell) for cell in notebook02["cells"])
@@ -1869,7 +1909,8 @@ def validate() -> None:
         "strict_full_sha_authority_update_v3",
         "--source-conflict-policy newer",
         "final_pipeline_storage_audit_post_publish_strict_full_sha.log",
-        "required_generator_schema = 11",
+        "required_generator_schema = 12",
+        "authenticated_matched_calibration_v5",
         "post_initial_review_adaptation_analysis_lock",
         "ADAPTATION_PRIMARY_FRACTION_POLICY",
     ):
@@ -1925,6 +1966,7 @@ def main() -> None:
     integrate_remaining_run_history()
     integrate_notebook03_strict_inputs()
     normalize_bootstrap_contracts()
+    integrate_shared_contract_versions()
     integrate_code_authority()
     integrate_notebook07_final_gate()
     validate()

@@ -154,7 +154,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "full_nominal_95ci_less_degraded",
             "nominal_95ci_inconclusive_stressed_difference",
             "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap",
-            "METRIC_CACHE_SCHEMA_VERSION = 2",
+            "METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION",
             "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero",
             "load_bootstrap_independence_contract",
             "expected_stress_spec",
@@ -281,7 +281,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook03_authenticates_every_matched_calibration_input(self):
         _, source = notebook_source("03_calibration_and_ci.ipynb")
         for token in (
-            "matched_cross_fitted_per_class_monotone_platt_v3",
+            "PROTOCOL = MATCHED_CALIBRATION_PROTOCOL",
             "cannot reverse within-fold score ordering",
             "fully nested deploy-time calibration estimate",
             "require_canonical_matched_input",
@@ -594,7 +594,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "adaptation_learning_curve",
             "group_safe_score_calibration_v2",
             "matched_cross_fitted_calibration",
-            "matched_monotone_calibration_v3",
+            "authenticated_matched_calibration_v5",
             "matched_structured_ablation_5fold",
             "matched_structured_ablation_fresh_full",
             "post_initial_review_adaptation_analysis_lock",
@@ -610,8 +610,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
-        self.assertIn("required_generator_schema = 11", source)
-        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 11", generator_source)
+        self.assertIn("required_generator_schema = 12", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 12", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 

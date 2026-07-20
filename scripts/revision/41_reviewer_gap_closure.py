@@ -29,6 +29,7 @@ from scripts.revision.common import (  # noqa: E402
     CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
     METRIC_DIR,
+    ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
     TABLE_DIR,
     ensure_revision_dirs,
     git_commit,
@@ -55,7 +56,6 @@ ROBUSTNESS_BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
     "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 )
-ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION = 2
 ROBUSTNESS_MACRO_CLASS_SUPPORT_POLICY = (
     "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
 )

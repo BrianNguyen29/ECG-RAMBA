@@ -519,6 +519,7 @@ def blocked_payload(
             "created_utc": now_utc(),
             "protocol": PROTOCOL,
             "git_commit": git_commit(),
+            "runner_sha256": sha256_file(RUNNER_SOURCE_PATH),
             "runner": inputs["runner"],
             "inputs": inputs,
             "reason": reason,
@@ -914,6 +915,7 @@ def main() -> None:
             "created_utc": now_utc(),
             "protocol": PROTOCOL,
             "git_commit": git_commit(),
+            "runner_sha256": sha256_file(RUNNER_SOURCE_PATH),
             "runner": summary["inputs"]["runner"],
             "inputs": summary["inputs"],
             "outputs": {

@@ -41,6 +41,8 @@ CACHE_SCHEMA_VERSION = 2
 AUTHENTICATED_RECORD_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
 CHAPMAN_GROUP_SEMANTICS = "physionet_ecg_arrhythmia_one_patient_per_record_v1"
 CHAPMAN_GROUP_REFERENCE = "https://physionet.org/content/ecg-arrhythmia/1.0.0/"
+MATCHED_CALIBRATION_PROTOCOL = "matched_fold_excluded_platt_posthoc_sensitivity_v5"
+ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION = 3
 CHAPMAN_GROUP_REFERENCE_COUNTS = {
     "chapman_shaoxing": {"patients": 10247, "recordings": 10247},
     "ningbo": {"patients": 34905, "recordings": 34905},

@@ -1080,6 +1080,7 @@ def main() -> None:
         "created_utc": now_utc(),
         "protocol": PROTOCOL,
         "git_commit": git_commit(),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "canonical_model_dir": str(canonical_model_dir),
         "canonical_folds": {"path": str(folds_path), "sha256": sha256_file(folds_path)},
         "hrv36_feature_contract": checkpoint_compatible_hrv36_contract(),

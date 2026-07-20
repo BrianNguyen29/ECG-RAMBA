@@ -37,6 +37,7 @@ from scripts.revision.common import (  # noqa: E402
     MANIFEST_DIR,
     METRIC_DIR,
     PREDICTION_DIR,
+    ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
     TABLE_DIR,
     calibration_summary,
     ensure_revision_dirs,
@@ -52,7 +53,7 @@ from scripts.revision.common import (  # noqa: E402
 
 PROTOCOL = "robustness_multicomparator_aggregation_v1"
 BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
-METRIC_CACHE_SCHEMA_VERSION = 3
+METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"

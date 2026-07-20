@@ -81,7 +81,7 @@ RUN_MATCHED_CALIBRATION_AUDIT = True
 matched_runner = Path('scripts/revision/42_matched_oof_calibration.py')
 matched_runner_source = matched_runner.read_text(encoding='utf-8', errors='replace') if matched_runner.is_file() else ''
 matched_runner_tokens = [
-    'matched_cross_fitted_per_class_monotone_platt_v3',
+    'PROTOCOL = MATCHED_CALIBRATION_PROTOCOL',
     'cannot reverse within-fold score ordering',
     'fully nested deploy-time calibration estimate',
     '--reuse-bootstrap',
@@ -204,7 +204,7 @@ for path in matched_outputs:
 if not RUN_MATCHED_CALIBRATION_AUDIT:
     print(
         'Matched calibration is deferred. Existing files, if any, are not readiness evidence; '
-        'Notebook 07 requires the authenticated monotone-Platt v3 protocol.'
+        'Notebook 07 requires the authenticated fold-excluded post-hoc monotone-Platt v5 protocol.'
     )
 if RUN_MATCHED_CALIBRATION_AUDIT and not all(path.is_file() and path.stat().st_size > 0 for path in matched_outputs):
     raise RuntimeError('Matched calibration audit did not produce every required artifact.')
@@ -567,7 +567,7 @@ def main() -> None:
         NOTEBOOK_DIR / "07_results_freeze.ipynb",
         "    'matched_cross_fitted_calibration',\n",
         "    'matched_cross_fitted_calibration',\n"
-        "    'matched_monotone_calibration_v3',\n",
+        "    'authenticated_matched_calibration_v5',\n",
         marker="required_generator_capabilities = {",
     )
     replace_in_notebook(

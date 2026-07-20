@@ -32,6 +32,7 @@ from scripts.revision.common import (  # noqa: E402
     CHAPMAN_GROUP_SEMANTICS,
     FIGURE_DIR,
     MANIFEST_DIR,
+    MATCHED_CALIBRATION_PROTOCOL,
     METRIC_DIR,
     PREDICTION_DIR,
     TABLE_DIR,
@@ -48,8 +49,8 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 6
-PROTOCOL = "matched_fold_excluded_platt_posthoc_sensitivity_v5"
+SCHEMA_VERSION = 7
+PROTOCOL = MATCHED_CALIBRATION_PROTOCOL
 PLATT_C = 1e6
 PLATT_MIN_SLOPE = 1e-8
 DEFAULT_MODELS = {
@@ -899,7 +900,7 @@ def main() -> None:
                         "state": state,
                         "metric": spec.name,
                         "higher_is_better": spec.higher_is_better,
-                        "bootstrap_unit": "Chapman record; one record per subject",
+                        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
                         "uncertainty_scope": (
                             "paired record bootstrap conditional on fixed base models and fitted "
                             "cross-fitted calibrators; no model or calibrator refit per replicate"

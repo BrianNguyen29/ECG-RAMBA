@@ -14,7 +14,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     MANIFEST_DIR,
+    MATCHED_CALIBRATION_PROTOCOL,
     METRIC_DIR,
     TABLE_DIR,
     git_commit,
@@ -25,7 +29,7 @@ from scripts.revision.common import (  # noqa: E402
 from src.features import checkpoint_compatible_hrv36_contract  # noqa: E402
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TITLE = "ECG-RAMBA: A Protocol-Faithful Evaluation of Structured Morphology-Rhythm ECG Modeling"
 CENTRAL_QUESTION = (
     "We test whether explicit morphology and rhythm interfaces provide benefits that survive "
@@ -109,9 +113,13 @@ def manifest_authenticates(
     *,
     protocol: str,
     accepted_statuses: set[str],
+    runner_path: Path,
 ) -> bool:
     manifest = read_json(manifest_path)
     if manifest.get("protocol") != protocol or manifest.get("status") not in accepted_statuses:
+        return False
+    resolved_runner = resolve(runner_path)
+    if not resolved_runner.is_file() or manifest.get("runner_sha256") != sha256_file(resolved_runner):
         return False
     output_hashes = manifest_output_hashes(manifest)
     for path in required_paths:
@@ -190,6 +198,7 @@ def ablation_finding(control: str) -> tuple[str, str]:
         [summary_path, paired_path],
         protocol="matched_retrained_structured_ablation_5fold_v3",
         accepted_statuses={"complete"},
+        runner_path=Path("scripts/revision/43_structured_ablation_5fold.py"),
     )
     if (
         summary.get("status") != "complete"
@@ -238,13 +247,21 @@ def calibration_finding() -> tuple[str, str]:
     authenticated = manifest_authenticates(
         MANIFEST_DIR / "matched_oof_calibration_manifest.json",
         [summary_path, bootstrap_path, paired_path],
-        protocol="matched_cross_fitted_per_class_monotone_platt_v3",
+        protocol=MATCHED_CALIBRATION_PROTOCOL,
         accepted_statuses={"complete"},
+        runner_path=Path("scripts/revision/42_matched_oof_calibration.py"),
     )
     if (
         summary.get("status") != "complete"
         or "full" not in summary.get("models", {})
-        or summary.get("bootstrap_unit") != "Chapman record; one record per subject"
+        or summary.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
+        or (summary.get("freeze_contract") or {}).get("bootstrap_unit")
+        != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
+        or (summary.get("freeze_contract") or {}).get("independence_contract")
+        != CHAPMAN_GROUP_SEMANTICS
+        or (summary.get("freeze_contract") or {}).get("group_semantics_reference")
+        != CHAPMAN_GROUP_REFERENCE
+        or not (summary.get("freeze_contract") or {}).get("group_sidecar_sha256")
         or "pools record-class label instances"
         not in str(summary.get("reliability_figure_scope", ""))
         or "cannot reverse within-fold score ordering"
@@ -257,7 +274,7 @@ def calibration_finding() -> tuple[str, str]:
     ):
         return (
             "pending_matched_calibration",
-            "Cross-fitted OOF-score calibration results are not complete; raw calibration claims remain unchanged.",
+            "Fold-excluded post-hoc OOF-score calibration results are not complete; raw calibration claims remain unchanged.",
         )
     full = summary["models"]["full"]
     raw = full.get("raw", {})
@@ -271,7 +288,7 @@ def calibration_finding() -> tuple[str, str]:
     return (
         "complete_oof_score_calibration_sensitivity",
         (
-            f"For ECG-RAMBA, cross-fitted OOF-score Platt changes Brier {raw.get('brier_macro', float('nan')):.4f}"
+            f"For ECG-RAMBA, fold-excluded post-hoc OOF-score Platt changes Brier {raw.get('brier_macro', float('nan')):.4f}"
             f" to {calibrated.get('brier_macro', float('nan')):.4f}, ECE "
             f"{raw.get('ece_macro', float('nan')):.4f} to "
             f"{calibrated.get('ece_macro', float('nan')):.4f}; nominal pointwise CI-favored changes: "
@@ -300,6 +317,7 @@ def adaptation_finding() -> tuple[str, str]:
         [primary_path, learning_curve_path, learning_curve_figure],
         protocol="frozen_encoder_true_linear_head_adaptation_v2_group_safe_gated",
         accepted_statuses={"complete_true_classifier_head_adaptation"},
+        runner_path=Path("scripts/revision/35_true_fewshot_head_adaptation.py"),
     )
     if not selected or not authenticated:
         return "pending_learning_curve", "The true frozen-encoder adaptation endpoint is unavailable."
@@ -489,7 +507,7 @@ def main() -> None:
         },
         {
             "hypothesis": "Score calibration",
-            "matched_control": "Raw vs per-class cross-fitted monotone Platt on frozen OOF scores",
+            "matched_control": "Raw vs per-class fold-excluded post-hoc Platt on frozen OOF scores",
             "evidence_status": calibration_status,
             "finding": calibration_text,
             "claim_boundary": (
