@@ -461,7 +461,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertNotEqual(first_commit, second_commit)
 
             fresh_namespace = dict(namespace)
-            with mock.patch.dict(os.environ, clean_environment, clear=False):
+            stale_runtime_environment = dict(clean_environment)
+            stale_runtime_environment["ECG_RAMBA_AUTHORITY_COMMIT"] = first_commit
+            with mock.patch.dict(os.environ, stale_runtime_environment, clear=False):
                 exec(
                     authority_block_source("00_colab_bootstrap.ipynb"),
                     fresh_namespace,

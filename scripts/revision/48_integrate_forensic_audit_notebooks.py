@@ -461,7 +461,6 @@ def _pin_forensic_code_authority():
     rotate_to_branch_head = (
         _AUTHORITY_BOOTSTRAP_ALLOWED
         and _authority_os.environ.get('ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD', '1') == '1'
-        and not requested_commit
         and not reset_requested
     )
     commit_pattern = _authority_re.compile(r'[0-9a-f]{{40}}')
