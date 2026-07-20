@@ -189,7 +189,7 @@ for rel_path in REVISION_REQUIRED_FILES:
         compatibility_failures.append(f'{rel_path}: missing or empty')
 
 if compatibility_failures:
-    authority = (CODE_AUTHORITY or {}).get('commit', 'unknown')
+    authority = (CODE_AUTHORITY or {}).get('git_commit', 'unknown')
     raise RuntimeError(
         f'Notebook 02 is incompatible with pinned authority {authority}: '
         + ' ; '.join(compatibility_failures)
@@ -458,6 +458,12 @@ def _pin_forensic_code_authority():
     manifest_path = _AuthorityPath(MIRROR_REVISION_ROOT) / 'manifests' / 'notebook_code_authority.json'
     requested_commit = _authority_os.environ.get('ECG_RAMBA_AUTHORITY_COMMIT', '').strip().lower()
     reset_requested = _authority_os.environ.get('ECG_RAMBA_RESET_CODE_AUTHORITY', '0') == '1'
+    rotate_to_branch_head = (
+        _AUTHORITY_BOOTSTRAP_ALLOWED
+        and _authority_os.environ.get('ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD', '1') == '1'
+        and not requested_commit
+        and not reset_requested
+    )
     commit_pattern = _authority_re.compile(r'[0-9a-f]{{40}}')
 
     def git(*args, check=True):
@@ -477,6 +483,11 @@ def _pin_forensic_code_authority():
                 + (result.stdout or '')[-4000:]
             )
         return result
+
+    if rotate_to_branch_head:
+        requested_commit = git('rev-parse', 'HEAD').stdout.strip().lower()
+        reset_requested = True
+        print('Notebook 00 authority rotation target:', requested_commit)
 
     if reset_requested and not _AUTHORITY_BOOTSTRAP_ALLOWED:
         raise RuntimeError(
@@ -546,7 +557,11 @@ def _pin_forensic_code_authority():
             'branch': str(BRANCH),
             'established_utc': _authority_datetime.now(_authority_timezone.utc).isoformat(),
             'established_by': '00_colab_bootstrap.ipynb',
-            'selection': 'explicit_environment_sha' if requested_commit else 'fetched_branch_head_at_initial_bootstrap',
+            'selection': (
+                'fetched_branch_head_at_notebook00_rotation'
+                if rotate_to_branch_head
+                else ('explicit_environment_sha' if requested_commit else 'fetched_branch_head_at_initial_bootstrap')
+            ),
         }}
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = manifest_path.with_name(
@@ -560,6 +575,7 @@ def _pin_forensic_code_authority():
         print('Established canonical code authority:', manifest_path)
 
     _authority_os.environ['ECG_RAMBA_AUTHORITY_COMMIT'] = expected_commit
+    _authority_os.environ.pop('ECG_RAMBA_RESET_CODE_AUTHORITY', None)
     globals()['CODE_AUTHORITY_MANIFEST_PATH'] = manifest_path
     globals()['CODE_AUTHORITY'] = manifest
     print('Pinned code authority:', expected_commit)

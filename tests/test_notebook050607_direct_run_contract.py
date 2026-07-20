@@ -347,6 +347,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         _, notebook00_source = notebook_source("00_colab_bootstrap.ipynb")
         self.assertIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", notebook00_source)
         self.assertIn("ECG_RAMBA_RESET_CODE_AUTHORITY", notebook00_source)
+        self.assertIn("ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD", notebook00_source)
+        self.assertIn("fetched_branch_head_at_notebook00_rotation", notebook00_source)
         for notebook in PIPELINE_NOTEBOOKS[1:]:
             _, source = notebook_source(notebook)
             self.assertNotIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", source)
@@ -417,6 +419,64 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                         missing_namespace,
                         missing_namespace,
                     )
+
+    def test_notebook00_rotates_existing_authority_to_checked_out_branch_head(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            canonical = root / "canonical"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "audit@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Audit Test"], cwd=repo, check=True)
+
+            namespace = {
+                "MIRROR_REVISION_ROOT": canonical,
+                "REPO_DIR": repo,
+                "REPO_URL": "https://github.com/BrianNguyen29/ECG-RAMBA.git",
+                "BRANCH": "main",
+            }
+            clean_environment = {
+                "ECG_RAMBA_AUTHORITY_COMMIT": "",
+                "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
+                "ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD": "1",
+            }
+
+            (repo / "authority.txt").write_text("first\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "first"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            first_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            with mock.patch.dict(os.environ, clean_environment, clear=False):
+                exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
+
+            subprocess.run(["git", "checkout", "-B", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            (repo / "authority.txt").write_text("second\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "second"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            second_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            self.assertNotEqual(first_commit, second_commit)
+
+            fresh_namespace = dict(namespace)
+            with mock.patch.dict(os.environ, clean_environment, clear=False):
+                exec(
+                    authority_block_source("00_colab_bootstrap.ipynb"),
+                    fresh_namespace,
+                    fresh_namespace,
+                )
+
+            manifest = json.loads(
+                (canonical / "manifests" / "notebook_code_authority.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["git_commit"], second_commit)
+            self.assertEqual(manifest["selection"], "fetched_branch_head_at_notebook00_rotation")
+            self.assertEqual(
+                subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
+                second_commit,
+            )
 
     def test_notebook02a_training_streams_stage_run_id_logs_to_drive(self):
         cells, source = notebook_source("02a_retrain_best_ema.ipynb")
