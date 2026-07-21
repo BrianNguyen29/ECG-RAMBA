@@ -15,8 +15,9 @@ MAMBA_SCHEMA_MARKER = "MAMBA_INSTALLER_SCHEMA_VERSION = 1"
 BASE_INSTALLER_MARKER = "BASE_INSTALLER_CAPABILITY = 'ecg_ramba_base_installer_v1'"
 BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
-AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_git_commit_pin_v1'"
-AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 1"
+AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
+AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260721-v1"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -205,7 +206,8 @@ if compatibility_failures:
         f'Notebook 02 is incompatible with pinned authority {authority}: '
         + ' ; '.join(compatibility_failures)
         + '. Do not hotfix a detached authority checkout from mutable GitHub main. '
-        'Commit and review the required change, then rotate authority through Notebook 00.'
+        'Open the current Notebook 00 and run it once; Notebook 00 migrates an older Drive '
+        'authority to its reviewed versioned release tag. Then restart Notebook 02 from Setup.'
     )
 print('Revision capability preflight: OK')
 # END FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT
@@ -450,7 +452,7 @@ def save(name: str, notebook: dict) -> None:
     path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def authority_pin_source(*, bootstrap: bool) -> str:
+def _legacy_authority_pin_source(*, bootstrap: bool) -> str:
     bootstrap_literal = "True" if bootstrap else "False"
     return f'''{AUTHORITY_BLOCK_START}
 {AUTHORITY_MARKER}
@@ -605,6 +607,261 @@ def _pin_forensic_code_authority():
     globals()['CODE_AUTHORITY'] = manifest
     print('Pinned code authority:', expected_commit)
     print('Authority manifest   :', manifest_path)
+    return manifest
+
+CODE_AUTHORITY = _pin_forensic_code_authority()
+{AUTHORITY_BLOCK_END}
+'''
+
+
+def authority_pin_source(*, bootstrap: bool) -> str:
+    """Build the v2 authority block used by every pipeline notebook."""
+    bootstrap_literal = "True" if bootstrap else "False"
+    return f'''{AUTHORITY_BLOCK_START}
+{AUTHORITY_MARKER}
+{AUTHORITY_SCHEMA_MARKER}
+_AUTHORITY_BOOTSTRAP_ALLOWED = {bootstrap_literal}
+_AUTHORITY_DEFAULT_RELEASE_REF = {AUTHORITY_RELEASE_REF!r}
+
+def _pin_forensic_code_authority():
+    import json as _authority_json
+    import os as _authority_os
+    import re as _authority_re
+    import subprocess as _authority_subprocess
+    import uuid as _authority_uuid
+    from datetime import datetime as _authority_datetime, timezone as _authority_timezone
+    from pathlib import Path as _AuthorityPath
+    from scripts.revision.artifact_mirror import PublishLock as _AuthorityPublishLock
+
+    manifest_path = _AuthorityPath(MIRROR_REVISION_ROOT) / 'manifests' / 'notebook_code_authority.json'
+    requested_commit = _authority_os.environ.get('ECG_RAMBA_AUTHORITY_COMMIT', '').strip().lower()
+    requested_release_ref = _authority_os.environ.get(
+        'ECG_RAMBA_AUTHORITY_REF', _AUTHORITY_DEFAULT_RELEASE_REF
+    ).strip()
+    reset_requested = _authority_os.environ.get('ECG_RAMBA_RESET_CODE_AUTHORITY', '0') == '1'
+    legacy_rotate_requested = (
+        _authority_os.environ.get('ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD', '0') == '1'
+    )
+    if legacy_rotate_requested:
+        raise RuntimeError(
+            'Implicit authority rotation to a moving branch head is disabled. '
+            'Notebook 00 follows only a reviewed versioned release tag. For an emergency explicit '
+            'pin, set ECG_RAMBA_RESET_CODE_AUTHORITY=1 with a full ECG_RAMBA_AUTHORITY_COMMIT.'
+        )
+    rotate_to_branch_head = False
+    commit_pattern = _authority_re.compile(r'[0-9a-f]{{40}}')
+    release_ref_pattern = _authority_re.compile(r'refs/tags/[A-Za-z0-9][A-Za-z0-9._/-]*')
+
+    def git(*args, check=True):
+        result = _authority_subprocess.run(
+            ['git', *args],
+            cwd=str(REPO_DIR),
+            check=False,
+            text=True,
+            stdout=_authority_subprocess.PIPE,
+            stderr=_authority_subprocess.STDOUT,
+        )
+        if check and result.returncode:
+            raise RuntimeError(
+                'Code-authority git command failed: git '
+                + ' '.join(args)
+                + '\\n'
+                + (result.stdout or '')[-4000:]
+            )
+        return result
+
+    def resolve_annotated_release_ref(release_ref):
+        if not release_ref_pattern.fullmatch(release_ref):
+            raise RuntimeError(
+                'ECG_RAMBA_AUTHORITY_REF must be a full refs/tags/... name. '
+                'Moving branches are not accepted as code authority.'
+            )
+        object_type = git('cat-file', '-t', release_ref, check=False)
+        if object_type.returncode or object_type.stdout.strip() != 'tag':
+            raise RuntimeError(
+                f'Code-authority release ref is missing or is not an annotated Git tag: {{release_ref}}. '
+                'Run the current Notebook 00 after the reviewed release tag has been pushed.'
+            )
+        object_id = git('rev-parse', '--verify', release_ref).stdout.strip().lower()
+        commit = git('rev-parse', '--verify', release_ref + '^{{commit}}').stdout.strip().lower()
+        if not commit_pattern.fullmatch(object_id) or not commit_pattern.fullmatch(commit):
+            raise RuntimeError(f'Could not resolve an immutable object and commit for {{release_ref}}.')
+        return commit, object_id
+
+    if reset_requested and not _AUTHORITY_BOOTSTRAP_ALLOWED:
+        raise RuntimeError(
+            'Only Notebook 00 may rotate the canonical code authority. '
+            'Run Notebook 00 with ECG_RAMBA_RESET_CODE_AUTHORITY=1 and an explicit '
+            'ECG_RAMBA_AUTHORITY_COMMIT.'
+        )
+    if reset_requested and not commit_pattern.fullmatch(requested_commit):
+        raise RuntimeError(
+            'Authority reset requires ECG_RAMBA_AUTHORITY_COMMIT as a full 40-character git SHA.'
+        )
+
+    tracked_status = git('status', '--porcelain', '--untracked-files=no').stdout.strip()
+    if tracked_status:
+        raise RuntimeError(
+            'Tracked files differ from git before authority checkout. Use a fresh Colab clone; '
+            'authority pinning will not stash or overwrite local edits.\\n' + tracked_status[:4000]
+        )
+
+    fetch = git('fetch', 'origin', '--prune', '--tags', check=False)
+    if fetch.returncode:
+        print('WARNING: git fetch failed; accepting only an already-present pinned commit/release tag.')
+        print((fetch.stdout or '')[-2000:])
+
+    manifest = None
+    manifest_raw = None
+    with _AuthorityPublishLock(
+        _AuthorityPath(MIRROR_REVISION_ROOT),
+        run_id='authority-read-' + _authority_uuid.uuid4().hex,
+    ):
+        if manifest_path.is_file():
+            manifest_raw = manifest_path.read_text(encoding='utf-8')
+            manifest = _authority_json.loads(manifest_raw)
+
+    authority_update_needed = False
+    update_reason = None
+    release_ref = None
+    release_ref_object_id = None
+
+    if reset_requested:
+        expected_commit = requested_commit
+        authority_update_needed = True
+        update_reason = 'explicit_environment_sha'
+    elif manifest is None:
+        if not _AUTHORITY_BOOTSTRAP_ALLOWED:
+            raise FileNotFoundError(
+                'Canonical code-authority manifest is missing. Run Notebook 00 first in a fresh runtime; '
+                'downstream notebooks fail closed instead of following a moving branch.'
+            )
+        release_ref = requested_release_ref
+        expected_commit, release_ref_object_id = resolve_annotated_release_ref(release_ref)
+        authority_update_needed = True
+        update_reason = 'initial_versioned_release_bootstrap'
+    else:
+        manifest_capability = manifest.get('capability')
+        manifest_schema = int(manifest.get('schema_version', 0))
+        legacy_manifest = (
+            manifest_capability == 'canonical_git_commit_pin_v1' and manifest_schema == 1
+        )
+        current_manifest = (
+            manifest_capability == 'canonical_versioned_git_release_v2' and manifest_schema == 2
+        )
+        if not legacy_manifest and not current_manifest:
+            raise RuntimeError('Canonical code-authority manifest capability/schema is invalid.')
+        manifest_commit = str(manifest.get('git_commit', '')).strip().lower()
+        if not commit_pattern.fullmatch(manifest_commit):
+            raise RuntimeError('Canonical code-authority manifest lacks a full git SHA.')
+        if str(manifest.get('repository_url', '')).rstrip('/') != str(REPO_URL).rstrip('/'):
+            raise RuntimeError('Canonical code-authority repository URL differs from this notebook.')
+        if str(manifest.get('branch', '')) != str(BRANCH):
+            raise RuntimeError('Canonical code-authority branch differs from this notebook runtime.')
+
+        if not _AUTHORITY_BOOTSTRAP_ALLOWED:
+            if legacy_manifest:
+                raise RuntimeError(
+                    'Canonical code authority uses the legacy schema. Run the current Notebook 00 once '
+                    'to migrate it to the reviewed versioned release before running downstream notebooks.'
+                )
+            expected_commit = manifest_commit
+            if requested_commit and requested_commit != expected_commit:
+                raise RuntimeError(
+                    'ECG_RAMBA_AUTHORITY_COMMIT differs from the canonical authority manifest. '
+                    'Rotate authority explicitly in Notebook 00; do not override it downstream.'
+                )
+        else:
+            release_ref = requested_release_ref
+            release_commit, release_ref_object_id = resolve_annotated_release_ref(release_ref)
+            manifest_ref = str(manifest.get('authority_ref', '')).strip()
+            manifest_ref_object = str(manifest.get('authority_ref_object_id', '')).strip().lower()
+            if current_manifest and manifest_ref == release_ref:
+                if manifest_commit != release_commit or manifest_ref_object != release_ref_object_id:
+                    raise RuntimeError(
+                        f'Code-authority release tag moved or changed after it was recorded: {{release_ref}}. '
+                        'Publish a new versioned tag instead of retagging an existing release.'
+                    )
+                expected_commit = manifest_commit
+            else:
+                expected_commit = release_commit
+                authority_update_needed = True
+                update_reason = (
+                    'legacy_manifest_migration'
+                    if legacy_manifest
+                    else 'versioned_release_upgrade'
+                )
+
+    if not commit_pattern.fullmatch(expected_commit):
+        raise RuntimeError('Notebook 00 could not resolve a full code-authority git SHA.')
+    git('cat-file', '-e', expected_commit + '^{{commit}}')
+    git('checkout', '--detach', expected_commit)
+    observed_commit = git('rev-parse', 'HEAD').stdout.strip().lower()
+    if observed_commit != expected_commit:
+        raise RuntimeError(
+            f'Code-authority checkout mismatch: expected={{expected_commit}} observed={{observed_commit}}'
+        )
+
+    if authority_update_needed:
+        previous_commit = None if manifest is None else str(manifest.get('git_commit', '')).strip().lower()
+        previous_ref = None if manifest is None else manifest.get('authority_ref')
+        manifest = {{
+            'capability': 'canonical_versioned_git_release_v2',
+            'schema_version': 2,
+            'git_commit': expected_commit,
+            'repository_url': str(REPO_URL),
+            'branch': str(BRANCH),
+            'established_utc': _authority_datetime.now(_authority_timezone.utc).isoformat(),
+            'established_by': '00_colab_bootstrap.ipynb',
+            'selection': (
+                'explicit_environment_sha'
+                if release_ref is None
+                else 'verified_annotated_versioned_release_tag'
+            ),
+            'authority_ref': release_ref,
+            'authority_ref_kind': None if release_ref is None else 'annotated_git_tag',
+            'authority_ref_object_id': release_ref_object_id,
+            'update_reason': update_reason,
+            'previous_git_commit': previous_commit,
+            'previous_authority_ref': previous_ref,
+        }}
+        with _AuthorityPublishLock(
+            _AuthorityPath(MIRROR_REVISION_ROOT),
+            run_id='authority-write-' + _authority_uuid.uuid4().hex,
+        ):
+            concurrent_raw = manifest_path.read_text(encoding='utf-8') if manifest_path.is_file() else None
+            if concurrent_raw != manifest_raw and not reset_requested:
+                concurrent = _authority_json.loads(concurrent_raw) if concurrent_raw else None
+                if not (
+                    concurrent
+                    and concurrent.get('capability') == 'canonical_versioned_git_release_v2'
+                    and int(concurrent.get('schema_version', 0)) == 2
+                    and str(concurrent.get('git_commit', '')).lower() == expected_commit
+                    and concurrent.get('authority_ref') == release_ref
+                    and str(concurrent.get('authority_ref_object_id', '')).lower()
+                    == str(release_ref_object_id or '').lower()
+                ):
+                    raise RuntimeError('A concurrent runtime established a different code authority.')
+                manifest = concurrent
+            else:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = manifest_path.with_name(
+                    manifest_path.name + '.partial.' + _authority_uuid.uuid4().hex
+                )
+                with temporary.open('w', encoding='utf-8') as handle:
+                    handle.write(_authority_json.dumps(manifest, indent=2, sort_keys=True) + '\\n')
+                    handle.flush()
+                    _authority_os.fsync(handle.fileno())
+                _authority_os.replace(temporary, manifest_path)
+        print('Established/updated canonical code authority:', manifest_path)
+
+    _authority_os.environ['ECG_RAMBA_AUTHORITY_COMMIT'] = expected_commit
+    _authority_os.environ.pop('ECG_RAMBA_RESET_CODE_AUTHORITY', None)
+    globals()['CODE_AUTHORITY_MANIFEST_PATH'] = manifest_path
+    globals()['CODE_AUTHORITY'] = manifest
+    print('Pinned code authority:', expected_commit)
+    print('Authority release  :', manifest.get('authority_ref'))
+    print('Authority manifest :', manifest_path)
     return manifest
 
 CODE_AUTHORITY = _pin_forensic_code_authority()

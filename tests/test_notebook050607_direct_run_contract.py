@@ -363,8 +363,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertNotIn("def canonical_installer_source(*markers):", retrain_source)
 
     def test_code_authority_is_pinned_across_direct_runs(self):
-        capability = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_git_commit_pin_v1'"
-        schema = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 1"
+        capability = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
+        schema = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
         for notebook in PIPELINE_NOTEBOOKS:
             cells, source = notebook_source(notebook)
             expected_count = 2 if notebook == "07_results_freeze.ipynb" else 1
@@ -374,6 +374,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertIn("git('checkout', '--detach', expected_commit)", source)
             self.assertIn("git('cat-file', '-e', expected_commit + '^{commit}')", source)
             self.assertIn("Tracked files differ from git before authority checkout", source)
+            self.assertIn("verified_annotated_versioned_release_tag", source)
+            self.assertIn("refs/tags/ecg-ramba-revision-20260721-v1", source)
+            self.assertIn("Publish a new versioned tag instead of retagging", source)
             setup_cells = [cell for cell in cells if capability in cell]
             for setup in setup_cells:
                 self.assertLess(setup.rfind("git pull --ff-only"), setup.index(capability))
@@ -384,6 +387,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertIn("ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD", notebook00_source)
         self.assertIn("Implicit authority rotation to a moving branch head is disabled", notebook00_source)
         self.assertIn("Authority reset requires ECG_RAMBA_AUTHORITY_COMMIT", notebook00_source)
+        self.assertNotIn("fetched_branch_head_at_initial_bootstrap", notebook00_source)
         for notebook in PIPELINE_NOTEBOOKS[1:]:
             _, source = notebook_source(notebook)
             self.assertNotIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", source)
@@ -404,6 +408,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             first_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=repo, text=True
             ).strip()
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v1", "-m", "authority v1", first_commit],
+                cwd=repo,
+                check=True,
+            )
 
             namespace = {
                 "MIRROR_REVISION_ROOT": canonical,
@@ -414,12 +423,15 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             clean_environment = {
                 "ECG_RAMBA_AUTHORITY_COMMIT": "",
                 "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
+                "ECG_RAMBA_AUTHORITY_REF": "refs/tags/authority-v1",
             }
             with mock.patch.dict(os.environ, clean_environment, clear=False):
                 exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
                 manifest_path = canonical / "manifests" / "notebook_code_authority.json"
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
                 self.assertEqual(manifest["git_commit"], first_commit)
+                self.assertEqual(manifest["authority_ref"], "refs/tags/authority-v1")
+                self.assertEqual(manifest["schema_version"], 2)
 
                 subprocess.run(["git", "checkout", "-B", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
                 (repo / "authority.txt").write_text("second\n", encoding="utf-8")
@@ -455,7 +467,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                         missing_namespace,
                     )
 
-    def test_notebook00_rejects_implicit_rotation_and_requires_explicit_sha(self):
+    def test_notebook00_upgrades_to_a_new_reviewed_release_tag(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / "repo"
@@ -475,6 +487,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                 "ECG_RAMBA_AUTHORITY_COMMIT": "",
                 "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
                 "ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD": "0",
+                "ECG_RAMBA_AUTHORITY_REF": "refs/tags/authority-v1",
             }
 
             (repo / "authority.txt").write_text("first\n", encoding="utf-8")
@@ -483,6 +496,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             first_commit = subprocess.check_output(
                 ["git", "rev-parse", "HEAD"], cwd=repo, text=True
             ).strip()
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v1", "-m", "authority v1", first_commit],
+                cwd=repo,
+                check=True,
+            )
             with mock.patch.dict(os.environ, clean_environment, clear=False):
                 exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
 
@@ -494,6 +512,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                 ["git", "rev-parse", "HEAD"], cwd=repo, text=True
             ).strip()
             self.assertNotEqual(first_commit, second_commit)
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v2", "-m", "authority v2", second_commit],
+                cwd=repo,
+                check=True,
+            )
 
             fresh_namespace = dict(namespace)
             implicit_rotation_environment = dict(clean_environment)
@@ -506,10 +529,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                         fresh_namespace,
                     )
 
-            explicit_rotation_environment = dict(clean_environment)
-            explicit_rotation_environment["ECG_RAMBA_AUTHORITY_COMMIT"] = second_commit
-            explicit_rotation_environment["ECG_RAMBA_RESET_CODE_AUTHORITY"] = "1"
-            with mock.patch.dict(os.environ, explicit_rotation_environment, clear=False):
+            release_upgrade_environment = dict(clean_environment)
+            release_upgrade_environment["ECG_RAMBA_AUTHORITY_REF"] = "refs/tags/authority-v2"
+            with mock.patch.dict(os.environ, release_upgrade_environment, clear=False):
                 exec(
                     authority_block_source("00_colab_bootstrap.ipynb"),
                     fresh_namespace,
@@ -520,11 +542,130 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                 (canonical / "manifests" / "notebook_code_authority.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["git_commit"], second_commit)
-            self.assertEqual(manifest["selection"], "explicit_environment_sha")
+            self.assertEqual(manifest["authority_ref"], "refs/tags/authority-v2")
+            self.assertEqual(manifest["selection"], "verified_annotated_versioned_release_tag")
+            self.assertEqual(manifest["update_reason"], "versioned_release_upgrade")
             self.assertEqual(
                 subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
                 second_commit,
             )
+
+    def test_notebook00_migrates_a_legacy_drive_authority_manifest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            canonical = root / "canonical"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "audit@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Audit Test"], cwd=repo, check=True)
+            (repo / "authority.txt").write_text("legacy\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "legacy"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            legacy_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            (repo / "authority.txt").write_text("reviewed release\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "reviewed"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            release_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v2", "-m", "authority v2", release_commit],
+                cwd=repo,
+                check=True,
+            )
+
+            manifest_path = canonical / "manifests" / "notebook_code_authority.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "capability": "canonical_git_commit_pin_v1",
+                        "schema_version": 1,
+                        "git_commit": legacy_commit,
+                        "repository_url": "https://github.com/BrianNguyen29/ECG-RAMBA.git",
+                        "branch": "main",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            namespace = {
+                "MIRROR_REVISION_ROOT": canonical,
+                "REPO_DIR": repo,
+                "REPO_URL": "https://github.com/BrianNguyen29/ECG-RAMBA.git",
+                "BRANCH": "main",
+            }
+            environment = {
+                "ECG_RAMBA_AUTHORITY_COMMIT": "",
+                "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
+                "ECG_RAMBA_AUTHORITY_REF": "refs/tags/authority-v2",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
+
+            migrated = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(migrated["schema_version"], 2)
+            self.assertEqual(migrated["git_commit"], release_commit)
+            self.assertEqual(migrated["previous_git_commit"], legacy_commit)
+            self.assertEqual(migrated["update_reason"], "legacy_manifest_migration")
+
+    def test_notebook00_rejects_a_moved_release_tag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            canonical = root / "canonical"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(["git", "config", "user.email", "audit@example.invalid"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Audit Test"], cwd=repo, check=True)
+            (repo / "authority.txt").write_text("first\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "first"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            first_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v1", "-m", "authority v1", first_commit],
+                cwd=repo,
+                check=True,
+            )
+            namespace = {
+                "MIRROR_REVISION_ROOT": canonical,
+                "REPO_DIR": repo,
+                "REPO_URL": "https://github.com/BrianNguyen29/ECG-RAMBA.git",
+                "BRANCH": "main",
+            }
+            environment = {
+                "ECG_RAMBA_AUTHORITY_COMMIT": "",
+                "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
+                "ECG_RAMBA_AUTHORITY_REF": "refs/tags/authority-v1",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                exec(authority_block_source("00_colab_bootstrap.ipynb"), namespace, namespace)
+
+            subprocess.run(["git", "checkout", "-B", "main"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            (repo / "authority.txt").write_text("second\n", encoding="utf-8")
+            subprocess.run(["git", "add", "authority.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "second"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            second_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+            ).strip()
+            subprocess.run(["git", "tag", "-d", "authority-v1"], cwd=repo, check=True, stdout=subprocess.PIPE)
+            subprocess.run(
+                ["git", "tag", "-a", "authority-v1", "-m", "moved", second_commit],
+                cwd=repo,
+                check=True,
+            )
+            fresh_namespace = dict(namespace)
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "release tag moved or changed"):
+                    exec(
+                        authority_block_source("00_colab_bootstrap.ipynb"),
+                        fresh_namespace,
+                        fresh_namespace,
+                    )
 
     def test_notebook02a_training_streams_stage_run_id_logs_to_drive(self):
         cells, source = notebook_source("02a_retrain_best_ema.ipynb")

@@ -1267,8 +1267,16 @@ def code_authority_manifest_failures(canonical_root: Path, current_head: str) ->
     observed = str(payload.get("git_commit") or payload.get("commit") or "").lower()
     if observed != current_head.lower():
         failures.append(f"code authority manifest {observed or 'missing'} != current HEAD {current_head}")
-    if payload.get("capability") not in {None, "canonical_git_commit_pin_v1"}:
+    if payload.get("capability") != "canonical_versioned_git_release_v2":
         failures.append("code authority manifest capability is unexpected")
+    if int(payload.get("schema_version", 0)) != 2:
+        failures.append("code authority manifest schema is unexpected")
+    authority_ref = str(payload.get("authority_ref") or "")
+    authority_ref_object = str(payload.get("authority_ref_object_id") or "").lower()
+    if not authority_ref.startswith("refs/tags/"):
+        failures.append("code authority manifest lacks a versioned tag ref")
+    if len(authority_ref_object) != 40:
+        failures.append("code authority manifest lacks the annotated tag object id")
     return failures
 
 

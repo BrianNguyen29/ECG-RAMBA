@@ -786,10 +786,16 @@ def main() -> None:
             ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True
         ).strip().lower()
         expected_head = str(authority.get("git_commit", "")).strip().lower()
-        if authority.get("capability") != "canonical_git_commit_pin_v1":
+        if authority.get("capability") != "canonical_versioned_git_release_v2":
             authority_issues.append("code_authority:capability")
-        if int(authority.get("schema_version", 0)) != 1:
+        if int(authority.get("schema_version", 0)) != 2:
             authority_issues.append("code_authority:schema")
+        authority_ref = str(authority.get("authority_ref", ""))
+        authority_ref_object = str(authority.get("authority_ref_object_id", "")).lower()
+        if not authority_ref.startswith("refs/tags/"):
+            authority_issues.append("code_authority:versioned_tag_ref")
+        if len(authority_ref_object) != 40:
+            authority_issues.append("code_authority:tag_object_id")
         if len(expected_head) != 40 or expected_head != current_head:
             authority_issues.append(
                 f"code_authority:git_commit expected={expected_head or 'missing'} observed={current_head}"
