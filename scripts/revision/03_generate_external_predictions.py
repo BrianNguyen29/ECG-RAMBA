@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import hashlib
 import json
 import os
@@ -76,6 +77,8 @@ AMP_DTYPE_NAME = (
 
 NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY = "external_export_full10s_grouped_v1"
 NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION = 1
+CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY = "cpsc_disk_backed_float32_windows_v2_resumable"
+CPSC_WINDOW_CACHE_SCHEMA_VERSION = 2
 
 
 def patch_wfdb_annotation_numpy2_overflow() -> None:
@@ -152,6 +155,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=TABLE_DIR / "table_cpsc2021_annotation_audit.csv",
         help="Per-record CPSC2021 annotation/window audit table.",
+    )
+    parser.add_argument(
+        "--cpsc-signal-memmap",
+        type=Path,
+        default=None,
+        help=(
+            "Optional local .npy path for disk-backed CPSC2021 float32 windows. "
+            "Use this for learned-comparator inference to avoid retaining the full window tensor in RAM."
+        ),
     )
     parser.add_argument("--extract-root", type=Path, default=Path("/content/ecg_ramba_runtime/external"))
     return parser.parse_args()
@@ -604,6 +616,206 @@ def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     )
 
 
+def cpsc_window_capacity(metadata: list[dict]) -> int:
+    """Return a conservative disk-backed capacity without loading ECG samples."""
+
+    capacity = 0
+    for row in tqdm(metadata, desc="Sizing cpsc2021 window store"):
+        try:
+            header = wfdb.rdheader(str(row["record_path"]))
+            source_fs = int(round(float(header.fs)))
+            signal_length = int(header.sig_len)
+            if source_fs <= 0 or signal_length <= 0:
+                raise ValueError("invalid WFDB header duration")
+            target_length = (signal_length * int(FS) + source_fs - 1) // source_fs
+            # Two guard windows cover resampling length rounding without making
+            # the final in-memory view larger than the number actually loaded.
+            capacity += max(1, target_length // 5000 + 2)
+        except Exception:
+            # rdrecord uses the same header. Reserve one row so malformed
+            # records can be audited/skipped without multi-GiB over-allocation.
+            capacity += 1
+    if capacity <= 0:
+        raise RuntimeError("Could not size the CPSC2021 disk-backed window store")
+    return int(capacity)
+
+
+def cpsc_cache_paths(path: Path) -> dict[str, Path]:
+    path = path.resolve()
+    return {
+        "final": path,
+        "contract": path.with_name(f"{path.name}.contract.npz"),
+        "partial": path.with_name(f".{path.name}.partial.npy"),
+        "progress": path.with_name(f".{path.name}.progress.json"),
+    }
+
+
+def cpsc_window_cache_contract(
+    metadata: list[dict],
+    limit: int,
+    source_archive_sha256: str | None,
+) -> dict:
+    payload = {
+        "schema_version": CPSC_WINDOW_CACHE_SCHEMA_VERSION,
+        "source_archive_sha256": str(source_archive_sha256 or ""),
+        "loader_source_sha256": sha256_file(Path(__file__).resolve()),
+        "evaluation_config_hash": EVALUATION_CONFIG_HASH,
+        "limit_records": int(limit),
+        "metadata_record_ids": [str(row["record_id"]) for row in metadata],
+        "window_policy": {
+            "sampling_frequency_hz": FS,
+            "window_samples": 5000,
+            "window_seconds": 10.0,
+            "stride_samples": 5000,
+            "strict_majority": True,
+            "exclude_partial": True,
+            "exclude_transition": True,
+            "exclude_tie": True,
+        },
+        "lead_order": STANDARD_LEADS,
+    }
+    payload["contract_sha256"] = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return payload
+
+
+def _quarantine_cache_path(path: Path) -> None:
+    if not path.exists():
+        return
+    suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    destination = path.with_name(f"{path.name}.stale.{suffix}")
+    os.replace(path, destination)
+    print(f"Quarantined stale CPSC cache artifact: {destination}", flush=True)
+
+
+def load_completed_cpsc_signal_cache(
+    path: Path,
+    contract: dict,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict, list[dict]] | None:
+    paths = cpsc_cache_paths(path)
+    if not paths["final"].exists() or not paths["contract"].exists():
+        return None
+    try:
+        with np.load(paths["contract"], allow_pickle=False) as cached:
+            required = {
+                "contract_json", "contract_sha256", "signal_file_sha256", "signal_count",
+                "labels", "record_ids", "group_ids", "split_ids", "load_summary_json",
+                "audit_rows_json",
+            }
+            if required - set(cached.files):
+                return None
+            if str(cached["contract_sha256"].item()) != contract["contract_sha256"]:
+                return None
+            if json.loads(str(cached["contract_json"].item())) != contract:
+                return None
+            expected_signal_sha = str(cached["signal_file_sha256"].item())
+            if sha256_file(paths["final"]) != expected_signal_sha:
+                return None
+            signal_count = int(cached["signal_count"].item())
+            labels = np.asarray(cached["labels"], dtype=np.float32)
+            record_ids = np.asarray(cached["record_ids"]).astype(str)
+            group_ids = np.asarray(cached["group_ids"]).astype(str)
+            split_ids = np.asarray(cached["split_ids"]).astype(str)
+            load_summary = json.loads(str(cached["load_summary_json"].item()))
+            audit_rows = json.loads(str(cached["audit_rows_json"].item()))
+        signals = np.load(paths["final"], mmap_mode="r", allow_pickle=False)[:signal_count]
+        if signals.shape != (signal_count, len(STANDARD_LEADS), 5000):
+            return None
+        if labels.shape != (signal_count, 1):
+            return None
+        if not (len(record_ids) == len(group_ids) == len(split_ids) == signal_count):
+            return None
+        print(
+            f"Reusing authenticated CPSC2021 window cache: windows={signal_count} path={paths['final']}",
+            flush=True,
+        )
+        return signals, labels, record_ids, group_ids, split_ids, load_summary, audit_rows
+    except Exception as exc:
+        print(f"CPSC2021 completed window cache rejected: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def create_or_resume_cpsc_signal_memmap(
+    path: Path,
+    metadata: list[dict],
+    contract: dict,
+) -> tuple[np.memmap, Path, dict | None]:
+    """Create or resume a source-bound CPSC window memmap."""
+
+    paths = cpsc_cache_paths(path)
+    path = paths["final"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    capacity = cpsc_window_capacity(metadata)
+    required_bytes = capacity * len(STANDARD_LEADS) * 5000 * np.dtype(np.float32).itemsize
+    free_bytes = shutil.disk_usage(path.parent).free
+    resume_state = None
+    if paths["partial"].exists() and paths["progress"].exists():
+        try:
+            candidate = json.loads(paths["progress"].read_text(encoding="utf-8"))
+            partial_array = np.load(paths["partial"], mmap_mode="r+", allow_pickle=False)
+            if (
+                candidate.get("contract_sha256") == contract["contract_sha256"]
+                and tuple(partial_array.shape) == (capacity, len(STANDARD_LEADS), 5000)
+                and str(partial_array.dtype) == "float32"
+            ):
+                resume_state = candidate
+                print(
+                    "Resuming CPSC2021 preprocessing checkpoint: "
+                    f"next_record={candidate.get('next_record_index')} windows={candidate.get('signal_count')}",
+                    flush=True,
+                )
+                return partial_array, paths["partial"], resume_state
+        except Exception as exc:
+            print(f"CPSC2021 partial cache rejected: {type(exc).__name__}: {exc}", flush=True)
+        _quarantine_cache_path(paths["partial"])
+        _quarantine_cache_path(paths["progress"])
+    elif paths["partial"].exists() or paths["progress"].exists():
+        _quarantine_cache_path(paths["partial"])
+        _quarantine_cache_path(paths["progress"])
+
+    if free_bytes < int(required_bytes * 1.05):
+        raise RuntimeError(
+            "CPSC2021 disk-backed loading needs more local disk space: "
+            f"required_about={required_bytes / 2**30:.1f} GiB free={free_bytes / 2**30:.1f} GiB "
+            f"path={path.parent}"
+        )
+    store = np.lib.format.open_memmap(
+        paths["partial"],
+        mode="w+",
+        dtype=np.float32,
+        shape=(capacity, len(STANDARD_LEADS), 5000),
+    )
+    print(
+        "CPSC2021 disk-backed window storage enabled: "
+        f"capacity={capacity} logical_size={required_bytes / 2**30:.1f} GiB path={paths['partial']}",
+        flush=True,
+    )
+    return store, paths["partial"], None
+
+
+def save_cpsc_preprocessing_progress(
+    signal_store: np.memmap,
+    progress_path: Path,
+    contract: dict,
+    next_record_index: int,
+    signal_count: int,
+    state: dict,
+) -> None:
+    signal_store.flush()
+    save_json(
+        progress_path,
+        {
+            "status": "in_progress",
+            "contract_sha256": contract["contract_sha256"],
+            "next_record_index": int(next_record_index),
+            "signal_count": int(signal_count),
+            "state": state,
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
 def interval_overlap(
     intervals: list[tuple[int, int]] | list[tuple[int, int, str]],
     start: int,
@@ -628,9 +840,34 @@ def load_cpsc_windows(
     root: Path,
     limit: int,
     annotation_audit_out: Path | None = None,
+    signal_memmap_path: Path | None = None,
+    source_archive_sha256: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     metadata, metadata_summary = cpsc_metadata(root, limit)
-    signals, labels, record_ids, group_ids, split_ids = [], [], [], [], []
+    cache_contract = cpsc_window_cache_contract(metadata, limit, source_archive_sha256)
+    if signal_memmap_path is not None:
+        completed = load_completed_cpsc_signal_cache(Path(signal_memmap_path), cache_contract)
+        if completed is not None:
+            signals, labels, record_ids, group_ids, split_ids, load_summary, audit_rows = completed
+            if annotation_audit_out is not None:
+                save_csv(annotation_audit_out, audit_rows)
+            return signals, labels, record_ids, group_ids, split_ids, load_summary
+        completed_paths = cpsc_cache_paths(Path(signal_memmap_path))
+        if completed_paths["final"].exists() or completed_paths["contract"].exists():
+            _quarantine_cache_path(completed_paths["final"])
+            _quarantine_cache_path(completed_paths["contract"])
+    signal_rows: list[np.ndarray] | None = [] if signal_memmap_path is None else None
+    signal_store: np.memmap | None = None
+    signal_store_partial: Path | None = None
+    signal_count = 0
+    resume_state: dict | None = None
+    if signal_memmap_path is not None:
+        signal_store, signal_store_partial, resume_state = create_or_resume_cpsc_signal_memmap(
+            signal_memmap_path,
+            metadata,
+            cache_contract,
+        )
+    labels, record_ids, group_ids, split_ids = [], [], [], []
     skipped_annotation = 0
     skipped_signal = 0
     signal_skip_examples = []
@@ -645,7 +882,75 @@ def load_cpsc_windows(
     transition_windows_excluded = 0
     missing_leads = []
     audit_rows = []
-    for row in tqdm(metadata, desc="Loading cpsc2021 windows"):
+    start_record_index = 0
+    if resume_state is not None:
+        state = resume_state.get("state") or {}
+        start_record_index = int(resume_state.get("next_record_index", 0))
+        signal_count = int(resume_state.get("signal_count", 0))
+        labels = [np.asarray([value], dtype=np.float32) for value in state.get("labels", [])]
+        record_ids = list(state.get("record_ids", []))
+        group_ids = list(state.get("group_ids", []))
+        split_ids = list(state.get("split_ids", []))
+        missing_leads = list(state.get("missing_leads", []))
+        audit_rows = list(state.get("audit_rows", []))
+        skipped_annotation = int(state.get("skipped_annotation", 0))
+        skipped_signal = int(state.get("skipped_signal", 0))
+        signal_skip_examples = list(state.get("signal_skip_examples", []))
+        annotation_skip_examples = list(state.get("annotation_skip_examples", []))
+        preprocessing_skip_examples = list(state.get("preprocessing_skip_examples", []))
+        transition_windows = int(state.get("transition_windows", 0))
+        positive_windows = int(state.get("positive_windows", 0))
+        negative_windows = int(state.get("negative_windows", 0))
+        ambiguous_windows = int(state.get("ambiguous_windows", 0))
+        partial_windows_excluded = int(state.get("partial_windows_excluded", 0))
+        tie_windows_excluded = int(state.get("tie_windows_excluded", 0))
+        transition_windows_excluded = int(state.get("transition_windows_excluded", 0))
+        if not (
+            len(labels) == len(record_ids) == len(group_ids) == len(split_ids)
+            == len(missing_leads) == signal_count
+        ):
+            raise RuntimeError("CPSC2021 preprocessing progress metadata is internally inconsistent")
+
+    def progress_payload() -> dict:
+        return {
+            "labels": [float(np.asarray(value).reshape(-1)[0]) for value in labels],
+            "record_ids": [str(value) for value in record_ids],
+            "group_ids": [str(value) for value in group_ids],
+            "split_ids": [str(value) for value in split_ids],
+            "missing_leads": [int(value) for value in missing_leads],
+            "audit_rows": audit_rows,
+            "skipped_annotation": skipped_annotation,
+            "skipped_signal": skipped_signal,
+            "signal_skip_examples": signal_skip_examples,
+            "annotation_skip_examples": annotation_skip_examples,
+            "preprocessing_skip_examples": preprocessing_skip_examples,
+            "transition_windows": transition_windows,
+            "positive_windows": positive_windows,
+            "negative_windows": negative_windows,
+            "ambiguous_windows": ambiguous_windows,
+            "partial_windows_excluded": partial_windows_excluded,
+            "tie_windows_excluded": tie_windows_excluded,
+            "transition_windows_excluded": transition_windows_excluded,
+        }
+
+    def checkpoint_record(next_record_index: int) -> None:
+        if signal_store is not None and signal_memmap_path is not None:
+            if next_record_index % 25 == 0 or next_record_index == len(metadata):
+                save_cpsc_preprocessing_progress(
+                    signal_store,
+                    cpsc_cache_paths(Path(signal_memmap_path))["progress"],
+                    cache_contract,
+                    next_record_index,
+                    signal_count,
+                    progress_payload(),
+                )
+        if next_record_index % 10 == 0:
+            gc.collect()
+
+    for metadata_index, row in enumerate(
+        tqdm(metadata[start_record_index:], desc="Loading cpsc2021 windows"),
+        start=start_record_index,
+    ):
         audit = {
             "record_id": str(row["record_id"]),
             "status": "started",
@@ -681,6 +986,7 @@ def load_cpsc_windows(
                 signal_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping signal {row['record_id']}: {exc}")
+            checkpoint_record(metadata_index + 1)
             continue
 
         try:
@@ -695,6 +1001,7 @@ def load_cpsc_windows(
                 annotation_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping annotation {row['record_id']}: {exc}")
+            checkpoint_record(metadata_index + 1)
             continue
 
         try:
@@ -749,7 +1056,19 @@ def load_cpsc_windows(
                 record_signals.append(normalized)
                 record_labels.append(np.asarray([label], dtype=np.float32))
                 record_ids_for_windows.append(f"{row['record_id']}:{start}:{stop}")
-            signals.extend(record_signals)
+            if signal_store is not None:
+                if signal_count + len(record_signals) > len(signal_store):
+                    raise RuntimeError(
+                        "CPSC2021 window-store capacity estimate was too small: "
+                        f"capacity={len(signal_store)} required={signal_count + len(record_signals)}"
+                    )
+                for signal in record_signals:
+                    signal_store[signal_count] = signal
+                    signal_count += 1
+            else:
+                assert signal_rows is not None
+                signal_rows.extend(record_signals)
+                signal_count += len(record_signals)
             labels.extend(record_labels)
             record_ids.extend(record_ids_for_windows)
             group_ids.extend([str(row["record_id"])] * len(record_signals))
@@ -781,9 +1100,10 @@ def load_cpsc_windows(
                 preprocessing_skip_examples.append({"record_id": str(row["record_id"]), "error": str(exc)})
             if skipped_annotation + skipped_signal <= 10:
                 print(f"Skipping preprocessing {row['record_id']}: {exc}")
+        checkpoint_record(metadata_index + 1)
     if annotation_audit_out is not None:
         save_csv(annotation_audit_out, audit_rows)
-    if not signals:
+    if signal_count == 0:
         raise RuntimeError(
             "No usable CPSC2021 annotation-aligned windows were loaded. "
             f"headers={len(metadata)}; "
@@ -796,36 +1116,75 @@ def load_cpsc_windows(
             "annotation files with recognized AF/AFL/normal rhythm boundaries; otherwise "
             "leave CPSC2021 deferred."
         )
+    load_summary = {
+        **metadata_summary,
+        "metadata_records": len(metadata),
+        "loaded_windows": signal_count,
+        "positive_windows": positive_windows,
+        "negative_windows": negative_windows,
+        "transition_windows": transition_windows,
+        "ambiguous_windows": ambiguous_windows,
+        "partial_windows_excluded": partial_windows_excluded,
+        "tie_windows_excluded": tie_windows_excluded,
+        "transition_windows_excluded": transition_windows_excluded,
+        "primary_window_length_samples": 5000,
+        "primary_window_length_seconds": 10.0,
+        "primary_requires_full_window": True,
+        "primary_excludes_transition_windows": True,
+        "primary_requires_strict_majority": True,
+        "skipped_annotation_records": skipped_annotation,
+        "skipped_signal_records": skipped_signal,
+        "annotation_audit_csv": str(annotation_audit_out) if annotation_audit_out is not None else "",
+        "missing_leads_mean": float(np.mean(missing_leads)),
+        "windows_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
+        "group_unit": "source_ecg_record",
+        "n_groups": len(set(group_ids)),
+        "signal_storage": (
+            "disk_backed_float32_npy_source_bound_resumable"
+            if signal_memmap_path is not None
+            else "in_memory_float32"
+        ),
+        "signal_cache_contract_sha256": cache_contract["contract_sha256"],
+    }
+    if signal_store is not None:
+        assert signal_store_partial is not None
+        signal_store.flush()
+        del signal_store
+        final_memmap = Path(signal_memmap_path).resolve()
+        os.replace(signal_store_partial, final_memmap)
+        signal_sha = sha256_file(final_memmap)
+        cache_paths = cpsc_cache_paths(final_memmap)
+        save_npz_compressed_atomic(
+            cache_paths["contract"],
+            contract_json=np.asarray(json.dumps(cache_contract, sort_keys=True)),
+            contract_sha256=np.asarray(cache_contract["contract_sha256"]),
+            signal_file_sha256=np.asarray(signal_sha),
+            signal_count=np.asarray(signal_count, dtype=np.int64),
+            labels=np.asarray(labels, dtype=np.float32),
+            record_ids=np.asarray(record_ids),
+            group_ids=np.asarray(group_ids),
+            split_ids=np.asarray(split_ids),
+            load_summary_json=np.asarray(json.dumps(load_summary, sort_keys=True)),
+            audit_rows_json=np.asarray(json.dumps(audit_rows, sort_keys=True)),
+            created_utc=np.asarray(datetime.now(timezone.utc).isoformat()),
+        )
+        cache_paths["progress"].unlink(missing_ok=True)
+        signals = np.load(final_memmap, mmap_mode="r", allow_pickle=False)[:signal_count]
+        print(
+            "CPSC2021 disk-backed signal array ready: "
+            f"windows={signal_count} path={final_memmap} sha256={signal_sha}",
+            flush=True,
+        )
+    else:
+        assert signal_rows is not None
+        signals = np.asarray(signal_rows, dtype=np.float32)
     return (
-        np.asarray(signals, dtype=np.float32),
+        signals,
         np.asarray(labels, dtype=np.float32),
         np.asarray(record_ids),
         np.asarray(group_ids),
         np.asarray(split_ids),
-        {
-            **metadata_summary,
-            "metadata_records": len(metadata),
-            "loaded_windows": len(signals),
-            "positive_windows": positive_windows,
-            "negative_windows": negative_windows,
-            "transition_windows": transition_windows,
-            "ambiguous_windows": ambiguous_windows,
-            "partial_windows_excluded": partial_windows_excluded,
-            "tie_windows_excluded": tie_windows_excluded,
-            "transition_windows_excluded": transition_windows_excluded,
-            "primary_window_length_samples": 5000,
-            "primary_window_length_seconds": 10.0,
-            "primary_requires_full_window": True,
-            "primary_excludes_transition_windows": True,
-            "primary_requires_strict_majority": True,
-            "skipped_annotation_records": skipped_annotation,
-            "skipped_signal_records": skipped_signal,
-            "annotation_audit_csv": str(annotation_audit_out) if annotation_audit_out is not None else "",
-            "missing_leads_mean": float(np.mean(missing_leads)),
-            "windows_with_missing_leads": int(np.sum(np.asarray(missing_leads) > 0)),
-            "group_unit": "source_ecg_record",
-            "n_groups": len(set(group_ids)),
-        },
+        load_summary,
     )
 
 
@@ -836,7 +1195,13 @@ def load_records(
     args: argparse.Namespace,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     if dataset == "cpsc2021":
-        return load_cpsc_windows(root, limit, args.cpsc_annotation_audit_out)
+        return load_cpsc_windows(
+            root,
+            limit,
+            args.cpsc_annotation_audit_out,
+            getattr(args, "cpsc_signal_memmap", None),
+            getattr(args, "source_archive_sha256", None),
+        )
     if dataset == "ptbxl":
         metadata, metadata_summary = ptb_metadata(root, limit, parse_ptbxl_folds(args.ptbxl_folds))
     elif dataset == "georgia":
@@ -1346,6 +1711,7 @@ def main() -> None:
     )
     created_utc = datetime.now(timezone.utc).isoformat()
     archive = archive_path(args.dataset)
+    args.source_archive_sha256 = sha256_file(archive)
     root = extract_archive(args.dataset, archive, args.extract_root)
     signals, y_true, record_ids, group_ids, split_ids, load_summary = load_records(
         args.dataset,

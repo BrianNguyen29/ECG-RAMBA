@@ -116,7 +116,9 @@ def build_oof_cache_provenance(
         Path(__file__),
         PROJECT_ROOT / "src" / "data_loader.py",
         PROJECT_ROOT / "src" / "features.py",
+        PROJECT_ROOT / "src" / "model.py",
         PROJECT_ROOT / "src" / "provenance.py",
+        PROJECT_ROOT / "scripts" / "revision" / "common.py",
         PROJECT_ROOT / "configs" / "config.py",
     ]
     contract = {
@@ -749,6 +751,15 @@ def parse_args() -> argparse.Namespace:
         help="Explicit canonical folds.pkl. Defaults to <model-dir>/folds.pkl.",
     )
     parser.add_argument(
+        "--require-frozen-folds",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Require the reviewed folds.pkl contract. Disable only for isolated debug runs; "
+            "manuscript OOF generation must never synthesize new folds."
+        ),
+    )
+    parser.add_argument(
         "--artifact-stem",
         default=None,
         help="Output stem override; required for non-Full architecture variants.",
@@ -830,6 +841,7 @@ def load_folds(
     y: np.ndarray,
     subjects: np.ndarray,
     folds_path_override: Path | None = None,
+    require_frozen: bool = True,
 ) -> list[dict[str, np.ndarray]]:
     folds_path = (
         folds_path_override
@@ -850,7 +862,12 @@ def load_folds(
         print(f"Loaded folds from: {folds_path}")
         return normalized
 
-    print("folds.pkl not found. Recomputing StratifiedGroupKFold from config.")
+    if require_frozen:
+        raise FileNotFoundError(
+            f"Canonical folds.pkl is required but missing: {folds_path}. "
+            "Restore the reviewed model-run split artifact; do not regenerate manuscript folds."
+        )
+    print("DEBUG ONLY: folds.pkl not found. Recomputing StratifiedGroupKFold from config.")
     from sklearn.model_selection import StratifiedGroupKFold
 
     y_strat = y.sum(axis=1).clip(max=3).astype(int)
@@ -1203,6 +1220,12 @@ def generate_oof(args: argparse.Namespace) -> None:
     X, y, X_raw_amp, subjects = prepare_clean_chapman(limit_records=args.limit_records)
     n_records, n_classes = y.shape
     dataset_record_fingerprint = record_order_fingerprint(subjects)
+    folds = load_folds(
+        y,
+        subjects,
+        args.folds_path,
+        require_frozen=bool(args.require_frozen_folds),
+    )
 
     X_rocket_raw, rocket_contract = generate_raw_rocket_cache(
         X,
@@ -1216,8 +1239,6 @@ def generate_oof(args: argparse.Namespace) -> None:
     X_hrv = generate_hrv_cache(X, X_raw_amp, subjects) if CONFIG["use_hrv"] else np.zeros(
         (n_records, CONFIG["hrv_dim"]), dtype=np.float32
     )
-    folds = load_folds(y, subjects, args.folds_path)
-
     if args.limit_records > 0:
         allowed = set(range(n_records))
         folds = [

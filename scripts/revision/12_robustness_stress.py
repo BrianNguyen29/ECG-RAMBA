@@ -71,7 +71,7 @@ from src.features import (  # noqa: E402
 from src.provenance import record_order_fingerprint  # noqa: E402
 
 
-PROTOCOL = "robustness_full_vs_minirocket_perturbation_v1"
+PROTOCOL = "robustness_full_vs_fixed_seed_rocket_perturbation_v2_source_bound"
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 INFERENCE_SCOPE = "pointwise_percentile_ci_effect_size_only"
 NULL_TEST = "not_run"
@@ -88,6 +88,27 @@ DEFAULT_STRESS_TESTS = [
     "precordial_dropout",
     "resample_250hz",
 ]
+SOURCE_BUNDLE_PATHS = (
+    "scripts/revision/12_robustness_stress.py",
+    "scripts/revision/common.py",
+    "scripts/revision/01_generate_predictions.py",
+    "scripts/revision/10_minirocket_only_baseline.py",
+    "src/aggregation.py",
+    "src/features.py",
+    "src/provenance.py",
+    "configs/config.py",
+)
+
+
+def source_bundle_contract() -> dict:
+    files = {relative: sha256_file(PROJECT_ROOT / relative) for relative in SOURCE_BUNDLE_PATHS}
+    return {
+        "schema_version": 1,
+        "files": files,
+        "sha256": hashlib.sha256(
+            json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 @dataclass(frozen=True)
@@ -250,6 +271,73 @@ def load_metric_cache(path: Path, expected_metadata: dict) -> tuple[dict, list[d
     samples = payload.get("samples")
     if not isinstance(row, dict) or not isinstance(samples, list):
         return None
+    expected_n_boot = int(expected_metadata.get("n_boot", 0))
+    if expected_n_boot < 1 or int(row.get("n_boot_valid", -1)) != expected_n_boot:
+        return None
+    if len(samples) != expected_n_boot:
+        return None
+    expected_indices = list(range(expected_n_boot))
+    try:
+        observed_indices = [int(sample["bootstrap_index"]) for sample in samples]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if observed_indices != expected_indices:
+        return None
+    sample_numeric_fields = (
+        "clean_full",
+        "stress_full",
+        "clean_minirocket",
+        "stress_minirocket",
+        "degradation_full",
+        "degradation_minirocket",
+        "robustness_advantage_full_less_degradation",
+        "stressed_advantage_full_over_minirocket",
+    )
+    for sample in samples:
+        if sample.get("stress_test") != expected_metadata.get("stress_test"):
+            return None
+        if sample.get("metric") != expected_metadata.get("metric"):
+            return None
+        try:
+            if not all(math.isfinite(float(sample[field])) for field in sample_numeric_fields):
+                return None
+        except (KeyError, TypeError, ValueError):
+            return None
+    required_row_fields = (
+        "clean_full",
+        "stress_full",
+        "degradation_full",
+        "clean_minirocket",
+        "stress_minirocket",
+        "degradation_minirocket",
+        "stressed_advantage_full_over_minirocket",
+        "stressed_advantage_ci_low",
+        "stressed_advantage_ci_high",
+        "degradation_advantage_full_less_degradation",
+        "degradation_advantage_ci_low",
+        "degradation_advantage_ci_high",
+    )
+    try:
+        if not all(math.isfinite(float(row[field])) for field in required_row_fields):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    if row.get("inference_scope") != INFERENCE_SCOPE:
+        return None
+    if row.get("null_test") != NULL_TEST:
+        return None
+    if row.get("multiplicity_adjustment") != MULTIPLICITY_ADJUSTMENT:
+        return None
+    for key, value in row.items():
+        lowered = str(key).lower()
+        if "p_value" in lowered and value not in (None, "", "not_reported"):
+            try:
+                if math.isfinite(float(value)):
+                    return None
+            except (TypeError, ValueError):
+                return None
+        if "significant" in str(value).lower():
+            return None
     return row, samples
 
 
@@ -396,6 +484,27 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
     if full["sha256"] != artifacts[rel].get("sha256"):
         raise RuntimeError("Full clean prediction SHA does not match freeze manifest.")
 
+    group_contract = freeze.get("group_contract") or {}
+    sidecar_artifact = group_contract.get("sidecar") or {}
+    sidecar_path_text = sidecar_artifact.get("path")
+    if (
+        group_contract.get("status") != "verified"
+        or group_contract.get("one_record_per_group") is not True
+        or not sidecar_path_text
+        or not sidecar_artifact.get("sha256")
+    ):
+        raise RuntimeError("Freeze manifest lacks a verified one-record-per-group sidecar contract.")
+    sidecar_path = resolve_path(Path(str(sidecar_path_text)))
+    if not sidecar_path.exists() or sidecar_path.stat().st_size <= 0:
+        raise FileNotFoundError(f"Missing authenticated OOF group sidecar: {sidecar_path}")
+    sidecar_sha256 = sha256_file(sidecar_path)
+    if sidecar_sha256 != sidecar_artifact.get("sha256"):
+        raise RuntimeError("OOF group sidecar SHA does not match the frozen group contract.")
+    if int(group_contract.get("n_records", -1)) != int(full["y_true"].shape[0]):
+        raise RuntimeError("OOF group contract record count does not match clean predictions.")
+    if int(group_contract.get("n_groups", -1)) != int(full["y_true"].shape[0]):
+        raise RuntimeError("Robustness record bootstrap requires the reviewed one-record-per-group contract.")
+
     mini_manifest = resolve_path(args.minirocket_manifest)
     mini_summary = resolve_path(args.minirocket_summary)
     if not mini_manifest.exists() or not mini_summary.exists():
@@ -426,6 +535,16 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
             "checkpoint_kind": freeze.get("checkpoint_kind"),
             "validated_records": freeze.get("validated_records"),
             "dataset_record_order_fingerprint": freeze.get("dataset_record_order_fingerprint"),
+        },
+        "group_contract": {
+            "status": group_contract.get("status"),
+            "one_record_per_group": group_contract.get("one_record_per_group"),
+            "n_records": group_contract.get("n_records"),
+            "n_groups": group_contract.get("n_groups"),
+            "bootstrap_unit": group_contract.get("bootstrap_unit"),
+            "group_semantics": group_contract.get("group_semantics"),
+            "sidecar_path": str(sidecar_path),
+            "sidecar_sha256": sidecar_sha256,
         },
         "minirocket_manifest": {
             "path": str(mini_manifest),
@@ -680,7 +799,7 @@ def generate_minirocket_features(
     }
     if save_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
+        save_npz_compressed_atomic(
             cache_path,
             X=X_rocket.astype(np.float16),
             storage_dtype=np.asarray("float16"),
@@ -729,7 +848,7 @@ def generate_hrv36_features(
     info = {"path": str(cache_path), "sha256": None, "cache_hit": False}
     if save_cache:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
+        save_npz_compressed_atomic(
             cache_path,
             X=feats.astype(np.float16),
             storage_dtype=np.asarray("float16"),
@@ -876,7 +995,7 @@ def fit_or_load_minirocket_heads(
 
     if np.any(fold_id < 0) or not np.isfinite(clean_prob).all():
         raise RuntimeError("MiniRocket robustness clean-head prediction coverage is incomplete.")
-    np.savez_compressed(
+    save_npz_compressed_atomic(
         clean_pred_path,
         y_true=y.astype(np.float32),
         y_prob=np.clip(clean_prob, 0.0, 1.0).astype(np.float32),
@@ -1152,30 +1271,8 @@ def load_existing_prediction(
         and cached_contract_hash
         and cached_contract_hash == expected_contract_hash
     )
-    if not contract_matches and expected_model_label == "Full ECG-RAMBA":
-        fold_rows = metadata.get("fold_rows") or []
-        cached_checkpoint_sha = {
-            int(row["fold"]): str(row.get("checkpoint_sha256") or "")
-            for row in fold_rows
-            if row.get("fold") is not None
-        }
-        contract_matches = bool(
-            expected_checkpoint_sha_by_fold
-            and all(
-                cached_checkpoint_sha.get(fold) == sha
-                for fold, sha in expected_checkpoint_sha_by_fold.items()
-            )
-        )
-    if not contract_matches and expected_model_label == "MiniRocket-only":
-        cached_head_manifest = metadata.get("minirocket_heads_manifest") or {}
-        contract_matches = bool(
-            expected_minirocket_params_hash
-            and expected_minirocket_clean_prediction_sha256
-            and cached_head_manifest.get("params_hash")
-            == expected_minirocket_params_hash
-            and cached_head_manifest.get("clean_prediction_sha256")
-            == expected_minirocket_clean_prediction_sha256
-        )
+    # Reuse is exact-contract only. Checkpoint/head equality alone cannot attest
+    # that the same perturbation and feature-extraction source produced a cache.
     if (
         cached_y.shape == y.shape
         and cached_prob.shape == y.shape
@@ -1201,6 +1298,7 @@ def prediction_contract_hash(
     checkpoint_contract_payload: dict | None = None,
     minirocket_heads_manifest: dict | None = None,
 ) -> str | None:
+    source_bundle = source_bundle_contract()
     if model_label == "Full ECG-RAMBA":
         payload = checkpoint_contract_payload or {}
         checkpoints = payload.get("checkpoints") or {}
@@ -1215,6 +1313,7 @@ def prediction_contract_hash(
             "model_label": model_label,
             "oof_run_manifest_sha256": payload.get("sha256"),
             "checkpoint_sha256_by_fold": checkpoint_sha,
+            "source_bundle_sha256": source_bundle["sha256"],
         }
     else:
         manifest = minirocket_heads_manifest or {}
@@ -1228,6 +1327,7 @@ def prediction_contract_hash(
             "minirocket_clean_prediction_sha256": manifest.get(
                 "clean_prediction_sha256"
             ),
+            "source_bundle_sha256": source_bundle["sha256"],
         }
     encoded = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode(
         "utf-8"
@@ -1587,7 +1687,13 @@ def main() -> None:
     )
 
     for stress in specs:
-        stress_hash = stable_hash(stress)
+        stress_hash = stable_hash(
+            {
+                "stress": stress,
+                "source_bundle_sha256": source_bundle_contract()["sha256"],
+                "record_order_fingerprint": record_fp,
+            }
+        )
         stress_name = stress["name"]
         print("\n" + "=" * 80, flush=True)
         print(f"Stress test: {stress_name} | hash={stress_hash}", flush=True)
@@ -1678,6 +1784,7 @@ def main() -> None:
                         "threshold": args.threshold,
                         "n_bins": args.n_bins,
                         "prediction_contract_hash": full_prediction_contract_hash,
+                        "source_bundle": source_bundle_contract(),
                         "feature_infos": feature_infos,
                         "fold_rows": full_fold_rows,
                         "slice_count_min": int(slice_count.min()),
@@ -1704,6 +1811,7 @@ def main() -> None:
                         "threshold": args.threshold,
                         "n_bins": args.n_bins,
                         "prediction_contract_hash": mini_prediction_contract_hash,
+                        "source_bundle": source_bundle_contract(),
                         "feature_infos": feature_infos,
                         "minirocket_heads_manifest": heads.manifest,
                     },
@@ -1763,6 +1871,10 @@ def main() -> None:
                 "full_stress_predictions_sha256": full_pred_sha,
                 "minirocket_stress_predictions_sha256": mini_pred_sha,
                 "expected_checkpoint_kind": str(args.expected_checkpoint_kind),
+                "source_bundle_sha256": source_bundle_contract()["sha256"],
+                "freeze_manifest_sha256": contract["freeze_manifest"]["sha256"],
+                "group_sidecar_sha256": contract["group_contract"]["sidecar_sha256"],
+                "bootstrap_unit": contract["group_contract"].get("bootstrap_unit"),
             }
             cache_path = metric_cache_path(args.metric_cache_dir, stress_name, spec.name)
             cached_metric = load_metric_cache(cache_path, cache_metadata) if args.reuse_metric_cache else None
@@ -1809,6 +1921,12 @@ def main() -> None:
                 f"n_boot_valid={ci['n_boot_valid']}",
                 flush=True,
             )
+            if int(ci["n_boot_valid"]) != int(args.n_boot):
+                raise RuntimeError(
+                    f"Robustness bootstrap for {stress_name}/{spec.name} produced "
+                    f"{ci['n_boot_valid']} valid rows, expected exactly {args.n_boot}. "
+                    "Do not publish a short manuscript-ready cache."
+                )
             row = {
                 "stress_test": stress_name,
                 "metric": spec.name,

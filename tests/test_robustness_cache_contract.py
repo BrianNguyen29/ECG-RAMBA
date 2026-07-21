@@ -27,6 +27,12 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     "clean_prediction_sha256": "clean-a",
                 }
             }
+            expected_contract_hash = ROBUSTNESS.prediction_contract_hash(
+                model_label="MiniRocket-only",
+                minirocket_heads_manifest=metadata["minirocket_heads_manifest"],
+            )
+            metadata["prediction_contract_hash"] = expected_contract_hash
+            metadata["source_bundle"] = ROBUSTNESS.source_bundle_contract()
             stress_spec = ROBUSTNESS.stress_specs(["snr20db"], 42)[0]
             np.savez_compressed(
                 path,
@@ -47,7 +53,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 expected_stress="snr20db",
                 expected_stress_spec=stress_spec,
                 expected_model_label="MiniRocket-only",
-                expected_contract_hash=None,
+                expected_contract_hash=expected_contract_hash,
                 expected_minirocket_params_hash="params-a",
                 expected_minirocket_clean_prediction_sha256="clean-a",
             )
@@ -60,7 +66,13 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 expected_stress="snr20db",
                 expected_stress_spec=stress_spec,
                 expected_model_label="MiniRocket-only",
-                expected_contract_hash=None,
+                expected_contract_hash=ROBUSTNESS.prediction_contract_hash(
+                    model_label="MiniRocket-only",
+                    minirocket_heads_manifest={
+                        **metadata["minirocket_heads_manifest"],
+                        "clean_prediction_sha256": "clean-b",
+                    },
+                ),
                 expected_minirocket_params_hash="params-a",
                 expected_minirocket_clean_prediction_sha256="clean-b",
             )
@@ -98,6 +110,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 "freeze_manifest_sha256": "freeze",
             }
             stress_spec = COMPARATOR_STRESS.robust_helpers.stress_specs(["snr20db"], 42)[0]
+            source_bundle = COMPARATOR_STRESS.source_bundle_contract()
             np.savez_compressed(
                 path,
                 y_true=y,
@@ -117,6 +130,12 @@ class RobustnessCacheContractTests(unittest.TestCase):
                 freeze_manifest_sha256=np.asarray("freeze"),
                 checkpoint_sha256=np.asarray(hashes),
                 raw_cache_sha256=np.asarray("raw-cache"),
+                source_bundle_sha256=np.asarray(source_bundle["sha256"]),
+                producer_runner_sha256=np.asarray(
+                    source_bundle["files"][
+                        "scripts/revision/23_generate_comparator_stress_predictions.py"
+                    ]
+                ),
             )
             self.assertTrue(
                 COMPARATOR_STRESS.validate_existing(
@@ -130,6 +149,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     stress_spec=stress_spec,
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
+                    source_bundle_sha256=source_bundle["sha256"],
                     raw_cache_sha256="raw-cache",
                 )
             )
@@ -145,6 +165,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     stress_spec={**stress_spec, "seed": 999},
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
+                    source_bundle_sha256=source_bundle["sha256"],
                     raw_cache_sha256="raw-cache",
                 )
             )
@@ -160,6 +181,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     stress_spec=stress_spec,
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
+                    source_bundle_sha256=source_bundle["sha256"],
                     raw_cache_sha256="different-raw-cache",
                 )
             )
@@ -175,6 +197,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
                     stress_spec=stress_spec,
                     freeze_contract=freeze,
                     checkpoint_hashes=hashes,
+                    source_bundle_sha256=source_bundle["sha256"],
                 )
             )
 

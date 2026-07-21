@@ -10,6 +10,9 @@ import numpy as np
 
 paired = importlib.import_module("scripts.revision.32_paired_external_comparators")
 fewshot = importlib.import_module("scripts.revision.35_true_fewshot_head_adaptation")
+external_runner = importlib.import_module(
+    "scripts.revision.31_generate_external_comparator_predictions"
+)
 
 
 class ExternalComparatorContractTests(unittest.TestCase):
@@ -89,6 +92,63 @@ class ExternalComparatorContractTests(unittest.TestCase):
                 np.arange(10, dtype=float),
                 n_boot=10,
             )
+
+    def test_external_fold_cache_binds_dataset_sidecar_and_slice_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fold.npz"
+            record_index = np.asarray([0, 0, 1], dtype=np.int64)
+            starts = np.asarray([0, 1250, 0], dtype=np.int32)
+            classes = np.asarray(["a", "b"])
+            np.savez_compressed(
+                path,
+                slice_prob=np.asarray([[0.2, 0.8], [0.4, 0.6], [0.7, 0.3]], dtype=np.float32),
+                slice_record_index=record_index,
+                slice_start=starts,
+                class_names=classes,
+                dataset=np.asarray("ptbxl"),
+                comparator=np.asarray("resnet"),
+                fold=np.asarray(1),
+                checkpoint_sha256=np.asarray("a" * 64),
+                input_fingerprint=np.asarray("b" * 64),
+                dataset_contract_sha256=np.asarray("c" * 64),
+                protocol_version=np.asarray(external_runner.PROTOCOL_VERSION),
+            )
+            kwargs = dict(
+                dataset="ptbxl",
+                comparator="resnet",
+                fold=1,
+                checkpoint_sha="a" * 64,
+                input_fingerprint="b" * 64,
+                class_names=classes,
+                dataset_contract_sha256="c" * 64,
+                expected_record_index=record_index,
+                expected_starts=starts,
+            )
+            self.assertTrue(external_runner.cache_matches(path, **kwargs))
+            self.assertFalse(
+                external_runner.cache_matches(
+                    path,
+                    **{**kwargs, "dataset_contract_sha256": "d" * 64},
+                )
+            )
+            self.assertFalse(
+                external_runner.cache_matches(
+                    path,
+                    **{**kwargs, "expected_starts": np.asarray([0, 0, 1250])},
+                )
+            )
+
+    def test_cache_only_preflight_precedes_signal_loading(self):
+        source = (
+            Path(external_runner.__file__).read_text(encoding="utf-8")
+        )
+        run_dataset = source[source.index("def run_dataset("):source.index("\ndef main()")]
+        self.assertLess(
+            run_dataset.index("load_dataset_contract(args, dataset, sources, contract)"),
+            run_dataset.index("external_helpers.load_records("),
+        )
+        self.assertIn("skipping archive extraction and signal loading", run_dataset)
+        self.assertIn("all requested fold caches passed the v2 dataset-sidecar contract", run_dataset)
 
     def test_true_fewshot_metric_cache_binds_group_and_runner_contract(self):
         args = SimpleNamespace(

@@ -21,7 +21,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.revision.common import METRIC_DIR, TABLE_DIR, save_csv, save_json_atomic  # noqa: E402
+from scripts.revision.common import (  # noqa: E402
+    METRIC_DIR,
+    TABLE_DIR,
+    save_csv,
+    save_json_atomic,
+    sha256_file,
+)
 
 
 TEXT_SUFFIXES = {".tex", ".md", ".txt", ".csv", ".json", ".tsv"}
@@ -30,7 +36,10 @@ CLAIM_PATTERNS = {
     "best_in_domain": re.compile(r"\bbest\s+in[- ]domain\b", re.I),
     "zero_shot_superiority": re.compile(r"\bzero[- ]shot\s+superiority\b", re.I),
     "broad_or_global_superiority": re.compile(
-        r"\b(?:broad|global|general|universal)\s+(?:external\s+|in[- ]domain\s+|robustness\s+)?superiority\b",
+        r"\b(?:broad|global|general|universal)\s+(?:external\s+|in[- ]domain\s+|robustness\s+)?superiority\b|"
+        r"\b(?:outperform(?:s|ed|ing)?|surpass(?:es|ed|ing)?|superior\s+to)\b"
+        r"[^\n.!?;]{0,100}\b(?:all|every)\b[^\n.!?;]{0,80}"
+        r"\b(?:fair\s+)?(?:baseline|comparator|model)s?\b",
         re.I,
     ),
     "proven_disentanglement": re.compile(
@@ -60,7 +69,7 @@ SAFE_PREFIX = re.compile(
     r"\bshould\s+not\b|\bcannot\b|\bcan\s+not\b|\bno\s+longer\b|"
     r"\bnot\s+supported\b|\bunsupported\b|\bwe\s+avoid\b|\bwe\s+refrain\b|"
     r"\bforbidden\b|\bprohibited\b|\bclaim\s+boundary\b)[^.!?\n]{0,100}$|"
-    r"\bnot\b[^.!?\n]{0,80}\bor\s+$",
+    r"\bnot\b[^.!?;\n]{0,80}\bor\s+$",
     re.I,
 )
 SAFE_SUFFIX = re.compile(
@@ -134,8 +143,14 @@ def collect_files(paths: list[Path]) -> tuple[list[Path], list[str]]:
 
 
 def local_context(text: str, start: int, end: int) -> tuple[str, str, str]:
-    left_boundary = max(text.rfind(marker, 0, start) for marker in ("\n", ".", "!", "?"))
-    right_candidates = [position for marker in ("\n", ".", "!", "?") if (position := text.find(marker, end)) >= 0]
+    # Semicolons and colons can introduce an adversative clause whose claim is
+    # independent from a preceding negation. Keeping them in one context lets
+    # "we do not claim X; however, Y proves superiority" bypass the scanner.
+    boundaries = ("\n", ".", "!", "?", ";", ":")
+    left_boundary = max(text.rfind(marker, 0, start) for marker in boundaries)
+    right_candidates = [
+        position for marker in boundaries if (position := text.find(marker, end)) >= 0
+    ]
     right_boundary = min(right_candidates) if right_candidates else len(text)
     prefix = text[left_boundary + 1 : start]
     suffix = text[end:right_boundary]
@@ -193,10 +208,20 @@ def main() -> None:
         except Exception as exc:
             read_failures.append(f"{path}: {exc}")
     unsafe = [row for row in rows if row["status"] == "unsafe_positive_claim"]
+    file_contracts = [
+        {
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+            "suffix": path.suffix.lower(),
+        }
+        for path in files
+    ]
     payload = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "status": not unsafe and not read_failures and (not missing or args.allow_missing),
         "files_scanned": len(files),
+        "file_contracts": file_contracts,
         "hits": len(rows),
         "safe_boundary_hits": len(rows) - len(unsafe),
         "unsafe_positive_claim_hits": len(unsafe),

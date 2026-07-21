@@ -10,7 +10,9 @@ intact PTB-XL patient groups and paired model deltas use shared resamples.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
+import io
 import json
 import math
 import sys
@@ -18,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+import zipfile
 
 import numpy as np
 
@@ -44,7 +47,7 @@ from scripts.revision.common import (  # noqa: E402
 
 
 PTBXL_FOLD_PROTOCOL_AUDIT_CAPABILITY = "ptbxl_fold9_fold10_patient_audit_v1"
-PTBXL_FOLD_PROTOCOL_AUDIT_SCHEMA_VERSION = 1
+PTBXL_FOLD_PROTOCOL_AUDIT_SCHEMA_VERSION = 2
 
 MODEL_STEMS = {
     "full": "full",
@@ -72,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--external-root", type=Path, default=EXPERIMENTAL_DIR / "external")
+    parser.add_argument(
+        "--ptbxl-archive",
+        type=Path,
+        required=True,
+        help="Authoritative PTB-XL ZIP containing ptbxl_database.csv.",
+    )
     parser.add_argument(
         "--analysis-lock",
         type=Path,
@@ -126,6 +135,89 @@ def prediction_path(root: Path, model: str, fold9: bool) -> Path:
     stem = MODEL_STEMS[model]
     suffix = "_fold9" if fold9 else ""
     return resolve(root) / "ptbxl" / f"ptbxl_{stem}{suffix}_predictions.npz"
+
+
+def _normalize_integer_id(value: Any, *, field: str) -> str:
+    text = str(value).strip()
+    try:
+        numeric = float(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {field}: {value!r}") from exc
+    if not math.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"Invalid integral {field}: {value!r}")
+    return str(int(numeric))
+
+
+def load_official_ptbxl_metadata(archive_path: Path) -> tuple[dict[str, tuple[str, int]], dict[str, Any]]:
+    archive_path = resolve(archive_path)
+    if not archive_path.is_file() or archive_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Authoritative PTB-XL archive is missing: {archive_path}")
+    if not zipfile.is_zipfile(archive_path):
+        raise ValueError(f"PTB-XL archive is not a valid ZIP: {archive_path}")
+    with zipfile.ZipFile(archive_path) as archive:
+        members = sorted(
+            name for name in archive.namelist()
+            if name.replace("\\", "/").lower().endswith("/ptbxl_database.csv")
+            or name.replace("\\", "/").lower() == "ptbxl_database.csv"
+        )
+        if len(members) != 1:
+            raise RuntimeError(
+                f"Expected exactly one ptbxl_database.csv in {archive_path}, found {members}"
+            )
+        member = members[0]
+        raw = archive.read(member)
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    required = {"ecg_id", "patient_id", "strat_fold"}
+    if not reader.fieldnames or required - set(reader.fieldnames):
+        raise ValueError(f"Official PTB-XL metadata lacks columns: {sorted(required)}")
+    rows: dict[str, tuple[str, int]] = {}
+    for row in reader:
+        ecg_id = _normalize_integer_id(row["ecg_id"], field="ecg_id")
+        patient_id = _normalize_integer_id(row["patient_id"], field="patient_id")
+        fold = int(_normalize_integer_id(row["strat_fold"], field="strat_fold"))
+        if ecg_id in rows:
+            raise RuntimeError(f"Official PTB-XL metadata contains duplicate ecg_id={ecg_id}")
+        rows[ecg_id] = (patient_id, fold)
+    if not rows:
+        raise RuntimeError("Official PTB-XL metadata is empty")
+    return rows, {
+        "archive_path": str(archive_path),
+        "archive_sha256": sha256_file(archive_path),
+        "metadata_member": member,
+        "metadata_member_sha256": hashlib.sha256(raw).hexdigest(),
+        "metadata_rows": len(rows),
+        "source_columns": ["ecg_id", "patient_id", "strat_fold"],
+    }
+
+
+def validate_against_official_metadata(
+    prediction: dict[str, Any],
+    official: dict[str, tuple[str, int]],
+    *,
+    expected_fold: int,
+    label: str,
+) -> None:
+    try:
+        record_ids = np.asarray(
+            [_normalize_integer_id(value, field="record_id") for value in prediction["record_id"]]
+        )
+        observed_groups = np.asarray(
+            [_normalize_integer_id(value, field="group_id") for value in prediction["group_id"]]
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"{label}: prediction IDs are not valid PTB-XL integer IDs") from exc
+    missing = [record_id for record_id in record_ids if record_id not in official]
+    if missing:
+        raise RuntimeError(f"{label}: records absent from official PTB-XL metadata: {missing[:10]}")
+    expected_groups = np.asarray([official[record_id][0] for record_id in record_ids])
+    observed_folds = np.asarray([official[record_id][1] for record_id in record_ids])
+    if not np.array_equal(observed_groups, expected_groups):
+        mismatch = int(np.sum(observed_groups != expected_groups))
+        raise RuntimeError(f"{label}: {mismatch} patient IDs differ from ptbxl_database.csv")
+    if not np.all(observed_folds == expected_fold):
+        raise RuntimeError(
+            f"{label}: official strat_fold differs; observed={sorted(set(observed_folds.tolist()))}"
+        )
 
 
 def load_prediction(path: Path, expected_split: str) -> dict[str, Any]:
@@ -236,12 +328,19 @@ def main() -> None:
     if models != ["full", "resnet", "raw_mamba", "transformer"]:
         raise ValueError("Audit requires full,resnet,raw_mamba,transformer in that order")
     lock = validate_lock(args.analysis_lock, models, args)
+    official_metadata, official_contract = load_official_ptbxl_metadata(args.ptbxl_archive)
     root = resolve(args.external_root)
     test = {model: load_prediction(prediction_path(root, model, False), "ptbxl_fold10") for model in models}
     fold9 = {model: load_prediction(prediction_path(root, model, True), "ptbxl_fold9") for model in models}
     for model in models[1:]:
         validate_same_reference(test["full"], test[model], f"fold10/{model}")
         validate_same_reference(fold9["full"], fold9[model], f"fold9/{model}")
+    validate_against_official_metadata(
+        fold9["full"], official_metadata, expected_fold=9, label="fold9/full"
+    )
+    validate_against_official_metadata(
+        test["full"], official_metadata, expected_fold=10, label="fold10/full"
+    )
     if not np.array_equal(test["full"]["class_names"], fold9["full"]["class_names"]):
         raise RuntimeError("PTB-XL fold9/fold10 class order differs")
     overlap = patient_overlap(fold9["full"]["group_id"], test["full"]["group_id"])
@@ -294,6 +393,7 @@ def main() -> None:
                     "n_boot": args.n_boot,
                     "seed": seed,
                     "analysis_lock_sha256": lock["sha256"],
+                    "official_metadata_member_sha256": official_contract["metadata_member_sha256"],
                 }
                 cache = cache_dir / f"{analysis_set}__{model}__{spec.name}__{canonical_json_sha256(contract)[:16]}.json"
                 ci = cached_metric(
@@ -342,6 +442,7 @@ def main() -> None:
                     "n_boot": args.n_boot,
                     "seed": seed,
                     "analysis_lock_sha256": lock["sha256"],
+                    "official_metadata_member_sha256": official_contract["metadata_member_sha256"],
                 }
                 cache = cache_dir / f"{analysis_set}__full_vs_{comparator}__{spec.name}__{canonical_json_sha256(contract)[:16]}.json"
                 paired = cached_metric(
@@ -395,6 +496,7 @@ def main() -> None:
         "capability": PTBXL_FOLD_PROTOCOL_AUDIT_CAPABILITY,
         "schema_version": PTBXL_FOLD_PROTOCOL_AUDIT_SCHEMA_VERSION,
         "analysis_lock": lock,
+        "official_metadata_contract": official_contract,
         "split_contract": {
             "adaptation_split": "ptbxl_fold9",
             "test_split": "ptbxl_fold10",
@@ -445,6 +547,7 @@ def main() -> None:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "runner_sha256": runner_sha,
             "analysis_lock": lock,
+            "official_metadata_contract": official_contract,
             "inputs": payload["inputs"],
             "outputs": [
                 {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}

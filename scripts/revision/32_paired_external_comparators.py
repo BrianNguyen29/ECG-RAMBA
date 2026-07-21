@@ -357,6 +357,9 @@ def metric_cache_contract(
     return {
         "protocol_version": PROTOCOL_VERSION,
         "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "statistical_helper_sha256": sha256_file(
+            PROJECT_ROOT / "scripts" / "revision" / "common.py"
+        ),
         "dataset": dataset,
         "comparator": comparator,
         "metric": metric,

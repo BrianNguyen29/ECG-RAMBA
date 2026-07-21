@@ -50,6 +50,14 @@ PAIR_FILES = {
     "Transformer ECG": "paired_full_vs_transformer_comparison.json",
     "Frozen-transform MLP head": "paired_full_vs_hybrid_morphology_comparison.json",
 }
+PAIR_RUNNERS = {
+    "Fixed-transform-only": "11_paired_full_vs_minirocket.py",
+    "ResNet1D/CNN": "15_paired_full_vs_resnet.py",
+    "Raw Mamba": "17_paired_full_vs_raw_mamba.py",
+    "Transformer ECG": "25_paired_full_vs_transformer.py",
+    "Frozen-transform MLP head": "27_paired_full_vs_hybrid_morphology.py",
+}
+EXPECTED_PAIR_METRICS = {"pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +221,7 @@ def validate_primary_contract(args: argparse.Namespace, paths: dict[str, Path]) 
     if int(calibration.get("n_boot", -1)) < 1000:
         errors.append("calibration bootstrap uses fewer than 1000 resamples")
     bootstrap_contract = calibration.get("bootstrap") or {}
+    group_contract = freeze.get("group_contract") or {}
     if bootstrap_contract.get("unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
         errors.append("calibration bootstrap unit is not an authenticated source patient-record")
     if bootstrap_contract.get("independence_contract") != CHAPMAN_GROUP_SEMANTICS:
@@ -221,6 +230,31 @@ def validate_primary_contract(args: argparse.Namespace, paths: dict[str, Path]) 
         errors.append("calibration patient-record semantics are not bound to PhysioNet")
     if not bootstrap_contract.get("group_sidecar_sha256"):
         errors.append("calibration does not bind its patient-record group sidecar SHA256")
+    sidecar_artifact = group_contract.get("sidecar") or {}
+    sidecar_path_value = sidecar_artifact.get("path")
+    sidecar_path = resolve(Path(sidecar_path_value)) if sidecar_path_value else None
+    sidecar_sha = sha256_file(sidecar_path) if sidecar_path and sidecar_path.is_file() else None
+    if group_contract.get("status") != "verified" or group_contract.get("one_record_per_group") is not True:
+        errors.append("freeze manifest lacks a verified one-record-per-patient group contract")
+    if not sidecar_path or not sidecar_path.is_file():
+        errors.append("freeze group sidecar is missing from the active evidence checkout")
+    elif sidecar_artifact.get("sha256") != sidecar_sha:
+        errors.append("freeze group sidecar SHA does not match the live sidecar")
+    elif bootstrap_contract.get("group_sidecar_sha256") != sidecar_sha:
+        errors.append("calibration group-sidecar SHA differs from the canonical freeze sidecar")
+    if sidecar_path and sidecar_path.is_file():
+        with np.load(sidecar_path, allow_pickle=False) as sidecar, np.load(paths["oof"], allow_pickle=False) as oof:
+            group_field = "group_id" if "group_id" in sidecar.files else "subject_id"
+            if not {"record_id", group_field}.issubset(sidecar.files):
+                errors.append("group sidecar lacks record_id and group_id/subject_id")
+            else:
+                sidecar_record_id = np.asarray(sidecar["record_id"])
+                sidecar_group_id = np.asarray(sidecar[group_field]).astype(str)
+                oof_record_id = np.asarray(oof["record_id"])
+                if not np.array_equal(sidecar_record_id, oof_record_id):
+                    errors.append("group sidecar record order differs from canonical OOF")
+                if len(np.unique(sidecar_group_id)) != len(oof_record_id):
+                    errors.append("group sidecar does not verify one unique patient group per record")
     if errors:
         raise RuntimeError("Primary evidence contract failed: " + "; ".join(errors))
     return {
@@ -234,6 +268,7 @@ def validate_primary_contract(args: argparse.Namespace, paths: dict[str, Path]) 
         "group_semantics": bootstrap_contract.get("independence_contract"),
         "group_semantics_reference": bootstrap_contract.get("group_semantics_reference"),
         "group_sidecar_sha256": bootstrap_contract.get("group_sidecar_sha256"),
+        "group_sidecar_path": str(sidecar_path) if sidecar_path else None,
     }
 
 
@@ -336,7 +371,49 @@ def paired_rows(metric_dir: Path, contract: dict[str, Any], strict: bool) -> tup
                 raise RuntimeError(message)
             skipped.append(message)
             continue
-        for metric_name, metric in (payload.get("metrics") or {}).items():
+        runner = PROJECT_ROOT / "scripts" / "revision" / PAIR_RUNNERS[label]
+        pair_contract = payload.get("paired_bootstrap") or {}
+        metrics = payload.get("metrics") or {}
+        contract_errors = []
+        if payload.get("paired_inference_schema_version", 0) < 2:
+            contract_errors.append("paired inference schema is stale")
+        if not runner.is_file() or payload.get("runner_sha256") != sha256_file(runner):
+            contract_errors.append("paired runner SHA does not match current authority")
+        if set(metrics) != EXPECTED_PAIR_METRICS:
+            contract_errors.append("paired metric family is incomplete")
+        if pair_contract.get("null_test") != "not_run":
+            contract_errors.append("paired artifact unexpectedly reports a null test")
+        if pair_contract.get("multiplicity_adjustment") != "not_applicable_no_null_test":
+            contract_errors.append("paired artifact has an invalid multiplicity declaration")
+        for metric_name, metric in metrics.items():
+            lo = float(metric.get("improvement_ci_low", np.nan))
+            hi = float(metric.get("improvement_ci_high", np.nan))
+            expected_interpretation = (
+                "full_nominal_95ci_better" if lo > 0 else
+                "comparator_nominal_95ci_better" if hi < 0 else
+                "nominal_95ci_inconclusive"
+            )
+            if not np.isfinite([lo, hi]).all() or lo > hi:
+                contract_errors.append(f"{metric_name} has an invalid CI")
+            if metric.get("interpretation") != expected_interpretation:
+                contract_errors.append(f"{metric_name} interpretation is not CI-derived")
+            if int(metric.get("n_boot_valid", 0)) < 1000:
+                contract_errors.append(f"{metric_name} has fewer than 1000 bootstrap replicates")
+            for p_field in ("p_value_two_sided", "holm_p_value_two_sided"):
+                value = metric.get(p_field)
+                if value is not None:
+                    try:
+                        if np.isfinite(float(value)):
+                            contract_errors.append(f"{metric_name} contains an unauthenticated p-value")
+                    except (TypeError, ValueError):
+                        pass
+        if contract_errors:
+            message = f"{label} paired contract failed: " + "; ".join(sorted(set(contract_errors)))
+            if strict:
+                raise RuntimeError(message)
+            skipped.append(message)
+            continue
+        for metric_name, metric in metrics.items():
             rows.append(
                 {
                     "comparator": label,

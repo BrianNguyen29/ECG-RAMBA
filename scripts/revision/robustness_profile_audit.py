@@ -24,7 +24,7 @@ from scripts.revision.common import (
 )
 
 
-PROTOCOL = "robustness_multicomparator_aggregation_v1"
+PROTOCOL = "robustness_multicomparator_aggregation_v2_source_bound"
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"

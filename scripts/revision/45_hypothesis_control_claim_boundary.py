@@ -384,7 +384,7 @@ def robustness_finding() -> tuple[str, str]:
     artifact_sha = manifest.get("artifact_sha256") or {}
     authenticated = (
         manifest.get("status") == "complete"
-        and manifest.get("protocol") == "robustness_multicomparator_aggregation_v1"
+        and manifest.get("protocol") == "robustness_multicomparator_aggregation_v2_source_bound"
         and set(manifest.get("stress_tests") or []) == expected_stresses
         and expected_comparators.issubset(set(manifest.get("comparators") or []))
         and all(path.is_file() and path.stat().st_size > 0 for path in [summary_path, table_path, pairwise_path])

@@ -38,6 +38,7 @@ FULL_LABEL = "Full ECG-RAMBA frozen OOF"
 COMPARATOR_LABEL = "Transformer ECG"
 EXPECTED_TRANSFORMER_PROTOCOL = "transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5"
 EXPECTED_TRANSFORMER_FEATURE_CONTRACT = "raw_ecg_12lead"
+PAIRED_INFERENCE_SCHEMA_VERSION = 2
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -178,6 +179,11 @@ def validate_transformer_artifacts(
         raise FileNotFoundError(f"Missing Transformer ECG manifest JSON: {manifest_path}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = PROJECT_ROOT / "scripts" / "revision" / "24_transformer_ecg_baseline.py"
+    producer_sha256 = sha256_file(producer)
+    for source_name, payload in (("summary", summary), ("manifest", manifest)):
+        if payload.get("runner_sha256") != producer_sha256:
+            raise RuntimeError(f"Transformer ECG {source_name} producer runner SHA is stale.")
     for source_name, payload in [("summary", summary), ("manifest", manifest)]:
         if payload.get("protocol") != EXPECTED_TRANSFORMER_PROTOCOL:
             raise ValueError(
@@ -317,6 +323,7 @@ def main() -> None:
 
     payload = {
         "status": True,
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "runner_sha256": runner_sha256,
@@ -334,6 +341,8 @@ def main() -> None:
             "seed": int(args.seed),
             "alpha": 0.05,
             "p_value": "not reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
             "group_contract": group_contract,
         },
         "threshold": float(args.threshold),
@@ -375,6 +384,7 @@ def main() -> None:
     manifest = {
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
         "runner_sha256": runner_sha256,
         "paired_helper_sha256": paired_helper_sha256,
         "comparison": "full_ecg_ramba_vs_transformer_ecg",

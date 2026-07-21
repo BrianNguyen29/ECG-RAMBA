@@ -6,6 +6,7 @@ import argparse
 import csv
 import fnmatch
 import json
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -776,6 +777,26 @@ def main() -> None:
     )
     manifest_path, manifest, manifest_rows = load_manifest(root)
 
+    authority_path = root / "manifests" / "notebook_code_authority.json"
+    authority_issues: list[str] = []
+    authority: dict = {}
+    try:
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        current_head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=PROJECT_ROOT, text=True
+        ).strip().lower()
+        expected_head = str(authority.get("git_commit", "")).strip().lower()
+        if authority.get("capability") != "canonical_git_commit_pin_v1":
+            authority_issues.append("code_authority:capability")
+        if int(authority.get("schema_version", 0)) != 1:
+            authority_issues.append("code_authority:schema")
+        if len(expected_head) != 40 or expected_head != current_head:
+            authority_issues.append(
+                f"code_authority:git_commit expected={expected_head or 'missing'} observed={current_head}"
+            )
+    except Exception as exc:
+        authority_issues.append(f"code_authority:{type(exc).__name__}:{exc}")
+
     missing_manifest_files: list[str] = []
     invalid_manifest_files: list[str] = []
     for relative, row in manifest_rows.items():
@@ -813,7 +834,7 @@ def main() -> None:
     recomputable_cache_stages, recomputable_cache_issues = audit_registered_recomputable_caches(root)
     stage_rows.extend(recomputable_cache_stages)
 
-    log_count = sum(1 for path in (root / "logs").glob("*.log") if path.is_file())
+    log_count = sum(1 for path in (root / "logs").rglob("*.log") if path.is_file())
     incomplete_required = [
         row.stage
         for row in stage_rows
@@ -822,13 +843,20 @@ def main() -> None:
     payload = {
         "status": not missing_manifest_files
         and not invalid_manifest_files
-        and not incomplete_required,
+        and not incomplete_required
+        and not authority_issues,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "canonical_root": str(root),
         "canonical_is_authoritative": True,
         "mirror_manifest": str(manifest_path),
         "mirror_manifest_sha256": sha256_file(manifest_path),
         "mirror_manifest_artifact_count": int(manifest.get("artifact_count", len(manifest_rows))),
+        "code_authority": {
+            "path": str(authority_path),
+            "sha256": sha256_file(authority_path) if authority_path.is_file() else None,
+            "git_commit": authority.get("git_commit"),
+            "issues": authority_issues,
+        },
         "verification": "size_and_presence" if not args.full_sha else "full_sha256",
         "logs_are_durable_but_not_manifested": True,
         "durable_log_count": log_count,
@@ -843,6 +871,7 @@ def main() -> None:
         "recomputable_cache_issues": recomputable_cache_issues,
         "missing_manifest_files": missing_manifest_files,
         "invalid_manifest_files": invalid_manifest_files,
+        "authority_issues": authority_issues,
         "incomplete_required_stages": incomplete_required,
         "stages": [asdict(row) for row in stage_rows],
     }
@@ -856,6 +885,7 @@ def main() -> None:
         "incomplete_required_stages": incomplete_required,
         "missing_manifest_files": len(missing_manifest_files),
         "invalid_manifest_files": len(invalid_manifest_files),
+        "authority_issues": authority_issues,
     }, indent=2))
     print(f"Wrote: {out_json}")
     print(f"Wrote: {out_csv}")

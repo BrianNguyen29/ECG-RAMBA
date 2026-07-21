@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -64,6 +65,8 @@ ROBUSTNESS_INTERPRETATIONS = {
     "comparator_nominal_95ci_more_favorable_change",
     "nominal_95ci_inconclusive_change_difference",
 }
+CANONICAL_OOF = PROJECT_ROOT / "reports" / "revision" / "predictions" / "oof_final_ema_predictions.npz"
+CANONICAL_FREEZE = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 POOLING_METHODS = (
     "mean",
     "power_mean_q2",
@@ -201,6 +204,64 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def canonical_evidence_contract() -> dict[str, str]:
+    freeze = read_json(CANONICAL_FREEZE)
+    if not CANONICAL_OOF.is_file() or freeze.get("status") != "frozen" or freeze.get("manuscript_ready") is not True:
+        raise RuntimeError("Canonical OOF/freeze contract is not manuscript-ready")
+    group = freeze.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    sidecar_path = resolve(Path(str(sidecar.get("path", ""))))
+    oof_sha = sha256_file(CANONICAL_OOF)
+    freeze_oof_sha = next(
+        (
+            row.get("sha256")
+            for row in freeze.get("artifacts") or []
+            if Path(str(row.get("path", ""))).name == CANONICAL_OOF.name
+        ),
+        None,
+    )
+    if freeze_oof_sha != oof_sha:
+        raise RuntimeError("Canonical freeze does not authenticate the current OOF artifact")
+    if (
+        group.get("status") != "verified"
+        or group.get("one_record_per_group") is not True
+        or not sidecar_path.is_file()
+        or sidecar.get("sha256") != sha256_file(sidecar_path)
+    ):
+        raise RuntimeError("Canonical freeze lacks a live authenticated patient/group sidecar")
+    return {
+        "oof_sha256": oof_sha,
+        "freeze_sha256": sha256_file(CANONICAL_FREEZE),
+        "group_sidecar_sha256": str(sidecar["sha256"]),
+    }
+
+
+def validate_manifest_canonical_contract(
+    manifest: dict[str, Any], canonical: dict[str, str], *, label: str
+) -> list[str]:
+    observed = manifest.get("canonical_contract") or {}
+    issues = []
+    for key, expected in canonical.items():
+        if observed.get(key) != expected:
+            issues.append(f"{label} canonical {key} is stale or missing")
+    return issues
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    path = resolve(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".partial." + os.urandom(8).hex())
+    try:
+        with temporary.open("w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def float_value(row: dict[str, Any], key: str) -> float:
     value = float(row[key])
     if not math.isfinite(value):
@@ -288,7 +349,7 @@ def write_latex(path: Path, rows: list[dict[str, Any]], columns: list[str]) -> N
     for row in rows:
         content.append(" & ".join(latex_escape(row.get(column, "")) for column in columns) + r" \\")
     content.extend([r"\bottomrule", r"\end{tabular}"])
-    path.write_text("\n".join(content) + "\n", encoding="utf-8")
+    write_text_atomic(path, "\n".join(content) + "\n")
 
 
 def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -310,6 +371,15 @@ def validate_external(args: argparse.Namespace) -> tuple[dict[str, Any], list[di
         issues.append("external paired manifest is incomplete")
     if not output_hash_matches(manifest, table_path):
         issues.append("external paired table SHA is not authenticated by its manifest")
+    if not output_hash_matches(manifest, resolve(args.external_summary)):
+        issues.append("external paired summary SHA is not authenticated by its manifest")
+    canonical_contract = getattr(args, "_canonical_contract", {})
+    if canonical_contract:
+        issues.extend(
+            validate_manifest_canonical_contract(
+                manifest, canonical_contract, label="external paired"
+            )
+        )
     if not runner_hash_matches(manifest, "32_paired_external_comparators.py"):
         issues.append("external paired runner SHA does not match the current implementation")
     for row in rows:
@@ -469,6 +539,13 @@ def validate_morphology(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             issues.append("controlled morphology JSON SHA is not authenticated by its manifest")
         if not runner_hash_matches(manifest, "40_paired_morphology_learnability.py"):
             issues.append("controlled morphology runner SHA does not match the current implementation")
+        canonical_contract = getattr(args, "_canonical_contract", {})
+        if canonical_contract:
+            issues.extend(
+                validate_manifest_canonical_contract(
+                    manifest, canonical_contract, label="controlled morphology"
+                )
+            )
         for row in rows:
             if int_value(row, "n_boot_valid") < 1000:
                 issues.append("controlled morphology comparison has fewer than 1000 bootstrap replicates")
@@ -537,6 +614,13 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
             issues.append("canonical robustness pairwise SHA is not authenticated by its manifest")
         if not runner_hash_matches(manifest, "21_robustness_multicomparator.py"):
             issues.append("canonical robustness runner SHA does not match the current implementation")
+        canonical_contract = getattr(args, "_canonical_contract", {})
+        if canonical_contract:
+            issues.extend(
+                validate_manifest_canonical_contract(
+                    manifest, canonical_contract, label="robustness"
+                )
+            )
         for label, payload in (("pairwise", pairwise), ("manifest", manifest)):
             if payload.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
                 issues.append(f"{label} robustness CI scope is stale or missing")
@@ -659,13 +743,14 @@ def write_compact(path: Path, rows: list[dict[str, Any]]) -> list[Path]:
     if rows:
         write_latex(tex_path, rows, list(rows[0]))
     else:
-        tex_path.write_text("% No complete reviewer-ready rows.\n", encoding="utf-8")
+        write_text_atomic(tex_path, "% No complete reviewer-ready rows.\n")
     return [path, tex_path]
 
 
 def main() -> None:
     args = parse_args()
     ensure_revision_dirs()
+    args._canonical_contract = canonical_evidence_contract()
     print("=" * 80)
     print("REVIEWER GAP CLOSURE GATE")
     print("=" * 80)
@@ -718,6 +803,7 @@ def main() -> None:
                 "allowed": "Only use reviewer-item wording whose manuscript_ready field is true.",
                 "not_allowed": "Do not promote incomplete or screening evidence to a final claim.",
             },
+            "canonical_contract": args._canonical_contract,
         },
     )
     output_paths.extend([status_path, status_table])
@@ -730,6 +816,7 @@ def main() -> None:
             "git_commit": git_commit(),
             "runner_sha256": sha256_file(Path(__file__).resolve()),
             "reviewer_items": [row["reviewer_item"] for row in status_rows],
+            "canonical_contract": args._canonical_contract,
             "artifacts": [
                 {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
                 for path in output_paths

@@ -38,8 +38,8 @@ from scripts.revision.common import (  # noqa: E402
     METRIC_DIR,
     PREDICTION_DIR,
     TABLE_DIR,
-    bootstrap_ci,
     calibration_summary,
+    cluster_bootstrap_ci,
     ensure_revision_dirs,
     macro_pr_auc,
     macro_roc_auc,
@@ -53,6 +53,7 @@ PROTOCOL = "hrv36_logistic_regression_same_folds_threshold_0.5"
 DOMAIN_PROTOCOL = "hrv36_domain_logistic_regression_stratified_cv"
 DEFAULT_OOF_PREDICTIONS = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE_MANIFEST = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
+RUNNER_SCHEMA_VERSION = 2
 
 
 def oof_label_fold_contract_sha256(
@@ -210,6 +211,40 @@ def validate_oof_freeze_contract(
         raise ValueError(f"Unexpected freeze validated_records: {freeze.get('validated_records')}")
     if int(freeze.get("n_classes", -1)) != len(CLASSES):
         raise ValueError(f"Unexpected freeze n_classes: {freeze.get('n_classes')}")
+    group_contract = freeze.get("group_contract") or {}
+    sidecar_artifact = group_contract.get("sidecar") or {}
+    sidecar_ref = sidecar_artifact.get("path")
+    if group_contract.get("status") != "verified" or group_contract.get("one_record_per_group") is not True:
+        raise ValueError("OOF freeze manifest lacks a verified one-record-per-group contract.")
+    if not sidecar_ref:
+        raise ValueError("OOF freeze manifest does not identify the authenticated group sidecar.")
+    sidecar_path = Path(sidecar_ref)
+    if not sidecar_path.is_absolute():
+        sidecar_path = PROJECT_ROOT / sidecar_path
+    sidecar_path = sidecar_path.resolve()
+    if not sidecar_path.is_file() or sidecar_path.stat().st_size == 0:
+        raise FileNotFoundError(f"Missing authenticated OOF group sidecar: {sidecar_path}")
+    sidecar_sha = sha256_file(sidecar_path)
+    if sidecar_sha != sidecar_artifact.get("sha256"):
+        raise RuntimeError("OOF group sidecar SHA256 differs from the frozen contract.")
+
+    with np.load(sidecar_path, allow_pickle=False) as sidecar:
+        required = {"record_id", "group_id", "one_record_per_group"}
+        missing = sorted(required - set(sidecar.files))
+        if missing:
+            raise ValueError(f"OOF group sidecar is missing fields: {missing}")
+        sidecar_record_id = np.asarray(sidecar["record_id"], dtype=np.int64)
+        group_id = np.asarray(sidecar["group_id"]).astype(str)
+        one_record_per_group = bool(np.asarray(sidecar["one_record_per_group"]).reshape(-1)[0])
+    with np.load(pred_path, allow_pickle=False) as pred:
+        record_id = np.asarray(pred["record_id"], dtype=np.int64)
+    if not np.array_equal(sidecar_record_id, record_id):
+        raise RuntimeError("OOF group sidecar record order differs from the canonical OOF artifact.")
+    if group_id.shape != (len(record_id),) or len(np.unique(group_id)) != len(record_id):
+        raise RuntimeError("OOF group sidecar does not establish one independent group per record.")
+    if not one_record_per_group:
+        raise RuntimeError("OOF group sidecar does not attest one_record_per_group=true.")
+
     return {
         "freeze_manifest": str(freeze_path),
         "freeze_manifest_sha256": sha256_file(freeze_path),
@@ -218,6 +253,12 @@ def validate_oof_freeze_contract(
         "checkpoint_kind": freeze.get("checkpoint_kind"),
         "validated_records": freeze.get("validated_records"),
         "n_classes": freeze.get("n_classes"),
+        "group_sidecar": str(sidecar_path),
+        "group_sidecar_sha256": sidecar_sha,
+        "group_id": group_id,
+        "n_groups": int(len(np.unique(group_id))),
+        "one_record_per_group": True,
+        "bootstrap_unit": str(group_contract.get("bootstrap_unit") or "chapman_record_subject"),
     }
 
 
@@ -572,16 +613,18 @@ def compute_hrv_baseline(
     n_bins: int,
     n_boot: int,
     seed: int,
+    groups: np.ndarray,
 ) -> dict:
     y_prob, fold_id, fold_rows = fit_predict_hrv_oof(X_hrv, y, folds, seed=seed)
     metrics = multilabel_metrics(y, y_prob, threshold=threshold)
     calibration = calibration_summary(y, y_prob, n_bins=n_bins)
     ci = {
-        "macro_pr_auc": bootstrap_ci(y, y_prob, macro_pr_auc, n_boot=n_boot, seed=seed),
-        "macro_roc_auc": bootstrap_ci(y, y_prob, macro_roc_auc, n_boot=n_boot, seed=seed),
-        "f1_macro": bootstrap_ci(
+        "macro_pr_auc": cluster_bootstrap_ci(y, y_prob, groups, macro_pr_auc, n_boot=n_boot, seed=seed),
+        "macro_roc_auc": cluster_bootstrap_ci(y, y_prob, groups, macro_roc_auc, n_boot=n_boot, seed=seed),
+        "f1_macro": cluster_bootstrap_ci(
             y,
             y_prob,
+            groups,
             lambda yt, yp: multilabel_metrics(yt, yp, threshold=threshold)["f1_macro"],
             n_boot=n_boot,
             seed=seed,
@@ -797,6 +840,8 @@ def write_outputs(
     _save_csv(fold_path, baseline["fold_rows"])
 
     baseline_summary = {
+        "schema_version": RUNNER_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__)),
         "created_utc": created_utc,
         "git_commit": _git_output(["rev-parse", "HEAD"]),
         "dataset": "chapman_oof",
@@ -811,6 +856,7 @@ def write_outputs(
         "metrics": baseline["metrics"],
         "calibration": baseline["calibration"],
         "bootstrap_ci": baseline["bootstrap_ci"],
+        "bootstrap_contract": baseline["bootstrap_contract"],
         "load_info": load_info,
         "artifacts": {
             "predictions_npz": str(prediction_path),
@@ -942,6 +988,8 @@ def write_outputs(
         outputs.extend([domain_prediction_path, domain_confusion_path, domain_summary_path])
 
     manifest = {
+        "schema_version": RUNNER_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__)),
         "created_utc": created_utc,
         "git": {
             "commit": _git_output(["rev-parse", "HEAD"]),
@@ -965,6 +1013,12 @@ def write_outputs(
             "hrv_only_baseline": "supported_as_feature_baseline_only",
             "hrv_domain_classifier": interpretation_for_domain_auc(domain_auc),
             "robustness": "not_run_by_this_script",
+        },
+        "canonical_contract": {
+            "oof_sha256": load_info["freeze_contract"]["oof_predictions_sha256"],
+            "freeze_sha256": load_info["freeze_contract"]["freeze_manifest_sha256"],
+            "group_sidecar_sha256": load_info["freeze_contract"]["group_sidecar_sha256"],
+            "bootstrap_unit": load_info["freeze_contract"]["bootstrap_unit"],
         },
     }
     manifest_path = MANIFEST_DIR / "hrv_domain_analysis_manifest.json"
@@ -1003,6 +1057,7 @@ def main() -> None:
     )
     X_hrv, y, folds, load_info = load_chapman_hrv_and_folds(args)
     load_info["freeze_contract"] = freeze_contract
+    groups = np.asarray(freeze_contract.pop("group_id")).astype(str)
     baseline = compute_hrv_baseline(
         X_hrv,
         y,
@@ -1011,7 +1066,16 @@ def main() -> None:
         n_bins=args.n_bins,
         n_boot=args.n_boot,
         seed=args.seed,
+        groups=groups,
     )
+    baseline["bootstrap_contract"] = {
+        "method": "percentile_cluster_bootstrap",
+        "unit": freeze_contract["bootstrap_unit"],
+        "n_groups": int(freeze_contract["n_groups"]),
+        "n_boot": int(args.n_boot),
+        "group_sidecar_sha256": freeze_contract["group_sidecar_sha256"],
+        "one_record_per_group": True,
+    }
     baseline["y_true"] = y
 
     domain_result = None

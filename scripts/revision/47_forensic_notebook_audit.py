@@ -1209,6 +1209,69 @@ def canonical_manifest_rows(root: Path, revision_root: Path) -> tuple[list[dict[
     return rows, failures
 
 
+def ptbxl_analysis_lock_failures(revision_root: Path) -> list[str]:
+    lock_path = revision_root / "manifests" / "ptbxl_adaptation_analysis_lock.json"
+    attestation_path = (
+        revision_root
+        / "manifests"
+        / "ptbxl_adaptation_analysis_lock_source_attestation.json"
+    )
+    failures: list[str] = []
+    if not lock_path.is_file() or lock_path.stat().st_size == 0:
+        return [f"PTB-XL analysis lock is missing: {lock_path}"]
+    if not attestation_path.is_file() or attestation_path.stat().st_size == 0:
+        return [f"PTB-XL analysis lock source attestation is missing: {attestation_path}"]
+    try:
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"PTB-XL analysis lock/attestation is unreadable: {exc}"]
+    if lock.get("status") != "locked":
+        failures.append("PTB-XL analysis lock status is not locked")
+    if lock.get("capability") != "ptbxl_fold9_fold10_analysis_lock_v1":
+        failures.append("PTB-XL analysis lock capability is unexpected")
+    if int(lock.get("schema_version", -1)) != 1:
+        failures.append("PTB-XL analysis lock schema is unexpected")
+    if attestation.get("status") != "complete":
+        failures.append("PTB-XL analysis lock source attestation is incomplete")
+    if attestation.get("capability") != "ptbxl_analysis_lock_implementation_attestation_v1":
+        failures.append("PTB-XL analysis lock source attestation capability is unexpected")
+    if int(attestation.get("schema_version", -1)) != 1:
+        failures.append("PTB-XL analysis lock source attestation schema is unexpected")
+    if attestation.get("protocol_unchanged") is not True:
+        failures.append("PTB-XL adaptation protocol changed after the analysis lock")
+    analysis_lock = attestation.get("analysis_lock") or {}
+    if analysis_lock.get("sha256") != sha256_file(lock_path):
+        failures.append("PTB-XL source attestation references a different analysis-lock SHA")
+    current_rows = attestation.get("current_runner_sources") or []
+    if not current_rows:
+        failures.append("PTB-XL source attestation has no current runner-source rows")
+    for row in current_rows:
+        relative = str(row.get("path") or "")
+        expected_sha = str(row.get("sha256") or "")
+        source_path = PROJECT_ROOT / relative
+        if not relative or not source_path.is_file() or sha256_file(source_path) != expected_sha:
+            failures.append(f"PTB-XL current runner-source attestation is stale: {relative or 'missing'}")
+    return failures
+
+
+def code_authority_manifest_failures(canonical_root: Path, current_head: str) -> list[str]:
+    path = canonical_root / "manifests" / "notebook_code_authority.json"
+    if not path.is_file() or path.stat().st_size == 0:
+        return [f"code authority manifest is missing: {path}"]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return [f"code authority manifest is unreadable: {exc}"]
+    failures = []
+    observed = str(payload.get("git_commit") or payload.get("commit") or "").lower()
+    if observed != current_head.lower():
+        failures.append(f"code authority manifest {observed or 'missing'} != current HEAD {current_head}")
+    if payload.get("capability") not in {None, "canonical_git_commit_pin_v1"}:
+        failures.append("code authority manifest capability is unexpected")
+    return failures
+
+
 def rerun_dependency_rows(revision_root: Path, current_head: str) -> list[dict[str, Any]]:
     stages = [
         ("02_oof_freeze", (), ("predictions/oof_final_ema_predictions.npz",), "A100 only if fold cache missing"),
@@ -1316,6 +1379,8 @@ def main() -> None:
         authority_failures.append(f"OOF producer commit {producer_commit or 'missing'} != authority {current_head}")
     if len(traceability) != 12:
         authority_failures.append("traceability must contain Associate Editor plus 11 reviewer comments")
+    authority_failures.extend(code_authority_manifest_failures(canonical_root, current_head))
+    analysis_lock_failures = ptbxl_analysis_lock_failures(revision_root)
 
     failures = (
         notebook_failures
@@ -1328,6 +1393,7 @@ def main() -> None:
         + provenance_failures
         + rerun_failures
         + authority_failures
+        + analysis_lock_failures
     )
     p0 = [item for item in failures if "oracle" in item.lower() or "q=" in item.lower() or "prediction shape" in item.lower()]
     p1 = [item for item in failures if item not in p0]
@@ -1398,6 +1464,7 @@ def main() -> None:
         "canonical_manifest_failures": provenance_failures,
         "paired_inference_artifacts": len(paired_inference_rows),
         "paired_inference_failures": paired_inference_failures,
+        "ptbxl_analysis_lock_failures": analysis_lock_failures,
         "p0_findings": p0,
         "p1_findings": p1,
         "p2_findings": p2,

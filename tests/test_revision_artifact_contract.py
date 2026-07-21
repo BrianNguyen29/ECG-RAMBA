@@ -113,7 +113,15 @@ class RevisionArtifactContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=hrv_domain.PROJECT_ROOT) as tmp:
             root = Path(tmp)
             pred = root / "oof_final_ema_predictions.npz"
-            pred.write_bytes(b"canonical-oof")
+            record_id = np.arange(44186, dtype=np.int64)
+            np.savez_compressed(pred, record_id=record_id)
+            sidecar = root / "oof_final_ema_group_sidecar.npz"
+            np.savez_compressed(
+                sidecar,
+                record_id=record_id,
+                group_id=record_id.astype(str),
+                one_record_per_group=np.asarray([True], dtype=np.bool_),
+            )
             freeze = root / "oof_final_ema_freeze_manifest.json"
             freeze.write_text(
                 json.dumps(
@@ -123,6 +131,15 @@ class RevisionArtifactContractTests(unittest.TestCase):
                         "checkpoint_kind": "final_ema",
                         "validated_records": 44186,
                         "n_classes": len(CLASSES),
+                        "group_contract": {
+                            "status": "verified",
+                            "one_record_per_group": True,
+                            "bootstrap_unit": "authenticated_source_patient_record",
+                            "sidecar": {
+                                "path": sidecar.relative_to(hrv_domain.PROJECT_ROOT).as_posix(),
+                                "sha256": sha256_file(sidecar),
+                            },
+                        },
                         "artifacts": [
                             {
                                 "path": pred.relative_to(hrv_domain.PROJECT_ROOT).as_posix(),
@@ -142,6 +159,8 @@ class RevisionArtifactContractTests(unittest.TestCase):
 
             self.assertEqual(payload["checkpoint_kind"], "final_ema")
             self.assertEqual(payload["oof_predictions_sha256"], sha256_file(pred))
+            self.assertEqual(payload["group_sidecar_sha256"], sha256_file(sidecar))
+            self.assertEqual(payload["n_groups"], 44186)
 
     def test_oof_artifact_stem_separates_best_and_final_outputs(self):
         self.assertEqual(generate_predictions.oof_artifact_stem("best"), "oof_full")

@@ -571,6 +571,8 @@ def paired_oof_contract_issues(
     label: str,
     oof_sha256: str,
     freeze_sha256: str,
+    runner_filename: str,
+    comparator_key: str,
 ) -> list[str]:
     if not payload:
         return [f"{label}: paired payload missing"]
@@ -578,10 +580,82 @@ def paired_oof_contract_issues(
         return [f"{label}: paired status={payload.get('status')!r}"]
     inputs = payload.get("inputs") if isinstance(payload.get("inputs"), dict) else {}
     issues: list[str] = []
+    runner_path = PROJECT_ROOT / "scripts" / "revision" / runner_filename
+    if not runner_path.exists() or payload.get("runner_sha256") != sha256_file(runner_path):
+        issues.append(f"{label}: paired runner SHA mismatch")
+    if int(payload.get("paired_inference_schema_version", 0)) < 2:
+        issues.append(f"{label}: paired inference schema is stale")
     if ((inputs.get("full_predictions") or {}).get("sha256")) != oof_sha256:
         issues.append(f"{label}: full OOF SHA mismatch")
     if ((inputs.get("freeze_manifest") or {}).get("sha256")) != freeze_sha256:
         issues.append(f"{label}: freeze manifest SHA mismatch")
+    comparator_input = inputs.get("comparator_predictions") or {}
+    comparator_relative = comparator_input.get("relative_path") or comparator_input.get("path")
+    if not comparator_relative or not comparator_input.get("sha256"):
+        issues.append(f"{label}: comparator prediction provenance missing")
+    else:
+        comparator_path = Path(str(comparator_relative))
+        if not comparator_path.is_absolute():
+            comparator_path = PROJECT_ROOT / comparator_path
+        if not comparator_path.exists() or comparator_path.stat().st_size <= 0:
+            issues.append(f"{label}: comparator prediction artifact missing")
+        elif sha256_file(comparator_path) != comparator_input.get("sha256"):
+            issues.append(f"{label}: comparator prediction SHA mismatch")
+    comparator_contract = inputs.get(comparator_key) or {}
+    for artifact_key in ("summary", "manifest"):
+        artifact = comparator_contract.get(artifact_key) or {}
+        relative = artifact.get("relative_path") or artifact.get("path")
+        if not relative or not artifact.get("sha256"):
+            issues.append(f"{label}: comparator {artifact_key} provenance missing")
+            continue
+        artifact_path = Path(str(relative))
+        if not artifact_path.is_absolute():
+            artifact_path = PROJECT_ROOT / artifact_path
+        if not artifact_path.exists() or sha256_file(artifact_path) != artifact.get("sha256"):
+            issues.append(f"{label}: comparator {artifact_key} SHA mismatch")
+    bootstrap = payload.get("paired_bootstrap") or {}
+    n_boot = int(bootstrap.get("n_boot", 0))
+    if n_boot < 1000 or bootstrap.get("null_test") != "not_run":
+        issues.append(f"{label}: paired bootstrap/null-test contract is stale")
+    if bootstrap.get("multiplicity_adjustment") != "not_applicable_no_null_test":
+        issues.append(f"{label}: paired multiplicity contract is stale")
+    metrics = payload.get("metrics") or {}
+    if set(metrics) != REQUIRED_ROBUSTNESS_METRICS:
+        issues.append(f"{label}: paired metric set mismatch")
+    for metric_name, row in metrics.items():
+        if row.get("inference_scope") != "pointwise_percentile_ci_effect_size_only":
+            issues.append(f"{label}/{metric_name}: inference scope mismatch")
+        if row.get("multiplicity_adjustment") != "not_applicable_no_null_test":
+            issues.append(f"{label}/{metric_name}: multiplicity scope mismatch")
+        if int(row.get("n_boot_valid", -1)) != n_boot:
+            issues.append(f"{label}/{metric_name}: incomplete bootstrap")
+        try:
+            low = float(row["improvement_ci_low"])
+            high = float(row["improvement_ci_high"])
+            value = float(row["improvement_full_over_comparator"])
+            if not all(math.isfinite(item) for item in (low, high, value)) or low > high:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            issues.append(f"{label}/{metric_name}: non-finite paired effect/CI")
+            continue
+        expected_interpretation = (
+            "full_nominal_95ci_better"
+            if low > 0.0
+            else "comparator_nominal_95ci_better"
+            if high < 0.0
+            else "inconclusive"
+        )
+        if row.get("interpretation") != expected_interpretation:
+            issues.append(f"{label}/{metric_name}: interpretation does not follow its CI")
+        for key, value in row.items():
+            if "p_value" in str(key).lower() and value not in (None, "", "not_reported"):
+                try:
+                    if math.isfinite(float(value)):
+                        issues.append(f"{label}/{metric_name}: finite p-value without a null test")
+                except (TypeError, ValueError):
+                    issues.append(f"{label}/{metric_name}: malformed p-value field")
+            if "significant" in str(value).lower():
+                issues.append(f"{label}/{metric_name}: unsupported significance wording")
     return issues
 
 
@@ -614,6 +688,28 @@ def external_comparator_audit_contract_issues(
     return issues
 
 
+def paired_comparator_guidance(payload: dict[str, Any], comparator_label: str) -> str:
+    metrics = payload.get("metrics") if isinstance(payload, dict) else {}
+    comparator_favored = sorted(
+        name
+        for name, row in (metrics or {}).items()
+        if row.get("interpretation") == "comparator_nominal_95ci_better"
+    )
+    full_favored = sorted(
+        name
+        for name, row in (metrics or {}).items()
+        if row.get("interpretation") == "full_nominal_95ci_better"
+    )
+    inconclusive = sorted(set(metrics or {}) - set(comparator_favored) - set(full_favored))
+    return (
+        f"Under the validated same-fold paired Chapman OOF audit, {comparator_label}-favored endpoints="
+        f"{','.join(comparator_favored) or 'none'}; ECG-RAMBA-favored endpoints="
+        f"{','.join(full_favored) or 'none'}; inconclusive endpoints="
+        f"{','.join(inconclusive) or 'none'}. Do not generalize these pointwise endpoint-specific "
+        "intervals to broad architecture-family superiority."
+    )
+
+
 def assert_robustness_contract(rows: list[dict[str, str]]) -> list[str]:
     issues: list[str] = []
     stresses = {str(row.get("stress_test", "")) for row in rows}
@@ -625,14 +721,70 @@ def assert_robustness_contract(rows: list[dict[str, str]]) -> list[str]:
     expected_rows = len(REQUIRED_ROBUSTNESS_STRESSES) * len(REQUIRED_ROBUSTNESS_METRICS)
     if len(rows) != expected_rows:
         issues.append(f"robustness row count {len(rows)} != {expected_rows}")
+    for row in rows:
+        label = f"{row.get('stress_test')}/{row.get('metric')}"
+        if row.get("inference_scope") != "pointwise_percentile_ci_effect_size_only":
+            issues.append(f"{label}: inference scope mismatch")
+        if row.get("null_test") != "not_run":
+            issues.append(f"{label}: null-test scope mismatch")
+        if row.get("multiplicity_adjustment") != "not_applicable_no_null_test":
+            issues.append(f"{label}: multiplicity scope mismatch")
+        try:
+            if int(row.get("n_boot_valid", -1)) < 1000:
+                issues.append(f"{label}: fewer than 1000 valid bootstrap rows")
+            degradation_low = float(row["degradation_advantage_ci_low"])
+            degradation_high = float(row["degradation_advantage_ci_high"])
+            stressed_low = float(row["stressed_advantage_ci_low"])
+            stressed_high = float(row["stressed_advantage_ci_high"])
+            if not all(
+                math.isfinite(value)
+                for value in (degradation_low, degradation_high, stressed_low, stressed_high)
+            ):
+                raise ValueError
+            if degradation_low > degradation_high or stressed_low > stressed_high:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            issues.append(f"{label}: invalid robustness CI")
+        for key, value in row.items():
+            if "p_value" in str(key).lower() and value not in (None, "", "not_reported"):
+                try:
+                    if math.isfinite(float(value)):
+                        issues.append(f"{label}: finite p-value without a null test")
+                except (TypeError, ValueError):
+                    issues.append(f"{label}: malformed p-value field")
+            if "significant" in str(value).lower():
+                issues.append(f"{label}: unsupported significance wording")
     return issues
 
 
 def robustness_claim_rows(rows: list[dict[str, str]]) -> list[dict[str, Any]]:
     claim_rows = []
     for row in rows:
-        degradation = str(row.get("degradation_interpretation", ""))
-        stressed = str(row.get("stressed_performance_interpretation", ""))
+        try:
+            degradation_low = float(row["degradation_advantage_ci_low"])
+            degradation_high = float(row["degradation_advantage_ci_high"])
+            stressed_low = float(row["stressed_advantage_ci_low"])
+            stressed_high = float(row["stressed_advantage_ci_high"])
+        except (KeyError, TypeError, ValueError):
+            degradation_low = degradation_high = stressed_low = stressed_high = math.nan
+        finite_intervals = all(
+            math.isfinite(value)
+            for value in (degradation_low, degradation_high, stressed_low, stressed_high)
+        )
+        degradation = (
+            "full_nominal_95ci_less_degraded"
+            if finite_intervals and degradation_low > 0.0
+            else "minirocket_nominal_95ci_less_degraded"
+            if finite_intervals and degradation_high < 0.0
+            else "nominal_95ci_inconclusive_degradation_difference"
+        )
+        stressed = (
+            "full_nominal_95ci_better_under_stress"
+            if finite_intervals and stressed_low > 0.0
+            else "minirocket_nominal_95ci_better_under_stress"
+            if finite_intervals and stressed_high < 0.0
+            else "nominal_95ci_inconclusive_stressed_difference"
+        )
         metric = str(row.get("metric", ""))
         if degradation == "full_nominal_95ci_less_degraded":
             normalized_degradation = "full_nominal_95ci_less_degraded"
@@ -1675,12 +1827,30 @@ def main() -> None:
         contract_issues.append("Calibration CI: OOF SHA mismatch")
     if calibration.get("freeze_manifest_sha256") != current_freeze_sha256:
         contract_issues.append("Calibration CI: freeze manifest SHA mismatch")
-    for label, paired_payload, required in (
-        ("Fixed-transform-only (legacy MiniRocket artifact)", paired_minirocket, True),
-        ("ResNet1D/CNN", paired_resnet, True),
-        ("Raw Mamba", paired_raw_mamba, False),
-        ("Transformer ECG", paired_transformer, False),
-        ("Frozen-transform MLP head", paired_hybrid_morphology, False),
+    for label, paired_payload, required, runner_filename, comparator_key in (
+        (
+            "Fixed-transform-only (legacy MiniRocket artifact)",
+            paired_minirocket,
+            True,
+            "11_paired_full_vs_minirocket.py",
+            "minirocket",
+        ),
+        ("ResNet1D/CNN", paired_resnet, True, "15_paired_full_vs_resnet.py", "resnet"),
+        ("Raw Mamba", paired_raw_mamba, False, "17_paired_full_vs_raw_mamba.py", "raw_mamba"),
+        (
+            "Transformer ECG",
+            paired_transformer,
+            False,
+            "25_paired_full_vs_transformer.py",
+            "transformer",
+        ),
+        (
+            "Frozen-transform MLP head",
+            paired_hybrid_morphology,
+            False,
+            "27_paired_full_vs_hybrid_morphology.py",
+            "hybrid_morphology",
+        ),
     ):
         if paired_payload or required:
             contract_issues.extend(
@@ -1689,6 +1859,8 @@ def main() -> None:
                     label=label,
                     oof_sha256=current_oof_sha256,
                     freeze_sha256=current_freeze_sha256,
+                    runner_filename=runner_filename,
+                    comparator_key=comparator_key,
                 )
             )
     if robustness_rows:
@@ -2214,10 +2386,8 @@ def main() -> None:
         "unresolved_blockers": unresolved_blockers,
         "claim_guidance": {
             "global_superiority": "Avoid broad comparator-family advantage wording.",
-            "resnet_in_domain": (
-                "The completed paired ResNet1D/CNN comparison favors ResNet on frozen Chapman OOF "
-                "PR-AUC, ROC-AUC, F1, Brier, and ECE; do not claim an ECG-RAMBA in-domain "
-                "performance advantage over fair CNN/ResNet baselines."
+            "resnet_in_domain": paired_comparator_guidance(
+                paired_resnet, "ResNet1D/CNN"
             ),
             "operating_point": (
                 "ECG-RAMBA operating-point advantages are comparator-specific. The fixed-transform-only "

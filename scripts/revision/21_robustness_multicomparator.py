@@ -51,12 +51,52 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-PROTOCOL = "robustness_multicomparator_aggregation_v1"
+PROTOCOL = "robustness_multicomparator_aggregation_v2_source_bound"
 BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
 METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
+COMPARATOR_STRESS_PROTOCOL = "comparator_stress_predictions_v2_source_bound_same_folds_power_mean_v2_q3"
+COMPARATOR_STRESS_SOURCE_PATHS = (
+    "scripts/revision/23_generate_comparator_stress_predictions.py",
+    "scripts/revision/12_robustness_stress.py",
+    "scripts/revision/common.py",
+    "scripts/revision/14_resnet1d_cnn_baseline.py",
+    "scripts/revision/16_raw_mamba_baseline.py",
+    "scripts/revision/24_transformer_ecg_baseline.py",
+    "src/aggregation.py",
+    "src/training_data.py",
+    "configs/config.py",
+)
+ROCKET_STRESS_PROTOCOL = "robustness_full_vs_fixed_seed_rocket_perturbation_v2_source_bound"
+ROCKET_STRESS_SOURCE_PATHS = (
+    "scripts/revision/12_robustness_stress.py",
+    "scripts/revision/common.py",
+    "scripts/revision/01_generate_predictions.py",
+    "scripts/revision/10_minirocket_only_baseline.py",
+    "src/aggregation.py",
+    "src/features.py",
+    "src/provenance.py",
+    "configs/config.py",
+)
+
+
+def current_comparator_stress_source_bundle() -> dict[str, Any]:
+    files = {
+        relative: sha256_file(PROJECT_ROOT / relative)
+        for relative in COMPARATOR_STRESS_SOURCE_PATHS
+    }
+    return {
+        "schema_version": 1,
+        "files": files,
+        "sha256": _canonical_json_sha256(files),
+    }
+
+
+def current_rocket_stress_source_bundle() -> dict[str, Any]:
+    files = {relative: sha256_file(PROJECT_ROOT / relative) for relative in ROCKET_STRESS_SOURCE_PATHS}
+    return {"schema_version": 1, "files": files, "sha256": _canonical_json_sha256(files)}
 MACRO_CLASS_SUPPORT_POLICY = (
     "rank_calibration_omit_single_resampled_class_f1_keeps_all_labels_zero_division_zero"
 )
@@ -313,6 +353,9 @@ def cache_metadata(
         "n_boot": int(args.n_boot),
         "seed": int(seed),
         "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "statistical_helper_sha256": sha256_file(
+            PROJECT_ROOT / "scripts" / "revision" / "common.py"
+        ),
         "metric_cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
         "bootstrap_engine_contract": BOOTSTRAP_ENGINE,
         "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
@@ -702,8 +745,17 @@ def validate_stress_provenance(
             raise RuntimeError(
                 f"{comparator}/{stress} stress checkpoints do not match the clean baseline contract"
             )
-        if str(scalar(stress_data, "protocol")) != "comparator_stress_predictions_v1_same_folds_power_mean_v2_q3":
+        if str(scalar(stress_data, "protocol")) != COMPARATOR_STRESS_PROTOCOL:
             raise RuntimeError(f"{comparator}/{stress} has an unexpected stress protocol")
+        source_bundle = current_comparator_stress_source_bundle()
+        if str(scalar(stress_data, "source_bundle_sha256")) != source_bundle["sha256"]:
+            raise RuntimeError(
+                f"{comparator}/{stress} was produced by a stale comparator-stress source bundle"
+            )
+        if str(scalar(stress_data, "producer_runner_sha256")) != source_bundle["files"][
+            "scripts/revision/23_generate_comparator_stress_predictions.py"
+        ]:
+            raise RuntimeError(f"{comparator}/{stress} producer runner SHA is stale")
         if str(scalar(stress_data, "comparator")) != comparator:
             raise RuntimeError(f"{comparator}/{stress} comparator tag mismatch")
         if str(scalar(stress_data, "stress_test")) != stress:
@@ -726,8 +778,13 @@ def validate_stress_provenance(
             raise RuntimeError(f"{comparator}/{stress} has incomplete record slice coverage")
         return
 
-    if str(scalar(stress_data, "protocol")) != "robustness_full_vs_minirocket_perturbation_v1":
+    if str(scalar(stress_data, "protocol")) != ROCKET_STRESS_PROTOCOL:
         raise RuntimeError(f"{comparator}/{stress} has an unexpected stress protocol")
+    metadata = json.loads(str(scalar(stress_data, "metadata_json", "{}")))
+    source_bundle = metadata.get("source_bundle") or {}
+    expected_bundle = current_rocket_stress_source_bundle()
+    if source_bundle.get("sha256") != expected_bundle["sha256"]:
+        raise RuntimeError(f"{comparator}/{stress} was produced by a stale robustness source bundle")
     if str(scalar(stress_data, "stress_name")) != stress:
         raise RuntimeError(f"{comparator}/{stress} stress tag mismatch")
     expected_model = "Full ECG-RAMBA" if comparator == "full" else "MiniRocket-only"

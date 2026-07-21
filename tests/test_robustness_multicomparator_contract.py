@@ -68,10 +68,11 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
             "fold_rows": [
                 {"fold": fold, "checkpoint_sha256": hashes[fold - 1]}
                 for fold in range(1, 6)
-            ]
+            ],
+            "source_bundle": ROBUSTNESS.current_rocket_stress_source_bundle(),
         }
         stress = {
-            "protocol": np.asarray("robustness_full_vs_minirocket_perturbation_v1"),
+            "protocol": np.asarray(ROBUSTNESS.ROCKET_STRESS_PROTOCOL),
             "stress_name": np.asarray("snr20db"),
             "stress_json": np.asarray(
                 json.dumps(ROBUSTNESS.expected_stress_spec("snr20db", 42), sort_keys=True)
@@ -101,7 +102,7 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
         stress = {
             "y_true": np.zeros((3, 2), dtype=np.float32),
             "checkpoint_sha256": hashes.copy(),
-            "protocol": np.asarray("comparator_stress_predictions_v1_same_folds_power_mean_v2_q3"),
+            "protocol": np.asarray(ROBUSTNESS.COMPARATOR_STRESS_PROTOCOL),
             "comparator": np.asarray("resnet"),
             "stress_test": np.asarray("snr20db"),
             "stress_metadata_json": np.asarray(json.dumps({"spec": expected_spec}, sort_keys=True)),
@@ -111,6 +112,14 @@ class RobustnessMulticomparatorContractTests(unittest.TestCase):
             "aggregation_implementation": np.asarray("power_mean_v2"),
             "power_mean_q": np.asarray(3.0),
             "slice_count": np.ones(3, dtype=np.int16),
+            "source_bundle_sha256": np.asarray(
+                ROBUSTNESS.current_comparator_stress_source_bundle()["sha256"]
+            ),
+            "producer_runner_sha256": np.asarray(
+                ROBUSTNESS.current_comparator_stress_source_bundle()["files"][
+                    "scripts/revision/23_generate_comparator_stress_predictions.py"
+                ]
+            ),
         }
         ROBUSTNESS.validate_stress_provenance(
             "resnet", "snr20db", clean, stress, expected_spec

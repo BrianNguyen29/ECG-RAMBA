@@ -51,8 +51,10 @@ from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabil
 from src.training_data import build_slice_index  # noqa: E402
 
 
-PROTOCOL_VERSION = 1
-CACHE_ONLY_CPU_AGGREGATION_CAPABILITY = "validated_external_fold_cache_aggregation_v1"
+PROTOCOL_VERSION = 2
+CACHE_ONLY_CPU_AGGREGATION_CAPABILITY = "validated_external_fold_cache_aggregation_v2_dataset_sidecar"
+CPSC_DISK_BACKED_INFERENCE_CAPABILITY = "cpsc_disk_backed_comparator_inference_v1"
+DATASET_CONTRACT_SCHEMA_VERSION = 1
 COMPARATOR_STEMS = {
     "resnet": "resnet1d_cnn",
     "raw_mamba": "raw_mamba",
@@ -181,6 +183,15 @@ def parse_args() -> argparse.Namespace:
         default=EXPERIMENTAL_DIR / "external",
     )
     parser.add_argument(
+        "--cpsc-signal-memmap",
+        type=Path,
+        default=None,
+        help=(
+            "Local .npy path for disk-backed CPSC2021 float32 windows. Defaults under --extract-root; "
+            "the file is intentionally ephemeral while fold prediction caches remain durable."
+        ),
+    )
+    parser.add_argument(
         "--oof-predictions",
         type=Path,
         default=PREDICTION_DIR / "oof_final_ema_predictions.npz",
@@ -228,6 +239,12 @@ def record_fingerprint(record_ids: np.ndarray, groups: np.ndarray, labels: np.nd
     digest.update(b"\0")
     digest.update(np.ascontiguousarray(labels.astype(np.float32)).tobytes())
     return digest.hexdigest()
+
+
+def stable_json_sha256(payload: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -334,6 +351,223 @@ def final_output_paths(args: argparse.Namespace, dataset: str, comparator: str) 
     }
 
 
+def full_model_source_paths(args: argparse.Namespace, dataset: str) -> dict[str, Path]:
+    tag = output_tag(args, dataset)
+    suffix = f"_{tag}" if tag else ""
+    stem = f"{dataset}_full{suffix}"
+    output_root = resolve(args.external_root) / dataset
+    return {
+        "predictions": output_root / f"{stem}_predictions.npz",
+        "slice_predictions": output_root / f"{stem}_slice_predictions.npz",
+        "summary": output_root / f"{stem}_prediction_summary.json",
+        "manifest": output_root / f"{stem}_prediction_run_manifest.json",
+    }
+
+
+def dataset_contract_path(args: argparse.Namespace, dataset: str) -> Path:
+    tag = output_tag(args, dataset)
+    suffix = f"_{tag}" if tag else ""
+    return resolve(args.fold_cache_dir) / f"{dataset}{suffix}_dataset_contract_v1.npz"
+
+
+def expected_class_names(dataset: str) -> np.ndarray:
+    if dataset == "ptbxl":
+        return np.asarray(list(external_helpers.PTB_SUPERCLASS_MAPPING))
+    if dataset == "cpsc2021":
+        return np.asarray(["AF_or_AFL"])
+    return np.asarray(CLASSES)
+
+
+def dataset_loader_contract(sources: dict[str, Any]) -> dict[str, Any]:
+    """Return the semantic input contract without the aggregation runner identity."""
+
+    return {
+        "archive_sha256": sources["archive_sha256"],
+        "external_loader_sha256": sources["external_loader_sha256"],
+        "loader_configuration": sources["loader_configuration"],
+        "georgia_mapping_review": sources.get("georgia_mapping_review"),
+        "slice_configuration": {
+            "slice_length": int(CONFIG["slice_length"]),
+            "slice_stride": int(CONFIG["slice_stride"]),
+            "max_slices_per_record": int(CONFIG["max_slices_per_record"]),
+        },
+    }
+
+
+def _manifest_output_sha(manifest: dict[str, Any], path: Path) -> str | None:
+    row = (manifest.get("outputs") or {}).get(path.name) or {}
+    return row.get("sha256")
+
+
+def build_dataset_contract_from_full_artifact(
+    args: argparse.Namespace,
+    dataset: str,
+    sources: dict[str, Any],
+    canonical: dict[str, str],
+) -> Path:
+    """Create a small durable sidecar from the authenticated Full external export.
+
+    This sidecar deliberately contains no ECG signal. It is sufficient to
+    authenticate fold-cache record/slice order and to aggregate completed fold
+    predictions on a fresh CPU runtime without loading CPSC2021 again.
+    """
+
+    paths = full_model_source_paths(args, dataset)
+    missing = [path for path in paths.values() if not path.exists() or path.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError(
+            f"{dataset}: current source-bound Full external export is required before comparator cache reuse: "
+            + "; ".join(str(path) for path in missing)
+        )
+    manifest = read_json(paths["manifest"])
+    expected_runner = sha256_file(PROJECT_ROOT / "scripts" / "revision" / "03_generate_external_predictions.py")
+    if manifest.get("runner_sha256") != expected_runner:
+        raise RuntimeError(f"{dataset}: Full external manifest was produced by a stale loader runner")
+    if manifest.get("canonical_contract") != canonical:
+        raise RuntimeError(f"{dataset}: Full external manifest is stale for the canonical OOF/freeze")
+    if (manifest.get("archive") or {}).get("sha256") != sources["archive_sha256"]:
+        raise RuntimeError(f"{dataset}: Full external manifest archive SHA does not match the active archive")
+    for name in ("predictions", "slice_predictions", "summary"):
+        observed = sha256_file(paths[name])
+        if _manifest_output_sha(manifest, paths[name]) != observed:
+            raise RuntimeError(f"{dataset}: Full external {name} failed manifest SHA validation")
+
+    with np.load(paths["predictions"], allow_pickle=False) as pred:
+        required = {"y_true", "record_id", "group_id", "split_id", "class_names", "dataset"}
+        if required - set(pred.files):
+            raise RuntimeError(f"{dataset}: Full external prediction contract is incomplete")
+        y_true = np.asarray(pred["y_true"], dtype=np.float32)
+        record_ids = np.asarray(pred["record_id"]).astype(str)
+        group_ids = np.asarray(pred["group_id"]).astype(str)
+        split_ids = np.asarray(pred["split_id"]).astype(str)
+        class_names = np.asarray(pred["class_names"]).astype(str)
+        if str(np.asarray(pred["dataset"]).item()) != dataset:
+            raise RuntimeError(f"{dataset}: Full external prediction dataset identity mismatch")
+    n_records = len(record_ids)
+    if y_true.shape != (n_records, len(class_names)):
+        raise RuntimeError(f"{dataset}: Full external label shape is invalid: {y_true.shape}")
+    if len(group_ids) != n_records or len(split_ids) != n_records:
+        raise RuntimeError(f"{dataset}: Full external record metadata lengths differ")
+    if len(set(record_ids.tolist())) != n_records:
+        raise RuntimeError(f"{dataset}: Full external record identifiers are not unique")
+    if not np.isfinite(y_true).all() or not np.isin(y_true, [0.0, 1.0]).all():
+        raise RuntimeError(f"{dataset}: Full external labels must be finite binary values")
+    if not np.array_equal(class_names, expected_class_names(dataset).astype(str)):
+        raise RuntimeError(f"{dataset}: Full external class order is not canonical")
+
+    with np.load(paths["slice_predictions"], allow_pickle=False) as sliced:
+        required = {"record_index", "slice_index", "record_id", "group_id", "split_id", "class_names"}
+        if required - set(sliced.files):
+            raise RuntimeError(f"{dataset}: Full external slice contract is incomplete")
+        slice_record_index = np.asarray(sliced["record_index"], dtype=np.int64)
+        slice_ordinal = np.asarray(sliced["slice_index"], dtype=np.int64)
+        slice_classes = np.asarray(sliced["class_names"]).astype(str)
+        slice_record_ids = np.asarray(sliced["record_id"]).astype(str)
+        slice_group_ids = np.asarray(sliced["group_id"]).astype(str)
+        slice_split_ids = np.asarray(sliced["split_id"]).astype(str)
+    if slice_record_index.ndim != 1 or len(slice_record_index) == 0:
+        raise RuntimeError(f"{dataset}: Full external slice index is empty or invalid")
+    if np.any(slice_record_index < 0) or np.any(slice_record_index >= n_records):
+        raise RuntimeError(f"{dataset}: Full external slice record index is out of bounds")
+    if not np.array_equal(slice_classes, class_names):
+        raise RuntimeError(f"{dataset}: Full external slice class order differs from record output")
+    if not np.array_equal(slice_record_ids, record_ids[slice_record_index]):
+        raise RuntimeError(f"{dataset}: Full external slice-to-record identity mapping changed")
+    if not np.array_equal(slice_group_ids, group_ids[slice_record_index]):
+        raise RuntimeError(f"{dataset}: Full external slice-to-group mapping changed")
+    if not np.array_equal(slice_split_ids, split_ids[slice_record_index]):
+        raise RuntimeError(f"{dataset}: Full external slice-to-split mapping changed")
+    slice_start = (slice_ordinal * int(CONFIG["slice_stride"])).astype(np.int32)
+    load_summary = manifest.get("load_summary") or read_json(paths["summary"]).get("load_summary") or {}
+    loader_contract = dataset_loader_contract(sources)
+    source_artifacts = {
+        name: {"path": str(path), "sha256": sha256_file(path), "size_bytes": path.stat().st_size}
+        for name, path in paths.items()
+    }
+    destination = dataset_contract_path(args, dataset)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    save_npz_compressed_atomic(
+        destination,
+        schema_version=np.asarray(DATASET_CONTRACT_SCHEMA_VERSION, dtype=np.int16),
+        dataset=np.asarray(dataset),
+        y_true=y_true,
+        record_id=record_ids,
+        group_id=group_ids,
+        split_id=split_ids,
+        class_names=class_names,
+        slice_record_index=slice_record_index,
+        slice_start=slice_start,
+        input_fingerprint=np.asarray(record_fingerprint(record_ids, group_ids, y_true)),
+        loader_contract_json=np.asarray(json.dumps(loader_contract, sort_keys=True)),
+        loader_contract_sha256=np.asarray(stable_json_sha256(loader_contract)),
+        source_artifacts_json=np.asarray(json.dumps(source_artifacts, sort_keys=True)),
+        load_summary_json=np.asarray(json.dumps(load_summary, sort_keys=True)),
+        created_utc=np.asarray(now_utc()),
+    )
+    print(f"Wrote authenticated dataset sidecar: {destination}", flush=True)
+    return destination
+
+
+def load_dataset_contract(
+    args: argparse.Namespace,
+    dataset: str,
+    sources: dict[str, Any],
+    canonical: dict[str, str],
+) -> dict[str, Any]:
+    path = dataset_contract_path(args, dataset)
+    loader_contract = dataset_loader_contract(sources)
+    expected_loader_sha = stable_json_sha256(loader_contract)
+
+    def read_valid() -> dict[str, Any] | None:
+        if not path.exists() or path.stat().st_size == 0:
+            return None
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                required = {
+                    "schema_version", "dataset", "y_true", "record_id", "group_id", "split_id",
+                    "class_names", "slice_record_index", "slice_start", "input_fingerprint",
+                    "loader_contract_sha256", "source_artifacts_json", "load_summary_json",
+                }
+                if required - set(data.files):
+                    return None
+                if int(data["schema_version"].item()) != DATASET_CONTRACT_SCHEMA_VERSION:
+                    return None
+                if str(data["dataset"].item()) != dataset:
+                    return None
+                if str(data["loader_contract_sha256"].item()) != expected_loader_sha:
+                    return None
+                payload = {name: np.asarray(data[name]) for name in (
+                    "y_true", "record_id", "group_id", "split_id", "class_names",
+                    "slice_record_index", "slice_start",
+                )}
+                payload["input_fingerprint"] = str(data["input_fingerprint"].item())
+                payload["source_artifacts"] = json.loads(str(data["source_artifacts_json"].item()))
+                payload["load_summary"] = json.loads(str(data["load_summary_json"].item()))
+        except Exception:
+            return None
+        current_paths = full_model_source_paths(args, dataset)
+        for name, row in payload["source_artifacts"].items():
+            current = current_paths.get(name)
+            if current is None or not current.exists() or sha256_file(current) != row.get("sha256"):
+                return None
+        y_true = np.asarray(payload["y_true"], dtype=np.float32)
+        record_ids = np.asarray(payload["record_id"]).astype(str)
+        group_ids = np.asarray(payload["group_id"]).astype(str)
+        if payload["input_fingerprint"] != record_fingerprint(record_ids, group_ids, y_true):
+            return None
+        payload["dataset_contract_path"] = path
+        payload["dataset_contract_sha256"] = sha256_file(path)
+        return payload
+
+    loaded = read_valid()
+    if loaded is None:
+        build_dataset_contract_from_full_artifact(args, dataset, sources, canonical)
+        loaded = read_valid()
+    if loaded is None:
+        raise RuntimeError(f"{dataset}: failed to build or authenticate the comparator dataset sidecar")
+    return loaded
+
+
 def source_contract(args: argparse.Namespace, dataset: str, archive: Path) -> dict[str, Any]:
     mapping_path = resolve(args.georgia_mapping_review) if dataset == "georgia" else None
     loader_path = PROJECT_ROOT / "scripts" / "revision" / "03_generate_external_predictions.py"
@@ -346,6 +580,11 @@ def source_contract(args: argparse.Namespace, dataset: str, archive: Path) -> di
             else None,
             "output_tag": output_tag(args, dataset),
             "limit_records": int(args.limit_records),
+            "cpsc_signal_storage": (
+                "disk_backed_float32_npy"
+                if dataset == "cpsc2021"
+                else None
+            ),
         },
         "georgia_mapping_review": (
             {"path": str(mapping_path), "sha256": sha256_file(mapping_path)}
@@ -424,6 +663,9 @@ def cache_matches(
     checkpoint_sha: str,
     input_fingerprint: str,
     class_names: np.ndarray,
+    dataset_contract_sha256: str,
+    expected_record_index: np.ndarray,
+    expected_starts: np.ndarray,
 ) -> bool:
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -439,6 +681,7 @@ def cache_matches(
                 "fold",
                 "checkpoint_sha256",
                 "input_fingerprint",
+                "dataset_contract_sha256",
                 "protocol_version",
             }
             if required - set(data.files):
@@ -449,9 +692,22 @@ def cache_matches(
                 and int(data["fold"].item()) == fold
                 and str(data["checkpoint_sha256"].item()) == checkpoint_sha
                 and str(data["input_fingerprint"].item()) == input_fingerprint
+                and str(data["dataset_contract_sha256"].item()) == dataset_contract_sha256
                 and int(data["protocol_version"].item()) == PROTOCOL_VERSION
                 and np.array_equal(np.asarray(data["class_names"]).astype(str), class_names.astype(str))
+                and np.array_equal(
+                    np.asarray(data["slice_record_index"], dtype=np.int64),
+                    np.asarray(expected_record_index, dtype=np.int64),
+                )
+                and np.array_equal(
+                    np.asarray(data["slice_start"], dtype=np.int32),
+                    np.asarray(expected_starts, dtype=np.int32),
+                )
+                and np.asarray(data["slice_prob"]).shape
+                == (len(expected_record_index), len(class_names))
                 and np.isfinite(np.asarray(data["slice_prob"], dtype=np.float32)).all()
+                and np.all(np.asarray(data["slice_prob"], dtype=np.float32) >= 0.0)
+                and np.all(np.asarray(data["slice_prob"], dtype=np.float32) <= 1.0)
             )
     except Exception:
         return False
@@ -499,12 +755,20 @@ def class_rows(dataset: str, comparator: str, y_true: np.ndarray, y_prob: np.nda
     return rows
 
 
-def external_loader_args(args: argparse.Namespace) -> SimpleNamespace:
+def external_loader_args(args: argparse.Namespace, sources: dict[str, Any]) -> SimpleNamespace:
+    cpsc_signal_memmap = args.cpsc_signal_memmap
+    if cpsc_signal_memmap is None:
+        cpsc_signal_memmap = (
+            resolve(args.fold_cache_dir)
+            / "cpsc2021_preprocessed_windows_source_bound_v2.npy"
+        )
     return SimpleNamespace(
         ptbxl_folds=args.ptbxl_folds,
         georgia_mapping_review=resolve(args.georgia_mapping_review),
         georgia_code_inventory_out=resolve(args.georgia_code_inventory_out),
         cpsc_annotation_audit_out=resolve(args.cpsc_annotation_audit_out),
+        cpsc_signal_memmap=resolve(cpsc_signal_memmap),
+        source_archive_sha256=sources["archive_sha256"],
     )
 
 
@@ -541,78 +805,121 @@ def run_dataset(
             pending.append((comparator, in_domain, checkpoints, checkpoint_hashes))
     if not pending:
         return result_rows
-    # Final artifacts can become stale after a metadata-only canonical-contract
-    # refresh even when all authenticated fold predictions remain reusable.
-    # Load the dataset contract and inspect those caches before requiring CUDA.
-    # The per-fold guard below still prevents accidental model inference on CPU.
-    root = external_helpers.extract_archive(dataset, archive, resolve(args.extract_root))
-    signals, y_true, record_ids, group_ids, split_ids, load_summary = external_helpers.load_records(
-        dataset,
-        root,
-        int(args.limit_records),
-        external_loader_args(args),
-    )
-    input_fingerprint = record_fingerprint(record_ids, group_ids, y_true)
-    all_indices = np.arange(len(signals), dtype=np.int64)
-    slice_record_ids, starts, _positions, skipped = build_slice_index(
-        all_indices,
-        signals,
-        slice_length=int(CONFIG["slice_length"]),
-        slice_stride=int(CONFIG["slice_stride"]),
-        max_slices_per_record=int(CONFIG["max_slices_per_record"]),
-    )
-    if skipped:
-        raise RuntimeError(f"{dataset}: records without valid slices: {skipped[:10]}")
-    dataset_obj = baseline_helpers.RawECGSliceDataset(
-        signals,
-        y_true,
-        slice_record_ids,
-        starts,
-        slice_length=int(CONFIG["slice_length"]),
-    )
-    loader = baseline_helpers.build_loader(
-        dataset_obj,
-        batch_size=int(args.batch_size),
-        shuffle=False,
-        num_workers=int(args.num_workers),
-        seed=42,
-        device=device,
-    )
+    metadata = load_dataset_contract(args, dataset, sources, contract)
+    y_true = np.asarray(metadata["y_true"], dtype=np.float32)
+    record_ids = np.asarray(metadata["record_id"]).astype(str)
+    group_ids = np.asarray(metadata["group_id"]).astype(str)
+    split_ids = np.asarray(metadata["split_id"]).astype(str)
+    class_order = np.asarray(metadata["class_names"]).astype(str)
+    slice_record_ids = np.asarray(metadata["slice_record_index"], dtype=np.int64)
+    starts = np.asarray(metadata["slice_start"], dtype=np.int32)
+    input_fingerprint = str(metadata["input_fingerprint"])
+    dataset_contract_sha = str(metadata["dataset_contract_sha256"])
+    load_summary = dict(metadata["load_summary"])
+    folds_now = selected_folds or set(range(1, 6))
+
+    def reusable_fold_cache(
+        comparator: str,
+        fold: int,
+        checkpoint_hashes: list[str],
+    ) -> bool:
+        return bool(
+            args.reuse_existing
+            and not args.force_rerun
+            and cache_matches(
+                cache_path(args, dataset, comparator, fold),
+                dataset=dataset,
+                comparator=comparator,
+                fold=fold,
+                checkpoint_sha=checkpoint_hashes[fold - 1],
+                input_fingerprint=input_fingerprint,
+                class_names=class_order,
+                dataset_contract_sha256=dataset_contract_sha,
+                expected_record_index=slice_record_ids,
+                expected_starts=starts,
+            )
+        )
+
+    missing_requested = [
+        (comparator, fold)
+        for comparator, _in_domain, _checkpoints, checkpoint_hashes in pending
+        for fold in sorted(folds_now)
+        if not reusable_fold_cache(comparator, fold, checkpoint_hashes)
+    ]
+    loader = None
+    dataset_obj = None
+    signals = None
+    if missing_requested:
+        if device.type != "cuda":
+            details = ", ".join(f"{name}/fold{fold}" for name, fold in missing_requested)
+            raise RuntimeError(
+                f"{dataset}: authenticated dataset metadata was restored without loading ECG signals, "
+                f"but CUDA inference is required for missing/stale fold caches: {details}. "
+                "No CPU model inference was started. Use a GPU runtime once; completed v2 fold "
+                "caches can then be aggregated on CPU."
+            )
+        root = external_helpers.extract_archive(dataset, archive, resolve(args.extract_root))
+        signals, loaded_y, loaded_records, loaded_groups, loaded_splits, loaded_summary = (
+            external_helpers.load_records(
+                dataset,
+                root,
+                int(args.limit_records),
+                external_loader_args(args, sources),
+            )
+        )
+        loaded_fingerprint = record_fingerprint(loaded_records, loaded_groups, loaded_y)
+        if loaded_fingerprint != input_fingerprint:
+            raise RuntimeError(f"{dataset}: live loader output differs from the authenticated dataset sidecar")
+        if not np.array_equal(np.asarray(loaded_splits).astype(str), split_ids):
+            raise RuntimeError(f"{dataset}: live loader split assignment differs from the dataset sidecar")
+        if dict(loaded_summary).get("group_unit") != load_summary.get("group_unit"):
+            raise RuntimeError(f"{dataset}: live loader group unit differs from the dataset sidecar")
+        all_indices = np.arange(len(signals), dtype=np.int64)
+        live_record_ids, live_starts, _positions, skipped = build_slice_index(
+            all_indices,
+            signals,
+            slice_length=int(CONFIG["slice_length"]),
+            slice_stride=int(CONFIG["slice_stride"]),
+            max_slices_per_record=int(CONFIG["max_slices_per_record"]),
+        )
+        if skipped:
+            raise RuntimeError(f"{dataset}: records without valid slices: {skipped[:10]}")
+        if not np.array_equal(live_record_ids, slice_record_ids) or not np.array_equal(live_starts, starts):
+            raise RuntimeError(f"{dataset}: live loader slice order differs from the authenticated sidecar")
+        dataset_obj = baseline_helpers.RawECGSliceDataset(
+            signals,
+            loaded_y,
+            slice_record_ids,
+            starts,
+            slice_length=int(CONFIG["slice_length"]),
+        )
+        loader = baseline_helpers.build_loader(
+            dataset_obj,
+            batch_size=int(args.batch_size),
+            shuffle=False,
+            num_workers=int(args.num_workers),
+            seed=42,
+            device=device,
+        )
+    else:
+        print(
+            f"{dataset}: all requested fold caches passed the v2 dataset-sidecar contract; "
+            "skipping archive extraction and signal loading.",
+            flush=True,
+        )
     for comparator, in_domain, checkpoints, checkpoint_hashes in pending:
-        folds_now = selected_folds or set(range(1, 6))
         for fold in sorted(folds_now):
             fold_cache = cache_path(args, dataset, comparator, fold)
-            if (
-                args.reuse_existing
-                and not args.force_rerun
-                and cache_matches(
-                    fold_cache,
-                    dataset=dataset,
-                    comparator=comparator,
-                    fold=fold,
-                    checkpoint_sha=checkpoint_hashes[fold - 1],
-                    input_fingerprint=input_fingerprint,
-                    class_names=np.asarray(
-                        list(external_helpers.PTB_SUPERCLASS_MAPPING)
-                        if dataset == "ptbxl"
-                        else ["AF_or_AFL"] if dataset == "cpsc2021" else CLASSES
-                    ),
-                )
-            ):
+            if reusable_fold_cache(comparator, fold, checkpoint_hashes):
                 print(f"Reusing {dataset}/{comparator}/fold{fold}: {fold_cache}", flush=True)
                 continue
             print(
-                f"Inference {dataset}/{comparator}/fold{fold} | records={len(signals)} "
+                f"Inference {dataset}/{comparator}/fold{fold} | records={len(record_ids)} "
                 f"slices={len(slice_record_ids)} checkpoint={checkpoints[fold - 1]}",
                 flush=True,
             )
-            if device.type != "cuda":
-                raise RuntimeError(
-                    "A required external learned-comparator fold cache is missing or stale and needs CUDA inference: "
-                    f"dataset={dataset} comparator={comparator} fold={fold} cache={fold_cache}. "
-                    "Use an A100/T4 GPU runtime, then rerun with --reuse-existing to resume only the missing fold. "
-                    "No CPU model inference was started."
-                )
+            if device.type != "cuda" or loader is None:
+                raise RuntimeError(f"{dataset}/{comparator}/fold{fold}: internal GPU-loader preflight failed")
             model = load_model(args, comparator, checkpoints[fold - 1], device)
             mapped, actual_record_index, actual_starts, class_names = infer_fold(
                 comparator=comparator,
@@ -637,6 +944,7 @@ def run_dataset(
                 checkpoint_path=np.asarray(str(checkpoints[fold - 1])),
                 checkpoint_sha256=np.asarray(checkpoint_hashes[fold - 1]),
                 input_fingerprint=np.asarray(input_fingerprint),
+                dataset_contract_sha256=np.asarray(dataset_contract_sha),
                 protocol_version=np.asarray(PROTOCOL_VERSION, dtype=np.int16),
                 created_utc=np.asarray(now_utc()),
             )
@@ -655,11 +963,10 @@ def run_dataset(
                 fold=fold,
                 checkpoint_sha=checkpoint_hashes[fold - 1],
                 input_fingerprint=input_fingerprint,
-                class_names=np.asarray(
-                    list(external_helpers.PTB_SUPERCLASS_MAPPING)
-                    if dataset == "ptbxl"
-                    else ["AF_or_AFL"] if dataset == "cpsc2021" else CLASSES
-                ),
+                class_names=class_order,
+                dataset_contract_sha256=dataset_contract_sha,
+                expected_record_index=slice_record_ids,
+                expected_starts=starts,
             )
             for fold, path in enumerate(all_caches, start=1)
         )
@@ -751,6 +1058,7 @@ def run_dataset(
             slice_count=slice_count.astype(np.int16),
             checkpoint_sha256=np.asarray(checkpoint_hashes),
             input_fingerprint=np.asarray(input_fingerprint),
+            dataset_contract_sha256=np.asarray(dataset_contract_sha),
             aggregation_method=np.asarray("power_mean"),
             aggregation_implementation=np.asarray(POWER_MEAN_IMPLEMENTATION),
             aggregation_q=np.asarray(float(CONFIG["power_mean_q"])),
@@ -825,6 +1133,12 @@ def run_dataset(
                 "canonical_contract": contract,
                 "source_contract": sources,
                 "input_fingerprint": input_fingerprint,
+                "dataset_contract": {
+                    "path": str(metadata["dataset_contract_path"]),
+                    "sha256": dataset_contract_sha,
+                    "schema_version": DATASET_CONTRACT_SCHEMA_VERSION,
+                    "capability": CACHE_ONLY_CPU_AGGREGATION_CAPABILITY,
+                },
                 "archive": {"path": str(archive), "sha256": sha256_file(archive)},
                 "checkpoints": [
                     {"fold": fold, "path": str(path), "sha256": checkpoint_hashes[fold - 1]}
@@ -851,7 +1165,12 @@ def run_dataset(
             }
         )
         print(f"Wrote external comparator artifact: {pred_path}", flush=True)
-    del loader, dataset_obj, signals
+    if loader is not None:
+        del loader
+    if dataset_obj is not None:
+        del dataset_obj
+    if signals is not None:
+        del signals
     gc.collect()
     return result_rows
 

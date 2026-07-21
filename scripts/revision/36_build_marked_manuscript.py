@@ -157,6 +157,7 @@ def blocker_payload(
         "status": status,
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "issue": issue,
         "tools": tools,
         "inputs": {"original": str(original), "revised": str(revised)},
@@ -172,7 +173,10 @@ def main() -> None:
     out_tex = resolve(args.out_tex)
     out_pdf = resolve(args.out_pdf)
     manifest_path = resolve(args.out_manifest)
-    tools = {name: executable(name) for name in ("latexdiff", "latexmk", "pdftotext")}
+    tools = {
+        name: executable(name)
+        for name in ("latexdiff", "latexmk", "pdftotext", "pdfinfo", "pdftoppm")
+    }
     print("=" * 80, flush=True)
     print("MARKED/HIGHLIGHTED MANUSCRIPT BUILD", flush=True)
     print("=" * 80, flush=True)
@@ -192,8 +196,11 @@ def main() -> None:
         if args.strict:
             raise FileNotFoundError(payload["issue"])
         return
-    if tools["latexdiff"] is None or (args.compile and tools["latexmk"] is None):
-        missing_tools = [name for name in ("latexdiff", "latexmk" if args.compile else "") if name and tools[name] is None]
+    required_tools = ["latexdiff"] + (
+        ["latexmk", "pdftotext", "pdfinfo", "pdftoppm"] if args.compile else []
+    )
+    if any(tools[name] is None for name in required_tools):
+        missing_tools = [name for name in required_tools if tools[name] is None]
         payload = blocker_payload(
             status="blocked_missing_tool",
             issue="Missing required executable(s): " + ", ".join(missing_tools),
@@ -243,6 +250,7 @@ def main() -> None:
     write_text_atomic(out_tex, marked_text)
 
     compile_log = None
+    visual_qa: dict[str, Any] | None = None
     if args.compile:
         job_name = out_pdf.stem
         compile_result = run_command(
@@ -262,6 +270,60 @@ def main() -> None:
             raise RuntimeError(f"Marked manuscript LaTeX compilation failed; inspect {compile_log}")
         if generated_pdf.resolve() != out_pdf.resolve():
             shutil.copy2(generated_pdf, out_pdf)
+        info_result = run_command([str(tools["pdfinfo"]), str(out_pdf)], cwd=out_pdf.parent)
+        page_match = re.search(r"^Pages:\s+(\d+)\s*$", info_result.stdout, flags=re.MULTILINE)
+        if info_result.returncode != 0 or page_match is None:
+            raise RuntimeError("pdfinfo could not validate the marked manuscript PDF")
+        page_count = int(page_match.group(1))
+        if page_count < 1:
+            raise RuntimeError("Marked manuscript PDF has no pages")
+        text_path = out_pdf.with_suffix(".pdf.txt")
+        text_result = run_command(
+            [str(tools["pdftotext"]), str(out_pdf), str(text_path)], cwd=out_pdf.parent
+        )
+        extracted_text = text_path.read_text(encoding="utf-8", errors="replace") if text_path.exists() else ""
+        if text_result.returncode != 0 or len(extracted_text.strip()) < 100:
+            raise RuntimeError("Marked manuscript PDF text extraction is empty or implausibly short")
+        rendered = []
+        for page in sorted({1, page_count}):
+            prefix = out_pdf.parent / f"{out_pdf.stem}_qa_page{page}"
+            render_result = run_command(
+                [
+                    str(tools["pdftoppm"]), "-f", str(page), "-l", str(page),
+                    "-singlefile", "-png", "-r", "72", str(out_pdf), str(prefix),
+                ],
+                cwd=out_pdf.parent,
+            )
+            image_path = prefix.with_suffix(".png")
+            if render_result.returncode != 0 or not image_path.is_file() or image_path.stat().st_size < 5000:
+                raise RuntimeError(f"Marked manuscript visual QA render failed for page {page}")
+            try:
+                from PIL import Image
+
+                with Image.open(image_path) as image:
+                    extrema = image.convert("L").getextrema()
+                    width, height = image.size
+                if extrema[0] == extrema[1] or width < 300 or height < 300:
+                    raise RuntimeError(f"Marked manuscript page {page} is blank or malformed")
+            except ImportError:
+                extrema = None
+                width = height = None
+            rendered.append(
+                {
+                    "page": page,
+                    "path": str(image_path),
+                    "sha256": sha256_file(image_path),
+                    "size_bytes": image_path.stat().st_size,
+                    "pixel_extrema": list(extrema) if extrema else None,
+                    "dimensions": [width, height] if width else None,
+                }
+            )
+        visual_qa = {
+            "status": "passed",
+            "page_count": page_count,
+            "pdf_text": {"path": str(text_path), "sha256": sha256_file(text_path)},
+            "rendered_pages": rendered,
+        }
 
     outputs = {"marked_tex": {"path": str(out_tex), "sha256": sha256_file(out_tex)}}
     if args.compile:
@@ -274,6 +336,7 @@ def main() -> None:
         "status": "complete_marked_manuscript" if args.compile else "complete_marked_tex_only",
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "editorial_ready": bool(args.compile),
         "tools": tools,
         "inputs": {
@@ -292,6 +355,7 @@ def main() -> None:
         },
         "outputs": outputs,
         "compile_log": str(compile_log) if compile_log else None,
+        "visual_qa": visual_qa,
     }
     save_json_atomic(manifest_path, payload)
     print(json.dumps(payload, indent=2), flush=True)

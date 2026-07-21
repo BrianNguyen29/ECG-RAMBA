@@ -103,7 +103,10 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                 "status": "complete",
                 "failures": [],
                 "runner_sha256": self.runner_sha("32_paired_external_comparators.py"),
-                "outputs": [self.output_row(self.args.external_table)],
+                "outputs": [
+                    self.output_row(self.args.external_table),
+                    self.output_row(self.args.external_summary),
+                ],
             },
         )
 

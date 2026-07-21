@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -122,6 +123,43 @@ class PTBXLFoldProtocolAuditTests(unittest.TestCase):
             candidate["record_id"][0] = "changed"
             with self.assertRaisesRegex(RuntimeError, "record_id differs"):
                 audit.validate_same_reference(payload, candidate, "changed")
+
+    def test_official_archive_binds_patient_ids_and_fold_assignment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive_path = root / "ptbxl.zip"
+            metadata = (
+                "ecg_id,patient_id,strat_fold\n"
+                "1,101,9\n"
+                "2,202,10\n"
+                "3,303,10\n"
+            )
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr("ptb-xl-a-large-publicly-available-electrocardiography-dataset-1.0.3/ptbxl_database.csv", metadata)
+
+            official, provenance = audit.load_official_ptbxl_metadata(archive_path)
+            self.assertEqual(official["1"], ("101", 9))
+            self.assertEqual(provenance["metadata_rows"], 3)
+            self.assertEqual(len(provenance["archive_sha256"]), 64)
+
+            fold10 = {
+                "record_id": np.asarray(["2.0", "3"]),
+                "group_id": np.asarray(["202", "303.0"]),
+            }
+            audit.validate_against_official_metadata(
+                fold10, official, expected_fold=10, label="fold10"
+            )
+
+            wrong_patient = {**fold10, "group_id": np.asarray(["999", "303"])}
+            with self.assertRaisesRegex(RuntimeError, "patient IDs differ"):
+                audit.validate_against_official_metadata(
+                    wrong_patient, official, expected_fold=10, label="fold10"
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "official strat_fold differs"):
+                audit.validate_against_official_metadata(
+                    fold10, official, expected_fold=9, label="fold9"
+                )
 
     def test_protocol_lock_validation_rejects_unlocked_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:

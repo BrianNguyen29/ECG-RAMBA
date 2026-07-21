@@ -20,6 +20,7 @@ import json
 import time
 import warnings
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import Event, Thread
 import numpy as np
 import pandas as pd
@@ -30,7 +31,8 @@ from torch.utils.data import DataLoader
 from sklearn.model_selection import StratifiedGroupKFold
 
 # Add project root to path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT))
 
 from configs.config import CLASSES, CONFIG, CONFIG_HASH, PATHS, DEVICE
 from src.data_loader import load_chapman_multilabel
@@ -85,6 +87,31 @@ def file_sha256(path: str) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+TRAINING_SOURCE_PATHS = (
+    "scripts/train.py",
+    "src/model.py",
+    "src/features.py",
+    "src/utils.py",
+    "src/aggregation.py",
+    "src/training_data.py",
+    "src/data_loader.py",
+    "configs/config.py",
+)
+
+
+def training_source_bundle() -> dict:
+    files = {
+        relative: file_sha256(str(PROJECT_ROOT / relative))
+        for relative in TRAINING_SOURCE_PATHS
+    }
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "schema_version": 1,
+        "files": files,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def cpu_state_dict(model: torch.nn.Module) -> dict:
@@ -261,6 +288,7 @@ def checkpoint_payload(
         "selection_metrics": selection_metrics,
         "training_seed": int(CONFIG["seeds"][0]) + int(fold),
         "config_hash": CONFIG_HASH,
+        "training_source_bundle": training_source_bundle(),
         "dataset_record_order_fingerprint": dataset_record_order_fingerprint,
         "class_names": list(CLASSES),
         "aggregation": {
@@ -300,7 +328,7 @@ def checkpoint_payload(
             "train_index_hash": index_fingerprint(train_indices),
             "output_dim": int(CONFIG["hydra_dim"]),
         },
-        "checkpoint_contract": "explicit_weights_kind_v2",
+        "checkpoint_contract": "explicit_weights_kind_v3_source_bound",
         "ablation_variant": str(ablation_variant),
         "ablation_spec": dict(ablation_spec or {}),
         "architecture_contract": "ecg_ramba_structured_ablation_v1",
@@ -661,15 +689,19 @@ def main():
                     "feature_contract": payload.get("feature_contract"),
                     "pca_contract": payload.get("pca_contract"),
                     "initialization_contract": payload.get("initialization_contract"),
+                    "training_source_bundle": payload.get("training_source_bundle"),
                 }
                 pca_contract = payload.get("pca_contract") or {}
                 initialization_contract = payload.get("initialization_contract") or {}
                 checkpoint_metadata_valid = (
                     payload.get("config_hash") == CONFIG_HASH
+                    and payload.get("training_source_bundle") == training_source_bundle()
                     and payload.get("dataset_record_order_fingerprint")
                     == split_audit["record_order_fingerprint"]
                     and payload.get("weights_kind") == "ema"
                     and payload.get("selection_rule") == "fixed_final_epoch"
+                    and payload.get("checkpoint_contract")
+                    == "explicit_weights_kind_v3_source_bound"
                     and int(payload.get("epoch", -1)) == int(CONFIG["epochs"])
                     and payload.get("ablation_variant", "full") == ablation_variant
                     and dict(payload.get("ablation_spec", {})) == ablation_spec

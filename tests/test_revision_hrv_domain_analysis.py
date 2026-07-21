@@ -205,6 +205,13 @@ class HRVDomainAnalysisTests(unittest.TestCase):
                 "metrics": {"roc_auc_macro": 0.5, "pr_auc_macro": 0.2, "f1_macro": 0.1},
                 "calibration": {},
                 "bootstrap_ci": {},
+                "bootstrap_contract": {
+                    "method": "percentile_cluster_bootstrap",
+                    "unit": "authenticated_source_patient_record",
+                    "n_groups": 4,
+                    "n_boot": 3,
+                    "group_sidecar_sha256": "1" * 64,
+                },
                 "per_class_rows": [
                     {
                         "class_index": idx,
@@ -234,7 +241,15 @@ class HRVDomainAnalysisTests(unittest.TestCase):
             ):
                 summary = hrv_analysis.write_outputs(
                     args,
-                    {"chapman_records": 4},
+                    {
+                        "chapman_records": 4,
+                        "freeze_contract": {
+                            "oof_predictions_sha256": "2" * 64,
+                            "freeze_manifest_sha256": "3" * 64,
+                            "group_sidecar_sha256": "1" * 64,
+                            "bootstrap_unit": "authenticated_source_patient_record",
+                        },
+                    },
                     baseline,
                     domain_result=None,
                     domain_blocker="missing external HRV",

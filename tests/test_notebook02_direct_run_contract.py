@@ -91,6 +91,15 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
             "require_gpu_inference_runtime('External learned-comparator inference for '",
             self.source,
         )
+        self.assertIn("for dataset in datasets:", self.source)
+        self.assertIn(
+            "Publishing external comparator outputs immediately for dataset=",
+            self.source,
+        )
+        self.assertIn(
+            "external_learned_comparators_{dataset}_mirror_publish.log",
+            self.source,
+        )
 
 
 if __name__ == "__main__":

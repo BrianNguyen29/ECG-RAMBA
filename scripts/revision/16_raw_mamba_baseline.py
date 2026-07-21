@@ -515,6 +515,7 @@ def write_fold_cache_status(
     payload = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "protocol": PROTOCOL,
         "feature_contract": FEATURE_CONTRACT,
         "selected_folds": sorted(int(x) for x in selected_folds),

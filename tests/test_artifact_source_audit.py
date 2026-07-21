@@ -320,11 +320,20 @@ class ArtifactSourceAuditTest(unittest.TestCase):
             / "31_generate_external_comparator_predictions.py"
         ).read_text(encoding="utf-8")
         self.assertIn("CACHE_ONLY_CPU_AGGREGATION_CAPABILITY", comparator_runner)
+        self.assertIn("CPSC_DISK_BACKED_INFERENCE_CAPABILITY", comparator_runner)
         self.assertIn("No CPU model inference was started", comparator_runner)
         self.assertNotIn(
             'if device.type != "cuda" and str(args.device).lower() == "auto":',
             comparator_runner,
         )
+        external_runner = (
+            Path(__file__).resolve().parents[1]
+            / "scripts"
+            / "revision"
+            / "03_generate_external_predictions.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY", external_runner)
+        self.assertIn("np.lib.format.open_memmap", external_runner)
 
     def test_classifies_identical_unique_and_conflicting_files(self):
         with tempfile.TemporaryDirectory() as tmp:

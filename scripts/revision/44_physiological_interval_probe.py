@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import itertools
 import json
 import math
@@ -36,8 +37,8 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-SCHEMA_VERSION = 4
-PROTOCOL = "fold_held_out_measured_physiological_interval_probe_v3"
+SCHEMA_VERSION = 5
+PROTOCOL = "checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4"
 RUNNER_SOURCE_PATH = Path(__file__).resolve()
 TARGET_ALIASES = {
     "heart_rate_bpm": ["heart_rate_bpm", "heart_rate", "hr", "ventricular_rate"],
@@ -69,6 +70,22 @@ TARGET_LABELS = {
     "qtc_ms": "QTc interval",
 }
 ACCEPTED_MEASUREMENT_KINDS = {"measured", "device_measured", "expert_annotated"}
+
+
+def load_revision_module(filename: str, module_name: str):
+    path = PROJECT_ROOT / "scripts" / "revision" / filename
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot import helper module: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+representation_helpers = load_revision_module(
+    "20_representation_probe.py", "_physiological_checkpoint_local_helpers"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -554,11 +571,17 @@ def main() -> None:
     embedding_path = resolve(args.embedding_npz)
     embedding_manifest_path = resolve(args.embedding_manifest)
     with np.load(embedding_path, allow_pickle=False) as data:
-        required = {"record_id", "fold_id"} | {f"{view}_embedding" for view in VIEWS}
+        required = {
+            "record_id",
+            "fold_id",
+            "source_bundle_sha256",
+            "local_fold_cache_index_json",
+        } | {f"{view}_embedding" for view in VIEWS}
         missing = required - set(data.files)
         if missing:
             raise KeyError(f"Embedding artifact missing {sorted(missing)}")
-        record_id = np.asarray(data["record_id"]).astype(str)
+        record_id_numeric = np.asarray(data["record_id"], dtype=np.int64)
+        record_id = record_id_numeric.astype(str)
         fold_id = np.asarray(data["fold_id"], dtype=np.int16)
         embeddings = {
             view: np.asarray(data[f"{view}_embedding"], dtype=np.float32) for view in VIEWS
@@ -573,6 +596,10 @@ def main() -> None:
             if "freeze_manifest_sha256" in data.files
             else ""
         )
+        source_bundle_sha256 = str(data["source_bundle_sha256"].item())
+        local_fold_cache_index = json.loads(
+            str(data["local_fold_cache_index_json"].item())
+        )
     embedding_provenance = validate_embedding_provenance(
         embedding_path=embedding_path,
         manifest_path=embedding_manifest_path,
@@ -581,6 +608,20 @@ def main() -> None:
         embeddings=embeddings,
         source_oof_sha256=source_oof_sha256,
         source_freeze_sha256=source_freeze_sha256,
+    )
+    local_folds = representation_helpers.load_checkpoint_local_folds(
+        {
+            "source_oof_sha256": source_oof_sha256,
+            "source_freeze_sha256": source_freeze_sha256,
+            "source_bundle_sha256": source_bundle_sha256,
+            "local_fold_cache_index": local_fold_cache_index,
+        },
+        {
+            "oof_sha256": source_oof_sha256,
+            "freeze_sha256": source_freeze_sha256,
+            "record_id": record_id_numeric,
+            "fold_id": fold_id,
+        },
     )
 
     if args.metadata_csv is None:
@@ -733,29 +774,42 @@ def main() -> None:
         low, high = PLAUSIBLE_RANGES[target]
         valid = np.isfinite(values) & (values >= low) & (values <= high)
         predictions_by_view = {}
-        for view_index, (view, matrix) in enumerate(embeddings.items()):
+        for view_index, view in enumerate(VIEWS):
             predictions = np.full(len(values), np.nan, dtype=np.float64)
-            for fold in sorted(int(value) for value in np.unique(fold_id)):
-                train = valid & (fold_id != fold)
-                test = valid & (fold_id == fold)
+            for local_fold in local_folds:
+                fold = int(local_fold["fold_id"])
+                train_ids = np.asarray(local_fold["train_record_id"], dtype=np.int64)
+                test_ids = np.asarray(local_fold["validation_record_id"], dtype=np.int64)
+                train_mask = valid[train_ids]
+                test_mask = valid[test_ids]
+                train = train_ids[train_mask]
+                test = test_ids[test_mask]
                 if len(np.unique(values[train])) < 2 or len(np.unique(values[test])) < 2:
                     raise RuntimeError(
                         f"{target}/fold{fold}: measured target lacks train/test variation"
                     )
+                x_train = np.asarray(
+                    local_fold["views"][view]["train"], dtype=np.float32
+                )[train_mask]
+                x_test = np.asarray(
+                    local_fold["views"][view]["validation"], dtype=np.float32
+                )[test_mask]
                 model = make_pipeline(
                     StandardScaler(),
                     Ridge(alpha=args.ridge_alpha, solver="lsqr"),
                 )
-                model.fit(matrix[train], values[train])
-                predictions[test] = model.predict(matrix[test])
+                model.fit(x_train, values[train])
+                predictions[test] = model.predict(x_test)
                 rows.append(
                     {
                         "row_type": "fold",
                         "target": target,
                         "view": view,
                         "fold": fold,
-                        "n_train": int(np.sum(train)),
-                        "n_test": int(np.sum(test)),
+                        "coordinate_system_id": local_fold["coordinate_system_id"],
+                        "checkpoint_sha256": local_fold["checkpoint_sha256"],
+                        "n_train": int(len(train)),
+                        "n_test": int(len(test)),
                         "mae": float(mean_absolute_error(values[test], predictions[test])),
                         "r2": float(r2_score(values[test], predictions[test])),
                         "spearman": safe_spearman(values[test], predictions[test]),
@@ -877,7 +931,16 @@ def main() -> None:
             "model": "ridge regression",
             "alpha": args.ridge_alpha,
             "standardization": "training folds only",
-            "evaluation": "five fold-held-out predictions",
+            "evaluation": "five checkpoint-local train-to-validation fold predictions",
+            "coordinate_design": representation_helpers.LOCAL_COORDINATE_PROTOCOL,
+            "coordinate_systems": [
+                {
+                    "fold": int(local_fold["fold_id"]),
+                    "coordinate_system_id": local_fold["coordinate_system_id"],
+                    "checkpoint_sha256": local_fold["checkpoint_sha256"],
+                }
+                for local_fold in local_folds
+            ],
             "uncertainty": "record bootstrap over aggregate held-out predictions",
             "view_contrasts": (
                 "all six pre-specified view pairs; positive paired deltas favor view_a"

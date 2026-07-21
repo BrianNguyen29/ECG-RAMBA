@@ -131,6 +131,88 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual(counts["normal_intervals"], 2)
         self.assertEqual(external.interval_overlap(intervals, 300, 500, "normal"), 200)
 
+    def test_cpsc_disk_backed_loader_avoids_full_signal_ram_accumulation(self):
+        record = SimpleNamespace(
+            p_signal=np.zeros((5000, 12), dtype=np.float32),
+            d_signal=None,
+            sig_name=list(external.STANDARD_LEADS),
+            fs=500.0,
+        )
+        metadata = [{"record_id": "cpsc-1", "record_path": Path("cpsc-1")}]
+        intervals = [(0, 5000, "normal")]
+        interval_counts = {
+            "recognized_intervals": 1,
+            "af_intervals": 0,
+            "normal_intervals": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            memmap_path = Path(tmp) / "cpsc_windows.npy"
+            with (
+                patch.object(
+                    external,
+                    "cpsc_metadata",
+                    return_value=(metadata, {"label_protocol": "test"}),
+                ),
+                patch.object(external, "cpsc_window_capacity", return_value=2),
+                patch.object(external.wfdb, "rdrecord", return_value=record),
+                patch.object(
+                    external,
+                    "cpsc_rhythm_intervals",
+                    return_value=(intervals, interval_counts),
+                ),
+                patch.object(external, "bandpass_filter", side_effect=lambda value, fs: value),
+                patch.object(external, "normalize_signal", side_effect=lambda value: value),
+            ):
+                signals, labels, record_ids, group_ids, split_ids, summary = (
+                    external.load_cpsc_windows(
+                        Path(tmp),
+                        limit=0,
+                        signal_memmap_path=memmap_path,
+                    )
+                )
+
+            self.assertIsInstance(signals, np.memmap)
+            self.assertEqual(signals.dtype, np.float32)
+            self.assertEqual(signals.shape, (1, 12, 5000))
+            np.testing.assert_array_equal(labels, [[0.0]])
+            np.testing.assert_array_equal(record_ids, ["cpsc-1:0:5000"])
+            np.testing.assert_array_equal(group_ids, ["cpsc-1"])
+            np.testing.assert_array_equal(split_ids, ["cpsc2021_external_pool"])
+            self.assertEqual(
+                summary["signal_storage"],
+                "disk_backed_float32_npy_source_bound_resumable",
+            )
+            self.assertTrue(memmap_path.exists())
+            self.assertTrue((Path(tmp) / "cpsc_windows.npy.contract.npz").exists())
+            self.assertFalse((Path(tmp) / ".cpsc_windows.npy.partial.npy").exists())
+            self.assertFalse((Path(tmp) / ".cpsc_windows.npy.progress.json").exists())
+            mmap_owner = getattr(signals, "_mmap", None)
+            if mmap_owner is not None:
+                mmap_owner.close()
+            del signals
+
+            with (
+                patch.object(
+                    external,
+                    "cpsc_metadata",
+                    return_value=(metadata, {"label_protocol": "test"}),
+                ),
+                patch.object(
+                    external.wfdb,
+                    "rdrecord",
+                    side_effect=AssertionError("completed CPSC cache should avoid signal loading"),
+                ),
+            ):
+                reused = external.load_cpsc_windows(
+                    Path(tmp),
+                    limit=0,
+                    signal_memmap_path=memmap_path,
+                )
+            self.assertEqual(reused[0].shape, (1, 12, 5000))
+            reused_owner = getattr(reused[0], "_mmap", None)
+            if reused_owner is not None:
+                reused_owner.close()
+
     def test_georgia_skips_records_without_mapped_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

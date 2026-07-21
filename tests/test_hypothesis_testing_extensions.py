@@ -680,6 +680,48 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            source_bundle_sha256 = "synthetic-source-bundle-sha"
+            local_fold_cache_index = []
+            for fold in range(1, 6):
+                train_ids = np.flatnonzero(fold_id != fold).astype(np.int64)
+                validation_ids = np.flatnonzero(fold_id == fold).astype(np.int64)
+                checkpoint_sha256 = f"synthetic-checkpoint-fold-{fold}"
+                train_index_sha256 = probe.array_sha256(train_ids, np.int64)
+                validation_index_sha256 = probe.array_sha256(validation_ids, np.int64)
+                cache_path = root / f"representation_fold{fold}.npz"
+                cache_payload = {
+                    "fold": np.asarray(fold, dtype=np.int16),
+                    "coordinate_protocol": np.asarray(
+                        probe.representation_helpers.LOCAL_COORDINATE_PROTOCOL
+                    ),
+                    "local_coordinate_schema_version": np.asarray(
+                        probe.representation_helpers.LOCAL_COORDINATE_SCHEMA_VERSION,
+                        dtype=np.int16,
+                    ),
+                    "checkpoint_sha256": np.asarray(checkpoint_sha256),
+                    "oof_predictions_sha256": np.asarray("oof-sha"),
+                    "freeze_manifest_sha256": np.asarray("freeze-sha"),
+                    "source_bundle_sha256": np.asarray(source_bundle_sha256),
+                    "train_record_id": train_ids,
+                    "validation_record_id": validation_ids,
+                    "train_index_sha256": np.asarray(train_index_sha256),
+                    "validation_index_sha256": np.asarray(validation_index_sha256),
+                }
+                for view, values in embeddings.items():
+                    cache_payload[f"train_{view}_embedding"] = values[train_ids]
+                    cache_payload[f"validation_{view}_embedding"] = values[validation_ids]
+                np.savez_compressed(cache_path, **cache_payload)
+                local_fold_cache_index.append(
+                    {
+                        "fold": fold,
+                        "path": str(cache_path),
+                        "sha256": probe.sha256_file(cache_path),
+                        "checkpoint_sha256": checkpoint_sha256,
+                        "coordinate_system_id": f"fold{fold}:{checkpoint_sha256}",
+                        "train_index_sha256": train_index_sha256,
+                        "validation_index_sha256": validation_index_sha256,
+                    }
+                )
             embedding_path = root / "embedding.npz"
             np.savez_compressed(
                 embedding_path,
@@ -687,6 +729,10 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
                 fold_id=fold_id,
                 oof_predictions_sha256=np.asarray("oof-sha"),
                 freeze_manifest_sha256=np.asarray("freeze-sha"),
+                source_bundle_sha256=np.asarray(source_bundle_sha256),
+                local_fold_cache_index_json=np.asarray(
+                    json.dumps(local_fold_cache_index, sort_keys=True)
+                ),
                 **{f"{view}_embedding": values for view, values in embeddings.items()},
             )
             manifest_path = root / "manifest.json"
@@ -753,6 +799,48 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            source_bundle_sha256 = "synthetic-source-bundle-sha"
+            local_fold_cache_index = []
+            for fold in range(1, 6):
+                train_ids = np.flatnonzero(fold_id != fold).astype(np.int64)
+                validation_ids = np.flatnonzero(fold_id == fold).astype(np.int64)
+                checkpoint_sha256 = f"synthetic-checkpoint-fold-{fold}"
+                train_index_sha256 = probe.array_sha256(train_ids, np.int64)
+                validation_index_sha256 = probe.array_sha256(validation_ids, np.int64)
+                cache_path = root / f"representation_fold{fold}.npz"
+                cache_payload = {
+                    "fold": np.asarray(fold, dtype=np.int16),
+                    "coordinate_protocol": np.asarray(
+                        probe.representation_helpers.LOCAL_COORDINATE_PROTOCOL
+                    ),
+                    "local_coordinate_schema_version": np.asarray(
+                        probe.representation_helpers.LOCAL_COORDINATE_SCHEMA_VERSION,
+                        dtype=np.int16,
+                    ),
+                    "checkpoint_sha256": np.asarray(checkpoint_sha256),
+                    "oof_predictions_sha256": np.asarray("oof-sha"),
+                    "freeze_manifest_sha256": np.asarray("freeze-sha"),
+                    "source_bundle_sha256": np.asarray(source_bundle_sha256),
+                    "train_record_id": train_ids,
+                    "validation_record_id": validation_ids,
+                    "train_index_sha256": np.asarray(train_index_sha256),
+                    "validation_index_sha256": np.asarray(validation_index_sha256),
+                }
+                for view, values in embeddings.items():
+                    cache_payload[f"train_{view}_embedding"] = values[train_ids]
+                    cache_payload[f"validation_{view}_embedding"] = values[validation_ids]
+                np.savez_compressed(cache_path, **cache_payload)
+                local_fold_cache_index.append(
+                    {
+                        "fold": fold,
+                        "path": str(cache_path),
+                        "sha256": probe.sha256_file(cache_path),
+                        "checkpoint_sha256": checkpoint_sha256,
+                        "coordinate_system_id": f"fold{fold}:{checkpoint_sha256}",
+                        "train_index_sha256": train_index_sha256,
+                        "validation_index_sha256": validation_index_sha256,
+                    }
+                )
             embedding_path = root / "embedding.npz"
             np.savez_compressed(
                 embedding_path,
@@ -760,6 +848,10 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
                 fold_id=fold_id,
                 oof_predictions_sha256=np.asarray("oof-sha"),
                 freeze_manifest_sha256=np.asarray("freeze-sha"),
+                source_bundle_sha256=np.asarray(source_bundle_sha256),
+                local_fold_cache_index_json=np.asarray(
+                    json.dumps(local_fold_cache_index, sort_keys=True)
+                ),
                 **{f"{view}_embedding": values for view, values in embeddings.items()},
             )
             embedding_manifest = root / "embedding_manifest.json"

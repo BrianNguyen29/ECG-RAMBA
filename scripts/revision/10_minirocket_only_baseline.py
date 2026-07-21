@@ -1068,6 +1068,7 @@ def main() -> None:
     summary = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "baseline_name": BASELINE_DISPLAY_NAME,
@@ -1106,6 +1107,7 @@ def main() -> None:
     manifest = {
         "created_utc": _now_utc(),
         "git_commit": _git_output(["rev-parse", "HEAD"]),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "protocol": PROTOCOL,
         "baseline_name": BASELINE_DISPLAY_NAME,
         "feature_contract": FEATURE_CONTRACT,

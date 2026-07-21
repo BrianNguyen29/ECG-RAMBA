@@ -50,7 +50,8 @@ from src.aggregation import aggregate_record_probabilities  # noqa: E402
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
 NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"
 NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1
-GATE_SCHEMA_VERSION = 6
+GATE_SCHEMA_VERSION = 7
+GATE_RUNNER_PATH = Path(__file__).resolve()
 METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
 AGGREGATION_IMPLEMENTATION_PATH = PROJECT_ROOT / "src" / "aggregation.py"
 EXPECTED_EXTERNAL_PROTOCOLS = {
@@ -207,6 +208,11 @@ def gate_cache_key(
         "external_root": project_relative(args.external_root),
         "oof_run_manifest": artifact(args.oof_run_manifest),
         "source_artifacts": {name: artifact(path) for name, path in sorted(required_paths.items())},
+        "implementation_sha256": {
+            "gate_runner": sha256_file(GATE_RUNNER_PATH),
+            "metric_helper": sha256_file(METRIC_IMPLEMENTATION_PATH),
+            "aggregation": sha256_file(AGGREGATION_IMPLEMENTATION_PATH),
+        },
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -861,6 +867,7 @@ def validate_dataset(
         "dataset": dataset,
         "created_utc": created_utc,
         "git_commit": git_commit(),
+        "runner_sha256": sha256_file(GATE_RUNNER_PATH),
         "gate_schema_version": GATE_SCHEMA_VERSION,
         "gate_cache_key": cache_key,
         "reused_existing": False,
@@ -933,6 +940,7 @@ def validate_dataset(
             "dataset": dataset,
             "created_utc": created_utc,
             "git_commit": payload["git_commit"],
+            "runner_sha256": payload["runner_sha256"],
             "gate_schema_version": GATE_SCHEMA_VERSION,
             "gate_cache_key": cache_key,
             "status": status,

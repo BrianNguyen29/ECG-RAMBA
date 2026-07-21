@@ -908,6 +908,7 @@ def main() -> None:
     summary = {
         "created_utc": now_utc(),
         "git_commit": git_output(["rev-parse", "HEAD"]),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "dataset": "chapman_oof",
         "protocol": PROTOCOL,
         "feature_contract": FEATURE_CONTRACT,

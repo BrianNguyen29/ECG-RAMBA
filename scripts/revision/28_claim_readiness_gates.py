@@ -39,7 +39,7 @@ from scripts.revision.common import (  # noqa: E402
 )
 
 
-ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v1"
+ROBUSTNESS_PROTOCOL = "robustness_multicomparator_aggregation_v2_source_bound"
 ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
 ROBUSTNESS_BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
@@ -1105,6 +1105,28 @@ def main() -> None:
     )
     if marked_payload and marked_payload.get("editorial_ready") is not True:
         marked_contract_issues.append("manifest.editorial_ready!=true")
+    if marked_payload:
+        marked_runner = PROJECT_ROOT / "scripts" / "revision" / "36_build_marked_manuscript.py"
+        if marked_payload.get("runner_sha256") != sha256_file(marked_runner):
+            marked_contract_issues.append("manifest.runner_sha256_mismatch=36_build_marked_manuscript.py")
+        for role in ("original", "revised"):
+            declared = (marked_payload.get("inputs") or {}).get(role) or {}
+            source_path = Path(str(declared.get("path") or ""))
+            if not source_path.is_absolute():
+                source_path = (PROJECT_ROOT / source_path).resolve()
+            if not source_path.is_file() or source_path.stat().st_size == 0:
+                marked_contract_issues.append(f"manifest.input_missing={role}")
+            elif declared.get("sha256") != sha256_file(source_path):
+                marked_contract_issues.append(f"manifest.input_sha256_mismatch={role}")
+        for role in ("marked_tex", "marked_pdf"):
+            declared = (marked_payload.get("outputs") or {}).get(role) or {}
+            output_path = Path(str(declared.get("path") or ""))
+            if not output_path.is_absolute():
+                output_path = (PROJECT_ROOT / output_path).resolve()
+            if not output_path.is_file() or output_path.stat().st_size == 0:
+                marked_contract_issues.append(f"manifest.output_missing={role}")
+            elif declared.get("sha256") != sha256_file(output_path):
+                marked_contract_issues.append(f"manifest.output_sha256_mismatch={role}")
     marked_status, marked_missing = complete_if_valid(
         required=marked_manuscript_required,
         complete_status="complete_marked_manuscript_pdf",

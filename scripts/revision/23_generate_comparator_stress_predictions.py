@@ -9,6 +9,7 @@ match the contract consumed by ``21_robustness_multicomparator.py``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import sys
@@ -37,7 +38,8 @@ from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabil
 from src.training_data import build_slice_index  # noqa: E402
 
 
-PROTOCOL = "comparator_stress_predictions_v1_same_folds_power_mean_v2_q3"
+PROTOCOL = "comparator_stress_predictions_v2_source_bound_same_folds_power_mean_v2_q3"
+SOURCE_BUNDLE_SCHEMA_VERSION = 1
 DEFAULT_OOF = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 DEFAULT_RESNET_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints"
@@ -57,6 +59,32 @@ BASELINE_CHECKPOINT_CONTRACTS = {
         "transformer_ecg_raw_same_folds_power_mean_v2_q3_threshold_0.5",
     ),
 }
+
+SOURCE_BUNDLE_PATHS = (
+    "scripts/revision/23_generate_comparator_stress_predictions.py",
+    "scripts/revision/12_robustness_stress.py",
+    "scripts/revision/14_resnet1d_cnn_baseline.py",
+    "scripts/revision/16_raw_mamba_baseline.py",
+    "scripts/revision/24_transformer_ecg_baseline.py",
+    "src/aggregation.py",
+    "src/training_data.py",
+    "configs/config.py",
+)
+
+
+def source_bundle_contract() -> dict[str, Any]:
+    files: dict[str, str] = {}
+    for relative in SOURCE_BUNDLE_PATHS:
+        path = PROJECT_ROOT / relative
+        if not path.is_file() or path.stat().st_size == 0:
+            raise FileNotFoundError(f"Missing comparator-stress source dependency: {path}")
+        files[relative] = sha256_file(path)
+    encoded = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "schema_version": SOURCE_BUNDLE_SCHEMA_VERSION,
+        "files": files,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -221,6 +249,7 @@ def validate_existing(
     stress_spec: dict[str, Any],
     freeze_contract: dict[str, Any],
     checkpoint_hashes: list[str],
+    source_bundle_sha256: str,
     raw_cache_sha256: str | None = None,
 ) -> bool:
     if not path.exists() or path.stat().st_size == 0:
@@ -256,6 +285,9 @@ def validate_existing(
                     np.asarray(data["checkpoint_sha256"]).astype(str),
                     np.asarray(checkpoint_hashes).astype(str),
                 )
+                and str(scalar(data, "source_bundle_sha256")) == source_bundle_sha256
+                and str(scalar(data, "producer_runner_sha256"))
+                == source_bundle_contract()["files"]["scripts/revision/23_generate_comparator_stress_predictions.py"]
                 and (
                     raw_cache_sha256 is None
                     or str(scalar(data, "raw_cache_sha256")) == raw_cache_sha256
@@ -416,6 +448,7 @@ def write_stress_npz(
     checkpoint_hashes: list[str],
     raw_cache_info: dict[str, Any],
     freeze_contract: dict[str, Any],
+    source_bundle: dict[str, Any],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     save_npz_compressed_atomic(
@@ -437,6 +470,12 @@ def write_stress_npz(
         checkpoint_paths=np.asarray([project_relative(path) for path in checkpoint_paths]),
         checkpoint_sha256=np.asarray(checkpoint_hashes),
         raw_cache_sha256=np.asarray(raw_cache_info.get("raw_cache_sha256", "")),
+        source_bundle_schema_version=np.asarray(int(source_bundle["schema_version"])),
+        source_bundle_sha256=np.asarray(str(source_bundle["sha256"])),
+        source_bundle_json=np.asarray(json.dumps(source_bundle, sort_keys=True)),
+        producer_runner_sha256=np.asarray(
+            str(source_bundle["files"]["scripts/revision/23_generate_comparator_stress_predictions.py"])
+        ),
         freeze_manifest_sha256=np.asarray(freeze_contract.get("freeze_manifest_sha256", "")),
         oof_predictions_sha256=np.asarray(freeze_contract.get("oof_predictions_sha256", "")),
         created_utc=np.asarray(datetime.now(timezone.utc).isoformat()),
@@ -452,6 +491,7 @@ def main() -> None:
     device = torch.device("cpu") if args.finalize_manifest_only else select_device(args.device)
     comparators = parse_list(args.comparators)
     stresses = robust_helpers.stress_specs(parse_list(args.stress_tests), int(args.seed))
+    source_bundle = source_bundle_contract()
     unknown = sorted(set(comparators) - {"resnet", "raw_mamba", "transformer"})
     if unknown:
         raise ValueError(f"Unsupported comparators for this runner: {unknown}")
@@ -506,6 +546,7 @@ def main() -> None:
                     stress_spec=spec,
                     freeze_contract=freeze_contract,
                     checkpoint_hashes=contract["sha256"],
+                    source_bundle_sha256=str(source_bundle["sha256"]),
                 ):
                     missing.append(f"{comparator}/{stress} missing or stale prediction: {out}")
                     continue
@@ -530,6 +571,7 @@ def main() -> None:
             "finalize_manifest_only": True,
             "canonical_contract": freeze_contract,
             "runner_sha256": sha256_file(Path(__file__).resolve()),
+            "source_bundle": source_bundle,
             "requires_saved_comparator_checkpoints": True,
         }
         save_json(resolve(args.out_manifest), payload)
@@ -566,6 +608,7 @@ def main() -> None:
                 stress_spec=spec,
                 freeze_contract=freeze_contract,
                 checkpoint_hashes=contract["sha256"],
+                source_bundle_sha256=str(source_bundle["sha256"]),
                 raw_cache_sha256=str(raw_cache_info.get("raw_cache_sha256") or ""),
             ):
                 print(f"Reusing existing {comparator}/{stress}: {out}", flush=True)
@@ -625,6 +668,7 @@ def main() -> None:
                 checkpoint_hashes=contract["sha256"],
                 raw_cache_info=raw_cache_info,
                 freeze_contract=freeze_contract,
+                source_bundle=source_bundle,
             )
             print(f"Wrote {comparator}/{stress}: {out}", flush=True)
             artifacts.append({"comparator": comparator, "stress": stress, "path": project_relative(out), "sha256": sha256_file(out), "reused": False})
@@ -640,6 +684,7 @@ def main() -> None:
         "device": str(device),
         "canonical_contract": freeze_contract,
         "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "source_bundle": source_bundle,
         "requires_saved_comparator_checkpoints": True,
     }
     save_json(resolve(args.out_manifest), payload)

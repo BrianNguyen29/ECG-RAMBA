@@ -64,6 +64,7 @@ REVISION_TOKEN_REQUIREMENTS = {
     ],
     'scripts/revision/01_generate_predictions.py': [
         '--fold-cache-dir',
+        '--require-frozen-folds',
         'OOF_CACHE_PROVENANCE_SCHEMA_VERSION',
         'cache_contract_sha256',
     ],
@@ -71,6 +72,7 @@ REVISION_TOKEN_REQUIREMENTS = {
         '--georgia-mapping-review',
         '--georgia-code-inventory-out',
         '--cpsc-annotation-audit-out',
+        'CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY',
         'validate_checkpoint_files_against_oof_run_manifest',
     ],
     'scripts/revision/06_freeze_oof.py': [
@@ -92,7 +94,9 @@ REVISION_TOKEN_REQUIREMENTS = {
         'validate_checkpoint_set',
         '--fold-cache-dir',
         'CACHE_ONLY_CPU_AGGREGATION_CAPABILITY',
-        'No CPU model inference was started',
+        'CPSC_DISK_BACKED_INFERENCE_CAPABILITY',
+        'DATASET_CONTRACT_SCHEMA_VERSION',
+        'skipping archive extraction and signal loading',
     ],
     'scripts/revision/32_paired_external_comparators.py': [
         'Paired external bootstrap requires at least two groups',
@@ -136,6 +140,8 @@ REVISION_TOKEN_REQUIREMENTS = {
         'PTBXL_FOLD_PROTOCOL_AUDIT_CAPABILITY',
         'patient-group percentile bootstrap',
         'sensitivity_exclude_unsupported_only',
+        'ptbxl_database.csv',
+        'official_metadata_member_sha256',
     ],
 }
 REVISION_REQUIRED_FILES = [
@@ -459,15 +465,21 @@ def _pin_forensic_code_authority():
     import uuid as _authority_uuid
     from datetime import datetime as _authority_datetime, timezone as _authority_timezone
     from pathlib import Path as _AuthorityPath
+    from scripts.revision.artifact_mirror import PublishLock as _AuthorityPublishLock
 
     manifest_path = _AuthorityPath(MIRROR_REVISION_ROOT) / 'manifests' / 'notebook_code_authority.json'
     requested_commit = _authority_os.environ.get('ECG_RAMBA_AUTHORITY_COMMIT', '').strip().lower()
     reset_requested = _authority_os.environ.get('ECG_RAMBA_RESET_CODE_AUTHORITY', '0') == '1'
-    rotate_to_branch_head = (
-        _AUTHORITY_BOOTSTRAP_ALLOWED
-        and _authority_os.environ.get('ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD', '1') == '1'
-        and not reset_requested
+    legacy_rotate_requested = (
+        _authority_os.environ.get('ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD', '0') == '1'
     )
+    if legacy_rotate_requested:
+        raise RuntimeError(
+            'Implicit authority rotation to a moving branch head is disabled. '
+            'Set ECG_RAMBA_RESET_CODE_AUTHORITY=1 together with an explicit full '
+            'ECG_RAMBA_AUTHORITY_COMMIT in Notebook 00.'
+        )
+    rotate_to_branch_head = False
     commit_pattern = _authority_re.compile(r'[0-9a-f]{{40}}')
 
     def git(*args, check=True):
@@ -488,11 +500,6 @@ def _pin_forensic_code_authority():
             )
         return result
 
-    if rotate_to_branch_head:
-        requested_commit = git('rev-parse', 'HEAD').stdout.strip().lower()
-        reset_requested = True
-        print('Notebook 00 authority rotation target:', requested_commit)
-
     if reset_requested and not _AUTHORITY_BOOTSTRAP_ALLOWED:
         raise RuntimeError(
             'Only Notebook 00 may rotate the canonical code authority. '
@@ -505,8 +512,13 @@ def _pin_forensic_code_authority():
         )
 
     manifest = None
-    if manifest_path.is_file() and not reset_requested:
-        manifest = _authority_json.loads(manifest_path.read_text(encoding='utf-8'))
+    with _AuthorityPublishLock(
+        _AuthorityPath(MIRROR_REVISION_ROOT),
+        run_id='authority-read-' + _authority_uuid.uuid4().hex,
+    ):
+        if manifest_path.is_file() and not reset_requested:
+            manifest = _authority_json.loads(manifest_path.read_text(encoding='utf-8'))
+    if manifest is not None:
         if manifest.get('capability') != 'canonical_git_commit_pin_v1':
             raise RuntimeError('Canonical code-authority manifest capability is invalid.')
         if int(manifest.get('schema_version', 0)) != 1:
@@ -562,20 +574,29 @@ def _pin_forensic_code_authority():
             'established_utc': _authority_datetime.now(_authority_timezone.utc).isoformat(),
             'established_by': '00_colab_bootstrap.ipynb',
             'selection': (
-                'fetched_branch_head_at_notebook00_rotation'
-                if rotate_to_branch_head
-                else ('explicit_environment_sha' if requested_commit else 'fetched_branch_head_at_initial_bootstrap')
+                'explicit_environment_sha'
+                if requested_commit
+                else 'fetched_branch_head_at_initial_bootstrap'
             ),
         }}
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = manifest_path.with_name(
-            manifest_path.name + '.partial.' + _authority_uuid.uuid4().hex
-        )
-        with temporary.open('w', encoding='utf-8') as handle:
-            handle.write(_authority_json.dumps(manifest, indent=2, sort_keys=True) + '\\n')
-            handle.flush()
-            _authority_os.fsync(handle.fileno())
-        _authority_os.replace(temporary, manifest_path)
+        with _AuthorityPublishLock(
+            _AuthorityPath(MIRROR_REVISION_ROOT),
+            run_id='authority-write-' + _authority_uuid.uuid4().hex,
+        ):
+            if manifest_path.is_file() and not reset_requested:
+                concurrent = _authority_json.loads(manifest_path.read_text(encoding='utf-8'))
+                if concurrent != manifest:
+                    raise RuntimeError('A concurrent runtime established a different code authority.')
+            else:
+                manifest_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = manifest_path.with_name(
+                    manifest_path.name + '.partial.' + _authority_uuid.uuid4().hex
+                )
+                with temporary.open('w', encoding='utf-8') as handle:
+                    handle.write(_authority_json.dumps(manifest, indent=2, sort_keys=True) + '\\n')
+                    handle.flush()
+                    _authority_os.fsync(handle.fileno())
+                _authority_os.replace(temporary, manifest_path)
         print('Established canonical code authority:', manifest_path)
 
     _authority_os.environ['ECG_RAMBA_AUTHORITY_COMMIT'] = expected_commit
@@ -1002,6 +1023,19 @@ else:
     print('Successful external exports were published with exact source-path selection; no broad mirror overwrite is needed.')"""
             if broad_final_publish in text:
                 text = text.replace(broad_final_publish, selected_final_publish, 1)
+            cpsc_command = "        command += f' --cpsc-annotation-audit-out \"{CPSC_ANNOTATION_AUDIT_OUT}\"'"
+            cpsc_resumable_command = (
+                "        cpsc_signal_cache = stable_mirror / 'predictions' / 'external_comparator_folds' / "
+                "'cpsc2021_preprocessed_windows_source_bound_v2.npy'\n"
+                "        command += (\n"
+                "            f' --cpsc-annotation-audit-out \"{CPSC_ANNOTATION_AUDIT_OUT}\"'\n"
+                "            f' --cpsc-signal-memmap \"{cpsc_signal_cache}\"'\n"
+                "        )"
+            )
+            if "cpsc2021_preprocessed_windows_source_bound_v2.npy" not in text:
+                if cpsc_command not in text:
+                    raise RuntimeError("Notebook 02 CPSC resumable-cache command anchor missing")
+                text = text.replace(cpsc_command, cpsc_resumable_command, 1)
         if "pending_external_comparator_test = test_should_run and not test_ready" in text:
             cache_aggregation_marker = (
                 "A CPU runtime may rebuild aggregate artifacts from complete caches"
@@ -1260,6 +1294,57 @@ print('Exact current paired models:', sorted(paired_refresh_complete_models))
         "learned_in_domain_ready = learned_in_domain_files_ready and resnet_checkpoint_contract_ready and raw_mamba_checkpoint_contract_ready",
         "learned_in_domain_ready = (learned_in_domain_files_ready and resnet_checkpoint_contract_ready and raw_mamba_checkpoint_contract_ready and {'resnet', 'raw_mamba'}.issubset(paired_refresh_complete_models))",
     )
+    if "Publishing external comparator outputs immediately for dataset=" not in comparator_text:
+        combined_test_block = r'''if test_should_run:
+    run(
+        base + ' ' + ' '.join(f'--dataset {dataset}' for dataset in datasets),
+        log_path='reports/revision/logs/external_learned_comparators_test.log',
+    )
+    run(
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size --mirror-root "{DRIVE_ROOT / "revision_artifacts" / "reports" / "revision"}"',
+        log_path='reports/revision/logs/external_learned_comparators_test_mirror_publish.log',
+    )
+else:
+    print('Reusing test-split external learned-comparator predictions.' if test_ready else 'Test-split external learned-comparator inference deferred; artifacts are not yet reusable.')'''
+        per_dataset_test_block = r'''if test_should_run:
+    for dataset in datasets:
+        dataset_outputs = [
+            path for model in comparator_models
+            for path in _comparator_artifacts(dataset, model)
+        ]
+        print(f'Running external learned comparators independently for dataset={dataset}')
+        run(
+            base + f' --dataset {dataset}',
+            log_path=f'reports/revision/logs/external_learned_comparators_{dataset}.log',
+        )
+        missing_dataset_outputs = [
+            path for path in dataset_outputs
+            if not path.exists() or path.stat().st_size == 0
+        ]
+        if missing_dataset_outputs:
+            raise FileNotFoundError(
+                f'External comparator runner returned without complete dataset={dataset} outputs: '
+                + '; '.join(str(path) for path in missing_dataset_outputs)
+            )
+        dataset_publish_args = ' '.join(
+            f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+            for path in dataset_outputs
+        )
+        print(f'Publishing external comparator outputs immediately for dataset={dataset}')
+        run(
+            f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+            f'--source-conflict-policy source {dataset_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
+            log_path=f'reports/revision/logs/external_learned_comparators_{dataset}_mirror_publish.log',
+        )
+else:
+    print('Reusing test-split external learned-comparator predictions.' if test_ready else 'Test-split external learned-comparator inference deferred; artifacts are not yet reusable.')'''
+        if combined_test_block not in comparator_text:
+            raise RuntimeError("Notebook 02 combined external-comparator invocation anchor missing")
+        comparator_text = comparator_text.replace(
+            combined_test_block,
+            per_dataset_test_block,
+            1,
+        )
     set_source(comparator_cell, comparator_text)
 
     audit_marker = "PTBXL_FOLD_PROTOCOL_AUDIT_CELL_V1"
@@ -1296,7 +1381,12 @@ ptbxl_protocol_inputs = [
         else [_comparator_artifacts('ptbxl', model)[0], _comparator_artifacts('ptbxl', model, 'fold9')[0]]
     )
 ]
-ptbxl_protocol_inputs_ready = all(path.exists() and path.stat().st_size > 0 for path in ptbxl_protocol_inputs)
+PTBXL_PROTOCOL_ARCHIVE = Path(external_archives.get('ptbxl', ''))
+ptbxl_protocol_inputs_ready = (
+    PTBXL_PROTOCOL_ARCHIVE.is_file()
+    and PTBXL_PROTOCOL_ARCHIVE.stat().st_size > 0
+    and all(path.exists() and path.stat().st_size > 0 for path in ptbxl_protocol_inputs)
+)
 ptbxl_protocol_should_run = RUN_PTBXL_FOLD_PROTOCOL_AUDIT is True or (
     str(RUN_PTBXL_FOLD_PROTOCOL_AUDIT).lower() == 'auto' and ptbxl_protocol_inputs_ready
 )
@@ -1307,7 +1397,8 @@ if ptbxl_protocol_should_run:
         'python -u scripts/revision/52_ptbxl_fold_protocol_audit.py '
         '--models full,resnet,raw_mamba,transformer --threshold 0.5 --n-bins 15 '
         f'--n-boot {PTBXL_FOLD_PROTOCOL_N_BOOT} --strict --reuse-existing '
-        f'--analysis-lock "{PTBXL_ADAPTATION_LOCK}" --metric-cache-dir "{PTBXL_FOLD_PROTOCOL_CACHE}"',
+        f'--analysis-lock "{PTBXL_ADAPTATION_LOCK}" --ptbxl-archive "{PTBXL_PROTOCOL_ARCHIVE}" '
+        f'--metric-cache-dir "{PTBXL_FOLD_PROTOCOL_CACHE}"',
         log_path='reports/revision/logs/ptbxl_fold_protocol_audit.log',
     )
     audit_publish_args = ' '.join(
@@ -1564,6 +1655,102 @@ def integrate_remaining_run_history() -> None:
         save(name, notebook)
 
 
+def integrate_notebook04_paired_reuse_contract() -> None:
+    """Reject paired artifacts produced by legacy pseudo-significance runners."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    target = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "def paired_output_artifacts_current_04" in source(cell)
+        ),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("Notebook 04 paired reuse helper cell not found")
+    text = source(target)
+    start = text.find("def paired_output_artifacts_current_04")
+    end = text.find("def canonical_file_sha256_04", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("Notebook 04 paired reuse helper boundaries not found")
+    replacement = '''def paired_output_artifacts_current_04(json_path, table_path, samples_path, manifest_path):
+    output_paths = {
+        'json': Path(json_path),
+        'table': Path(table_path),
+        'bootstrap_samples': Path(samples_path),
+    }
+    manifest_path = Path(manifest_path)
+    missing = [
+        str(path) for path in [*output_paths.values(), manifest_path]
+        if not path.exists() or path.stat().st_size == 0
+    ]
+    if missing:
+        return False, 'paired output artifact missing or empty: ' + ', '.join(missing)
+    runner_by_json = {
+        'paired_full_vs_minirocket_comparison.json': '11_paired_full_vs_minirocket.py',
+        'paired_full_vs_resnet_comparison.json': '15_paired_full_vs_resnet.py',
+        'paired_full_vs_raw_mamba_comparison.json': '17_paired_full_vs_raw_mamba.py',
+        'paired_full_vs_transformer_comparison.json': '25_paired_full_vs_transformer.py',
+        'paired_full_vs_hybrid_morphology_comparison.json': '27_paired_full_vs_hybrid_morphology.py',
+    }
+    try:
+        payload = json.loads(output_paths['json'].read_text(encoding='utf-8'))
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        declared = manifest.get('artifact_sha256') or {}
+        current = {name: sha256_file(path) for name, path in output_paths.items()}
+    except Exception as exc:
+        return False, f'could not validate paired output manifest: {exc!r}'
+    mismatched = [name for name, digest in current.items() if declared.get(name) != digest]
+    if mismatched:
+        return False, 'paired output SHA mismatch for: ' + ', '.join(mismatched)
+    runner_name = runner_by_json.get(output_paths['json'].name)
+    if runner_name is None:
+        return False, 'paired output has no registered current runner contract'
+    runner_path = Path('scripts/revision') / runner_name
+    expected_runner_sha = sha256_file(runner_path)
+    if manifest.get('runner_sha256') != expected_runner_sha:
+        return False, f'paired manifest runner SHA is stale for {runner_name}'
+    if payload.get('runner_sha256') != expected_runner_sha:
+        return False, f'paired JSON runner SHA is stale for {runner_name}'
+    if int(manifest.get('paired_inference_schema_version', 0)) != 2:
+        return False, 'paired manifest inference schema is stale'
+    if int(payload.get('paired_inference_schema_version', 0)) != 2:
+        return False, 'paired JSON inference schema is stale'
+    inference = payload.get('paired_bootstrap') or {}
+    if inference.get('null_test') != 'not_run':
+        return False, 'paired artifact does not declare null_test=not_run'
+    if inference.get('multiplicity_adjustment') != 'not_applicable_no_null_test':
+        return False, 'paired artifact has an invalid multiplicity contract'
+    if not str(inference.get('p_value', '')).lower().startswith('not'):
+        return False, 'paired percentile-bootstrap artifact reports a p-value'
+    metrics = payload.get('metrics') or {}
+    if not metrics:
+        return False, 'paired artifact has no metric rows'
+    for metric, row in metrics.items():
+        if row.get('inference_scope') != 'pointwise_percentile_ci_effect_size_only':
+            return False, f'paired metric {metric} has a stale inference scope'
+        for field in ('p_value_two_sided', 'holm_p_value_two_sided'):
+            value = row.get(field)
+            if value is not None:
+                try:
+                    if math.isfinite(float(value)):
+                        return False, f'paired metric {metric} contains legacy finite {field}'
+                except (TypeError, ValueError):
+                    return False, f'paired metric {metric} contains malformed {field}'
+        language = ' '.join(
+            str(row.get(field, '')) for field in ('interpretation', 'safe_wording')
+        ).lower()
+        if 'significant' in language:
+            return False, f'paired metric {metric} contains unsupported significance wording'
+    return True, 'paired outputs match SHA, runner, and pointwise effect-size inference contracts'
+
+'''
+    set_source(target, text[:start] + replacement + text[end:])
+    save(name, notebook)
+
+
 def integrate_notebook03_strict_inputs() -> None:
     name = "03_calibration_and_ci.ipynb"
     notebook = load(name)
@@ -1595,11 +1782,32 @@ freeze_group_sidecar_sha = _sha256(freeze_group_sidecar_path)
 if freeze_group_sidecar_sha != freeze_group_sidecar.get('sha256'):
     raise RuntimeError('Authenticated group sidecar SHA differs from the strict freeze manifest.')
 '''
-            if "freeze_group_sidecar_sha = _sha256" not in text:
-                # _sha256 is defined immediately below the original anchor, so
-                # insert the sidecar check after that helper definition instead.
-                helper_end = "    return digest.hexdigest()\n\n"
-                text = text.replace(helper_end, helper_end + binding, 1)
+            # Keep fresh-kernel execution valid: parse the freeze manifest only
+            # after the local SHA helper exists and before any sidecar field is
+            # dereferenced. Older generated notebooks placed the binding above
+            # ``freeze_payload`` and accidentally depended on kernel state.
+            helper_end = "    return digest.hexdigest()\n\n"
+            if helper_end not in text:
+                raise RuntimeError("Notebook 03 SHA helper insertion anchor missing")
+            if text.count(anchor) != 1 or text.count(binding) != 1:
+                raise RuntimeError(
+                    "Notebook 03 freeze/group-sidecar binding must occur exactly once"
+                )
+            helper_position = text.index(helper_end)
+            anchor_position = text.index(anchor)
+            binding_position = text.index(binding)
+            if not helper_position < anchor_position < binding_position:
+                text = text.replace(binding, "")
+                text = text.replace(anchor, "")
+                text = text.replace(helper_end, helper_end + anchor + binding + "\n", 1)
+            # Repeated historical integrations left harmless blank lines. Keep a
+            # canonical boundary so rerunning this integrator produces no diff.
+            text = re.sub(
+                re.escape(binding) + r"\n*pred_sha =",
+                binding + "\npred_sha =",
+                text,
+                count=1,
+            )
             comparison_anchor = "        if not bootstrap_contract.get('group_sidecar_sha256'):\n            stale_reasons.append('bootstrap_group_sidecar_sha256_missing')\n"
             if comparison_anchor in text and "bootstrap_group_sidecar_sha_mismatch" not in text:
                 text = text.replace(
@@ -1610,6 +1818,251 @@ if freeze_group_sidecar_sha != freeze_group_sidecar.get('sha256'):
                     1,
                 )
         set_source(cell, text)
+    save(name, notebook)
+
+
+def integrate_notebook03_cpu_only_setup() -> None:
+    """Keep calibration runnable from authenticated artifacts on a CPU runtime."""
+
+    name = "03_calibration_and_ci.ipynb"
+    notebook = load(name)
+    matched = 0
+    for cell in notebook["cells"]:
+        text = source(cell)
+        marker_text = (
+            "# Notebook 03 consumes frozen artifacts only. Dataset/model discovery is\n"
+            "# advisory and must never force a GPU runtime or a multi-GB archive restore.\n"
+        )
+        if marker_text in text:
+            text = re.sub(f"(?:{re.escape(marker_text)})+", marker_text, text, count=1)
+            set_source(cell, text)
+            matched += 1
+            continue
+        start = text.find("chapman_candidates = [")
+        end = text.find("def _run_setup", start)
+        if start < 0 or end < 0:
+            continue
+        replacement = '''# Notebook 03 consumes frozen artifacts only. Dataset/model discovery is
+# advisory and must never force a GPU runtime or a multi-GB archive restore.
+chapman_candidates = [
+    DRIVE_ROOT / 'WFDB-ChapmanShaoxing.zip',
+    DRIVE_ROOT / 'WFDB_ChapmanShaoxing.zip',
+    DRIVE_ROOT / 'chapman.zip',
+    DRIVE_ROOT / 'archive.zip',
+]
+chapman_zip = next((path for path in chapman_candidates if path.is_file()), None)
+if chapman_zip is not None:
+    if chapman_zip.stat().st_size == 0 or not zipfile.is_zipfile(chapman_zip):
+        raise ValueError(f'Visible Chapman archive is invalid: {chapman_zip}')
+    os.environ['ECG_RAMBA_CHAPMAN_ZIP'] = str(chapman_zip)
+else:
+    print('Chapman archive is not visible; this is valid for artifact-only calibration.')
+
+model_pointer = DRIVE_ROOT / 'model_runs' / 'current_final_ema_model_dir.txt'
+model_dir_env = os.environ.get('ECG_RAMBA_MODEL_DIR', '').strip()
+model_dir = Path(model_dir_env).expanduser() if model_dir_env else None
+if model_dir is None and model_pointer.is_file():
+    pointer_value = model_pointer.read_text(encoding='utf-8').strip()
+    model_dir = Path(pointer_value).expanduser() if pointer_value else None
+if model_dir is not None and model_dir.is_dir():
+    os.environ['ECG_RAMBA_MODEL_DIR'] = str(model_dir)
+else:
+    model_dir = None
+    print('Model directory is not visible; this is valid for artifact-only calibration.')
+
+os.environ['ECG_RAMBA_LOCAL_ROOT'] = str(LOCAL_RUNTIME_ROOT)
+os.environ['ECG_RAMBA_EXTRACT_DIR'] = str(LOCAL_RUNTIME_ROOT / 'chapman')
+os.environ['ECG_RAMBA_USE_CLEAN_CACHE'] = '0'
+os.environ['ECG_RAMBA_SAVE_CLEAN_CACHE'] = '0'
+
+'''
+        set_source(cell, text[:start] + replacement + text[end:])
+        matched += 1
+    if matched != 1:
+        raise RuntimeError(f"Notebook 03 CPU-only setup candidates={matched}, expected 1")
+    save(name, notebook)
+
+
+def integrate_notebook04_same_fold_and_calibration() -> None:
+    """Use accurate comparator terminology and run calibration after baseline production."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    for cell in notebook["cells"]:
+        text = source(cell)
+        text = text.replace("## Fair Baseline Completion Matrix", "## Same-Fold Comparator Completion Matrix")
+        text = text.replace("superiority over fair baselines", "superiority over same-fold comparators")
+        text = text.replace("Fair-baseline superiority", "Same-fold-comparator superiority")
+        text = text.replace("fair baseline rows", "same-fold comparator rows")
+        text = text.replace("required fair baseline rows", "required same-fold comparator rows")
+        text = text.replace(
+            "This CPU-only cell performs 1,000 paired record-level bootstrap replicates with Holm correction.",
+            "This CPU-only cell reports 1,000 paired group-bootstrap pointwise effect-size intervals; no null test or Holm correction is performed.",
+        )
+        set_source(cell, text)
+
+    marker = "FORENSIC_MATCHED_CALIBRATION_AFTER_BASELINES = 'authenticated_v1'"
+    existing = [cell for cell in notebook["cells"] if marker in source(cell)]
+    calibration_nb = load("03_calibration_and_ci.ipynb")
+    calibration_source = next(
+        source(cell)
+        for cell in calibration_nb["cells"]
+        if "MATCHED_CALIBRATION_N_BOOT" in source(cell)
+    )
+    calibration_source = (
+        marker
+        + "\n# This cell is intentionally placed after all baseline runners and paired gates.\n"
+        + "stable_mirror = Path(MIRROR_REVISION_ROOT)\n"
+        + calibration_source.replace("restore_selected_from_mirror(", "restore_available_revision_artifacts(")
+    )
+    if existing:
+        if len(existing) != 1:
+            raise RuntimeError("Notebook 04 has duplicate matched-calibration cells")
+        set_source(existing[0], calibration_source)
+    else:
+        insert_at = next(
+            index for index, cell in enumerate(notebook["cells"])
+            if "## Component And Claim Evidence Ledger" in source(cell)
+        )
+        notebook["cells"].insert(
+            insert_at,
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": ["## Matched Cross-Fitted Calibration Audit\n"],
+            },
+        )
+        notebook["cells"].insert(
+            insert_at + 1,
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": calibration_source.splitlines(keepends=True),
+            },
+        )
+    save(name, notebook)
+
+
+def integrate_notebook06_authenticated_cache_restore() -> None:
+    """Never rewrite canonical cache attestations before a producer validates them."""
+
+    name = "06_pooling_and_representation.ipynb"
+    notebook = load(name)
+    matched = 0
+    old = '''        if stale_representation_cache_rows:
+            print('Repairing stale direct-cache manifest rows before Notebook 06 restore:', stale_representation_cache_rows)
+            run(
+                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--refresh-existing-cache-dirs --refresh-existing-prefix predictions/folds '
+                f'--mirror-root "{mirror_root}"',
+                log_path='reports/revision/logs/representation_cache_manifest_repair.log',
+            )
+            payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+            rows = {row.get('relative_path'): row for row in payload.get('artifacts', []) if row.get('relative_path')}
+        for relative in rows:
+            if relative.startswith('predictions/folds/representation_') and relative.endswith('.npz'):
+                relative_paths.append(relative)
+'''
+    new = '''        if stale_representation_cache_rows:
+            print(
+                'Ignoring unauthenticated/stale representation cache rows; '
+                'the extraction runner must validate and republish them:',
+                stale_representation_cache_rows,
+            )
+        for relative in rows:
+            if (
+                relative.startswith('predictions/folds/representation_')
+                and relative.endswith('.npz')
+                and relative not in stale_representation_cache_rows
+            ):
+                relative_paths.append(relative)
+'''
+    for cell in notebook["cells"]:
+        text = source(cell)
+        if old in text:
+            set_source(cell, text.replace(old, new, 1))
+            matched += 1
+        elif "Ignoring unauthenticated/stale representation cache rows" in text:
+            matched += 1
+    if matched != 1:
+        raise RuntimeError(f"Notebook 06 authenticated cache-restore candidates={matched}, expected 1")
+    save(name, notebook)
+
+
+def integrate_notebook05_hrv_group_contract() -> None:
+    """Invalidate HRV outputs unless runner, freeze, and group-bootstrap contracts match."""
+
+    name = "05_hrv_domain_and_robustness.ipynb"
+    notebook = load(name)
+    matched = 0
+    summary_anchor = "        baseline_summary = json.loads((revision_root / 'metrics' / 'hrv_only_baseline_summary.json').read_text(encoding='utf-8'))\n"
+    summary_checks = '''        hrv_runner_path = Path('scripts/revision/09_hrv_domain_analysis.py')
+        hrv_manifest_path = revision_root / 'manifests' / 'hrv_domain_analysis_manifest.json'
+        hrv_manifest = json.loads(hrv_manifest_path.read_text(encoding='utf-8'))
+        active_freeze = json.loads(freeze_path.read_text(encoding='utf-8'))
+        active_group = (active_freeze.get('group_contract') or {}).get('sidecar') or {}
+        active_group_sha = str(active_group.get('sha256') or '')
+        bootstrap_contract = baseline_summary.get('bootstrap_contract') or {}
+        audit.update({
+            'runner_sha256': baseline_summary.get('runner_sha256'),
+            'group_sidecar_sha256': bootstrap_contract.get('group_sidecar_sha256'),
+            'bootstrap_unit': bootstrap_contract.get('unit'),
+        })
+        if int(baseline_summary.get('schema_version', 0)) < 2:
+            audit['issues'].append('hrv_runner_schema_stale')
+        if baseline_summary.get('runner_sha256') != sha256_file(hrv_runner_path):
+            audit['issues'].append('hrv_runner_sha_mismatch')
+        if int(bootstrap_contract.get('n_boot', -1)) != 1000:
+            audit['issues'].append('hrv_bootstrap_count_mismatch')
+        if bootstrap_contract.get('method') != 'percentile_cluster_bootstrap':
+            audit['issues'].append('hrv_bootstrap_method_mismatch')
+        if bootstrap_contract.get('unit') != 'authenticated_source_patient_record':
+            audit['issues'].append('hrv_bootstrap_unit_mismatch')
+        if bootstrap_contract.get('one_record_per_group') is not True:
+            audit['issues'].append('hrv_group_independence_not_verified')
+        if not active_group_sha or bootstrap_contract.get('group_sidecar_sha256') != active_group_sha:
+            audit['issues'].append('hrv_group_sidecar_sha_mismatch')
+        manifest_contract = hrv_manifest.get('canonical_contract') or {}
+        if hrv_manifest.get('runner_sha256') != sha256_file(hrv_runner_path):
+            audit['issues'].append('hrv_manifest_runner_sha_mismatch')
+        if manifest_contract.get('group_sidecar_sha256') != active_group_sha:
+            audit['issues'].append('hrv_manifest_group_sidecar_sha_mismatch')
+'''
+    for cell in notebook["cells"]:
+        text = source(cell)
+        if summary_anchor not in text:
+            continue
+        if "hrv_runner_schema_stale" not in text:
+            text = text.replace(summary_anchor, summary_anchor + summary_checks, 1)
+        set_source(cell, text)
+        matched += 1
+    if matched != 1:
+        raise RuntimeError(f"Notebook 05 HRV contract candidates={matched}, expected 1")
+    save(name, notebook)
+
+
+def integrate_notebook00_full_sha_audit() -> None:
+    """Run the bootstrap storage inventory with full hashes without requiring completion."""
+
+    name = "00_colab_bootstrap.ipynb"
+    notebook = load(name)
+    matched = 0
+    for cell in notebook["cells"]:
+        text = source(cell)
+        if "storage_audit_command = (" not in text:
+            continue
+        if "--full-sha" not in text:
+            text = text.replace(
+                "f'--canonical-root \"{CANONICAL_REVISION_MIRROR}\"'",
+                "f'--canonical-root \"{CANONICAL_REVISION_MIRROR}\" --full-sha'",
+                1,
+            )
+            set_source(cell, text)
+        matched += 1
+    if matched != 1:
+        raise RuntimeError(f"Notebook 00 storage-audit candidates={matched}, expected 1")
     save(name, notebook)
 
 
@@ -1718,6 +2171,16 @@ def integrate_notebook07_final_gate() -> None:
             "required_generator_schema = 12",
         )
         updated = updated.replace("    'matched_monotone_calibration_v3',\n", "")
+        updated = updated.replace(
+            "if len(payload.get('evidence_matrix', [])) != 6 or len(payload.get('robustness_claims', [])) != 30:\n"
+            "    raise RuntimeError('Final matrix shape is unexpected.')\n",
+            "required_claim_ids = {'C01', 'C02', 'C03', 'C04', 'C05', 'C06', 'C07'}\n"
+            "observed_claim_ids = {row.get('claim_id') for row in payload.get('evidence_matrix', [])}\n"
+            "if observed_claim_ids != required_claim_ids:\n"
+            "    raise RuntimeError(f'Final evidence claim IDs are unexpected: {sorted(observed_claim_ids)}')\n"
+            "if len(payload.get('robustness_claims', [])) != 30:\n"
+            "    raise RuntimeError('Final robustness matrix must contain 30 stress/metric rows.')\n",
+        )
         capability = "    'post_initial_review_adaptation_analysis_lock',\n"
         if "required_generator_capabilities = {" in updated and capability not in updated:
             updated = updated.replace(
@@ -1749,6 +2212,162 @@ def integrate_notebook07_final_gate() -> None:
             break
     if target is None:
         raise RuntimeError("Notebook 07 final inventory/publish cell not found")
+    submission_marker = "FORENSIC_SUBMISSION_DOCUMENT_GATE = 'current_document_sha_bound_v1'"
+    submission_cell = next(
+        (cell for cell in notebook["cells"] if submission_marker in source(cell)),
+        None,
+    )
+    submission_source = r'''FORENSIC_SUBMISSION_DOCUMENT_GATE = 'current_document_sha_bound_v1'
+import shlex
+import shutil
+from datetime import datetime, timezone
+from scripts.revision.common import save_json, save_csv, sha256_file
+
+SUBMISSION_MODE = os.environ.get('ECG_RAMBA_SUBMISSION_MODE', 'snapshot').strip().lower()
+if SUBMISSION_MODE not in {'snapshot', 'final'}:
+    raise ValueError('ECG_RAMBA_SUBMISSION_MODE must be snapshot or final.')
+REQUIRE_SUBMISSION_PACKAGE = SUBMISSION_MODE == 'final'
+submission_inputs = {
+    'original_tex': Path(os.environ.get('ECG_RAMBA_ORIGINAL_TEX', '')).expanduser(),
+    'revised_tex': Path(os.environ.get('ECG_RAMBA_REVISED_TEX', '')).expanduser(),
+    'response': Path(os.environ.get('ECG_RAMBA_RESPONSE_PATH', '')).expanduser(),
+}
+missing_submission_inputs = [
+    name for name, path in submission_inputs.items()
+    if not str(path) or not path.is_file() or path.stat().st_size == 0
+]
+submission_status_path = Path('reports/revision/metrics/submission_package_readiness.json')
+submission_status_table = Path('reports/revision/tables/table_submission_package_readiness.csv')
+if missing_submission_inputs:
+    submission_status = {
+        'status': 'blocked_missing_current_document_inputs',
+        'submission_package_ready': False,
+        'evidence_snapshot_may_continue': True,
+        'submission_mode': SUBMISSION_MODE,
+        'missing_inputs': missing_submission_inputs,
+        'required_environment': {
+            'ECG_RAMBA_ORIGINAL_TEX': 'previous submitted manuscript TeX',
+            'ECG_RAMBA_REVISED_TEX': 'current revised main.tex',
+            'ECG_RAMBA_RESPONSE_PATH': 'current response letter source/text',
+        },
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(submission_status_path, submission_status)
+    save_csv(submission_status_table, [{
+        'status': submission_status['status'],
+        'submission_package_ready': False,
+        'missing_inputs': ','.join(missing_submission_inputs),
+    }])
+    print('Submission document gate:', submission_status['status'])
+    if REQUIRE_SUBMISSION_PACKAGE:
+        raise RuntimeError(
+            'Submission package was required but current document inputs are missing: '
+            + ', '.join(missing_submission_inputs)
+        )
+else:
+    marked_dir = Path('reports/revision/manuscript')
+    marked_dir.mkdir(parents=True, exist_ok=True)
+    if shutil.which('latexmk') is None or shutil.which('pdftotext') is None:
+        raise RuntimeError('Final document gate requires latexmk and pdftotext in PATH.')
+    revised_pdf = marked_dir / 'main_revised.pdf'
+    revised_pdf_text = marked_dir / 'main_revised.pdf.txt'
+    revised_compile_dir = marked_dir.resolve()
+    run(
+        'latexmk -pdf -interaction=nonstopmode -halt-on-error '
+        f'-outdir={shlex.quote(str(revised_compile_dir))} '
+        f'{shlex.quote(str(submission_inputs["revised_tex"].resolve()))}',
+        cwd=submission_inputs['revised_tex'].resolve().parent,
+        log_path='reports/revision/logs/final_revised_manuscript_compile.log',
+    )
+    produced_pdf = revised_compile_dir / submission_inputs['revised_tex'].with_suffix('.pdf').name
+    if not produced_pdf.is_file() or produced_pdf.stat().st_size == 0:
+        raise FileNotFoundError(f'latexmk did not produce the revised PDF: {produced_pdf}')
+    if produced_pdf.resolve() != revised_pdf.resolve():
+        shutil.copy2(produced_pdf, revised_pdf)
+    run(
+        f'pdftotext {shlex.quote(str(revised_pdf.resolve()))} {shlex.quote(str(revised_pdf_text.resolve()))}',
+        log_path='reports/revision/logs/final_revised_manuscript_pdftotext.log',
+    )
+    if not revised_pdf_text.is_file() or revised_pdf_text.stat().st_size == 0:
+        raise RuntimeError('pdftotext produced no text for the current revised PDF.')
+    marked_tex = marked_dir / 'main_marked.tex'
+    marked_pdf = marked_dir / 'main_marked.pdf'
+    marked_manifest = Path('reports/revision/manifests/marked_manuscript_manifest.json')
+    run(
+        'python -u scripts/revision/36_build_marked_manuscript.py '
+        f"--original {shlex.quote(str(submission_inputs['original_tex']))} "
+        f"--revised {shlex.quote(str(submission_inputs['revised_tex']))} "
+        f"--out-tex {shlex.quote(str(marked_tex))} "
+        f"--out-pdf {shlex.quote(str(marked_pdf))} "
+        f"--out-manifest {shlex.quote(str(marked_manifest))} --compile --strict",
+        log_path='reports/revision/logs/final_marked_manuscript_build.log',
+    )
+    scan_paths = [
+        submission_inputs['revised_tex'],
+        submission_inputs['response'],
+        revised_pdf_text,
+        Path('reports/revision/tables'),
+    ]
+    scan_command = 'python -u scripts/revision/46_submission_claim_scan.py --strict '
+    scan_command += ' '.join(f"--path {shlex.quote(str(path))}" for path in scan_paths)
+    scan_command += (
+        ' --out-json reports/revision/metrics/submission_forbidden_claim_scan.json'
+        ' --out-table reports/revision/tables/table_submission_forbidden_claim_scan.csv'
+    )
+    run(scan_command, log_path='reports/revision/logs/final_submission_forbidden_claim_scan.log')
+    scan_payload = json.loads(
+        Path('reports/revision/metrics/submission_forbidden_claim_scan.json').read_text(encoding='utf-8')
+    )
+    marked_payload = json.loads(marked_manifest.read_text(encoding='utf-8'))
+    submission_status = {
+        'status': 'complete' if scan_payload.get('status') is True and marked_payload.get('editorial_ready') is True else 'blocked',
+        'submission_package_ready': bool(
+            scan_payload.get('status') is True and marked_payload.get('editorial_ready') is True
+        ),
+        'submission_mode': SUBMISSION_MODE,
+        'created_utc': datetime.now(timezone.utc).isoformat(),
+        'input_sha256': {
+            name: sha256_file(path) for name, path in submission_inputs.items()
+        },
+        'compiled_revised_pdf': {
+            'path': str(revised_pdf),
+            'sha256': sha256_file(revised_pdf),
+            'text_path': str(revised_pdf_text),
+            'text_sha256': sha256_file(revised_pdf_text),
+        },
+        'forbidden_claim_scan': {
+            'path': 'reports/revision/metrics/submission_forbidden_claim_scan.json',
+            'sha256': sha256_file('reports/revision/metrics/submission_forbidden_claim_scan.json'),
+        },
+        'marked_manuscript_manifest': {
+            'path': str(marked_manifest),
+            'sha256': sha256_file(marked_manifest),
+        },
+    }
+    save_json(submission_status_path, submission_status)
+    save_csv(submission_status_table, [{
+        'status': submission_status['status'],
+        'submission_package_ready': submission_status['submission_package_ready'],
+        'missing_inputs': '',
+    }])
+    if not submission_status['submission_package_ready']:
+        raise RuntimeError('Current manuscript/response/PDF submission gate did not pass.')
+    print('Submission document gate: PASS')
+'''
+    if submission_cell is None:
+        target_index = notebook["cells"].index(target)
+        notebook["cells"].insert(
+            target_index,
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": submission_source.splitlines(keepends=True),
+            },
+        )
+    else:
+        set_source(submission_cell, submission_source)
     gate_source = f'''{gate_marker}
 if CODE_AUTHORITY.get('git_commit') != os.environ.get('ECG_RAMBA_AUTHORITY_COMMIT'):
     raise RuntimeError('Notebook 07 code-authority session contract is missing or inconsistent.')
@@ -1759,11 +2378,13 @@ run(
 # Current-authority outputs may legitimately replace an older canonical audit.
 # The detached commit pin above prevents a stale branch/runtime from publishing.
 run(
-    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full --source-conflict-policy newer --mirror-root "{{MIRROR_REVISION_ROOT}}"',
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full --source-conflict-policy source --mirror-root "{{MIRROR_REVISION_ROOT}}"',
     log_path='reports/revision/logs/final_evidence_authority_publish.log',
 )
 run(
-    f'python -u scripts/revision/38_pipeline_storage_audit.py --canonical-root "{{MIRROR_REVISION_ROOT}}" --strict --full-sha',
+    f'python -u scripts/revision/38_pipeline_storage_audit.py --canonical-root "{{MIRROR_REVISION_ROOT}}" --strict --full-sha '
+    '--out-json reports/revision/metrics/pipeline_storage_audit.json '
+    '--out-csv reports/revision/tables/table_pipeline_storage_audit.csv',
     log_path='reports/revision/logs/final_pipeline_storage_audit_strict_full_sha.log',
 )
 run(
@@ -1771,11 +2392,13 @@ run(
     log_path='reports/revision/logs/final_notebook_forensic_audit.log',
 )
 run(
-    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full --source-conflict-policy newer --mirror-root "{{MIRROR_REVISION_ROOT}}"',
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full --source-conflict-policy source --mirror-root "{{MIRROR_REVISION_ROOT}}"',
     log_path='reports/revision/logs/final_forensic_audit_authority_publish.log',
 )
 run(
-    f'python -u scripts/revision/38_pipeline_storage_audit.py --canonical-root "{{MIRROR_REVISION_ROOT}}" --strict --full-sha',
+    f'python -u scripts/revision/38_pipeline_storage_audit.py --canonical-root "{{MIRROR_REVISION_ROOT}}" --strict --full-sha '
+    '--out-json reports/revision/metrics/pipeline_storage_audit.json '
+    '--out-csv reports/revision/tables/table_pipeline_storage_audit.csv',
     log_path='reports/revision/logs/final_pipeline_storage_audit_post_publish_strict_full_sha.log',
 )
 '''
@@ -1837,6 +2460,18 @@ run(
         "Path('reports/revision/tables/table_ptbxl_fold_protocol_audit.csv')",
         "Path('reports/revision/tables/table_ptbxl_unsupported_only_sensitivity.csv')",
         "Path('reports/revision/manifests/ptbxl_fold_protocol_audit_manifest.json')",
+        "Path('reports/revision/metrics/pipeline_storage_audit.json')",
+        "Path('reports/revision/tables/table_pipeline_storage_audit.csv')",
+        "Path('reports/revision/metrics/submission_forbidden_claim_scan.json')",
+        "Path('reports/revision/tables/table_submission_forbidden_claim_scan.csv')",
+        "Path('reports/revision/manifests/notebook_code_authority.json')",
+        "Path('reports/revision/manifests/marked_manuscript_manifest.json')",
+        "Path('reports/revision/metrics/submission_package_readiness.json')",
+        "Path('reports/revision/tables/table_submission_package_readiness.csv')",
+        "Path('reports/revision/manuscript/main_marked.tex')",
+        "Path('reports/revision/manuscript/main_marked.pdf')",
+        "Path('reports/revision/manuscript/main_revised.pdf')",
+        "Path('reports/revision/manuscript/main_revised.pdf.txt')",
     ]
     anchor = "optional_sources = [\n"
     missing_forensic_sources = [item for item in forensic_sources if item not in export_text]
@@ -1846,6 +2481,25 @@ run(
             anchor + "    " + ",\n    ".join(missing_forensic_sources) + ",\n",
             1,
         )
+        set_source(export_cell, export_text)
+    export_text = source(export_cell)
+    collision_anchor = "selected_sources = final_sources + [path for path in optional_sources if path.exists() and path.stat().st_size > 0]\n"
+    collision_guard = '''selected_sources = final_sources + [path for path in optional_sources if path.exists() and path.stat().st_size > 0]
+export_name_sources = {}
+for source_path in selected_sources:
+    export_name_sources.setdefault(source_path.name, []).append(source_path)
+export_name_collisions = {
+    name: paths for name, paths in export_name_sources.items() if len(paths) > 1
+}
+if export_name_collisions:
+    details = '; '.join(
+        f"{name}={[str(path) for path in paths]}"
+        for name, paths in sorted(export_name_collisions.items())
+    )
+    raise RuntimeError('Flat final-evidence export has basename collisions: ' + details)
+'''
+    if collision_anchor in export_text and "export_name_collisions" not in export_text:
+        export_text = export_text.replace(collision_anchor, collision_guard, 1)
         set_source(export_cell, export_text)
     save(name, notebook)
 
@@ -1880,6 +2534,150 @@ def integrate_notebook00_authority_manifest_publish() -> None:
         matched += 1
     if matched != 1:
         raise RuntimeError(f"Notebook 00 authority publish count={matched}, expected 1")
+    save(name, notebook)
+
+
+def integrate_notebook02a_checkpoint_and_pointer_contract() -> None:
+    name = "02a_retrain_best_ema.ipynb"
+    notebook = load(name)
+    target = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "manifest_payload = {" in source(cell)
+            and "CURRENT_MODEL_POINTER" in source(cell)
+            and (
+                "CURRENT_MODEL_POINTER.write_text" in source(cell)
+                or "pointer_tmp = CURRENT_MODEL_POINTER.with_name" in source(cell)
+            )
+        ),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("Notebook 02a checkpoint-manifest cell not found")
+    text = source(target)
+    marker = "FORENSIC_RETRAIN_CHECKPOINT_SPLIT_CONTRACT = 'folds_pkl_checkpoint_membership_v1'\n"
+    if marker in text and "# Promote this run only after all checkpoint/log/resume assertions above pass." in text:
+        if text.count("os.replace(pointer_tmp, CURRENT_MODEL_POINTER)") != 1:
+            raise RuntimeError("Notebook 02a pointer promotion is not single/atomic")
+        save(name, notebook)
+        return
+    import_block = (
+        "import joblib\n"
+        "import numpy as np\n"
+        "from scripts.revision.common import save_json_atomic\n"
+    )
+    fold_block = (
+        "fold_contracts = joblib.load(model_dir / 'folds.pkl')\n"
+        "if len(fold_contracts) != 5:\n"
+        "    raise RuntimeError(f'Expected five reviewed folds, found {len(fold_contracts)}')\n"
+        "validation_membership = []\n"
+        "for fold, split in enumerate(fold_contracts, start=1):\n"
+        "    tr_idx = np.ascontiguousarray(np.asarray(split['tr_idx'], dtype=np.int64))\n"
+        "    va_idx = np.ascontiguousarray(np.asarray(split['va_idx'], dtype=np.int64))\n"
+        "    if len(np.intersect1d(tr_idx, va_idx)):\n"
+        "        raise RuntimeError(f'Fold {fold} train/validation membership overlaps')\n"
+        "    validation_membership.extend(va_idx.tolist())\n"
+        "if len(validation_membership) != len(set(validation_membership)):\n"
+        "    raise RuntimeError('Validation records overlap across folds')\n"
+    )
+    source_contract_block = (
+        "training_source_paths = (\n"
+        "    'scripts/train.py', 'src/model.py', 'src/features.py', 'src/utils.py',\n"
+        "    'src/aggregation.py', 'src/training_data.py', 'src/data_loader.py', 'configs/config.py',\n"
+        ")\n"
+        "live_training_source_files = {\n"
+        "    relative: hashlib.sha256(Path(relative).read_bytes()).hexdigest()\n"
+        "    for relative in training_source_paths\n"
+        "}\n"
+        "live_training_source_sha = hashlib.sha256(\n"
+        "    json.dumps(live_training_source_files, sort_keys=True, separators=(',', ':')).encode('utf-8')\n"
+        ").hexdigest()\n"
+        "live_training_source_bundle = {\n"
+        "    'schema_version': 1, 'files': live_training_source_files, 'sha256': live_training_source_sha,\n"
+        "}\n"
+    )
+
+    # Normalize notebooks produced by earlier non-idempotent integrations before
+    # installing the canonical import and split-contract blocks exactly once.
+    text = text.replace(marker, "")
+    text = text.replace(import_block, "")
+    text = text.replace(fold_block, "")
+    text = text.replace(source_contract_block, "")
+    import_anchor = "import pandas as pd\nimport torch\n"
+    if import_anchor not in text:
+        raise RuntimeError("Notebook 02a checkpoint-contract import anchor missing")
+    text = text.replace(import_anchor, import_anchor + import_block + marker, 1)
+    rows_anchor = "rows = []\ndataset_record_fingerprints = set()\n"
+    if rows_anchor not in text:
+        raise RuntimeError("Notebook 02a checkpoint-contract rows anchor missing")
+    text = text.replace(rows_anchor, fold_block + source_contract_block + rows_anchor, 1)
+    text = text.replace(
+        "        payload = torch.load(ckpt, map_location='cpu')\n",
+        "        payload = torch.load(ckpt, map_location='cpu', weights_only=False)\n"
+        "        split = fold_contracts[fold - 1]\n"
+        "        expected_train_hash = hashlib.sha256(\n"
+        "            np.ascontiguousarray(np.asarray(split['tr_idx'], dtype=np.int64)).view(np.uint8)\n"
+        "        ).hexdigest()[:16]\n"
+        "        expected_val_hash = hashlib.sha256(\n"
+        "            np.ascontiguousarray(np.asarray(split['va_idx'], dtype=np.int64)).view(np.uint8)\n"
+        "        ).hexdigest()[:16]\n"
+        "        checkpoint_split = payload.get('split') or {}\n"
+        "        if payload.get('checkpoint_contract') != 'explicit_weights_kind_v3_source_bound':\n"
+        "            raise RuntimeError(f'{ckpt} is not a source-bound v3 checkpoint')\n"
+        "        if payload.get('training_source_bundle') != live_training_source_bundle:\n"
+        "            raise RuntimeError(f'{ckpt} training source bundle differs from the active authority checkout')\n"
+        "        if checkpoint_split.get('train_index_hash') != expected_train_hash:\n"
+        "            raise RuntimeError(f'{ckpt} train split hash differs from folds.pkl')\n"
+        "        if checkpoint_split.get('val_index_hash') != expected_val_hash:\n"
+        "            raise RuntimeError(f'{ckpt} validation split hash differs from folds.pkl')\n",
+        1,
+    )
+    # Promotion must occur only after every checkpoint, epoch-log, and resume
+    # integrity assertion below has passed. Normalize older integrated forms,
+    # remove the early write, then append one crash-atomic promotion block.
+    early_write_variants = [
+        (
+            "manifest_path.write_text(json.dumps(manifest_payload, indent=2, sort_keys=True), encoding='utf-8')\n"
+            "CURRENT_MODEL_POINTER.parent.mkdir(parents=True, exist_ok=True)\n"
+            "CURRENT_MODEL_POINTER.write_text(str(model_dir), encoding='utf-8')\n"
+            "print('Wrote:', manifest_path)\n"
+            "print('Wrote current model pointer:', CURRENT_MODEL_POINTER, '->', model_dir)\n"
+            "display(pd.DataFrame(rows))\n"
+        ),
+        (
+            "save_json_atomic(manifest_path, manifest_payload)\n"
+            "CURRENT_MODEL_POINTER.parent.mkdir(parents=True, exist_ok=True)\n"
+            "pointer_tmp = CURRENT_MODEL_POINTER.with_name(CURRENT_MODEL_POINTER.name + '.partial.' + os.urandom(8).hex())\n"
+            "with pointer_tmp.open('w', encoding='utf-8') as handle:\n"
+            "    handle.write(str(model_dir) + '\\n')\n"
+            "    handle.flush()\n"
+            "    os.fsync(handle.fileno())\n"
+            "os.replace(pointer_tmp, CURRENT_MODEL_POINTER)\n"
+            "print('Wrote:', manifest_path)\n"
+            "print('Wrote current model pointer:', CURRENT_MODEL_POINTER, '->', model_dir)\n"
+            "display(pd.DataFrame(rows))\n"
+        ),
+    ]
+    for early_write in early_write_variants:
+        text = text.replace(early_write, "display(pd.DataFrame(rows))\n", 1)
+    if "os.replace(pointer_tmp, CURRENT_MODEL_POINTER)" in text:
+        raise RuntimeError("Notebook 02a still contains an early model-pointer promotion")
+    text = text.rstrip() + (
+        "\n\n# Promote this run only after all checkpoint/log/resume assertions above pass.\n"
+        "manifest_payload['training_source_bundle'] = live_training_source_bundle\n"
+        "save_json_atomic(manifest_path, manifest_payload)\n"
+        "CURRENT_MODEL_POINTER.parent.mkdir(parents=True, exist_ok=True)\n"
+        "pointer_tmp = CURRENT_MODEL_POINTER.with_name(CURRENT_MODEL_POINTER.name + '.partial.' + os.urandom(8).hex())\n"
+        "with pointer_tmp.open('w', encoding='utf-8') as handle:\n"
+        "    handle.write(str(model_dir) + '\\n')\n"
+        "    handle.flush()\n"
+        "    os.fsync(handle.fileno())\n"
+        "os.replace(pointer_tmp, CURRENT_MODEL_POINTER)\n"
+        "print('Wrote:', manifest_path)\n"
+        "print('Promoted current model pointer:', CURRENT_MODEL_POINTER, '->', model_dir)\n"
+    )
+    set_source(target, text)
     save(name, notebook)
 
 
@@ -1991,7 +2789,7 @@ def validate() -> None:
         "notebook_forensic_audit.md",
         "table_paired_inference_audit.csv",
         "strict_full_sha_authority_update_v3",
-        "--source-conflict-policy newer",
+        "--source-conflict-policy source",
         "final_pipeline_storage_audit_post_publish_strict_full_sha.log",
         "required_generator_schema = 12",
         "authenticated_matched_calibration_v5",
@@ -2048,11 +2846,18 @@ def main() -> None:
     integrate_installer_consumers()
     integrate_notebook02a_training_log()
     integrate_remaining_run_history()
+    integrate_notebook04_paired_reuse_contract()
     integrate_notebook03_strict_inputs()
+    integrate_notebook03_cpu_only_setup()
+    integrate_notebook04_same_fold_and_calibration()
+    integrate_notebook06_authenticated_cache_restore()
+    integrate_notebook05_hrv_group_contract()
+    integrate_notebook00_full_sha_audit()
     normalize_bootstrap_contracts()
     integrate_shared_contract_versions()
     integrate_code_authority()
     integrate_notebook00_authority_manifest_publish()
+    integrate_notebook02a_checkpoint_and_pointer_contract()
     integrate_notebook07_final_gate()
     validate()
     print("Forensic notebook integration complete and validated.")

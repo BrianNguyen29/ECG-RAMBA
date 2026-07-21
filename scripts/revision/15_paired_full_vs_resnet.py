@@ -44,6 +44,7 @@ from scripts.revision.common import (  # noqa: E402
 
 FULL_LABEL = "Full ECG-RAMBA frozen OOF"
 COMPARATOR_LABEL = "ResNet1D/CNN"
+PAIRED_INFERENCE_SCHEMA_VERSION = 2
 EXPECTED_RESNET_PROTOCOL = "resnet1d_cnn_raw_same_folds_power_mean_v2_q3_threshold_0.5"
 
 
@@ -282,6 +283,11 @@ def validate_resnet_artifacts(
         raise FileNotFoundError(f"Missing ResNet1D/CNN manifest JSON: {manifest_path}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = PROJECT_ROOT / "scripts" / "revision" / "14_resnet1d_cnn_baseline.py"
+    producer_sha256 = sha256_file(producer)
+    for source_name, payload in (("summary", summary), ("manifest", manifest)):
+        if payload.get("runner_sha256") != producer_sha256:
+            raise RuntimeError(f"ResNet1D/CNN {source_name} producer runner SHA is stale.")
     for source_name, payload in [("summary", summary), ("manifest", manifest)]:
         if payload.get("protocol") != EXPECTED_RESNET_PROTOCOL:
             raise ValueError(
@@ -550,6 +556,8 @@ def main() -> None:
 
     payload = {
         "status": True,
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "comparison": "full_ecg_ramba_vs_resnet1d_cnn",
@@ -604,6 +612,8 @@ def main() -> None:
     manifest = {
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "comparison": "full_ecg_ramba_vs_resnet1d_cnn",
         "input_sha256": {
             "full_predictions": full.sha256,

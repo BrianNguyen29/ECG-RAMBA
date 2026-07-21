@@ -227,8 +227,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "_probe_is_v3_ready()",
             "representation_probe_fold_safe_v3_projection_and_fold_audit",
             "--refresh-existing-cache-dirs",
-            "Repairing stale direct-cache manifest rows before Notebook 06 restore",
-            "representation_cache_manifest_repair.log",
+            "Ignoring unauthenticated/stale representation cache rows",
             "--refresh-existing-prefix predictions/folds",
         ):
             self.assertIn(token, source)
@@ -383,7 +382,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", notebook00_source)
         self.assertIn("ECG_RAMBA_RESET_CODE_AUTHORITY", notebook00_source)
         self.assertIn("ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD", notebook00_source)
-        self.assertIn("fetched_branch_head_at_notebook00_rotation", notebook00_source)
+        self.assertIn("Implicit authority rotation to a moving branch head is disabled", notebook00_source)
+        self.assertIn("Authority reset requires ECG_RAMBA_AUTHORITY_COMMIT", notebook00_source)
         for notebook in PIPELINE_NOTEBOOKS[1:]:
             _, source = notebook_source(notebook)
             self.assertNotIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", source)
@@ -455,7 +455,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                         missing_namespace,
                     )
 
-    def test_notebook00_rotates_existing_authority_to_checked_out_branch_head(self):
+    def test_notebook00_rejects_implicit_rotation_and_requires_explicit_sha(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             repo = root / "repo"
@@ -474,7 +474,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             clean_environment = {
                 "ECG_RAMBA_AUTHORITY_COMMIT": "",
                 "ECG_RAMBA_RESET_CODE_AUTHORITY": "0",
-                "ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD": "1",
+                "ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD": "0",
             }
 
             (repo / "authority.txt").write_text("first\n", encoding="utf-8")
@@ -496,9 +496,20 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertNotEqual(first_commit, second_commit)
 
             fresh_namespace = dict(namespace)
-            stale_runtime_environment = dict(clean_environment)
-            stale_runtime_environment["ECG_RAMBA_AUTHORITY_COMMIT"] = first_commit
-            with mock.patch.dict(os.environ, stale_runtime_environment, clear=False):
+            implicit_rotation_environment = dict(clean_environment)
+            implicit_rotation_environment["ECG_RAMBA_ROTATE_CODE_AUTHORITY_TO_BRANCH_HEAD"] = "1"
+            with mock.patch.dict(os.environ, implicit_rotation_environment, clear=False):
+                with self.assertRaisesRegex(RuntimeError, "Implicit authority rotation"):
+                    exec(
+                        authority_block_source("00_colab_bootstrap.ipynb"),
+                        fresh_namespace,
+                        fresh_namespace,
+                    )
+
+            explicit_rotation_environment = dict(clean_environment)
+            explicit_rotation_environment["ECG_RAMBA_AUTHORITY_COMMIT"] = second_commit
+            explicit_rotation_environment["ECG_RAMBA_RESET_CODE_AUTHORITY"] = "1"
+            with mock.patch.dict(os.environ, explicit_rotation_environment, clear=False):
                 exec(
                     authority_block_source("00_colab_bootstrap.ipynb"),
                     fresh_namespace,
@@ -509,7 +520,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
                 (canonical / "manifests" / "notebook_code_authority.json").read_text(encoding="utf-8")
             )
             self.assertEqual(manifest["git_commit"], second_commit)
-            self.assertEqual(manifest["selection"], "fetched_branch_head_at_notebook00_rotation")
+            self.assertEqual(manifest["selection"], "explicit_environment_sha")
             self.assertEqual(
                 subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
                 second_commit,
@@ -536,7 +547,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         gate = next(cell for cell in cells if "FORENSIC_NOTEBOOK07_FINAL_GATE" in cell)
         for token in (
             "strict_full_sha_authority_update_v3",
-            "--source-conflict-policy newer",
+            "--source-conflict-policy source",
             "final_pipeline_storage_audit_strict_full_sha.log",
             "final_forensic_audit_authority_publish.log",
             "final_pipeline_storage_audit_post_publish_strict_full_sha.log",

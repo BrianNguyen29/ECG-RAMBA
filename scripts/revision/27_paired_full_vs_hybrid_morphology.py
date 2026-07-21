@@ -35,6 +35,7 @@ FULL_LABEL = "Full ECG-RAMBA frozen OOF"
 COMPARATOR_LABEL = "Frozen-transform morphology MLP head"
 EXPECTED_HYBRID_PROTOCOL = "fixed_seed_rocket_family_max_ppv_mlp_head_same_folds_threshold_0.5"
 EXPECTED_HYBRID_FEATURE_CONTRACT = "fixed_seed_rocket_family_random_convolution_max_ppv_frozen_mlp_head"
+PAIRED_INFERENCE_SCHEMA_VERSION = 2
 
 
 def load_revision_module(filename: str, module_name: str):
@@ -128,6 +129,13 @@ def validate_hybrid_morphology_artifacts(
         raise FileNotFoundError(f"Missing frozen-transform morphology MLP-head manifest JSON: {manifest_path}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    producer = PROJECT_ROOT / "scripts" / "revision" / "26_hybrid_morphology_baseline.py"
+    producer_sha256 = sha256_file(producer)
+    for source_name, payload in (("summary", summary), ("manifest", manifest)):
+        if payload.get("runner_sha256") != producer_sha256:
+            raise RuntimeError(
+                f"Frozen-transform morphology MLP-head {source_name} producer runner SHA is stale."
+            )
     for source_name, payload in [("summary", summary), ("manifest", manifest)]:
         if payload.get("protocol") != EXPECTED_HYBRID_PROTOCOL:
             raise ValueError(
@@ -268,6 +276,8 @@ def main() -> None:
 
     payload = {
         "status": True,
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "comparison": "full_ecg_ramba_vs_hybrid_morphology",
@@ -280,6 +290,8 @@ def main() -> None:
             "seed": int(args.seed),
             "alpha": 0.05,
             "p_value": "not reported; percentile bootstrap is used only for pointwise effect-size confidence intervals",
+            "null_test": "not_run",
+            "multiplicity_adjustment": "not_applicable_no_null_test",
         },
         "threshold": float(args.threshold),
         "n_bins": int(args.n_bins),
@@ -320,6 +332,8 @@ def main() -> None:
     manifest = {
         "created_utc": now_utc(),
         "git_commit": git_commit(),
+        "paired_inference_schema_version": PAIRED_INFERENCE_SCHEMA_VERSION,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
         "comparison": "full_ecg_ramba_vs_hybrid_morphology",
         "input_sha256": {
             "full_predictions": full.sha256,
