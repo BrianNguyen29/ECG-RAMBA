@@ -78,6 +78,8 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertLess(audit, score)
         self.assertLess(audit, head)
         self.assertIn("--analysis-lock \"{PTBXL_ADAPTATION_LOCK}\"", self.source)
+        self.assertIn("ptbxl_adaptation_analysis_lock_source_attestation.json", self.source)
+        self.assertIn("Runner source drift:", self.source)
         self.assertIn("table_ptbxl_unsupported_only_sensitivity.csv", self.source)
         self.assertIn("paired_refresh_complete_models", self.source)
         self.assertIn("{'resnet', 'raw_mamba'}.issubset(paired_refresh_complete_models)", self.source)

@@ -429,6 +429,7 @@ def reviewer_traceability_rows(
         "R2-C3": ["metrics/robustness_multicomparator_pairwise.json"],
         "R2-C4": [
             "manifests/ptbxl_adaptation_analysis_lock.json",
+            "manifests/ptbxl_adaptation_analysis_lock_source_attestation.json",
             "metrics/ptbxl_fold_protocol_audit.json",
             "tables/table_ptbxl_unsupported_only_sensitivity.csv",
             "metrics/true_fewshot_head_ptbxl_summary.csv",

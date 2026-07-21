@@ -20,11 +20,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.revision.common import MANIFEST_DIR, save_json_atomic, sha256_file  # noqa: E402
+from scripts.revision.common import (  # noqa: E402
+    MANIFEST_DIR,
+    git_commit,
+    save_json_atomic,
+    sha256_file,
+)
 
 
 PTBXL_ADAPTATION_LOCK_CAPABILITY = "ptbxl_fold9_fold10_analysis_lock_v1"
 PTBXL_ADAPTATION_LOCK_SCHEMA_VERSION = 1
+PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION_CAPABILITY = (
+    "ptbxl_analysis_lock_implementation_attestation_v1"
+)
+PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION_SCHEMA_VERSION = 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         "--out-lock",
         type=Path,
         default=MANIFEST_DIR / "ptbxl_adaptation_analysis_lock.json",
+    )
+    parser.add_argument(
+        "--out-source-attestation",
+        type=Path,
+        default=MANIFEST_DIR / "ptbxl_adaptation_analysis_lock_source_attestation.json",
     )
     return parser.parse_args()
 
@@ -131,15 +145,103 @@ def expected_lock(args: argparse.Namespace) -> dict[str, Any]:
 
 def validate_existing(existing: dict[str, Any], expected: dict[str, Any]) -> list[str]:
     issues = []
-    for key in ("status", "capability", "schema_version", "lock_scope", "temporal_qualification", "protocol", "protocol_sha256", "runner_sources"):
+    for key in (
+        "status",
+        "capability",
+        "schema_version",
+        "lock_scope",
+        "temporal_qualification",
+        "protocol",
+        "protocol_sha256",
+    ):
         if existing.get(key) != expected.get(key):
             issues.append(key)
+    existing_sources = existing.get("runner_sources")
+    expected_sources = expected.get("runner_sources") or []
+    if not isinstance(existing_sources, list):
+        issues.append("runner_sources")
+        return issues
+    existing_by_path = {
+        str(row.get("path")): row
+        for row in existing_sources
+        if isinstance(row, dict) and row.get("path")
+    }
+    expected_paths = {str(row["path"]) for row in expected_sources}
+    if set(existing_by_path) != expected_paths:
+        issues.append("runner_sources")
+        return issues
+
+    def valid_sha256(value: Any) -> bool:
+        text = str(value or "").lower()
+        return len(text) == 64 and all(character in "0123456789abcdef" for character in text)
+
+    if any(not valid_sha256(existing_by_path[path].get("sha256")) for path in expected_paths):
+        issues.append("runner_sources")
     return issues
+
+
+def runner_source_drift(
+    existing: dict[str, Any], expected: dict[str, Any]
+) -> list[dict[str, str]]:
+    """Describe implementation drift without mutating the immutable protocol lock."""
+
+    existing_by_path = {
+        str(row["path"]): str(row["sha256"])
+        for row in existing.get("runner_sources") or []
+    }
+    expected_by_path = {
+        str(row["path"]): str(row["sha256"])
+        for row in expected.get("runner_sources") or []
+    }
+    return [
+        {
+            "path": path,
+            "locked_sha256": existing_by_path[path],
+            "current_sha256": expected_by_path[path],
+            "classification": "implementation_changed_after_protocol_lock",
+        }
+        for path in sorted(expected_by_path)
+        if existing_by_path.get(path) != expected_by_path[path]
+    ]
+
+
+def write_source_attestation(
+    path: Path,
+    *,
+    lock_path: Path,
+    lock: dict[str, Any],
+    current: dict[str, Any],
+) -> dict[str, Any]:
+    drift = runner_source_drift(lock, current)
+    payload = {
+        "status": "complete",
+        "capability": PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION_CAPABILITY,
+        "schema_version": PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION_SCHEMA_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "git_commit": git_commit(),
+        "analysis_lock": {
+            "path": str(lock_path),
+            "sha256": sha256_file(lock_path),
+            "protocol_sha256": lock["protocol_sha256"],
+        },
+        "protocol_unchanged": lock.get("protocol") == current.get("protocol"),
+        "locked_runner_sources_preserved": True,
+        "current_runner_sources": current.get("runner_sources") or [],
+        "runner_source_drift": drift,
+        "interpretation": (
+            "The immutable post-initial-review lock fixes analysis choices, not future source bytes. "
+            "Runner changes are disclosed here; each generated result manifest must independently bind "
+            "the current runner SHA and the unchanged lock SHA."
+        ),
+    }
+    save_json_atomic(path, payload)
+    return payload
 
 
 def main() -> None:
     args = parse_args()
     out = resolve(args.out_lock)
+    attestation_out = resolve(args.out_source_attestation)
     expected = expected_lock(args)
     if out.exists():
         existing = json.loads(out.read_text(encoding="utf-8"))
@@ -149,15 +251,34 @@ def main() -> None:
                 f"PTB-XL analysis lock mismatch in {out}: {issues}. "
                 "Do not overwrite it silently; use a new versioned lock after documented protocol review."
             )
-        print(f"Reusing exact PTB-XL adaptation analysis lock: {out}", flush=True)
+        attestation = write_source_attestation(
+            attestation_out,
+            lock_path=out,
+            lock=existing,
+            current=expected,
+        )
+        print(f"Reusing exact PTB-XL adaptation protocol lock: {out}", flush=True)
+        print(
+            "Implementation drift attested without modifying the lock: "
+            f"{[row['path'] for row in attestation['runner_source_drift']]}",
+            flush=True,
+        )
+        print(f"Wrote source attestation: {attestation_out}", flush=True)
         return
     payload = {
         **expected,
         "created_utc": datetime.now(timezone.utc).isoformat(),
     }
     save_json_atomic(out, payload)
+    write_source_attestation(
+        attestation_out,
+        lock_path=out,
+        lock=payload,
+        current=expected,
+    )
     print(f"Wrote immutable PTB-XL adaptation analysis lock: {out}", flush=True)
     print(f"protocol_sha256={payload['protocol_sha256']}", flush=True)
+    print(f"Wrote source attestation: {attestation_out}", flush=True)
 
 
 if __name__ == "__main__":

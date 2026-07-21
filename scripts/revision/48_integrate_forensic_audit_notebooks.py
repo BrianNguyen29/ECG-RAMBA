@@ -127,6 +127,8 @@ REVISION_TOKEN_REQUIREMENTS = {
     ],
     'scripts/revision/51_ptbxl_adaptation_analysis_lock.py': [
         'PTBXL_ADAPTATION_LOCK_CAPABILITY',
+        'PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION_CAPABILITY',
+        'locked_runner_sources_preserved',
         'post_initial_result_review',
         'evaluate_fold10_only_after_configuration_lock_validation',
     ],
@@ -752,6 +754,7 @@ def integrate_notebook02() -> None:
     }
     lock_code_text = r'''# PTBXL_ADAPTATION_ANALYSIS_LOCK_CELL_V1
 PTBXL_ADAPTATION_LOCK = Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock.json')
+PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION = Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock_source_attestation.json')
 if '_restore_report_artifact' in globals():
     lock_restore_roots = globals().get('restore_source_roots', [MIRROR_REVISION_ROOT])
     print('PTB-XL analysis-lock restore:', _restore_report_artifact(PTBXL_ADAPTATION_LOCK, lock_restore_roots))
@@ -759,18 +762,26 @@ run(
     'python -u scripts/revision/51_ptbxl_adaptation_analysis_lock.py '
     '--models full,resnet,raw_mamba,transformer --fractions 0,0.01,0.05,0.10 '
     '--primary-fraction 0.10 --seeds 42,43,44,45,46 --threshold 0.5 '
-    '--n-bins 15 --n-boot 1000 --head-c 1.0 --max-iter 5000',
+    '--n-bins 15 --n-boot 1000 --head-c 1.0 --max-iter 5000 '
+    '--out-source-attestation reports/revision/manifests/ptbxl_adaptation_analysis_lock_source_attestation.json',
     log_path='reports/revision/logs/ptbxl_adaptation_analysis_lock.log',
 )
 run(
     f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
     f'--source-conflict-policy source --include-path "manifests/ptbxl_adaptation_analysis_lock.json" '
+    f'--include-path "manifests/ptbxl_adaptation_analysis_lock_source_attestation.json" '
     f'--mirror-root "{MIRROR_REVISION_ROOT}"',
     log_path='reports/revision/logs/ptbxl_adaptation_analysis_lock_mirror_publish.log',
 )
 ptbxl_analysis_lock = json.loads(PTBXL_ADAPTATION_LOCK.read_text(encoding='utf-8'))
+ptbxl_analysis_lock_source_attestation = json.loads(
+    PTBXL_ADAPTATION_LOCK_SOURCE_ATTESTATION.read_text(encoding='utf-8')
+)
 print('PTB-XL analysis lock:', ptbxl_analysis_lock['protocol_sha256'])
 print('Temporal qualification:', ptbxl_analysis_lock['temporal_qualification'])
+print('Runner source drift:', [
+    row['path'] for row in ptbxl_analysis_lock_source_attestation.get('runner_source_drift', [])
+])
 '''
     lock_code = {
         "cell_type": "code",
@@ -1820,6 +1831,7 @@ run(
         "Path('reports/revision/tables/table_physiological_interval_probe_contrasts.csv')",
         "Path('reports/revision/tables/table_physiological_interval_probe.tex')",
         "Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock.json')",
+        "Path('reports/revision/manifests/ptbxl_adaptation_analysis_lock_source_attestation.json')",
         "Path('reports/revision/metrics/in_domain_paired_contract_refresh.json')",
         "Path('reports/revision/metrics/ptbxl_fold_protocol_audit.json')",
         "Path('reports/revision/tables/table_ptbxl_fold_protocol_audit.csv')",

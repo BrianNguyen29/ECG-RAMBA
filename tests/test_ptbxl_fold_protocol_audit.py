@@ -53,6 +53,53 @@ class PTBXLFoldProtocolAuditTests(unittest.TestCase):
         changed["protocol"]["primary_fraction"] = 0.05
         self.assertIn("protocol", lock_runner.validate_existing(changed, expected))
 
+        implementation_drift = json.loads(json.dumps(expected))
+        implementation_drift["runner_sources"][0]["sha256"] = "0" * 64
+        self.assertEqual(lock_runner.validate_existing(implementation_drift, expected), [])
+        drift = lock_runner.runner_source_drift(implementation_drift, expected)
+        self.assertEqual(len(drift), 1)
+        self.assertEqual(
+            drift[0]["classification"],
+            "implementation_changed_after_protocol_lock",
+        )
+
+        malformed_sources = json.loads(json.dumps(expected))
+        malformed_sources["runner_sources"][0]["sha256"] = "not-a-sha"
+        self.assertIn(
+            "runner_sources",
+            lock_runner.validate_existing(malformed_sources, expected),
+        )
+
+    def test_source_attestation_preserves_immutable_lock_bytes(self):
+        expected = lock_runner.expected_lock(self.lock_args())
+        locked = json.loads(json.dumps(expected))
+        locked["created_utc"] = "2026-07-20T00:00:00+00:00"
+        locked["runner_sources"][0]["sha256"] = "0" * 64
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock_path = root / "lock.json"
+            attestation_path = root / "attestation.json"
+            lock_runner.save_json_atomic(lock_path, locked)
+            before = lock_runner.sha256_file(lock_path)
+
+            attestation = lock_runner.write_source_attestation(
+                attestation_path,
+                lock_path=lock_path,
+                lock=locked,
+                current=expected,
+            )
+
+            self.assertEqual(lock_runner.sha256_file(lock_path), before)
+            self.assertEqual(attestation["analysis_lock"]["sha256"], before)
+            self.assertTrue(attestation["protocol_unchanged"])
+            self.assertTrue(attestation["locked_runner_sources_preserved"])
+            self.assertEqual(len(attestation["runner_source_drift"]), 1)
+            self.assertEqual(
+                json.loads(attestation_path.read_text(encoding="utf-8"))["analysis_lock"]["sha256"],
+                before,
+            )
+
     def test_fold_prediction_loader_and_patient_overlap_gate(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "fold10.npz"
