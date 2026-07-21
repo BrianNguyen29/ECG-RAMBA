@@ -2,10 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from scripts.revision.common import CACHE_SCHEMA_VERSION, sha256_file
+from scripts.revision import external_reuse_contract
 from scripts.revision.external_reuse_contract import validate_external_prediction_reuse
 from src.aggregation import aggregate_record_probabilities
 
@@ -157,6 +159,67 @@ class ExternalReuseContractTests(unittest.TestCase):
             )
             self.assertFalse(result["ready"])
             self.assertIn("label_protocol_mismatch", result["reasons"])
+
+    def test_dataset_scoped_attestation_accepts_only_both_pinned_runner_hashes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision_root, exporter, oof, freeze, archive, manifest_path = self._fixture(root)
+            producer_sha = sha256_file(exporter)
+            exporter.write_text("# exporter v2 with unrelated CPSC-only change\n", encoding="utf-8")
+            current_sha = sha256_file(exporter)
+            attestation = {
+                producer_sha: {
+                    "compatible_current_runner_sha256": current_sha,
+                    "producer_release": "refs/tags/test-v1",
+                    "reviewed_change_scope": "cpsc2021_window_storage_only",
+                }
+            }
+            with patch.dict(
+                external_reuse_contract.RUNNER_COMPATIBILITY_ATTESTATIONS,
+                {"ptbxl": attestation},
+                clear=True,
+            ):
+                result = validate_external_prediction_reuse(
+                    "ptbxl",
+                    revision_root=revision_root,
+                    archive_path=archive,
+                    exporter_path=exporter,
+                    oof_path=oof,
+                    freeze_path=freeze,
+                    archive_hash_cache_dir=root / "archive_hash_cache",
+                )
+            self.assertTrue(result["ready"], result["reasons"])
+            accepted = result["diagnostics"]["runner_compatibility_attestation"]
+            self.assertEqual(
+                accepted["status"],
+                "accepted_dataset_unaffected_by_reviewed_change",
+            )
+
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["runner_sha256"] = "f" * 64
+            manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+            with patch.dict(
+                external_reuse_contract.RUNNER_COMPATIBILITY_ATTESTATIONS,
+                {"ptbxl": attestation},
+                clear=True,
+            ):
+                rejected = validate_external_prediction_reuse(
+                    "ptbxl",
+                    revision_root=revision_root,
+                    archive_path=archive,
+                    exporter_path=exporter,
+                    oof_path=oof,
+                    freeze_path=freeze,
+                    archive_hash_cache_dir=root / "archive_hash_cache",
+                )
+            self.assertFalse(rejected["ready"])
+            self.assertIn("external_exporter_sha_mismatch", rejected["reasons"])
+
+    def test_cpsc_has_no_legacy_runner_compatibility_attestation(self):
+        self.assertNotIn(
+            "cpsc2021",
+            external_reuse_contract.RUNNER_COMPATIBILITY_ATTESTATIONS,
+        )
 
 
 if __name__ == "__main__":

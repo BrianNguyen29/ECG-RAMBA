@@ -18,8 +18,27 @@ from scripts.revision.common import CACHE_SCHEMA_VERSION, save_json, sha256_file
 from src.aggregation import aggregate_record_probabilities
 
 
-EXTERNAL_REUSE_CAPABILITY = "source_bound_external_reuse_v1"
-EXTERNAL_REUSE_SCHEMA_VERSION = 1
+EXTERNAL_REUSE_CAPABILITY = "source_bound_external_reuse_v2_dataset_scoped_attestation"
+EXTERNAL_REUSE_SCHEMA_VERSION = 2
+# The v2 exporter change is confined to the CPSC2021 disk-backed window loader.
+# Bind the exception to both immutable source hashes so any later exporter edit
+# fails closed. CPSC2021 is deliberately absent and must be regenerated.
+RUNNER_COMPATIBILITY_ATTESTATIONS = {
+    "ptbxl": {
+        "68bd59aad0323a5077a1665edc1a1afd2a73542f4060e4d534998287dff04df8": {
+            "compatible_current_runner_sha256": "8ebd81758b8f566f148702d3a7e17b99da93342aa793e9157c8b8ab2960fa216",
+            "producer_release": "refs/tags/ecg-ramba-revision-20260721-v1",
+            "reviewed_change_scope": "cpsc2021_window_storage_only",
+        }
+    },
+    "georgia": {
+        "68bd59aad0323a5077a1665edc1a1afd2a73542f4060e4d534998287dff04df8": {
+            "compatible_current_runner_sha256": "8ebd81758b8f566f148702d3a7e17b99da93342aa793e9157c8b8ab2960fa216",
+            "producer_release": "refs/tags/ecg-ramba-revision-20260721-v1",
+            "reviewed_change_scope": "cpsc2021_window_storage_only",
+        }
+    },
+}
 EXPECTED_LABEL_PROTOCOLS = {
     "ptbxl": "official_ptbxl_diagnostic_superclass_any_positive_likelihood",
     "georgia": "chapman_27_class_snomed_intersection",
@@ -146,8 +165,23 @@ def validate_external_prediction_reuse(
     current_runner_sha = sha256_file(exporter_path)
     diagnostics["current_runner_sha256"] = current_runner_sha
     diagnostics["observed_runner_sha256"] = manifest.get("runner_sha256")
-    if manifest.get("runner_sha256") != current_runner_sha:
-        reasons.append("external_exporter_sha_mismatch")
+    observed_runner_sha = str(manifest.get("runner_sha256", ""))
+    if observed_runner_sha != current_runner_sha:
+        attestation = RUNNER_COMPATIBILITY_ATTESTATIONS.get(dataset, {}).get(
+            observed_runner_sha
+        )
+        if (
+            not attestation
+            or attestation.get("compatible_current_runner_sha256") != current_runner_sha
+        ):
+            reasons.append("external_exporter_sha_mismatch")
+        else:
+            diagnostics["runner_compatibility_attestation"] = {
+                **attestation,
+                "observed_runner_sha256": observed_runner_sha,
+                "current_runner_sha256": current_runner_sha,
+                "status": "accepted_dataset_unaffected_by_reviewed_change",
+            }
 
     manifest_archive = manifest.get("archive") or {}
     current_archive_size = int(archive_path.stat().st_size)

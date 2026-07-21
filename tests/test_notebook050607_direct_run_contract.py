@@ -387,7 +387,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertIn("git('cat-file', '-e', expected_commit + '^{commit}')", source)
             self.assertIn("Tracked files differ from git before authority checkout", source)
             self.assertIn("verified_annotated_versioned_release_tag", source)
-            self.assertIn("refs/tags/ecg-ramba-revision-20260722-v2", source)
+            self.assertIn("refs/tags/ecg-ramba-revision-20260722-v3", source)
             self.assertIn("Publish a new versioned tag instead of retagging", source)
             setup_cells = [cell for cell in cells if capability in cell]
             for setup in setup_cells:
