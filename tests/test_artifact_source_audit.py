@@ -253,7 +253,8 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertNotIn("--check-only", source)
         self.assertIn("metric_implementation_sha256", source)
         self.assertIn("positive_label_multilabel_reduction", source)
-        self.assertIn("Verified final external comparator artifacts were not reusable", source)
+        self.assertIn("CACHE_ONLY_CPU_AGGREGATION_CAPABILITY", source)
+        self.assertIn("A CPU runtime may rebuild aggregate artifacts from complete caches", source)
         self.assertIn("EXTERNAL_GATE_DATASETS = 'ptbxl,georgia,cpsc2021'", source)
         self.assertIn("EXTERNAL_GATE_STRICT = True", source)
         self.assertIn("EXTERNAL_GATE_INPUT_PATHS", source)
@@ -283,7 +284,7 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("def _baseline_checkpoint_contract_status_02", source)
         self.assertIn("resnet_checkpoint_contract_ready", source)
         self.assertIn("Existing compatible checkpoints are reused and are not retrained", source)
-        self.assertIn("DEFERRED external learned-comparator inference", source)
+        self.assertIn("External comparator runner will validate final provenance first", source)
         self.assertIn("DEFERRED external representation extraction", source)
         self.assertIn("External paired-result targeted restore", source)
         self.assertIn("Group-safe calibration targeted restore", source)
@@ -318,8 +319,12 @@ class ArtifactSourceAuditTest(unittest.TestCase):
             / "revision"
             / "31_generate_external_comparator_predictions.py"
         ).read_text(encoding="utf-8")
-        self.assertIn("Verified final external comparator artifacts were not reusable", comparator_runner)
-        self.assertIn('device.type != "cuda" and str(args.device).lower() == "auto"', comparator_runner)
+        self.assertIn("CACHE_ONLY_CPU_AGGREGATION_CAPABILITY", comparator_runner)
+        self.assertIn("No CPU model inference was started", comparator_runner)
+        self.assertNotIn(
+            'if device.type != "cuda" and str(args.device).lower() == "auto":',
+            comparator_runner,
+        )
 
     def test_classifies_identical_unique_and_conflicting_files(self):
         with tempfile.TemporaryDirectory() as tmp:

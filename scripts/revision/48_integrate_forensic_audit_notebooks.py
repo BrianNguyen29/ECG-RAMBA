@@ -91,7 +91,8 @@ REVISION_TOKEN_REQUIREMENTS = {
     'scripts/revision/31_generate_external_comparator_predictions.py': [
         'validate_checkpoint_set',
         '--fold-cache-dir',
-        'Verified final external comparator artifacts were not reusable',
+        'CACHE_ONLY_CPU_AGGREGATION_CAPABILITY',
+        'No CPU model inference was started',
     ],
     'scripts/revision/32_paired_external_comparators.py': [
         'Paired external bootstrap requires at least two groups',
@@ -822,6 +823,14 @@ print('Temporal qualification:', ptbxl_analysis_lock['temporal_qualification'])
     )
     for cell in notebook["cells"]:
         text = source(cell)
+        text = text.replace(
+            "A100-only when fold caches are missing. ResNet1D/CNN, Raw Mamba, and a completed Transformer ECG baseline",
+            "CPU validates provenance and aggregates complete fold caches; A100 is required only when a fold cache is missing or stale. ResNet1D/CNN, Raw Mamba, and a completed Transformer ECG baseline",
+        )
+        text = text.replace(
+            "# GPU required. The script caches each dataset/comparator/fold directly on Drive, so a disconnect resumes.",
+            "# CPU cache-only aggregation is supported. GPU inference starts only for a missing/stale fold cache.",
+        )
         legacy_start = "# Notebook 02 may be rerun in a fresh /content clone"
         if NOTEBOOK02_PREFLIGHT_START in text:
             start = text.index(NOTEBOOK02_PREFLIGHT_START)
@@ -982,6 +991,36 @@ else:
     print('Successful external exports were published with exact source-path selection; no broad mirror overwrite is needed.')"""
             if broad_final_publish in text:
                 text = text.replace(broad_final_publish, selected_final_publish, 1)
+        if "pending_external_comparator_test = test_should_run and not test_ready" in text:
+            cache_aggregation_marker = (
+                "A CPU runtime may rebuild aggregate artifacts from complete caches"
+            )
+            if cache_aggregation_marker not in text:
+                gpu_preflight_pattern = re.compile(
+                    r"pending_external_comparator_test = test_should_run and not test_ready\n"
+                    r"pending_external_comparator_fold9 = fold9_should_run and not fold9_ready\n"
+                    r"if pending_external_comparator_test or pending_external_comparator_fold9:\n"
+                    r".*?(?=\nbase = \()",
+                    flags=re.DOTALL,
+                )
+                cache_aggregation_preflight = r'''pending_external_comparator_test = test_should_run and not test_ready
+pending_external_comparator_fold9 = fold9_should_run and not fold9_ready
+if test_should_run or fold9_should_run:
+    print(
+        'External comparator runner will validate final provenance first, then validate per-fold Drive caches. '
+        'A CPU runtime may rebuild aggregate artifacts from complete caches; it will stop before model inference '
+        'and name the exact missing/stale fold when CUDA is required.'
+    )
+'''
+                text, preflight_replacements = gpu_preflight_pattern.subn(
+                    cache_aggregation_preflight.rstrip(),
+                    text,
+                    count=1,
+                )
+                if preflight_replacements != 1:
+                    raise RuntimeError(
+                        f"Notebook 02 external comparator cache-preflight replacement_count={preflight_replacements}"
+                    )
         if "EXTERNAL_GATE_INPUT_PATHS = [" in text:
             gate_list_end = """        Path(f'reports/revision/experimental/external/{dataset}/{dataset}_full_prediction_run_manifest.json'),
     ]

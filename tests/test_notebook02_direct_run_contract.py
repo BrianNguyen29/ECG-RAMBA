@@ -82,6 +82,14 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("paired_refresh_complete_models", self.source)
         self.assertIn("{'resnet', 'raw_mamba'}.issubset(paired_refresh_complete_models)", self.source)
 
+    def test_external_comparator_cpu_cache_aggregation_precedes_gpu_requirement(self):
+        self.assertIn("CPU cache-only aggregation is supported", self.source)
+        self.assertIn("A CPU runtime may rebuild aggregate artifacts from complete caches", self.source)
+        self.assertNotIn(
+            "require_gpu_inference_runtime('External learned-comparator inference for '",
+            self.source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

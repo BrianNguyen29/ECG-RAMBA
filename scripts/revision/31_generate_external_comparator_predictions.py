@@ -52,6 +52,7 @@ from src.training_data import build_slice_index  # noqa: E402
 
 
 PROTOCOL_VERSION = 1
+CACHE_ONLY_CPU_AGGREGATION_CAPABILITY = "validated_external_fold_cache_aggregation_v1"
 COMPARATOR_STEMS = {
     "resnet": "resnet1d_cnn",
     "raw_mamba": "raw_mamba",
@@ -540,14 +541,10 @@ def run_dataset(
             pending.append((comparator, in_domain, checkpoints, checkpoint_hashes))
     if not pending:
         return result_rows
-    if device.type != "cuda" and str(args.device).lower() == "auto":
-        pending_names = ",".join(item[0] for item in pending)
-        raise RuntimeError(
-            "Verified final external comparator artifacts were not reusable and model inference is pending "
-            f"for {dataset}/{pending_names}. Attach a CUDA GPU (A100 High-RAM preferred), then rerun with "
-            "--device auto. Existing per-fold Drive caches remain reusable. Pass --device cpu only when the "
-            "slow CPU inference path is explicitly intended."
-        )
+    # Final artifacts can become stale after a metadata-only canonical-contract
+    # refresh even when all authenticated fold predictions remain reusable.
+    # Load the dataset contract and inspect those caches before requiring CUDA.
+    # The per-fold guard below still prevents accidental model inference on CPU.
     root = external_helpers.extract_archive(dataset, archive, resolve(args.extract_root))
     signals, y_true, record_ids, group_ids, split_ids, load_summary = external_helpers.load_records(
         dataset,
@@ -611,8 +608,10 @@ def run_dataset(
             )
             if device.type != "cuda":
                 raise RuntimeError(
-                    "A required external learned-comparator fold cache is missing or stale and needs CUDA inference. "
-                    "Use an A100/T4 GPU runtime, then rerun with --reuse-existing to resume only the missing fold."
+                    "A required external learned-comparator fold cache is missing or stale and needs CUDA inference: "
+                    f"dataset={dataset} comparator={comparator} fold={fold} cache={fold_cache}. "
+                    "Use an A100/T4 GPU runtime, then rerun with --reuse-existing to resume only the missing fold. "
+                    "No CPU model inference was started."
                 )
             model = load_model(args, comparator, checkpoints[fold - 1], device)
             mapped, actual_record_index, actual_starts, class_names = infer_fold(
