@@ -760,7 +760,7 @@ def external_loader_args(args: argparse.Namespace, sources: dict[str, Any]) -> S
     if cpsc_signal_memmap is None:
         cpsc_signal_memmap = (
             resolve(args.fold_cache_dir)
-            / "cpsc2021_preprocessed_windows_source_bound_v2.npy"
+            / "cpsc2021_preprocessed_windows_source_bound_v3.npy"
         )
     return SimpleNamespace(
         ptbxl_folds=args.ptbxl_folds,

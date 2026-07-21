@@ -131,6 +131,38 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual(counts["normal_intervals"], 2)
         self.assertEqual(external.interval_overlap(intervals, 300, 500, "normal"), 200)
 
+    def test_cpsc_capacity_prescan_counts_only_primary_eligible_windows(self):
+        metadata = [{"record_id": "cpsc-1", "record_path": Path("cpsc-1")}]
+        header = SimpleNamespace(fs=500.0, sig_len=15000)
+        intervals = [
+            (0, 5000, "normal"),
+            (5000, 10000, "AF_or_AFL"),
+            (10000, 12500, "normal"),
+            (12500, 15000, "AF_or_AFL"),
+        ]
+        with (
+            patch.object(external.wfdb, "rdheader", return_value=header),
+            patch.object(
+                external,
+                "cpsc_rhythm_intervals",
+                return_value=(intervals, {}),
+            ),
+        ):
+            capacity = external.cpsc_window_capacity(metadata)
+        self.assertEqual(capacity, 2)
+
+    def test_cpsc_cache_contract_declares_exact_annotation_capacity(self):
+        contract = external.cpsc_window_cache_contract(
+            [{"record_id": "cpsc-1", "record_path": Path("cpsc-1")}],
+            limit=0,
+            source_archive_sha256="a" * 64,
+        )
+        self.assertEqual(contract["schema_version"], 3)
+        self.assertEqual(
+            contract["capacity_policy"],
+            "annotation_prescan_exact_primary_windows_v1",
+        )
+
     def test_cpsc_disk_backed_loader_avoids_full_signal_ram_accumulation(self):
         record = SimpleNamespace(
             p_signal=np.zeros((5000, 12), dtype=np.float32),

@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260721-v1"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v2"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -74,6 +74,7 @@ REVISION_TOKEN_REQUIREMENTS = {
         '--georgia-code-inventory-out',
         '--cpsc-annotation-audit-out',
         'CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY',
+        'CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY',
         'validate_checkpoint_files_against_oof_run_manifest',
     ],
     'scripts/revision/06_freeze_oof.py': [
@@ -1282,17 +1283,51 @@ else:
                 text = text.replace(broad_final_publish, selected_final_publish, 1)
             cpsc_command = "        command += f' --cpsc-annotation-audit-out \"{CPSC_ANNOTATION_AUDIT_OUT}\"'"
             cpsc_resumable_command = (
-                "        cpsc_signal_cache = stable_mirror / 'predictions' / 'external_comparator_folds' / "
-                "'cpsc2021_preprocessed_windows_source_bound_v2.npy'\n"
+                "        cpsc_signal_cache = stable_mirror / 'predictions' / 'cpsc_window_cache' / "
+                "'cpsc2021_preprocessed_windows_source_bound_v3.npy'\n"
                 "        command += (\n"
                 "            f' --cpsc-annotation-audit-out \"{CPSC_ANNOTATION_AUDIT_OUT}\"'\n"
                 "            f' --cpsc-signal-memmap \"{cpsc_signal_cache}\"'\n"
                 "        )"
             )
-            if "cpsc2021_preprocessed_windows_source_bound_v2.npy" not in text:
+            text = text.replace(
+                "stable_mirror / 'predictions' / 'external_comparator_folds' / "
+                "'cpsc2021_preprocessed_windows_source_bound_v2.npy'",
+                "stable_mirror / 'predictions' / 'cpsc_window_cache' / "
+                "'cpsc2021_preprocessed_windows_source_bound_v3.npy'",
+            )
+            if "cpsc2021_preprocessed_windows_source_bound_v3.npy" not in text:
                 if cpsc_command not in text:
                     raise RuntimeError("Notebook 02 CPSC resumable-cache command anchor missing")
                 text = text.replace(cpsc_command, cpsc_resumable_command, 1)
+        if "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT" in text:
+            comparator_cache_assignment = (
+                "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT / 'revision_artifacts' / 'reports' / "
+                "'revision' / 'predictions' / 'external_comparator_folds'\n"
+            )
+            shared_cpsc_cache_assignment = comparator_cache_assignment + (
+                "EXTERNAL_CPSC_SIGNAL_CACHE = DRIVE_ROOT / 'revision_artifacts' / 'reports' / "
+                "'revision' / 'predictions' / 'cpsc_window_cache' / "
+                "'cpsc2021_preprocessed_windows_source_bound_v3.npy'\n"
+            )
+            if "EXTERNAL_CPSC_SIGNAL_CACHE =" not in text:
+                if comparator_cache_assignment not in text:
+                    raise RuntimeError("Notebook 02 external-comparator cache assignment anchor missing")
+                text = text.replace(
+                    comparator_cache_assignment,
+                    shared_cpsc_cache_assignment,
+                    1,
+                )
+            comparator_base_anchor = (
+                "    f'--strict --fold-cache-dir \"{EXTERNAL_COMPARATOR_CACHE_DIR}\" '\n"
+            )
+            comparator_base_with_cpsc = comparator_base_anchor + (
+                "    f'--cpsc-signal-memmap \"{EXTERNAL_CPSC_SIGNAL_CACHE}\" '\n"
+            )
+            if "f'--cpsc-signal-memmap \"{EXTERNAL_CPSC_SIGNAL_CACHE}\" '" not in text:
+                if comparator_base_anchor not in text:
+                    raise RuntimeError("Notebook 02 external-comparator command anchor missing")
+                text = text.replace(comparator_base_anchor, comparator_base_with_cpsc, 1)
         if "pending_external_comparator_test = test_should_run and not test_ready" in text:
             cache_aggregation_marker = (
                 "A CPU runtime may rebuild aggregate artifacts from complete caches"

@@ -77,8 +77,9 @@ AMP_DTYPE_NAME = (
 
 NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY = "external_export_full10s_grouped_v1"
 NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION = 1
-CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY = "cpsc_disk_backed_float32_windows_v2_resumable"
-CPSC_WINDOW_CACHE_SCHEMA_VERSION = 2
+CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY = "cpsc_disk_backed_float32_windows_v3_exact_annotation_capacity"
+CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY = "annotation_prescan_exact_primary_windows_v1"
+CPSC_WINDOW_CACHE_SCHEMA_VERSION = 3
 
 
 def patch_wfdb_annotation_numpy2_overflow() -> None:
@@ -616,10 +617,48 @@ def cpsc_metadata(root: Path, limit: int) -> tuple[list[dict], dict]:
     )
 
 
+def cpsc_primary_window_decisions(
+    target_length: int,
+    target_intervals: list[tuple[int, int, str]],
+) -> list[tuple[int, int, str]]:
+    """Classify each non-overlapping target-rate window under the primary protocol."""
+
+    decisions = []
+    for start in range(0, int(target_length), 5000):
+        stop = min(start + 5000, int(target_length))
+        valid_length = stop - start
+        if valid_length != 5000:
+            decisions.append((start, stop, "partial"))
+            continue
+        af_samples = interval_overlap(target_intervals, start, stop, "AF_or_AFL")
+        normal_samples = interval_overlap(target_intervals, start, stop, "normal")
+        af_fraction = af_samples / valid_length
+        normal_fraction = normal_samples / valid_length
+        if 0.0 < af_fraction < 1.0:
+            decision = "transition"
+        elif af_fraction > 0.5:
+            decision = "positive"
+        elif normal_fraction > 0.5:
+            decision = "negative"
+        elif np.isclose(af_fraction, normal_fraction, atol=0.0, rtol=0.0):
+            decision = "tie"
+        else:
+            decision = "ambiguous"
+        decisions.append((start, stop, decision))
+    return decisions
+
+
 def cpsc_window_capacity(metadata: list[dict]) -> int:
-    """Return a conservative disk-backed capacity without loading ECG samples."""
+    """Count primary-analysis windows from headers and annotations only.
+
+    The prior duration-only estimate reserved every possible window, including
+    records without usable rhythm annotations and windows later excluded as
+    transition/tie/ambiguous. This prescan applies the exact primary label rule
+    used by ``load_cpsc_windows`` without loading signal samples.
+    """
 
     capacity = 0
+    skipped = 0
     for row in tqdm(metadata, desc="Sizing cpsc2021 window store"):
         try:
             header = wfdb.rdheader(str(row["record_path"]))
@@ -628,15 +667,26 @@ def cpsc_window_capacity(metadata: list[dict]) -> int:
             if source_fs <= 0 or signal_length <= 0:
                 raise ValueError("invalid WFDB header duration")
             target_length = (signal_length * int(FS) + source_fs - 1) // source_fs
-            # Two guard windows cover resampling length rounding without making
-            # the final in-memory view larger than the number actually loaded.
-            capacity += max(1, target_length // 5000 + 2)
+            intervals, _counts = cpsc_rhythm_intervals(row["record_path"], signal_length)
+            scale = FS / float(source_fs)
+            target_intervals = [
+                (int(round(start * scale)), int(round(stop * scale)), label)
+                for start, stop, label in intervals
+            ]
+            decisions = cpsc_primary_window_decisions(target_length, target_intervals)
+            capacity += sum(
+                decision in {"positive", "negative"}
+                for _start, _stop, decision in decisions
+            )
         except Exception:
-            # rdrecord uses the same header. Reserve one row so malformed
-            # records can be audited/skipped without multi-GiB over-allocation.
-            capacity += 1
+            skipped += 1
     if capacity <= 0:
         raise RuntimeError("Could not size the CPSC2021 disk-backed window store")
+    print(
+        "CPSC2021 exact annotation-capacity prescan: "
+        f"eligible_windows={capacity} skipped_records={skipped}",
+        flush=True,
+    )
     return int(capacity)
 
 
@@ -672,6 +722,7 @@ def cpsc_window_cache_contract(
             "exclude_transition": True,
             "exclude_tie": True,
         },
+        "capacity_policy": CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY,
         "lead_order": STANDARD_LEADS,
     }
     payload["contract_sha256"] = hashlib.sha256(
@@ -1024,29 +1075,25 @@ def load_cpsc_windows(
                 (int(round(start * scale)), int(round(stop * scale)), label)
                 for start, stop, label in intervals
             ]
-            for start in range(0, filtered.shape[-1], 5000):
-                stop = min(start + 5000, filtered.shape[-1])
-                valid_length = stop - start
-                if valid_length != 5000:
+            for start, stop, decision in cpsc_primary_window_decisions(
+                filtered.shape[-1], target_intervals
+            ):
+                if decision == "partial":
                     record_partial_windows_excluded += 1
                     continue
-                af_samples = interval_overlap(target_intervals, start, stop, "AF_or_AFL")
-                normal_samples = interval_overlap(target_intervals, start, stop, "normal")
-                af_fraction = af_samples / valid_length
-                normal_fraction = normal_samples / valid_length
-                if 0.0 < af_fraction < 1.0:
+                if decision == "transition":
                     record_transition_windows += 1
                     record_transition_windows_excluded += 1
                     continue
-                if af_fraction > 0.5:
+                if decision == "positive":
                     label = 1.0
                     record_positive_windows += 1
-                elif normal_fraction > 0.5:
+                elif decision == "negative":
                     label = 0.0
                     record_negative_windows += 1
                 else:
                     record_ambiguous_windows += 1
-                    if np.isclose(af_fraction, normal_fraction, atol=0.0, rtol=0.0):
+                    if decision == "tie":
                         record_tie_windows_excluded += 1
                     continue
                 segment = pad_or_truncate(filtered[:, start:stop], target_len=5000).astype(np.float32)

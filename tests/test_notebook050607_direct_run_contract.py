@@ -332,6 +332,18 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         )
         self.assertIn("NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1", gate_source)
 
+    def test_notebook02_shares_the_exact_sized_cpsc_window_cache(self):
+        _, source = notebook_source("02_predictions_and_external_eval.ipynb")
+        cache_name = "cpsc2021_preprocessed_windows_source_bound_v3.npy"
+        self.assertGreaterEqual(source.count(cache_name), 2)
+        self.assertIn("EXTERNAL_CPSC_SIGNAL_CACHE", source)
+        self.assertIn(
+            "--cpsc-signal-memmap \"{EXTERNAL_CPSC_SIGNAL_CACHE}\"",
+            source,
+        )
+        self.assertIn("CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY", source)
+        self.assertNotIn("cpsc2021_preprocessed_windows_source_bound_v2.npy", source)
+
     def test_installer_discovery_uses_exact_capability_schema_pair(self):
         _, notebook02_source = notebook_source("02_predictions_and_external_eval.ipynb")
         markers = (
@@ -375,7 +387,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertIn("git('cat-file', '-e', expected_commit + '^{commit}')", source)
             self.assertIn("Tracked files differ from git before authority checkout", source)
             self.assertIn("verified_annotated_versioned_release_tag", source)
-            self.assertIn("refs/tags/ecg-ramba-revision-20260721-v1", source)
+            self.assertIn("refs/tags/ecg-ramba-revision-20260722-v2", source)
             self.assertIn("Publish a new versioned tag instead of retagging", source)
             setup_cells = [cell for cell in cells if capability in cell]
             for setup in setup_cells:
