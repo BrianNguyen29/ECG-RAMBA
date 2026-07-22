@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v7"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v8"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -1378,6 +1378,117 @@ EXTERNAL_FEATURE_PARITY_RECORDS = 4
                 "EXTERNAL_FEATURE_BATCH_SIZE = 128\n",
                 "EXTERNAL_FEATURE_BATCH_SIZE = 256\n",
             )
+            if "EXTERNAL_RUN_PROFILE =" not in text:
+                external_profile_pattern = re.compile(
+                    r"# PTB-XL is already manuscript-gated; Georgia/CPSC2021 will run only when their prediction artifacts are missing\.\n"
+                    r"# Allowed values for BUILD_FOLD_PCA and RUN_\*_EXPORT: True, False, or 'auto'\.\n"
+                    r"BUILD_FOLD_PCA = 'auto'\n"
+                    r"RUN_PTBXL_EXPORT = 'auto'\n"
+                    r"RUN_GEORGIA_EXPORT = 'auto'\n"
+                    r"RUN_CPSC2021_EXPORT = 'auto'\n"
+                    r"EXTERNAL_BATCH_SIZE = 128\n"
+                    r"# The fixed-seed ROCKET-family feature transform is the external-export bottleneck\.\n"
+                    r"# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which\n"
+                    r"# preserves the input precision used when fitting the frozen fold PCA objects\.\n"
+                    r"EXTERNAL_FEATURE_DEVICE = 'auto'\n"
+                    r"EXTERNAL_FEATURE_BATCH_SIZE = 256\n"
+                    r"EXTERNAL_FEATURE_PARITY_RECORDS = 4\n"
+                    r"EXTERNAL_LIMIT_RECORDS = 0\n"
+                    r"ALLOW_EXTERNAL_EXPORT_FAILURES = True\n"
+                    r"GEORGIA_MAPPING_REVIEW = Path\('docs/revision_plan/georgia_label_mapping_review_20260703\.csv'\)\n"
+                    r"GEORGIA_CODE_INVENTORY_OUT = Path\('reports/revision/tables/table_georgia_snomed_code_inventory\.csv'\)\n"
+                    r"CPSC_ANNOTATION_AUDIT_OUT = Path\('reports/revision/tables/table_cpsc2021_annotation_audit\.csv'\)\n"
+                    r"FOLD_PCA_MANIFEST = Path\('reports/revision/manifests/fold_pca_manifest\.json'\)\n\n"
+                    r"# Direct-rerun convenience: restore external/gate/few-shot artifacts from Drive mirror\n"
+                    r"# before deciding whether expensive export/model inference is needed\. This avoids\n"
+                    r"# rerunning the earlier full mirror-restore cell after a Colab disconnect\.\n"
+                    r"AUTO_RESTORE_EXTERNAL_ARTIFACTS = True\n"
+                    r"EXTERNAL_RESTORE_DATASETS = \['ptbxl', 'georgia', 'cpsc2021'\]\n"
+                )
+                external_profile_config = """# Choose one execution profile. The default is intentionally limited to the
+# current CPSC2021 GPU-resume task; it cannot silently start PTB-XL or Georgia.
+# Set ECG_RAMBA_EXTERNAL_RUN_PROFILE=full_reviewer_a100 only for the full
+# three-dataset evidence refresh after the CPSC run is safely published.
+EXTERNAL_RUN_PROFILE = os.environ.get(
+    'ECG_RAMBA_EXTERNAL_RUN_PROFILE', 'cpsc_resume_a100'
+).strip().lower()
+EXTERNAL_RUN_PROFILES = {
+    'cpsc_resume_a100': {
+        'exports': {'ptbxl': False, 'georgia': False, 'cpsc2021': 'auto'},
+        'gate_datasets': 'cpsc2021',
+        'restore_datasets': ['cpsc2021'],
+        'feature_device': 'cuda',
+        'allow_export_failures': False,
+    },
+    'full_reviewer_a100': {
+        'exports': {'ptbxl': 'auto', 'georgia': 'auto', 'cpsc2021': 'auto'},
+        'gate_datasets': 'ptbxl,georgia,cpsc2021',
+        'restore_datasets': ['ptbxl', 'georgia', 'cpsc2021'],
+        'feature_device': 'cuda',
+        'allow_export_failures': False,
+    },
+    'cpu_gate_cpsc': {
+        'exports': {'ptbxl': False, 'georgia': False, 'cpsc2021': False},
+        'gate_datasets': 'cpsc2021',
+        'restore_datasets': ['cpsc2021'],
+        'feature_device': 'auto',
+        'allow_export_failures': False,
+    },
+    'cpu_gate_all': {
+        'exports': {'ptbxl': False, 'georgia': False, 'cpsc2021': False},
+        'gate_datasets': 'ptbxl,georgia,cpsc2021',
+        'restore_datasets': ['ptbxl', 'georgia', 'cpsc2021'],
+        'feature_device': 'auto',
+        'allow_export_failures': False,
+    },
+}
+if EXTERNAL_RUN_PROFILE not in EXTERNAL_RUN_PROFILES:
+    raise ValueError(
+        'Unknown ECG_RAMBA_EXTERNAL_RUN_PROFILE=' + repr(EXTERNAL_RUN_PROFILE)
+        + '; choose one of ' + ', '.join(sorted(EXTERNAL_RUN_PROFILES))
+    )
+EXTERNAL_RUN_CONFIG = EXTERNAL_RUN_PROFILES[EXTERNAL_RUN_PROFILE]
+
+# Allowed values for BUILD_FOLD_PCA and RUN_*_EXPORT: True, False, or 'auto'.
+BUILD_FOLD_PCA = 'auto'
+RUN_PTBXL_EXPORT = EXTERNAL_RUN_CONFIG['exports']['ptbxl']
+RUN_GEORGIA_EXPORT = EXTERNAL_RUN_CONFIG['exports']['georgia']
+RUN_CPSC2021_EXPORT = EXTERNAL_RUN_CONFIG['exports']['cpsc2021']
+EXTERNAL_BATCH_SIZE = 128
+# The fixed-seed ROCKET-family feature transform is the external-export bottleneck.
+# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which
+# preserves the input precision used when fitting the frozen fold PCA objects.
+# A100 40 GB: batch 256 is the validated default. Reducing it to 128 after a real
+# CUDA OOM intentionally creates a new partial-cache contract rather than mixing batches.
+EXTERNAL_FEATURE_DEVICE = EXTERNAL_RUN_CONFIG['feature_device']
+EXTERNAL_FEATURE_BATCH_SIZE = 256
+EXTERNAL_FEATURE_PARITY_RECORDS = 4
+EXTERNAL_LIMIT_RECORDS = 0
+ALLOW_EXTERNAL_EXPORT_FAILURES = EXTERNAL_RUN_CONFIG['allow_export_failures']
+GEORGIA_MAPPING_REVIEW = Path('docs/revision_plan/georgia_label_mapping_review_20260703.csv')
+GEORGIA_CODE_INVENTORY_OUT = Path('reports/revision/tables/table_georgia_snomed_code_inventory.csv')
+CPSC_ANNOTATION_AUDIT_OUT = Path('reports/revision/tables/table_cpsc2021_annotation_audit.csv')
+FOLD_PCA_MANIFEST = Path('reports/revision/manifests/fold_pca_manifest.json')
+
+# Direct-rerun convenience: restore only the profile's authenticated artifacts before
+# deciding whether expensive inference is necessary.
+AUTO_RESTORE_EXTERNAL_ARTIFACTS = True
+EXTERNAL_RESTORE_DATASETS = list(EXTERNAL_RUN_CONFIG['restore_datasets'])
+EXTERNAL_GATE_DATASETS_DEFAULT = EXTERNAL_RUN_CONFIG['gate_datasets']
+print(
+    'External run profile:', EXTERNAL_RUN_PROFILE,
+    '| exports=', EXTERNAL_RUN_CONFIG['exports'],
+    '| gate=', EXTERNAL_GATE_DATASETS_DEFAULT,
+    '| feature_device=', EXTERNAL_FEATURE_DEVICE,
+)
+"""
+                text, profile_replacements = external_profile_pattern.subn(
+                    external_profile_config,
+                    text,
+                    count=1,
+                )
+                if profile_replacements != 1:
+                    raise RuntimeError("Notebook 02 external run-profile configuration anchor missing")
             external_command_anchor = (
                 "        f'--dataset {dataset} --checkpoint-kind final_ema --batch-size {EXTERNAL_BATCH_SIZE} '\n"
                 "        '--allow-experimental'"
@@ -1507,6 +1618,20 @@ if test_should_run or fold9_should_run:
                         f"Notebook 02 external comparator cache-preflight replacement_count={preflight_replacements}"
                     )
         if "EXTERNAL_GATE_INPUT_PATHS = [" in text:
+            default_gate_config = """RUN_EXTERNAL_PROTOCOL_GATE = True
+EXTERNAL_GATE_DATASETS = 'ptbxl,georgia,cpsc2021'
+EXTERNAL_GATE_N_BOOT = 1000
+"""
+            profile_gate_config = """RUN_EXTERNAL_PROTOCOL_GATE = True
+# Inherit the dataset scope from the preceding external-run profile. Override this
+# single assignment only when intentionally running a different CPU gate.
+EXTERNAL_GATE_DATASETS = str(globals().get(
+    'EXTERNAL_GATE_DATASETS_DEFAULT', 'ptbxl,georgia,cpsc2021'
+))
+EXTERNAL_GATE_N_BOOT = 1000
+"""
+            if default_gate_config in text:
+                text = text.replace(default_gate_config, profile_gate_config, 1)
             if "EXTERNAL_GATE_DATASET_LIST =" not in text:
                 gate_dataset_config_anchor = "EXTERNAL_GATE_REUSE_EXISTING = True\n"
                 gate_dataset_config = """EXTERNAL_GATE_REUSE_EXISTING = True
@@ -1640,7 +1765,7 @@ if stale_gate_inputs:
         'External protocol gate stopped before bootstrap because restored prediction artifacts are stale: '
         + details
         + '. Reconnect an A100 High-RAM runtime and run Experimental External Prediction Commands '
-        'with RUN_PTBXL_EXPORT=RUN_GEORGIA_EXPORT=RUN_CPSC2021_EXPORT="auto". '
+        'with an A100 external-run profile that selects the stale dataset(s). '
         'Wait for External cache handoff: VERIFIED before returning to this CPU gate cell.'
     )
 
