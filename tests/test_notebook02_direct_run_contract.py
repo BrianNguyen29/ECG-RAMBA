@@ -24,7 +24,7 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
 
     def test_only_true_fewshot_removes_unpublished_regenerable_outputs(self):
         self.assertIn(
-            "def _restore_report_artifact(path, source_roots, remove_unpublished_active=False)",
+            "def _restore_report_artifact(path, source_roots, remove_unpublished_active=False, allow_unpublished_active=False)",
             self.source,
         )
         self.assertIn("Active artifact is not authenticated by the canonical mirror manifest", self.source)
@@ -64,6 +64,21 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("EXTERNAL_FEATURE_CACHE_ROOT = stable_mirror / 'predictions' / 'external_feature_cache'", self.source)
         self.assertIn("os.environ['ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR']", self.source)
         self.assertIn('--refresh-existing-prefix "predictions/external_feature_cache"', self.source)
+        self.assertIn(
+            "cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz",
+            self.source,
+        )
+        self.assertIn("def external_publish_refresh_args(dataset):", self.source)
+        self.assertIn("def publish_external_dataset_outputs(dataset, mirror_root, log_path):", self.source)
+        self.assertIn("def _is_external_export_recovery_artifact(path):", self.source)
+        self.assertIn(
+            "allow_unpublished_active=_is_external_export_recovery_artifact(path)",
+            self.source,
+        )
+        self.assertIn(
+            "Recovering source-bound external outputs after an interrupted mirror publish",
+            self.source,
+        )
         self.assertIn("PTBXL_FOLD9_FEATURE_DEVICE = 'auto'", self.source)
         self.assertIn("f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '", self.source)
         self.assertIn("PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT", self.source)

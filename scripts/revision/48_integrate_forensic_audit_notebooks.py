@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v8"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v9"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -251,6 +251,50 @@ NOTEBOOK02_EXTERNAL_REUSE_FUNCTION = r'''def external_prediction_ready(dataset):
     if diagnostics.get('q3_reconstruction_max_abs') is not None:
         print('  Q=3 reconstruction max_abs:', diagnostics['q3_reconstruction_max_abs'])
     return bool(result.get('ready', False))
+'''
+
+
+NOTEBOOK02_EXTERNAL_PUBLISH_HELPERS = r'''def external_publish_artifacts(dataset):
+    paths = [
+        *external_required_artifacts(dataset),
+        Path('reports/revision/experimental/external/external_summary_experimental.csv'),
+    ]
+    if dataset == 'georgia':
+        paths.append(GEORGIA_CODE_INVENTORY_OUT)
+    elif dataset == 'cpsc2021':
+        paths.append(CPSC_ANNOTATION_AUDIT_OUT)
+    return paths
+
+
+def external_publish_refresh_args(dataset):
+    # Feature caches and the CPSC signal-cache contract are written directly to
+    # the canonical Drive mirror. Re-attest only those mutable paths. In
+    # particular, do not refresh the whole CPSC cache directory because that
+    # would hash the multi-gigabyte signal memmap after every export.
+    refresh_paths = ['predictions/external_feature_cache']
+    if dataset == 'cpsc2021':
+        refresh_paths.append(
+            'predictions/cpsc_window_cache/'
+            'cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz'
+        )
+    return ' '.join(
+        f'--refresh-existing-prefix "{relative}"'
+        for relative in refresh_paths
+    )
+
+
+def publish_external_dataset_outputs(dataset, mirror_root, log_path):
+    external_publish_paths = external_publish_artifacts(dataset)
+    external_publish_args = ' '.join(
+        f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+        for path in external_publish_paths
+    )
+    run(
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+        f'{external_publish_refresh_args(dataset)} '
+        f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',
+        log_path=log_path,
+    )
 '''
 
 
@@ -1250,6 +1294,116 @@ else:
                 raise RuntimeError(
                     f"Notebook 02 external reuse function replacement_count={replacement_count}"
                 )
+            if "def external_publish_refresh_args(dataset):" not in text:
+                publish_helper_anchor = "\n\ndef resolve_auto_flag(value, ready):"
+                if publish_helper_anchor not in text:
+                    raise RuntimeError("Notebook 02 external publish-helper anchor missing")
+                text = text.replace(
+                    publish_helper_anchor,
+                    "\n\n" + NOTEBOOK02_EXTERNAL_PUBLISH_HELPERS.rstrip()
+                    + publish_helper_anchor,
+                    1,
+                )
+            text = text.replace(
+                "def _restore_report_artifact(path, source_roots, remove_unpublished_active=False):",
+                "def _restore_report_artifact(path, source_roots, remove_unpublished_active=False, allow_unpublished_active=False):",
+                1,
+            )
+            unpublished_active_anchor = """    if path.exists() and path.stat().st_size > 0:
+        if remove_unpublished_active:
+            size = path.stat().st_size
+            path.unlink()
+            return {'path': str(path), 'status': 'removed_unpublished_active', 'source': '', 'size': size}
+        raise RuntimeError("""
+            unpublished_active_replacement = """    if path.exists() and path.stat().st_size > 0:
+        if allow_unpublished_active:
+            return {
+                'path': str(path),
+                'status': 'unpublished_active',
+                'source': '',
+                'size': path.stat().st_size,
+            }
+        if remove_unpublished_active:
+            size = path.stat().st_size
+            path.unlink()
+            return {'path': str(path), 'status': 'removed_unpublished_active', 'source': '', 'size': size}
+        raise RuntimeError("""
+            if unpublished_active_anchor in text:
+                text = text.replace(
+                    unpublished_active_anchor,
+                    unpublished_active_replacement,
+                    1,
+                )
+            text = text.replace(
+                "_restore_report_artifact(path, restore_source_roots)\n"
+                "        for path in _external_artifact_paths_for_restore(EXTERNAL_RESTORE_DATASETS)",
+                "_restore_report_artifact(\n"
+                "            path,\n"
+                "            restore_source_roots,\n"
+                "            allow_unpublished_active=_is_external_export_recovery_artifact(path),\n"
+                "        )\n"
+                "        for path in _external_artifact_paths_for_restore(EXTERNAL_RESTORE_DATASETS)",
+                1,
+            )
+            text = text.replace(
+                "_restore_report_artifact(path, restore_source_roots, allow_unpublished_active=True)\n"
+                "        for path in _external_artifact_paths_for_restore(EXTERNAL_RESTORE_DATASETS)",
+                "_restore_report_artifact(\n"
+                "            path,\n"
+                "            restore_source_roots,\n"
+                "            allow_unpublished_active=_is_external_export_recovery_artifact(path),\n"
+                "        )\n"
+                "        for path in _external_artifact_paths_for_restore(EXTERNAL_RESTORE_DATASETS)",
+                1,
+            )
+            if "def _is_external_export_recovery_artifact(path):" not in text:
+                recovery_predicate_anchor = "\n\nexternal_unpublished_active_paths = set()\n"
+                recovery_predicate = r'''
+
+def _is_external_export_recovery_artifact(path):
+    normalized = Path(path).as_posix()
+    return (
+        normalized.startswith('reports/revision/experimental/external/')
+        or normalized == 'reports/revision/tables/table_georgia_snomed_code_inventory.csv'
+        or normalized == 'reports/revision/tables/table_cpsc2021_annotation_audit.csv'
+    )
+'''
+                if recovery_predicate_anchor not in text:
+                    raise RuntimeError("Notebook 02 external recovery-predicate anchor missing")
+                text = text.replace(
+                    recovery_predicate_anchor,
+                    recovery_predicate.rstrip() + recovery_predicate_anchor,
+                    1,
+                )
+            if "external_unpublished_active_paths =" not in text:
+                restore_summary_anchor = """    missing_count = int((restore_df['status'] == 'missing_in_sources').sum()) if not restore_df.empty else 0
+    print(f'External targeted restore: restored={restored_count} missing_in_sources={missing_count}')"""
+                restore_summary_replacement = """    missing_count = int((restore_df['status'] == 'missing_in_sources').sum()) if not restore_df.empty else 0
+    external_unpublished_active_paths = set(
+        restore_df.loc[restore_df['status'] == 'unpublished_active', 'path'].astype(str)
+    ) if not restore_df.empty else set()
+    print(
+        f'External targeted restore: restored={restored_count} missing_in_sources={missing_count} '
+        f'unpublished_active={len(external_unpublished_active_paths)}'
+    )"""
+                if restore_summary_anchor not in text:
+                    raise RuntimeError("Notebook 02 external restore-summary anchor missing")
+                text = text.replace(
+                    restore_summary_anchor,
+                    restore_summary_replacement,
+                    1,
+                )
+                text = text.replace(
+                    "display(restore_df[restore_df['status'].isin(['restored', 'missing_in_sources'])])",
+                    "display(restore_df[restore_df['status'].isin(['restored', 'missing_in_sources', 'unpublished_active'])])",
+                    1,
+                )
+                text = text.replace(
+                    "if AUTO_RESTORE_EXTERNAL_ARTIFACTS:\n",
+                    "external_unpublished_active_paths = set()\n"
+                    "if AUTO_RESTORE_EXTERNAL_ARTIFACTS:\n",
+                    1,
+                )
             text = text.replace(
                 "artifact_mirror.py publish --verify-existing size --mirror-root",
                 "artifact_mirror.py publish --verify-existing size --source-conflict-policy source --mirror-root",
@@ -1287,6 +1441,66 @@ else:
                 legacy_selected_dataset_publish,
                 refreshed_selected_dataset_publish,
             )
+            selected_dataset_publish_current = """            external_publish_paths = [
+                *external_required_artifacts(dataset),
+                Path('reports/revision/experimental/external/external_summary_experimental.csv'),
+            ]
+            if dataset == 'georgia':
+                external_publish_paths.append(GEORGIA_CODE_INVENTORY_OUT)
+            elif dataset == 'cpsc2021':
+                external_publish_paths.append(CPSC_ANNOTATION_AUDIT_OUT)
+            external_publish_args = ' '.join(
+                f'--include-path "{path.relative_to(Path("reports/revision")).as_posix()}"'
+                for path in external_publish_paths
+            )
+            run(
+                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--refresh-existing-prefix "predictions/external_feature_cache" '
+                f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',
+                log_path=f'reports/revision/logs/{dataset}_external_export_mirror_publish.log',
+            )"""
+            selected_dataset_publish_helper = """            publish_external_dataset_outputs(
+                dataset,
+                mirror_root,
+                f'reports/revision/logs/{dataset}_external_export_mirror_publish.log',
+            )"""
+            if selected_dataset_publish_current in text:
+                text = text.replace(
+                    selected_dataset_publish_current,
+                    selected_dataset_publish_helper,
+                    1,
+                )
+            if "Recovering source-bound external outputs after an interrupted mirror publish" not in text:
+                recovery_anchor = "print('Resolved external export jobs:', external_jobs)\n"
+                recovery_block = r'''
+
+# If inference completed but the previous mirror transaction failed, validate
+# the active artifacts first and then finish only the interrupted publish. This
+# path does not invoke CUDA, feature extraction, or model inference.
+for dataset in EXTERNAL_RESTORE_DATASETS:
+    required_strings = {str(path) for path in external_publish_artifacts(dataset)}
+    needs_recovery_publish = bool(
+        external_ready.get(dataset, False)
+        and required_strings.intersection(external_unpublished_active_paths)
+    )
+    if needs_recovery_publish:
+        print(
+            'Recovering source-bound external outputs after an interrupted mirror publish: '
+            + dataset
+        )
+        publish_external_dataset_outputs(
+            dataset,
+            stable_mirror,
+            f'reports/revision/logs/{dataset}_external_export_recovery_mirror_publish.log',
+        )
+'''
+                if recovery_anchor not in text:
+                    raise RuntimeError("Notebook 02 external recovery-publish anchor missing")
+                text = text.replace(
+                    recovery_anchor,
+                    recovery_anchor + recovery_block,
+                    1,
+                )
             broad_final_publish = """if external_export_ran:
     print('All successful external datasets were already published individually; refreshing the merged manifest.')
     mirror_root = globals().get('stable_mirror', DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision')

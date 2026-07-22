@@ -127,6 +127,70 @@ class ArtifactMirrorStorageSafetyTests(unittest.TestCase):
                 ],
             )
 
+    def test_exact_cache_sidecar_refresh_does_not_refresh_large_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            revision = root / "revision"
+            mirror = root / "mirror"
+            source = revision / "metrics" / "summary.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"initial")
+            self._publish(revision, mirror)
+
+            cache_dir = mirror / "predictions" / "cpsc_window_cache"
+            cache_dir.mkdir(parents=True)
+            signal = cache_dir / "cpsc2021_preprocessed_windows_source_bound_v3.npy"
+            contract = cache_dir / f"{signal.name}.contract.npz"
+            signal.write_bytes(b"large-signal-placeholder")
+            contract.write_bytes(b"old-contract")
+
+            # Re-attest the direct-canonical cache files once so they enter the
+            # manifest, then mutate only the small contract sidecar as happens
+            # when a resumed CPSC cache is finalized.
+            self._publish(
+                revision,
+                mirror,
+                verify_existing="size",
+                refresh_existing_prefixes=["predictions/cpsc_window_cache"],
+            )
+            old_signal_sha = artifact_mirror.sha256_file(signal)
+            contract.write_bytes(b"new-source-bound-contract-with-a-different-size")
+
+            with patch.object(
+                artifact_mirror,
+                "sha256_file",
+                wraps=artifact_mirror.sha256_file,
+            ) as sha_spy:
+                manifest_path = self._publish(
+                    revision,
+                    mirror,
+                    verify_existing="size",
+                    refresh_existing_prefixes=[
+                        "predictions/cpsc_window_cache/"
+                        "cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz"
+                    ],
+                )
+
+            hashed_paths = {Path(call.args[0]) for call in sha_spy.call_args_list}
+            self.assertIn(contract, hashed_paths)
+            self.assertNotIn(signal, hashed_paths)
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = {row["relative_path"]: row for row in payload["artifacts"]}
+            self.assertEqual(
+                rows[
+                    "predictions/cpsc_window_cache/"
+                    "cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz"
+                ]["sha256"],
+                artifact_mirror.sha256_file(contract),
+            )
+            self.assertEqual(
+                rows[
+                    "predictions/cpsc_window_cache/"
+                    "cpsc2021_preprocessed_windows_source_bound_v3.npy"
+                ]["sha256"],
+                old_signal_sha,
+            )
+
     def test_truncated_staging_never_replaces_complete_artifact_or_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             revision, mirror, source, destination = self._seed_published_artifact(
