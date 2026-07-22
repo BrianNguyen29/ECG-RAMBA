@@ -63,6 +63,14 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT", self.source)
         self.assertIn("external_fixed_rocket_gpu_parity_checked_v1", self.source)
 
+    def test_external_gate_and_handoff_follow_the_explicit_dataset_selection(self):
+        self.assertIn("EXTERNAL_GATE_DATASET_LIST =", self.source)
+        self.assertIn("for dataset in EXTERNAL_GATE_DATASET_LIST", self.source)
+        self.assertIn("if 'georgia' in EXTERNAL_GATE_DATASET_LIST:", self.source)
+        self.assertIn("if 'cpsc2021' in EXTERNAL_GATE_DATASET_LIST:", self.source)
+        self.assertIn("external_handoff_datasets = [", self.source)
+        self.assertIn("for dataset in external_handoff_datasets", self.source)
+
     def test_missing_oof_group_sidecar_is_repaired_without_automatic_gpu_inference(self):
         self.assertIn("scripts/revision/49_build_oof_group_sidecar.py", self.source)
         self.assertIn("def ensure_oof_group_sidecar():", self.source)

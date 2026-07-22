@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v6"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v7"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -1298,6 +1298,38 @@ else:
     print('Successful external exports were published with exact source-path selection; no broad mirror overwrite is needed.')"""
             if broad_final_publish in text:
                 text = text.replace(broad_final_publish, selected_final_publish, 1)
+            if "external_handoff_datasets = [" not in text:
+                handoff_dataset_anchor = "external_handoff_issues = []\nfor dataset in EXTERNAL_RESTORE_DATASETS:\n"
+                handoff_dataset_replacement = """# Do not make a deliberately selected export wait for an unrelated dataset.
+# Final evidence still requires all datasets, but this handoff only certifies the
+# artifacts selected in this GPU session or already accepted for reuse.
+external_handoff_datasets = [
+    dataset
+    for dataset, enabled in external_jobs
+    if enabled or external_ready.get(dataset, False)
+]
+print('External cache handoff datasets:', external_handoff_datasets)
+external_handoff_issues = []
+for dataset in external_handoff_datasets:
+"""
+                if handoff_dataset_anchor not in text:
+                    raise RuntimeError("Notebook 02 selected external-handoff dataset anchor missing")
+                text = text.replace(
+                    handoff_dataset_anchor,
+                    handoff_dataset_replacement,
+                    1,
+                )
+                text = text.replace(
+                    "for local_path in [path for dataset in EXTERNAL_RESTORE_DATASETS for path in external_required_artifacts(dataset)]:",
+                    "for local_path in [path for dataset in external_handoff_datasets for path in external_required_artifacts(dataset)]:",
+                    1,
+                )
+                text = text.replace(
+                    "print('External cache handoff: VERIFIED 15/15 active + canonical artifacts with manifest SHA256.')",
+                    "external_handoff_count = len(external_handoff_datasets) * 5\n"
+                    "    print(f'External cache handoff: VERIFIED {external_handoff_count}/{external_handoff_count} selected active + canonical artifacts with manifest SHA256.')",
+                    1,
+                )
             cpsc_command = "        command += f' --cpsc-annotation-audit-out \"{CPSC_ANNOTATION_AUDIT_OUT}\"'"
             cpsc_resumable_command = (
                 "        cpsc_signal_cache = stable_mirror / 'predictions' / 'cpsc_window_cache' / "
@@ -1475,6 +1507,51 @@ if test_should_run or fold9_should_run:
                         f"Notebook 02 external comparator cache-preflight replacement_count={preflight_replacements}"
                     )
         if "EXTERNAL_GATE_INPUT_PATHS = [" in text:
+            if "EXTERNAL_GATE_DATASET_LIST =" not in text:
+                gate_dataset_config_anchor = "EXTERNAL_GATE_REUSE_EXISTING = True\n"
+                gate_dataset_config = """EXTERNAL_GATE_REUSE_EXISTING = True
+EXTERNAL_GATE_DATASET_LIST = (
+    ['ptbxl', 'georgia', 'cpsc2021']
+    if EXTERNAL_GATE_DATASETS.strip().lower() == 'all'
+    else [item.strip() for item in EXTERNAL_GATE_DATASETS.split(',') if item.strip()]
+)
+_unknown_external_gate_datasets = sorted(
+    set(EXTERNAL_GATE_DATASET_LIST) - {'ptbxl', 'georgia', 'cpsc2021'}
+)
+if not EXTERNAL_GATE_DATASET_LIST or _unknown_external_gate_datasets:
+    raise ValueError(
+        'EXTERNAL_GATE_DATASETS must select one or more of ptbxl,georgia,cpsc2021; '
+        f'observed={EXTERNAL_GATE_DATASETS!r} unknown={_unknown_external_gate_datasets}'
+    )
+print('External protocol-gate datasets:', EXTERNAL_GATE_DATASET_LIST)
+"""
+                if gate_dataset_config_anchor not in text:
+                    raise RuntimeError("Notebook 02 external gate dataset-selection anchor missing")
+                text = text.replace(gate_dataset_config_anchor, gate_dataset_config, 1)
+            unconditional_gate_audit_inputs = """EXTERNAL_GATE_INPUT_PATHS.extend([
+    Path('reports/revision/tables/table_georgia_snomed_code_inventory.csv'),
+    Path('reports/revision/tables/table_cpsc2021_annotation_audit.csv'),
+])"""
+            selected_gate_audit_inputs = """if 'georgia' in EXTERNAL_GATE_DATASET_LIST:
+    EXTERNAL_GATE_INPUT_PATHS.append(
+        Path('reports/revision/tables/table_georgia_snomed_code_inventory.csv')
+    )
+if 'cpsc2021' in EXTERNAL_GATE_DATASET_LIST:
+    EXTERNAL_GATE_INPUT_PATHS.append(
+        Path('reports/revision/tables/table_cpsc2021_annotation_audit.csv')
+    )"""
+            if "if 'georgia' in EXTERNAL_GATE_DATASET_LIST:" not in text:
+                if unconditional_gate_audit_inputs not in text:
+                    raise RuntimeError("Notebook 02 external gate selected audit-input anchor missing")
+                text = text.replace(
+                    unconditional_gate_audit_inputs,
+                    selected_gate_audit_inputs,
+                    1,
+                )
+            text = text.replace(
+                "for dataset in ['ptbxl', 'georgia', 'cpsc2021']",
+                "for dataset in EXTERNAL_GATE_DATASET_LIST",
+            )
             gate_list_end = """        Path(f'reports/revision/experimental/external/{dataset}/{dataset}_full_prediction_run_manifest.json'),
     ]
 ]"""
@@ -1528,7 +1605,7 @@ gate_archive_names = {
     'cpsc2021': ['cpsc2021.zip', 'CPSC2021.zip'],
 }
 gate_source_preflight = {}
-for dataset in ['ptbxl', 'georgia', 'cpsc2021']:
+for dataset in EXTERNAL_GATE_DATASET_LIST:
     archive = next(
         (DRIVE_ROOT / name for name in gate_archive_names[dataset] if (DRIVE_ROOT / name).is_file()),
         None,
@@ -1585,7 +1662,7 @@ if stale_gate_inputs:
     Path('reports/revision/metrics/external_protocol_gate_summary.csv'),
     *[
         path
-        for dataset in ['ptbxl', 'georgia', 'cpsc2021']
+        for dataset in EXTERNAL_GATE_DATASET_LIST
         for path in [
             Path(f'reports/revision/metrics/external_{dataset}_protocol_gate.json'),
             Path(f'reports/revision/tables/table_external_{dataset}_label_mapping.csv'),

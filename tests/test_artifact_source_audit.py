@@ -292,7 +292,11 @@ class ArtifactSourceAuditTest(unittest.TestCase):
         self.assertIn("table_notebook02_reviewer_evidence_status.csv", source)
         self.assertIn("all_reviewer_external_stages_ready", source)
         self.assertIn("files_ready = bool(paths) and present == len(paths)", source)
-        self.assertIn("External cache handoff: VERIFIED 15/15", source)
+        self.assertIn("external_handoff_count = len(external_handoff_datasets) * 5", source)
+        self.assertIn(
+            "External cache handoff: VERIFIED {external_handoff_count}/{external_handoff_count}",
+            source,
+        )
         self.assertIn("SAFE TO DISCONNECT A100", source)
         self.assertIn("canonical manifest mismatch", source)
         self.assertIn("external_reuse_diagnostics", source)
