@@ -48,6 +48,17 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("--source-conflict-policy source", self.source)
         self.assertIn("--include-path", self.source)
 
+    def test_external_rocket_features_are_gpu_parity_checked_and_resumable(self):
+        self.assertIn("EXTERNAL_FEATURE_DEVICE = 'auto'", self.source)
+        self.assertIn("EXTERNAL_FEATURE_BATCH_SIZE = 256", self.source)
+        self.assertIn("EXTERNAL_FEATURE_PARITY_RECORDS = 4", self.source)
+        self.assertIn("f'--feature-device {EXTERNAL_FEATURE_DEVICE} '", self.source)
+        self.assertIn("f'--feature-batch-size {EXTERNAL_FEATURE_BATCH_SIZE} '", self.source)
+        self.assertIn("f'--feature-parity-records {EXTERNAL_FEATURE_PARITY_RECORDS} '", self.source)
+        self.assertIn("PTBXL_FOLD9_FEATURE_DEVICE = 'auto'", self.source)
+        self.assertIn("f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '", self.source)
+        self.assertIn("external_fixed_rocket_gpu_parity_checked_v1", self.source)
+
     def test_missing_oof_group_sidecar_is_repaired_without_automatic_gpu_inference(self):
         self.assertIn("scripts/revision/49_build_oof_group_sidecar.py", self.source)
         self.assertIn("def ensure_oof_group_sidecar():", self.source)

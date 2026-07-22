@@ -124,7 +124,7 @@ def exclusive_cache_writer(
     *,
     stale_seconds: float = 6 * 60 * 60,
 ):
-    """Serialize final-name cache commits and recover only clearly stale locks."""
+    """Serialize final-name cache commits and recover safely after a dead local owner."""
 
     path = Path(destination)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -163,7 +163,13 @@ def exclusive_cache_writer(
                     "ECG_RAMBA_RECOVER_FOREIGN_STALE_LOCK=1 only after confirming that "
                     "the foreign runtime is no longer active."
                 )
-            if age < stale_seconds:
+            # A Colab kernel can be killed without executing context-manager
+            # cleanup. A same-host PID that no longer exists is conclusive
+            # evidence that no writer remains, so resume immediately rather
+            # than making a valid checkpoint unusable for six hours.
+            if owner_alive is False:
+                pass
+            elif age < stale_seconds:
                 raise RuntimeError(
                     f"Cache writer lock is active or unverifiable: {lock} owner={existing}"
                 )

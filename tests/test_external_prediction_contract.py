@@ -102,6 +102,99 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual(features.shape, (36,))
         np.testing.assert_array_equal(features[25:30], np.zeros(5, dtype=np.float32))
 
+    def test_rocket_feature_precision_and_readonly_memmap_boundary(self):
+        values = np.asarray([[0.10001, -1.2345, 123.4567]], dtype=np.float32)
+        expected = values.astype(np.float16).astype(np.float32)
+        np.testing.assert_array_equal(
+            external.training_pca_compatible_rocket_values(values), expected
+        )
+
+        signals = np.zeros((1, 12, 5000), dtype=np.float32)
+        signals.setflags(write=False)
+        batch = external.writable_signal_batch(signals, 0, 1)
+        self.assertTrue(batch.flags.writeable)
+        self.assertTrue(batch.flags.c_contiguous)
+        self.assertEqual(batch.dtype, np.float32)
+
+    def test_rocket_feature_device_and_batch_configuration(self):
+        with patch.object(external.torch.cuda, "is_available", return_value=False):
+            self.assertEqual(external.resolve_rocket_feature_device("auto"), "cpu")
+            self.assertEqual(external.resolve_rocket_feature_device("cpu"), "cpu")
+            with self.assertRaises(RuntimeError):
+                external.resolve_rocket_feature_device("cuda")
+        self.assertEqual(
+            external.resolve_rocket_feature_batch_size("cpu", 0),
+            external.DEFAULT_ROCKET_CPU_BATCH_SIZE,
+        )
+        self.assertEqual(
+            external.resolve_rocket_feature_batch_size("cuda", 0),
+            external.DEFAULT_ROCKET_CUDA_BATCH_SIZE,
+        )
+        self.assertEqual(external.resolve_rocket_feature_batch_size("cuda", 256), 256)
+        with self.assertRaises(ValueError):
+            external.resolve_rocket_feature_batch_size("cpu", -1)
+
+    def test_rocket_feature_partial_cache_resumes_only_matching_contract(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "features.npz"
+            contract = {
+                "archive_sha256": "archive-a",
+                "record_id_fingerprint": "records-a",
+                "rocket_feature_value_contract": external.EXTERNAL_FEATURE_VALUE_CONTRACT,
+            }
+            raw, raw_path, progress_path, completed, resume_contract = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                )
+            )
+            raw[0] = np.asarray([1.0, 2.0], dtype=np.float16)
+            raw.flush()
+            completed.add(0)
+            external.save_rocket_resume_progress(progress_path, resume_contract, completed)
+            owner = getattr(raw, "_mmap", None)
+            if owner is not None:
+                owner.close()
+
+            reused, raw_path_2, progress_path_2, completed_2, resume_contract_2 = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                )
+            )
+            self.assertEqual((raw_path_2, progress_path_2), (raw_path, progress_path))
+            self.assertEqual(completed_2, {0})
+            self.assertEqual(resume_contract_2, resume_contract)
+            np.testing.assert_array_equal(reused[0], np.asarray([1.0, 2.0], dtype=np.float16))
+            reused_owner = getattr(reused, "_mmap", None)
+            if reused_owner is not None:
+                reused_owner.close()
+
+            # Starts are only meaningful under the same batch partition. A
+            # changed batch size must quarantine rather than skip an unwritten
+            # portion of a previously larger batch.
+            changed, changed_raw, changed_progress, changed_completed, changed_contract = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=1,
+                )
+            )
+            self.assertEqual(changed_completed, set())
+            self.assertEqual(changed_contract["batch_size"], 1)
+            self.assertTrue(list(cache_path.parent.glob(f"{raw_path.name}.stale.*")))
+            external.cleanup_rocket_resume(changed, changed_raw, changed_progress)
+            self.assertFalse(raw_path.exists())
+            self.assertFalse(progress_path.exists())
+
     def test_cpsc_annotation_failure_is_not_converted_to_negative(self):
         with patch.object(external.wfdb, "rdann", side_effect=FileNotFoundError("missing atr")):
             with self.assertRaises(FileNotFoundError):

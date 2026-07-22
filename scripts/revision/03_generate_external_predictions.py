@@ -58,7 +58,7 @@ from src.features import (  # noqa: E402
     extract_global_record_stats,
     extract_hrv_features,
 )
-from src.provenance import ndarray_sha256, source_bundle_sha256  # noqa: E402
+from src.provenance import exclusive_cache_writer, ndarray_sha256, source_bundle_sha256  # noqa: E402
 
 
 STANDARD_LEADS = ["I", "II", "III", "AVR", "AVL", "AVF", "V1", "V2", "V3", "V4", "V5", "V6"]
@@ -80,6 +80,12 @@ NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION = 1
 CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY = "cpsc_disk_backed_float32_windows_v3_exact_annotation_capacity"
 CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY = "annotation_prescan_exact_primary_windows_v1"
 CPSC_WINDOW_CACHE_SCHEMA_VERSION = 3
+EXTERNAL_FEATURE_ACCELERATION_CAPABILITY = "external_fixed_rocket_gpu_parity_checked_v1"
+EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION = 1
+EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION = 3
+EXTERNAL_FEATURE_VALUE_CONTRACT = "float16_storage_roundtrip_v1_training_pca_aligned"
+DEFAULT_ROCKET_CPU_BATCH_SIZE = 64
+DEFAULT_ROCKET_CUDA_BATCH_SIZE = 128
 
 
 def patch_wfdb_annotation_numpy2_overflow() -> None:
@@ -118,6 +124,30 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["ptbxl", "georgia", "cpsc2021"], required=True)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--feature-device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help=(
+            "Device for the fixed-seed ROCKET-family feature transform. CUDA is used only "
+            "after a deterministic CPU/GPU float16-roundtrip parity check."
+        ),
+    )
+    parser.add_argument(
+        "--feature-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "ROCKET-family feature batch size; 0 chooses a conservative device-specific "
+            "default (64 CPU, 128 CUDA)."
+        ),
+    )
+    parser.add_argument(
+        "--feature-parity-records",
+        type=int,
+        default=4,
+        help="Deterministic records checked against CPU before CUDA feature extraction.",
+    )
     parser.add_argument("--checkpoint-kind", choices=CHECKPOINT_KINDS, default="best")
     parser.add_argument("--limit-records", type=int, default=0)
     parser.add_argument(
@@ -1357,14 +1387,289 @@ def feature_cache_path(
         "extractor_source_sha256": source_sha,
         "config_sha256": EVALUATION_CONFIG_HASH,
         "record_order_sha256": record_id_fingerprint(record_ids),
+        "rocket_feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
     }
     contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
     path = cache_dir / (
-        f"{dataset}_features_v{CACHE_SCHEMA_VERSION}_{EVALUATION_CONFIG_HASH}_"
+        f"{dataset}_features_v{EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION}_{EVALUATION_CONFIG_HASH}_"
         f"{contract_sha[:16]}_{pca_fingerprint}_"
         f"N{len(record_ids)}_{record_id_fingerprint(record_ids)}.npz"
     )
     return path, contract
+
+
+def resolve_rocket_feature_device(requested: str) -> str:
+    """Choose a device without silently accepting an unavailable CUDA request."""
+
+    requested = str(requested).strip().lower()
+    if requested not in {"auto", "cpu", "cuda"}:
+        raise ValueError(f"Unsupported ROCKET feature device: {requested}")
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "--feature-device cuda was requested, but CUDA is unavailable. "
+            "Use --feature-device cpu or select a GPU runtime."
+        )
+    return requested
+
+
+def resolve_rocket_feature_batch_size(device: str, requested: int) -> int:
+    requested = int(requested)
+    if requested < 0:
+        raise ValueError("--feature-batch-size must be non-negative")
+    if requested:
+        return requested
+    return DEFAULT_ROCKET_CUDA_BATCH_SIZE if device == "cuda" else DEFAULT_ROCKET_CPU_BATCH_SIZE
+
+
+def writable_signal_batch(signals: np.ndarray, start: int, stop: int) -> np.ndarray:
+    """Copy one memmap slice before passing it to Torch.
+
+    CPSC2021 uses a read-only NPY memmap on Drive.  Torch warns when wrapping
+    that buffer because an accidental write would be undefined behavior.  The
+    transform is inference-only, but a bounded writable copy also gives CUDA a
+    contiguous host buffer for a non-blocking transfer.
+    """
+
+    return np.array(signals[start:stop], dtype=np.float32, copy=True, order="C")
+
+
+def training_pca_compatible_rocket_values(values: np.ndarray) -> np.ndarray:
+    """Match the float16 storage roundtrip used to fit the frozen fold PCA models."""
+
+    array = np.asarray(values, dtype=np.float32)
+    if not np.isfinite(array).all():
+        raise RuntimeError("ROCKET-family transform produced non-finite features")
+    return array.astype(np.float16).astype(np.float32)
+
+
+def rocket_resume_paths(cache_path: Path) -> tuple[Path, Path]:
+    stem = cache_path.stem
+    raw_path = cache_path.with_name(f".{stem}.rocket_f16.partial.npy")
+    progress_path = cache_path.with_name(f".{stem}.rocket_f16.progress.json")
+    return raw_path, progress_path
+
+
+def rocket_resume_contract(
+    cache_contract: dict[str, str],
+    *,
+    n_records: int,
+    n_features: int,
+    batch_size: int,
+) -> dict[str, object]:
+    return {
+        "schema_version": EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION,
+        "feature_cache_contract": cache_contract,
+        "n_records": int(n_records),
+        "n_features": int(n_features),
+        # Completed batches are stored by start offset, so a different batch
+        # partition cannot safely reuse a partial matrix after interruption.
+        "batch_size": int(batch_size),
+        "storage_dtype": "float16",
+        "feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
+    }
+
+
+def quarantine_rocket_resume(paths: tuple[Path, Path], reason: str) -> None:
+    """Never reuse a partial feature matrix whose source-bound contract changed."""
+
+    suffix = hashlib.sha256(reason.encode("utf-8")).hexdigest()[:12]
+    for path in paths:
+        if not path.exists():
+            continue
+        candidate = path.with_name(f"{path.name}.stale.{suffix}")
+        ordinal = 1
+        while candidate.exists():
+            candidate = path.with_name(f"{path.name}.stale.{suffix}.{ordinal}")
+            ordinal += 1
+        path.replace(candidate)
+        print(f"Quarantined stale ROCKET partial: {path.name} -> {candidate.name}")
+
+
+def open_rocket_resume_cache(
+    cache_path: Path,
+    cache_contract: dict[str, str],
+    *,
+    n_records: int,
+    n_features: int,
+    batch_size: int,
+) -> tuple[np.memmap, Path, Path, set[int], dict[str, object]]:
+    """Open a source-bound float16 raw-feature checkpoint or create a new one."""
+
+    raw_path, progress_path = rocket_resume_paths(cache_path)
+    expected = rocket_resume_contract(
+        cache_contract,
+        n_records=n_records,
+        n_features=n_features,
+        batch_size=batch_size,
+    )
+    if raw_path.exists() or progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            raw = np.load(raw_path, mmap_mode="r+")
+            completed = {int(value) for value in progress.get("completed_starts", [])}
+            valid = (
+                progress.get("resume_contract") == expected
+                and raw.shape == (n_records, n_features)
+                and raw.dtype == np.float16
+                and all(0 <= value < n_records for value in completed)
+            )
+            if valid:
+                print(
+                    "Resuming source-bound ROCKET feature checkpoint: "
+                    f"completed_batches={len(completed)} path={raw_path}"
+                )
+                return raw, raw_path, progress_path, completed, expected
+            mmap_owner = getattr(raw, "_mmap", None)
+            if mmap_owner is not None:
+                mmap_owner.close()
+        except Exception as exc:
+            print(f"ROCKET partial cache is not reusable: {type(exc).__name__}: {exc}")
+        quarantine_rocket_resume((raw_path, progress_path), "resume_contract_mismatch")
+
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw = np.lib.format.open_memmap(
+        raw_path,
+        mode="w+",
+        dtype=np.float16,
+        shape=(n_records, n_features),
+    )
+    raw.flush()
+    save_json(
+        progress_path,
+        {
+            "resume_contract": expected,
+            "completed_starts": [],
+        },
+    )
+    print(f"Created source-bound ROCKET feature checkpoint: {raw_path}")
+    return raw, raw_path, progress_path, set(), expected
+
+
+def save_rocket_resume_progress(
+    progress_path: Path,
+    resume_contract: dict[str, object],
+    completed_starts: set[int],
+) -> None:
+    save_json(
+        progress_path,
+        {
+            "resume_contract": resume_contract,
+            "completed_starts": sorted(int(value) for value in completed_starts),
+        },
+    )
+
+
+def _cuda_rocket_runtime_settings() -> dict[str, bool]:
+    return {
+        "matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
+    }
+
+
+def configure_deterministic_cuda_rocket() -> dict[str, bool]:
+    previous = _cuda_rocket_runtime_settings()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    return previous
+
+
+def restore_cuda_rocket_runtime(previous: dict[str, bool]) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = previous["matmul_allow_tf32"]
+    torch.backends.cudnn.allow_tf32 = previous["cudnn_allow_tf32"]
+    torch.backends.cudnn.benchmark = previous["cudnn_benchmark"]
+    torch.backends.cudnn.deterministic = previous["cudnn_deterministic"]
+
+
+def verify_cuda_rocket_parity(
+    signals: np.ndarray,
+    *,
+    n_records: int,
+) -> dict[str, object]:
+    """Accept CUDA only when its float16 PCA inputs match CPU on fixed records."""
+
+    if n_records <= 0:
+        raise ValueError("--feature-parity-records must be positive for CUDA feature extraction")
+    count = min(int(n_records), len(signals))
+    indices = np.unique(np.linspace(0, len(signals) - 1, num=count, dtype=np.int64))
+    cpu_rocket = MiniRocketNative(c_in=12, seq_len=5000, seed=42).cpu().eval()
+    cuda_rocket = MiniRocketNative(c_in=12, seq_len=5000, seed=42).cuda().eval()
+    previous = configure_deterministic_cuda_rocket()
+    max_abs = 0.0
+    try:
+        with torch.inference_mode():
+            for index in indices.tolist():
+                batch = writable_signal_batch(signals, index, index + 1)
+                cpu_values = cpu_rocket(torch.from_numpy(batch)).numpy()
+                cuda_values = cuda_rocket(
+                    torch.from_numpy(batch).pin_memory().to("cuda", non_blocking=True)
+                ).float().cpu().numpy()
+                max_abs = max(max_abs, float(np.max(np.abs(cpu_values - cuda_values))))
+                if not np.array_equal(
+                    training_pca_compatible_rocket_values(cpu_values),
+                    training_pca_compatible_rocket_values(cuda_values),
+                ):
+                    raise RuntimeError(
+                        "CUDA ROCKET-family transform failed the exact float16-roundtrip parity "
+                        f"check at record_index={index}; max_abs={max_abs:.8g}. "
+                        "Use --feature-device cpu and report the runtime mismatch."
+                    )
+    finally:
+        restore_cuda_rocket_runtime(previous)
+        del cpu_rocket, cuda_rocket
+        gc.collect()
+        torch.cuda.empty_cache()
+    return {
+        "status": "passed",
+        "records_checked": [int(value) for value in indices.tolist()],
+        "max_abs_before_float16_roundtrip": max_abs,
+        "comparison": "exact_float16_storage_roundtrip",
+    }
+
+
+def transform_external_rocket_features(
+    raw_features: np.memmap,
+    pca_paths: list[Path],
+    *,
+    batch_size: int,
+) -> list[np.ndarray]:
+    """Apply frozen fold PCA in bounded chunks instead of materializing 5+ GiB arrays."""
+
+    n_records = len(raw_features)
+    pca_batch_size = max(256, min(2048, int(batch_size) * 8))
+    hydra: list[np.ndarray] = []
+    for fold, path in enumerate(pca_paths, start=1):
+        pca = joblib.load(path)
+        n_components = int(np.asarray(pca.components_).shape[0])
+        projected = np.empty((n_records, n_components), dtype=np.float32)
+        for start in tqdm(
+            range(0, n_records, pca_batch_size),
+            desc=f"Fold {fold} PCA",
+            leave=False,
+        ):
+            stop = min(n_records, start + pca_batch_size)
+            chunk = np.asarray(raw_features[start:stop], dtype=np.float32)
+            projected[start:stop] = pca.transform(chunk).astype(np.float32)
+        hydra.append(projected)
+        del pca
+    return hydra
+
+
+def cleanup_rocket_resume(raw_features: np.memmap, raw_path: Path, progress_path: Path) -> None:
+    raw_features.flush()
+    mmap_owner = getattr(raw_features, "_mmap", None)
+    if mmap_owner is not None:
+        mmap_owner.close()
+    del raw_features
+    gc.collect()
+    for path in (raw_path, progress_path):
+        if path.exists():
+            path.unlink()
 
 
 def generate_features(
@@ -1374,7 +1679,11 @@ def generate_features(
     record_ids: np.ndarray,
     pca_paths: list[Path],
     force: bool,
-) -> tuple[list[np.ndarray], np.ndarray, Path, bool]:
+    *,
+    feature_device: str,
+    feature_batch_size: int,
+    feature_parity_records: int,
+) -> tuple[list[np.ndarray], np.ndarray, Path, bool, dict[str, object]]:
     cache_path, cache_contract = feature_cache_path(dataset, archive, signals, pca_paths, record_ids)
     hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
     if cache_path.exists() and not force:
@@ -1387,46 +1696,124 @@ def generate_features(
                 for key in cache_contract
             }
             if (
-                schema == CACHE_SCHEMA_VERSION
+                schema == EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION
                 and observed_contract == cache_contract
                 and len(hydra) == len(pca_paths)
+                and all(
+                    key in data.files
+                    for key in (
+                        "feature_device",
+                        "feature_batch_size",
+                        "feature_runtime_json",
+                        "rocket_feature_value_contract",
+                    )
+                )
                 and all(values.dtype == np.float32 for values in hydra)
                 and hrv.dtype == np.float32
                 and all(len(values) == len(signals) for values in hydra)
             ):
                 print(f"Loaded float32 external feature cache: {cache_path}")
-                return hydra, hrv, cache_path, True
+                runtime = {
+                    "status": "cached",
+                    "feature_device": str(data["feature_device"].item()),
+                    "feature_batch_size": int(data["feature_batch_size"].item()),
+                    "feature_value_contract": str(data["rocket_feature_value_contract"].item()),
+                }
+                return hydra, hrv, cache_path, True, runtime
 
-    rocket = MiniRocketNative(c_in=12, seq_len=5000, seed=42).cpu().eval()
-    raw_features = []
-    with torch.no_grad():
-        for start in tqdm(range(0, len(signals), 64), desc="MiniRocket"):
-            batch = torch.from_numpy(signals[start : start + 64])
-            raw_features.append(rocket(batch).numpy())
-    raw_features = np.concatenate(raw_features, axis=0)
-    hydra = [
-        joblib.load(path).transform(raw_features).astype(np.float32)
-        for path in pca_paths
-    ]
-    hrv = np.asarray(
-        [checkpoint_compatible_hrv36(signal) for signal in tqdm(signals, desc="HRV36")],
-        dtype=np.float32,
-    )
+    device = resolve_rocket_feature_device(feature_device)
+    batch_size = resolve_rocket_feature_batch_size(device, feature_batch_size)
+    if feature_parity_records <= 0:
+        raise ValueError("--feature-parity-records must be positive")
+    runtime: dict[str, object] = {
+        "status": "generated",
+        "capability": EXTERNAL_FEATURE_ACCELERATION_CAPABILITY,
+        "schema_version": EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION,
+        "requested_device": str(feature_device),
+        "feature_device": device,
+        "feature_batch_size": batch_size,
+        "feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
+    }
+    if device == "cuda":
+        runtime["cuda_parity"] = verify_cuda_rocket_parity(
+            signals,
+            n_records=int(feature_parity_records),
+        )
+
+    probe = MiniRocketNative(c_in=12, seq_len=5000, seed=42).cpu().eval()
+    n_features = int(probe.num_features)
+    del probe
+    raw_path, _ = rocket_resume_paths(cache_path)
+    # The partial raw feature matrix and its progress journal are a single
+    # transactional unit. Lock before opening either file so two disconnected
+    # Colab runtimes cannot both create/write the same final-name checkpoint.
+    with exclusive_cache_writer(raw_path):
+        raw_features, raw_path, progress_path, completed_starts, resume_contract = open_rocket_resume_cache(
+            cache_path,
+            cache_contract,
+            n_records=len(signals),
+            n_features=n_features,
+            batch_size=batch_size,
+        )
+        pending_starts = [
+            start for start in range(0, len(signals), batch_size) if start not in completed_starts
+        ]
+        print(
+            "ROCKET-family feature extraction: "
+            f"device={device} batch_size={batch_size} pending_batches={len(pending_starts)} "
+            f"total_batches={int(np.ceil(len(signals) / batch_size))}"
+        )
+        if pending_starts:
+            rocket = MiniRocketNative(c_in=12, seq_len=5000, seed=42).to(device).eval()
+            previous = configure_deterministic_cuda_rocket() if device == "cuda" else None
+            try:
+                with torch.inference_mode():
+                    for start in tqdm(pending_starts, desc="ROCKET-family", unit="batch"):
+                        stop = min(len(signals), start + batch_size)
+                        batch = torch.from_numpy(writable_signal_batch(signals, start, stop))
+                        if device == "cuda":
+                            batch = batch.pin_memory().to("cuda", non_blocking=True)
+                        values = rocket(batch).float().cpu().numpy()
+                        raw_features[start:stop] = training_pca_compatible_rocket_values(values)
+                        raw_features.flush()
+                        completed_starts.add(start)
+                        save_rocket_resume_progress(progress_path, resume_contract, completed_starts)
+            finally:
+                if previous is not None:
+                    restore_cuda_rocket_runtime(previous)
+                del rocket
+                gc.collect()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+
+    if raw_features.shape != (len(signals), n_features) or not np.isfinite(raw_features).all():
+        raise RuntimeError(
+            f"Invalid external ROCKET feature checkpoint: shape={raw_features.shape}, "
+            f"finite={bool(np.isfinite(raw_features).all())}"
+        )
+    hydra = transform_external_rocket_features(raw_features, pca_paths, batch_size=batch_size)
+    hrv = np.empty((len(signals), int(CONFIG["hrv_dim"])), dtype=np.float32)
+    for index, signal in enumerate(tqdm(signals, desc="HRV36")):
+        hrv[index] = checkpoint_compatible_hrv36(signal)
     payload = {
         "X_hrv": hrv,
-        "cache_schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
+        "cache_schema_version": np.asarray(EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION, dtype=np.int16),
         "config_hash": np.asarray(EVALUATION_CONFIG_HASH),
         "pca_paths": np.asarray([str(path) for path in pca_paths]),
         "pca_sha256": np.asarray([sha256_file(path) for path in pca_paths]),
         "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
         "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
+        "feature_device": np.asarray(str(runtime["feature_device"])),
+        "feature_batch_size": np.asarray(int(runtime["feature_batch_size"]), dtype=np.int32),
+        "feature_runtime_json": np.asarray(json.dumps(runtime, sort_keys=True)),
     }
     payload.update({key: np.asarray(value) for key, value in cache_contract.items()})
     payload.update({key: values for key, values in zip(hydra_keys, hydra)})
     # Feature construction can run for hours on CPSC2021. A partial cache must
     # never be mistaken for a valid reusable cache after a Colab disconnect.
     save_npz_compressed_atomic(cache_path, **payload)
-    return hydra, hrv, cache_path, False
+    cleanup_rocket_resume(raw_features, raw_path, progress_path)
+    return hydra, hrv, cache_path, False, runtime
 
 
 def build_slices(
@@ -1767,13 +2154,16 @@ def main() -> None:
         args,
     )
 
-    hydra_by_fold, hrv, feature_cache, feature_cache_hit = generate_features(
+    hydra_by_fold, hrv, feature_cache, feature_cache_hit, feature_runtime = generate_features(
         args.dataset,
         archive,
         signals,
         record_ids,
         pca_paths,
         args.force_features,
+        feature_device=args.feature_device,
+        feature_batch_size=args.feature_batch_size,
+        feature_parity_records=args.feature_parity_records,
     )
     xs, xhr, slice_record_index, slice_index = build_slices(signals, hrv)
     model_slice_probs = infer_ensemble(
@@ -1909,6 +2299,7 @@ def main() -> None:
         "aggregation_implementation": POWER_MEAN_IMPLEMENTATION,
         "feature_cache": str(feature_cache),
         "feature_cache_hit": feature_cache_hit,
+        "feature_runtime": feature_runtime,
         "hrv_semantics": "checkpoint_compatible_amplitude_slots_zero",
         "load_summary": load_summary,
         "prediction_file": str(prediction_path),

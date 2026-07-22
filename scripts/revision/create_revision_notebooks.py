@@ -1179,6 +1179,11 @@ RUN_PTBXL_EXPORT = False
 RUN_GEORGIA_EXPORT = False
 RUN_CPSC2021_EXPORT = False
 EXTERNAL_BATCH_SIZE = 64
+# CUDA is accepted only after the exporter verifies exact float16-roundtrip
+# parity against the CPU transform used to fit the frozen fold PCA models.
+EXTERNAL_FEATURE_DEVICE = 'auto'
+EXTERNAL_FEATURE_BATCH_SIZE = 256
+EXTERNAL_FEATURE_PARITY_RECORDS = 4
 EXTERNAL_LIMIT_RECORDS = 0
 
 if BUILD_FOLD_PCA:
@@ -1198,6 +1203,9 @@ for dataset, enabled in external_jobs:
     command = (
         'python -u scripts/revision/03_generate_external_predictions.py '
         f'--dataset {dataset} --checkpoint-kind best --batch-size {EXTERNAL_BATCH_SIZE} '
+        f'--feature-device {EXTERNAL_FEATURE_DEVICE} '
+        f'--feature-batch-size {EXTERNAL_FEATURE_BATCH_SIZE} '
+        f'--feature-parity-records {EXTERNAL_FEATURE_PARITY_RECORDS} '
         '--allow-experimental'
     )
     if EXTERNAL_LIMIT_RECORDS:

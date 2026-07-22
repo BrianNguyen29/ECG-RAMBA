@@ -40,6 +40,30 @@ class ProvenanceWriterSafetyTests(unittest.TestCase):
 
             self.assertTrue(lock.is_file())
 
+    def test_dead_same_host_writer_is_recovered_without_waiting_for_stale_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "cache.npz"
+            lock = destination.with_name(f".{destination.name}.write.lock")
+            lock.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "run_id": "dead",
+                        "pid": 999_999_999,
+                        "hostname": socket.gethostname(),
+                        "created_epoch": time.time(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with mock.patch("src.provenance._same_host_pid_is_alive", return_value=False):
+                with exclusive_cache_writer(destination, stale_seconds=24 * 60 * 60):
+                    self.assertTrue(lock.is_file())
+
+            self.assertFalse(lock.exists())
+            self.assertEqual(len(list(destination.parent.glob(f"{lock.name}.stale.*"))), 1)
+
     def test_invalid_npz_is_rejected_before_final_name_is_exposed(self):
         with tempfile.TemporaryDirectory() as tmp:
             destination = Path(tmp) / "cache.npz"

@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v4"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v5"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -37,6 +37,8 @@ REVISION_CAPABILITY_REQUIREMENTS = {
     'scripts/revision/03_generate_external_predictions.py': {
         'NOTEBOOK_02_EXTERNAL_EXPORT_CAPABILITY': 'external_export_full10s_grouped_v1',
         'NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION': 1,
+        'EXTERNAL_FEATURE_ACCELERATION_CAPABILITY': 'external_fixed_rocket_gpu_parity_checked_v1',
+        'EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION': 1,
     },
     'scripts/revision/18_external_protocol_gate.py': {
         'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
@@ -75,6 +77,10 @@ REVISION_TOKEN_REQUIREMENTS = {
         '--cpsc-annotation-audit-out',
         'CPSC_DISK_BACKED_WINDOW_LOADER_CAPABILITY',
         'CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY',
+        '--feature-device',
+        '--feature-batch-size',
+        'EXTERNAL_FEATURE_VALUE_CONTRACT',
+        'training_pca_compatible_rocket_values',
         'validate_checkpoint_files_against_oof_run_manifest',
     ],
     'scripts/revision/06_freeze_oof.py': [
@@ -1300,6 +1306,76 @@ else:
                 if cpsc_command not in text:
                     raise RuntimeError("Notebook 02 CPSC resumable-cache command anchor missing")
                 text = text.replace(cpsc_command, cpsc_resumable_command, 1)
+            if "EXTERNAL_FEATURE_DEVICE =" not in text:
+                feature_config = """EXTERNAL_BATCH_SIZE = 128
+# The fixed-seed ROCKET-family feature transform is the external-export bottleneck.
+# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which
+# preserves the input precision used when fitting the frozen fold PCA objects.
+EXTERNAL_FEATURE_DEVICE = 'auto'
+# A100 40 GB: 256 keeps the largest convolution activation below the available
+# memory budget. Reduce to 128 only after a real CUDA out-of-memory error.
+EXTERNAL_FEATURE_BATCH_SIZE = 256
+EXTERNAL_FEATURE_PARITY_RECORDS = 4
+"""
+                text, config_replacements = re.subn(
+                    r"EXTERNAL_BATCH_SIZE = \d+\n",
+                    feature_config,
+                    text,
+                    count=1,
+                )
+                if config_replacements != 1:
+                    raise RuntimeError("Notebook 02 external feature configuration anchor missing")
+            text = text.replace(
+                "EXTERNAL_FEATURE_BATCH_SIZE = 128\n",
+                "EXTERNAL_FEATURE_BATCH_SIZE = 256\n",
+            )
+            external_command_anchor = (
+                "        f'--dataset {dataset} --checkpoint-kind final_ema --batch-size {EXTERNAL_BATCH_SIZE} '\n"
+                "        '--allow-experimental'"
+            )
+            external_command_with_features = (
+                "        f'--dataset {dataset} --checkpoint-kind final_ema --batch-size {EXTERNAL_BATCH_SIZE} '\n"
+                "        f'--feature-device {EXTERNAL_FEATURE_DEVICE} '\n"
+                "        f'--feature-batch-size {EXTERNAL_FEATURE_BATCH_SIZE} '\n"
+                "        f'--feature-parity-records {EXTERNAL_FEATURE_PARITY_RECORDS} '\n"
+                "        '--allow-experimental'"
+            )
+            if "f'--feature-device {EXTERNAL_FEATURE_DEVICE} '" not in text:
+                if external_command_anchor not in text:
+                    raise RuntimeError("Notebook 02 external feature command anchor missing")
+                text = text.replace(
+                    external_command_anchor,
+                    external_command_with_features,
+                    1,
+                )
+        if "RUN_PTBXL_FOLD9_EXPORT" in text:
+            if "PTBXL_FOLD9_FEATURE_DEVICE =" not in text:
+                fold9_config_anchor = "PTBXL_FOLD9_BATCH_SIZE = 128\n"
+                fold9_config = """PTBXL_FOLD9_BATCH_SIZE = 128
+PTBXL_FOLD9_FEATURE_DEVICE = 'auto'
+PTBXL_FOLD9_FEATURE_BATCH_SIZE = 256
+PTBXL_FOLD9_FEATURE_PARITY_RECORDS = 4
+"""
+                if fold9_config_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 feature configuration anchor missing")
+                text = text.replace(fold9_config_anchor, fold9_config, 1)
+            text = text.replace(
+                "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 128\n",
+                "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 256\n",
+            )
+            fold9_command_anchor = (
+                "f'--checkpoint-kind final_ema --batch-size {PTBXL_FOLD9_BATCH_SIZE} --allow-experimental'"
+            )
+            fold9_command_with_features = (
+                "f'--checkpoint-kind final_ema --batch-size {PTBXL_FOLD9_BATCH_SIZE} '\n"
+                "        f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '\n"
+                "        f'--feature-batch-size {PTBXL_FOLD9_FEATURE_BATCH_SIZE} '\n"
+                "        f'--feature-parity-records {PTBXL_FOLD9_FEATURE_PARITY_RECORDS} --allow-experimental'"
+            )
+            if "f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '" not in text:
+                if fold9_command_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 feature command anchor missing")
+                text = text.replace(fold9_command_anchor, fold9_command_with_features, 1)
         if "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT" in text:
             comparator_cache_assignment = (
                 "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT / 'revision_artifacts' / 'reports' / "
