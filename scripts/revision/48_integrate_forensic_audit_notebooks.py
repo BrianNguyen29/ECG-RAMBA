@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v5"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v6"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -80,6 +80,7 @@ REVISION_TOKEN_REQUIREMENTS = {
         '--feature-device',
         '--feature-batch-size',
         'EXTERNAL_FEATURE_VALUE_CONTRACT',
+        'ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR',
         'training_pca_compatible_rocket_values',
         'validate_checkpoint_files_against_oof_run_manifest',
     ],
@@ -1271,11 +1272,21 @@ else:
             )
             run(
                 f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--refresh-existing-prefix "predictions/external_feature_cache" '
                 f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',
                 log_path=f'reports/revision/logs/{dataset}_external_export_mirror_publish.log',
             )"""
             if broad_dataset_publish in text:
                 text = text.replace(broad_dataset_publish, selected_dataset_publish, 1)
+            legacy_selected_dataset_publish = """                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',"""
+            refreshed_selected_dataset_publish = """                f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+                f'--refresh-existing-prefix "predictions/external_feature_cache" '
+                f'--source-conflict-policy source {external_publish_args} --mirror-root "{mirror_root}"',"""
+            text = text.replace(
+                legacy_selected_dataset_publish,
+                refreshed_selected_dataset_publish,
+            )
             broad_final_publish = """if external_export_ran:
     print('All successful external datasets were already published individually; refreshing the merged manifest.')
     mirror_root = globals().get('stable_mirror', DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision')
@@ -1306,6 +1317,12 @@ else:
                 if cpsc_command not in text:
                     raise RuntimeError("Notebook 02 CPSC resumable-cache command anchor missing")
                 text = text.replace(cpsc_command, cpsc_resumable_command, 1)
+            if "EXTERNAL_FEATURE_CACHE_ROOT =" not in text:
+                feature_cache_anchor = "if 'run' not in globals():\n"
+                feature_cache_block = """# External feature caches must live below the canonical mirror, not beside\n# the Drive dataset archives. Completed caches can therefore be authenticated\n# and restored after a Colab disconnect; hidden partials stay excluded.\nstable_mirror = Path(globals().get(\n    'MIRROR_REVISION_ROOT',\n    globals().get('stable_mirror', DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'),\n))\nstable_mirror.mkdir(parents=True, exist_ok=True)\nMIRROR_REVISION_ROOT = stable_mirror\nEXTERNAL_FEATURE_CACHE_ROOT = stable_mirror / 'predictions' / 'external_feature_cache'\nEXTERNAL_FEATURE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)\nos.environ['ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR'] = str(EXTERNAL_FEATURE_CACHE_ROOT)\nprint('Canonical external feature cache root:', EXTERNAL_FEATURE_CACHE_ROOT)\n\n"""
+                if feature_cache_anchor not in text:
+                    raise RuntimeError("Notebook 02 external feature-cache anchor missing")
+                text = text.replace(feature_cache_anchor, feature_cache_block + feature_cache_anchor, 1)
             if "EXTERNAL_FEATURE_DEVICE =" not in text:
                 feature_config = """EXTERNAL_BATCH_SIZE = 128
 # The fixed-seed ROCKET-family feature transform is the external-export bottleneck.
@@ -1349,6 +1366,25 @@ EXTERNAL_FEATURE_PARITY_RECORDS = 4
                     1,
                 )
         if "RUN_PTBXL_FOLD9_EXPORT" in text:
+            if "PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT" not in text:
+                fold9_cache_anchor = "RUN_PTBXL_FOLD9_EXPORT = 'auto'\n"
+                fold9_cache_block = """RUN_PTBXL_FOLD9_EXPORT = 'auto'
+# Keep the fold-9 feature cache in the same canonical location even when this
+# cell is run directly after reconnecting to a fresh Colab runtime.
+PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT = Path(globals().get(
+    'EXTERNAL_FEATURE_CACHE_ROOT',
+    Path(globals().get(
+        'MIRROR_REVISION_ROOT',
+        DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision',
+    )) / 'predictions' / 'external_feature_cache',
+))
+PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ['ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR'] = str(PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT)
+print('Canonical PTB-XL fold-9 feature cache root:', PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT)
+"""
+                if fold9_cache_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 feature-cache anchor missing")
+                text = text.replace(fold9_cache_anchor, fold9_cache_block, 1)
             if "PTBXL_FOLD9_FEATURE_DEVICE =" not in text:
                 fold9_config_anchor = "PTBXL_FOLD9_BATCH_SIZE = 128\n"
                 fold9_config = """PTBXL_FOLD9_BATCH_SIZE = 128
@@ -1376,6 +1412,10 @@ PTBXL_FOLD9_FEATURE_PARITY_RECORDS = 4
                 if fold9_command_anchor not in text:
                     raise RuntimeError("Notebook 02 PTB-XL fold 9 feature command anchor missing")
                 text = text.replace(fold9_command_anchor, fold9_command_with_features, 1)
+            text = text.replace(
+                "artifact_mirror.py publish --verify-existing size --mirror-root \"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"",
+                "artifact_mirror.py publish --verify-existing size --refresh-existing-prefix \"predictions/external_feature_cache\" --mirror-root \"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"",
+            )
         if "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT" in text:
             comparator_cache_assignment = (
                 "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT / 'revision_artifacts' / 'reports' / "

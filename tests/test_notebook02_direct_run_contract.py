@@ -55,8 +55,12 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("f'--feature-device {EXTERNAL_FEATURE_DEVICE} '", self.source)
         self.assertIn("f'--feature-batch-size {EXTERNAL_FEATURE_BATCH_SIZE} '", self.source)
         self.assertIn("f'--feature-parity-records {EXTERNAL_FEATURE_PARITY_RECORDS} '", self.source)
+        self.assertIn("EXTERNAL_FEATURE_CACHE_ROOT = stable_mirror / 'predictions' / 'external_feature_cache'", self.source)
+        self.assertIn("os.environ['ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR']", self.source)
+        self.assertIn('--refresh-existing-prefix "predictions/external_feature_cache"', self.source)
         self.assertIn("PTBXL_FOLD9_FEATURE_DEVICE = 'auto'", self.source)
         self.assertIn("f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '", self.source)
+        self.assertIn("PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT", self.source)
         self.assertIn("external_fixed_rocket_gpu_parity_checked_v1", self.source)
 
     def test_missing_oof_group_sidecar_is_repaired_without_automatic_gpu_inference(self):

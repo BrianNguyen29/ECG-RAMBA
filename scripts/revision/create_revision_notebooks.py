@@ -1185,6 +1185,13 @@ EXTERNAL_FEATURE_DEVICE = 'auto'
 EXTERNAL_FEATURE_BATCH_SIZE = 256
 EXTERNAL_FEATURE_PARITY_RECORDS = 4
 EXTERNAL_LIMIT_RECORDS = 0
+# Completed external feature caches belong to the canonical artifact root. This
+# keeps their provenance and resume contract in the same manifest as outputs.
+import os
+EXTERNAL_FEATURE_CACHE_ROOT = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision' / 'predictions' / 'external_feature_cache'
+EXTERNAL_FEATURE_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ['ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR'] = str(EXTERNAL_FEATURE_CACHE_ROOT)
+print('Canonical external feature cache root:', EXTERNAL_FEATURE_CACHE_ROOT)
 
 if BUILD_FOLD_PCA:
     run(

@@ -1,5 +1,6 @@
 import importlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -133,6 +134,36 @@ class ExternalPredictionContractTests(unittest.TestCase):
         self.assertEqual(external.resolve_rocket_feature_batch_size("cuda", 256), 256)
         with self.assertRaises(ValueError):
             external.resolve_rocket_feature_batch_size("cpu", -1)
+
+    def test_external_feature_cache_override_requires_canonical_absolute_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "source.zip"
+            archive.write_bytes(b"source")
+            pca = root / "fold1_pca.joblib"
+            pca.write_bytes(b"pca")
+            canonical_cache = root / "canonical" / "predictions" / "external_feature_cache"
+            signals = np.zeros((2, 12, 5000), dtype=np.float32)
+            record_ids = np.asarray(["record-a", "record-b"])
+
+            with patch.dict(
+                os.environ,
+                {external.EXTERNAL_FEATURE_CACHE_DIR_ENV: str(canonical_cache)},
+                clear=False,
+            ):
+                path, _ = external.feature_cache_path(
+                    "cpsc2021", archive, signals, [pca], record_ids
+                )
+            self.assertEqual(path.parent, canonical_cache)
+            self.assertTrue(canonical_cache.is_dir())
+
+            with patch.dict(
+                os.environ,
+                {external.EXTERNAL_FEATURE_CACHE_DIR_ENV: "relative-cache"},
+                clear=False,
+            ):
+                with self.assertRaises(ValueError):
+                    external.feature_cache_path("cpsc2021", archive, signals, [pca], record_ids)
 
     def test_rocket_feature_partial_cache_resumes_only_matching_contract(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -84,6 +84,7 @@ EXTERNAL_FEATURE_ACCELERATION_CAPABILITY = "external_fixed_rocket_gpu_parity_che
 EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION = 1
 EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION = 3
 EXTERNAL_FEATURE_VALUE_CONTRACT = "float16_storage_roundtrip_v1_training_pca_aligned"
+EXTERNAL_FEATURE_CACHE_DIR_ENV = "ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR"
 DEFAULT_ROCKET_CPU_BATCH_SIZE = 64
 DEFAULT_ROCKET_CUDA_BATCH_SIZE = 128
 
@@ -1373,7 +1374,19 @@ def feature_cache_path(
     pca_paths: list[Path],
     record_ids: np.ndarray,
 ) -> tuple[Path, dict[str, str]]:
-    cache_dir = Path(PATHS["cache_dir"]) / "revision_external_cache"
+    configured_cache_dir = os.environ.get(EXTERNAL_FEATURE_CACHE_DIR_ENV, "").strip()
+    if configured_cache_dir:
+        cache_dir = Path(configured_cache_dir).expanduser()
+        if not cache_dir.is_absolute():
+            raise ValueError(
+                f"{EXTERNAL_FEATURE_CACHE_DIR_ENV} must be an absolute path when configured: "
+                f"{configured_cache_dir!r}"
+            )
+    else:
+        # Retain the historical location for non-Colab/manual invocations. The
+        # revision notebooks explicitly set the environment override to the
+        # canonical artifact mirror before external inference starts.
+        cache_dir = Path(PATHS["cache_dir"]) / "revision_external_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     pca_fingerprint = hashlib.sha256(
         ":".join(file_fingerprint(path) for path in pca_paths).encode()
@@ -1685,6 +1698,7 @@ def generate_features(
     feature_parity_records: int,
 ) -> tuple[list[np.ndarray], np.ndarray, Path, bool, dict[str, object]]:
     cache_path, cache_contract = feature_cache_path(dataset, archive, signals, pca_paths, record_ids)
+    print(f"External ROCKET-family feature cache: {cache_path}")
     hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
     if cache_path.exists() and not force:
         with np.load(cache_path, allow_pickle=False) as data:
