@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v3"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260722-v4"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -1870,6 +1870,64 @@ def integrate_installer_consumers() -> None:
         save(name, notebook)
 
 
+def integrate_notebook04_mamba_installer_consumer() -> None:
+    """Make Raw Mamba use the same fail-closed installer selector as other notebooks."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    candidates = [
+        cell
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+        and "def ensure_mamba_runtime_for_raw_mamba()" in source(cell)
+    ]
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Notebook 04 Raw Mamba installer cell candidate_count={len(candidates)}"
+        )
+
+    text = source(candidates[0])
+    old_selector = '''    installer_source = None
+    for candidate in nb02.get('cells', []):
+        candidate_source = ''.join(candidate.get('source', []))
+        if (
+            'Mamba wheel environment' in candidate_source
+            and 'mamba_ssm' in candidate_source
+            and 'causal_conv1d' in candidate_source
+            and 'AUTO_PIN_TORCH_FOR_MAMBA' in candidate_source
+        ):
+            installer_source = candidate_source
+            break
+
+    if installer_source is None:
+        raise RuntimeError('Could not locate the canonical Mamba installer cell in notebook 02.')
+'''
+    strict_selector = f'''    installer_candidates = []
+    for candidate in nb02.get('cells', []):
+        candidate_source = ''.join(candidate.get('source', []))
+        if (
+            {MAMBA_MARKER!r} in candidate_source
+            and {MAMBA_SCHEMA_MARKER!r} in candidate_source
+        ):
+            installer_candidates.append(candidate_source)
+
+    if len(installer_candidates) != 1:
+        raise RuntimeError(
+            'Could not locate exactly one canonical Mamba installer cell in Notebook 02. '
+            f'candidate_count={{len(installer_candidates)}}; expected capability/schema pair.'
+        )
+    installer_source = installer_candidates[0]
+'''
+    if old_selector in text:
+        text = text.replace(old_selector, strict_selector, 1)
+    elif MAMBA_MARKER not in text or MAMBA_SCHEMA_MARKER not in text:
+        raise RuntimeError(
+            "Notebook 04 Raw Mamba installer selector is neither the expected legacy nor strict form"
+        )
+    set_source(candidates[0], text)
+    save(name, notebook)
+
+
 def integrate_notebook02a_training_log() -> None:
     name = "02a_retrain_best_ema.ipynb"
     notebook = load(name)
@@ -3130,12 +3188,27 @@ def validate() -> None:
     if len(training_cells) != 1 or "subprocess.Popen" in training_cells[0]:
         raise RuntimeError("Notebook 02a training cell bypasses the forensic run-history wrapper")
 
+    notebook04_text = "\n".join(
+        source(cell) for cell in load("04_baselines_and_component_checks.ipynb")["cells"]
+    )
+    for token in (
+        "def ensure_mamba_runtime_for_raw_mamba()",
+        MAMBA_MARKER,
+        MAMBA_SCHEMA_MARKER,
+        "Could not locate exactly one canonical Mamba installer cell in Notebook 02.",
+    ):
+        if token not in notebook04_text:
+            raise RuntimeError(f"Notebook 04 Raw Mamba installer contract token missing: {token}")
+    if "'Mamba wheel environment' in candidate_source" in notebook04_text:
+        raise RuntimeError("Notebook 04 Raw Mamba installer still uses a legacy descriptive selector")
+
 
 def main() -> None:
     integrate_notebook02()
     integrate_notebook00()
     integrate_notebook01()
     integrate_installer_consumers()
+    integrate_notebook04_mamba_installer_consumer()
     integrate_notebook02a_training_log()
     integrate_remaining_run_history()
     integrate_notebook04_paired_reuse_contract()

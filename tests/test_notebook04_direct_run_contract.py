@@ -118,6 +118,21 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.source)
 
+    def test_raw_mamba_installer_uses_the_capability_schema_pair(self):
+        raw_mamba_cell = next(
+            cell
+            for cell in self.code_cells
+            if "def ensure_mamba_runtime_for_raw_mamba()" in cell
+        )
+        for token in (
+            "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'",
+            "MAMBA_INSTALLER_SCHEMA_VERSION = 1",
+            "installer_candidates = []",
+            "Could not locate exactly one canonical Mamba installer cell in Notebook 02.",
+        ):
+            self.assertIn(token, raw_mamba_cell)
+        self.assertNotIn("'Mamba wheel environment' in candidate_source", raw_mamba_cell)
+
     def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
         for token in (
             "39_morphology_learnability_control.py",

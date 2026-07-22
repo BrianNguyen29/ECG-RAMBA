@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FORENSIC_INTEGRATOR = PROJECT_ROOT / "scripts" / "revision" / "48_integrate_forensic_audit_notebooks.py"
 PIPELINE_NOTEBOOKS = (
     "00_colab_bootstrap.ipynb",
     "01_a0_protocol_audit.ipynb",
@@ -38,6 +39,19 @@ def notebook_source(name: str) -> tuple[list[str], str]:
 def notebook_payload(name: str) -> dict:
     path = PROJECT_ROOT / "notebooks" / name
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def literal_integrator_assignment(assignment_name: str):
+    tree = ast.parse(FORENSIC_INTEGRATOR.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == assignment_name
+            for target in node.targets
+        ):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"Integrator assignment not found: {assignment_name}")
 
 
 def literal_notebook_assignment(name: str, assignment_name: str):
@@ -377,6 +391,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_code_authority_is_pinned_across_direct_runs(self):
         capability = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
         schema = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
+        authority_ref = literal_integrator_assignment("AUTHORITY_RELEASE_REF")
+        self.assertRegex(authority_ref, r"^refs/tags/ecg-ramba-revision-\d{8}-v\d+$")
         for notebook in PIPELINE_NOTEBOOKS:
             cells, source = notebook_source(notebook)
             expected_count = 2 if notebook == "07_results_freeze.ipynb" else 1
@@ -387,7 +403,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertIn("git('cat-file', '-e', expected_commit + '^{commit}')", source)
             self.assertIn("Tracked files differ from git before authority checkout", source)
             self.assertIn("verified_annotated_versioned_release_tag", source)
-            self.assertIn("refs/tags/ecg-ramba-revision-20260722-v3", source)
+            self.assertIn(authority_ref, source)
             self.assertIn("Publish a new versioned tag instead of retagging", source)
             setup_cells = [cell for cell in cells if capability in cell]
             for setup in setup_cells:
