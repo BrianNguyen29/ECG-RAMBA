@@ -11,12 +11,81 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         notebook = json.loads(NOTEBOOK_PATH.read_text(encoding="utf-8"))
+        cls.cells = notebook["cells"]
         cls.code_cells = [
             "".join(cell.get("source", []))
             for cell in notebook["cells"]
             if cell.get("cell_type") == "code"
         ]
         cls.source = "\n".join(cls.code_cells)
+
+    def test_external_runner_is_split_into_authenticated_cpu_and_a100_phases(self):
+        feature_cells = [
+            "".join(cell.get("source", []))
+            for cell in self.cells
+            if "EXTERNAL_FEATURE_PHASE_CELL_V1" in "".join(cell.get("source", []))
+        ]
+        fold9_feature_cells = [
+            "".join(cell.get("source", []))
+            for cell in self.cells
+            if "PTBXL_FOLD9_FEATURE_PHASE_CELL_V1"
+            in "".join(cell.get("source", []))
+        ]
+        inference_cells = [
+            "".join(cell.get("source", []))
+            for cell in self.cells
+            if "EXTERNAL_RUN_PROFILE = os.environ.get(" in "".join(cell.get("source", []))
+        ]
+        fold9_inference_cells = [
+            "".join(cell.get("source", []))
+            for cell in self.cells
+            if "RUN_PTBXL_FOLD9_EXPORT = 'auto'" in "".join(cell.get("source", []))
+        ]
+        self.assertEqual(len(feature_cells), 1)
+        self.assertEqual(len(fold9_feature_cells), 1)
+        self.assertEqual(len(inference_cells), 1)
+        self.assertEqual(len(fold9_inference_cells), 1)
+
+        feature = feature_cells[0]
+        self.assertIn("--features-only", feature)
+        self.assertIn("--feature-device cpu", feature)
+        self.assertIn("external_feature_inference_handoff_v1", feature)
+        self.assertIn("external_features_only_mirror_publish.log", feature)
+        self.assertNotIn("require_gpu_inference_runtime", feature)
+        self.assertNotIn("--inference-only", feature)
+
+        inference = inference_cells[0]
+        self.assertIn(
+            "03_generate_external_predictions.py --inference-only", inference
+        )
+        self.assertIn("require_gpu_inference_runtime", inference)
+        self.assertIn("external_{dataset}_feature_cache_manifest.json", inference)
+        self.assertIn(
+            "reports/revision/predictions/oof_final_ema_predictions.npz",
+            inference,
+        )
+        self.assertIn(
+            "reports/revision/manifests/oof_final_ema_prediction_run_manifest.json",
+            inference,
+        )
+        self.assertNotIn(
+            '--refresh-existing-prefix "predictions/external_feature_cache"',
+            inference[inference.index("def external_publish_refresh_args(dataset):") :],
+        )
+
+        fold9_feature = fold9_feature_cells[0]
+        self.assertIn("--output-tag fold9 --features-only", fold9_feature)
+        self.assertNotIn("require_gpu_inference_runtime", fold9_feature)
+        fold9_inference = fold9_inference_cells[0]
+        self.assertIn(
+            "03_generate_external_predictions.py --inference-only", fold9_inference
+        )
+        self.assertIn("PTBXL_FOLD9_FEATURE_HANDOFF", fold9_inference)
+        self.assertIn("PTBXL_FOLD9_CONTRACT_INPUTS", fold9_inference)
+        self.assertIn(
+            "reports/revision/manifests/oof_final_ema_prediction_run_manifest.json",
+            fold9_inference,
+        )
 
     def test_every_code_cell_compiles(self):
         for index, source in enumerate(self.code_cells):

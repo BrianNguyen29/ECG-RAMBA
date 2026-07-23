@@ -98,7 +98,8 @@ Colab bootstrap is expensive.
 
 | Work | Hardware | What `auto` does |
 | --- | --- | --- |
-| Notebook 02 canonical OOF or missing external Full-model prediction | A100 High-RAM preferred | Reuses frozen OOF/external artifacts when manifest checks pass; otherwise runs inference. |
+| Notebook 02 external fixed-transform features | CPU High-RAM | `--features-only` resumes the canonical source-bound ROCKET-family cache and writes a SHA-bound CPU-to-GPU handoff; no Mamba runtime is needed. |
+| Notebook 02 external Full-model prediction | A100 High-RAM | `--inference-only` authenticates and reuses the completed CPU feature handoff, then runs only ECG-RAMBA/Mamba inference and output generation. |
 | Notebook 03 calibration and presentation assets | CPU | Reuses matching CI/table/figure outputs. Presentation assets defer until current paired artifacts exist. |
 | Notebook 04 Raw Mamba, Transformer, frozen-transform MLP, controlled kernel-learnability bank | A100 High-RAM | Trains only missing or stale folds; checkpoints and fold prediction caches are mirrored after each fold. |
 | Notebook 04 paired comparisons and ledger | CPU | Bootstrap is CPU-bound; no model inference. |
@@ -164,16 +165,23 @@ matrix, copy, and publication cells can run on CPU.
 
 1. Run Notebook 00 and Notebook 01 once in a fresh Colab runtime. They mount
    Drive, pull the current repository, and verify the base protocol.
-2. Run Notebook 02 through the canonical OOF, external Full-model export, and
-   external protocol-gate cells. This can run before Notebook 04. It will also
-   export PTB-XL fold 9 when needed for group-safe adaptation.
-3. Run Notebook 03 through the canonical calibration CI. The **Matched
+2. In a CPU High-RAM runtime, run Notebook 02 Setup and Base Dependencies, then
+   **CPU External Feature Preparation**. Keep the default CPSC resume profile
+   and batch size 64 when continuing the existing partial cache. Wait for
+   `CPU FEATURE PHASE COMPLETE` and successful mirror publication.
+3. Reconnect A100 High-RAM, rerun Setup, Base Dependencies, and Model
+   Dependencies, skip the CPU feature cell, and run **GPU External Prediction
+   Inference**. The cell accepts only an authenticated CPU handoff and cannot
+   silently recompute features. Then run the external protocol gate on CPU or
+   GPU. PTB-XL fold 9 follows the same dedicated CPU-feature/GPU-inference pair
+   when needed for group-safe adaptation.
+4. Run Notebook 03 through the canonical calibration CI. The **Matched
    Cross-Fitted Calibration Audit** and reviewer-presentation cell may print
    `Deferred` at this point; that is expected until Notebook 04 has published
    the required learned-baseline OOF artifacts. A missing optional
    frozen-transform MLP does not block the five-model matched audit. A present
    artifact with an invalid checksum still fails immediately.
-4. Run Notebook 04. Leave the heavy runner controls as `auto`. For any missing
+5. Run Notebook 04. Leave the heavy runner controls as `auto`. For any missing
    Raw Mamba, Transformer, frozen-transform MLP, or controlled
    frozen-versus-partially-learnable morphology folds, the notebook runs one
    fold at a time and publishes the Drive mirror immediately. Then run every
@@ -182,26 +190,26 @@ matrix, copy, and publication cells can run on CPU.
    Runner** repeatedly on A100 until all four variants have five authenticated
    folds. Its final invocation exports OOF predictions and computes the paired
    record-bootstrap table.
-5. Return to the new end-of-Notebook-02 cells. Their first pass after Notebook
+6. Return to the new end-of-Notebook-02 cells. Their first pass after Notebook
    04 produces or verifies zero-target-label PTB-XL/Georgia ResNet1D/CNN and
    Raw Mamba outputs. A Transformer is added only if its in-domain OOF and
    paired gate passed. The remaining cells then run external paired bootstrap,
    PTB-XL group-safe score calibration, optional frozen-encoder representations,
    and true linear-head adaptation. Before Notebook 04 these cells defer
    instead of failing.
-6. Return to Notebook 03 and run **Matched Cross-Fitted Calibration Audit**,
+7. Return to Notebook 03 and run **Matched Cross-Fitted Calibration Audit**,
    followed by the reviewer-presentation cell. The calibration cell is CPU-only,
    uses positive-slope monotone Platt mappings, and reuses bootstrap entries only
    when probability hashes, protocol v3, and the frozen OOF contract match. The
    presentation cell creates the reliability figure, compact calibration/paired-CI
    tables, Q=3 sensitivity table, fold-specific PCA variance table, and
    training-configuration table.
-7. Run Notebook 05 with `ROBUSTNESS_MULTI_RUN_PROFILE='canonical_resume'`.
+8. Run Notebook 05 with `ROBUSTNESS_MULTI_RUN_PROFILE='canonical_resume'`.
    The six stresses are processed separately and publish after each completed
    stage; the shared metric cache resumes interrupted 1,000-bootstrap work.
    Notebook 07 rejects reviewer-minimal screening output as final R2-C3
    evidence.
-8. Run Notebook 06. External pooling keeps PTB-XL, Georgia, and CPSC2021
+9. Run Notebook 06. External pooling keeps PTB-XL, Georgia, and CPSC2021
    separate and requires six methods plus 1,000 group-bootstrap replicates.
    Run
    representation extraction only if missing; it needs the same Mamba runtime
@@ -236,13 +244,13 @@ measurement kind only after this source audit. Accepted measurement kinds are
 `measured`, `device_measured`, and `expert_annotated`. Protocol v3 also requires
 at least two measured target values in every evaluated fold and all requested
 pointwise bootstrap replicates to be finite before it emits a complete status.
-9. Run Notebook 07. It first runs claim-readiness gates and the strict
+10. Run Notebook 07. It first runs claim-readiness gates and the strict
    Hypothesis--Control--Finding--Claim-boundary ledger, then writes final
    evidence tables only when calibration and paired OOF contracts match the
    active frozen OOF. It mirrors all artifacts and copies the current source
    tables to the output-only `final_evidence_tables` snapshot with an export
    checksum manifest.
-10. Build the marked manuscript only in an environment with both `latexdiff`
+11. Build the marked manuscript only in an environment with both `latexdiff`
     and `latexmk`/LaTeX. A `blocked_missing_tool` manifest is deliberate and
     must not be called a marked PDF.
 

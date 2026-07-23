@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v12"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v13"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -41,6 +41,8 @@ REVISION_CAPABILITY_REQUIREMENTS = {
         'EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION': 1,
         'EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY': 'external_rocket_backend_bound_cache_v1',
         'EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION': 1,
+        'EXTERNAL_TWO_PHASE_CAPABILITY': 'external_feature_inference_handoff_v1',
+        'EXTERNAL_TWO_PHASE_SCHEMA_VERSION': 1,
     },
     'scripts/revision/18_external_protocol_gate.py': {
         'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
@@ -81,6 +83,9 @@ REVISION_TOKEN_REQUIREMENTS = {
         'CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY',
         '--feature-device',
         '--feature-batch-size',
+        '--features-only',
+        '--inference-only',
+        'EXTERNAL_TWO_PHASE_CAPABILITY',
         'EXTERNAL_FEATURE_VALUE_CONTRACT',
         'ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR',
         'training_pca_compatible_rocket_values',
@@ -1070,6 +1075,10 @@ def replace_installer_discovery(text: str) -> str:
     return text
 
 
+NOTEBOOK02_EXTERNAL_FEATURE_PHASE_MARKER = "EXTERNAL_FEATURE_PHASE_CELL_V1"
+NOTEBOOK02_FOLD9_FEATURE_PHASE_MARKER = "PTBXL_FOLD9_FEATURE_PHASE_CELL_V1"
+
+
 def integrate_notebook02() -> None:
     name = "02_predictions_and_external_eval.ipynb"
     notebook = load(name)
@@ -1137,6 +1146,102 @@ print('Runner source drift:', [
         set_source(notebook["cells"][existing_lock_indexes[0]], lock_code_text)
     else:
         notebook["cells"][external_heading_index:external_heading_index] = [lock_markdown, lock_code]
+
+    def upsert_phase_section(
+        *,
+        marker: str,
+        template_name: str,
+        before_heading: str,
+        markdown_title: str,
+        markdown_body: str,
+    ) -> None:
+        template_path = PROJECT_ROOT / "scripts" / "revision" / "notebook_cells" / template_name
+        template = template_path.read_text(encoding="utf-8")
+        matches = [
+            index
+            for index, cell in enumerate(notebook["cells"])
+            if marker in source(cell)
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(f"Notebook 02 contains duplicate phase marker {marker}")
+        markdown_text = f"## {markdown_title}\n\n{markdown_body}\n"
+        if matches:
+            code_index = matches[0]
+            set_source(notebook["cells"][code_index], template)
+            if code_index == 0 or notebook["cells"][code_index - 1].get("cell_type") != "markdown":
+                raise RuntimeError(f"Notebook 02 {marker} is missing its markdown heading")
+            set_source(notebook["cells"][code_index - 1], markdown_text)
+            return
+        heading_index = next(
+            index
+            for index, cell in enumerate(notebook["cells"])
+            if cell.get("cell_type") == "markdown"
+            and before_heading in source(cell)
+        )
+        notebook["cells"][heading_index:heading_index] = [
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": markdown_text.splitlines(keepends=True),
+            },
+            {
+                "cell_type": "code",
+                "execution_count": None,
+                "metadata": {},
+                "outputs": [],
+                "source": template.splitlines(keepends=True),
+            },
+        ]
+
+    upsert_phase_section(
+        marker=NOTEBOOK02_EXTERNAL_FEATURE_PHASE_MARKER,
+        template_name="02_external_features_only.py",
+        before_heading="## Experimental External Prediction Commands",
+        markdown_title="CPU External Feature Preparation",
+        markdown_body=(
+            "Run this phase on a CPU High-RAM runtime after **Setup** and "
+            "**Install Base Dependencies**. It resumes the canonical Drive-backed "
+            "feature checkpoint and publishes a SHA-bound handoff. Skip "
+            "**Install Model Dependencies** here. Keep batch size 64 for an existing "
+            "CPSC partial; use 128/256 only for a new cache after a resource check."
+        ),
+    )
+    upsert_phase_section(
+        marker=NOTEBOOK02_FOLD9_FEATURE_PHASE_MARKER,
+        template_name="02_ptbxl_fold9_features_only.py",
+        before_heading="## PTB-XL Fold 9 Adaptation-Pool Export",
+        markdown_title="PTB-XL Fold 9 CPU Feature Preparation",
+        markdown_body=(
+            "CPU-only preparation for the official fold-9 adaptation pool. "
+            "It produces the same authenticated feature handoff used by the A100 "
+            "fold-9 inference phase."
+        ),
+    )
+
+    for cell in notebook["cells"]:
+        if cell.get("cell_type") != "markdown":
+            continue
+        text = source(cell)
+        if "## Experimental External Prediction Commands" in text:
+            set_source(
+                cell,
+                text.replace(
+                    "## Experimental External Prediction Commands",
+                    "## GPU External Prediction Inference",
+                ).replace(
+                    "feature extraction",
+                    "authenticated feature-cache reuse",
+                ),
+            )
+        elif "## PTB-XL Fold 9 Adaptation-Pool Export" in text:
+            set_source(
+                cell,
+                text.replace(
+                    "## PTB-XL Fold 9 Adaptation-Pool Export",
+                    "## PTB-XL Fold 9 Adaptation-Pool Inference",
+                ),
+            )
+
     candidates = [cell for cell in notebook["cells"] if cell.get("cell_type") == "code" and "AUTO_PIN_TORCH_FOR_MAMBA" in source(cell) and "Mamba wheel environment" in source(cell)]
     if len(candidates) != 1:
         raise RuntimeError(f"Notebook 02 Mamba installer candidate_count={len(candidates)}")
@@ -1196,6 +1301,56 @@ print('Runner source drift:', [
                 "--expected-checkpoint-kind final_ema",
                 strict_oof_flags,
             )
+        if "def _external_artifact_paths_for_restore" in text:
+            handoff_restore_anchor = (
+                "            Path(f'reports/revision/manifests/"
+                "external_{dataset}_protocol_gate_manifest.json'),\n"
+            )
+            handoff_restore_line = (
+                "            Path(f'reports/revision/manifests/"
+                "external_{dataset}_feature_cache_manifest.json'),\n"
+            )
+            if handoff_restore_line not in text:
+                if handoff_restore_anchor not in text:
+                    raise RuntimeError("Notebook 02 feature-handoff restore anchor missing")
+                text = text.replace(
+                    handoff_restore_anchor,
+                    handoff_restore_anchor + handoff_restore_line,
+                    1,
+                )
+            external_phase_token_block = (
+                "    '--features-only',\n"
+                "    '--inference-only',\n"
+                "    'EXTERNAL_TWO_PHASE_CAPABILITY',\n"
+            )
+            while external_phase_token_block + external_phase_token_block in text:
+                text = text.replace(
+                    external_phase_token_block + external_phase_token_block,
+                    external_phase_token_block,
+                    1,
+                )
+            if external_phase_token_block not in text:
+                text = text.replace(
+                    "    'from scipy.io import loadmat',\n",
+                    "    'from scipy.io import loadmat',\n" + external_phase_token_block,
+                    1,
+                )
+            publish_refresh_replacement = """def external_publish_refresh_args(dataset):
+    # The CPU feature phase owns feature-cache and CPSC memmap attestation.
+    # GPU inference publishes only newly generated prediction/audit outputs.
+    return ''
+"""
+            if publish_refresh_replacement not in text:
+                refresh_start = text.find("def external_publish_refresh_args(dataset):\n")
+                refresh_end_marker = "\n\ndef publish_external_dataset_outputs"
+                refresh_end = text.find(refresh_end_marker, refresh_start)
+                if refresh_start < 0 or refresh_end < 0:
+                    raise RuntimeError("Notebook 02 GPU publish-refresh boundary missing")
+                text = (
+                    text[:refresh_start]
+                    + publish_refresh_replacement
+                    + text[refresh_end:]
+                )
         if "RUN_OOF_EXPORT = True" in text and "def freeze_oof(label):" in text:
             sidecar_anchor = "OOF_FOLD_CACHE_DIR.mkdir(parents=True, exist_ok=True)\n"
             if "def ensure_oof_group_sidecar():" not in text:
@@ -1590,6 +1745,23 @@ EXTERNAL_FEATURE_PARITY_RECORDS = 4
                     raise RuntimeError("Notebook 02 external feature configuration anchor missing")
             text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 128\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
             text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 256\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
+            if "oof_final_ema_prediction_run_manifest.json'),\n        FOLD_PCA_MANIFEST" not in text:
+                restore_anchor = (
+                    "def _external_artifact_paths_for_restore(datasets):\n"
+                    "    paths = [FOLD_PCA_MANIFEST]\n"
+                )
+                restore_replacement = (
+                    "def _external_artifact_paths_for_restore(datasets):\n"
+                    "    paths = [\n"
+                    "        Path('reports/revision/predictions/oof_final_ema_predictions.npz'),\n"
+                    "        Path('reports/revision/manifests/oof_final_ema_freeze_manifest.json'),\n"
+                    "        Path('reports/revision/manifests/oof_final_ema_prediction_run_manifest.json'),\n"
+                    "        FOLD_PCA_MANIFEST,\n"
+                    "    ]\n"
+                )
+                if restore_anchor not in text:
+                    raise RuntimeError("Notebook 02 external OOF restore anchor missing")
+                text = text.replace(restore_anchor, restore_replacement, 1)
             if "EXTERNAL_RUN_PROFILE =" not in text:
                 external_profile_pattern = re.compile(
                     r"# PTB-XL is already manuscript-gated; Georgia/CPSC2021 will run only when their prediction artifacts are missing\.\n"
@@ -1711,6 +1883,23 @@ print(
                 "# float16-roundtrip features. A100 remains available for downstream model inference.\n",
             )
             text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 256\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
+            gpu_refresh_replacement = """def external_publish_refresh_args(dataset):
+    # The CPU feature phase owns feature-cache and CPSC memmap attestation.
+    # GPU inference publishes only newly generated prediction/audit outputs.
+    return ''
+"""
+            gpu_refresh_start = text.find("def external_publish_refresh_args(dataset):\n")
+            gpu_refresh_end = text.find(
+                "\n\ndef publish_external_dataset_outputs",
+                gpu_refresh_start,
+            )
+            if gpu_refresh_start < 0 or gpu_refresh_end < 0:
+                raise RuntimeError("Notebook 02 GPU publish-refresh boundary missing")
+            text = (
+                text[:gpu_refresh_start]
+                + gpu_refresh_replacement
+                + text[gpu_refresh_end:]
+            )
             external_command_anchor = (
                 "        f'--dataset {dataset} --checkpoint-kind final_ema --batch-size {EXTERNAL_BATCH_SIZE} '\n"
                 "        '--allow-experimental'"
@@ -1730,7 +1919,72 @@ print(
                     external_command_with_features,
                     1,
                 )
+            inference_command_anchor = (
+                "        'python -u scripts/revision/03_generate_external_predictions.py '\n"
+                "        f'--dataset {dataset}"
+            )
+            inference_command_replacement = (
+                "        'python -u scripts/revision/03_generate_external_predictions.py "
+                "--inference-only '\n"
+                "        f'--dataset {dataset}"
+            )
+            if "03_generate_external_predictions.py --inference-only" not in text:
+                if inference_command_anchor not in text:
+                    raise RuntimeError("Notebook 02 external inference-only command anchor missing")
+                text = text.replace(
+                    inference_command_anchor,
+                    inference_command_replacement,
+                    1,
+                )
+            text = text.replace(
+                "# The fixed-seed ROCKET-family feature transform is the external-export bottleneck.\n"
+                "# CPU is canonical because the frozen fold PCA objects were fitted from CPU-produced\n"
+                "# float16-roundtrip features. A100 remains available for downstream model inference.\n",
+                "# The CPU phase owns feature preparation. This A100 phase authenticates and reuses\n"
+                "# the completed cache; --inference-only cannot compute missing ROCKET features.\n",
+            )
         if "RUN_PTBXL_FOLD9_EXPORT" in text:
+            if "PTBXL_FOLD9_CONTRACT_INPUTS =" not in text:
+                fold9_inputs_anchor = (
+                    "PTBXL_FOLD9_REQUIRED = [\n"
+                )
+                fold9_inputs_block = (
+                    "PTBXL_FOLD9_CONTRACT_INPUTS = [\n"
+                    "    Path('reports/revision/predictions/oof_final_ema_predictions.npz'),\n"
+                    "    Path('reports/revision/manifests/oof_final_ema_freeze_manifest.json'),\n"
+                    "    Path('reports/revision/manifests/oof_final_ema_prediction_run_manifest.json'),\n"
+                    "]\n"
+                    "PTBXL_FOLD9_REQUIRED = [\n"
+                )
+                if fold9_inputs_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 OOF input anchor missing")
+                text = text.replace(fold9_inputs_anchor, fold9_inputs_block, 1)
+            if "PTBXL_FOLD9_FEATURE_HANDOFF =" not in text:
+                fold9_handoff_anchor = "RUN_PTBXL_FOLD9_EXPORT = 'auto'\n"
+                fold9_handoff_block = (
+                    "RUN_PTBXL_FOLD9_EXPORT = 'auto'\n"
+                    "PTBXL_FOLD9_FEATURE_HANDOFF = Path(\n"
+                    "    'reports/revision/manifests/"
+                    "external_ptbxl_fold9_feature_cache_manifest.json'\n"
+                    ")\n"
+                )
+                if fold9_handoff_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 handoff anchor missing")
+                text = text.replace(
+                    fold9_handoff_anchor,
+                    fold9_handoff_block,
+                    1,
+                )
+            text = text.replace(
+                "        for path in PTBXL_FOLD9_REQUIRED\n",
+                "        for path in [*PTBXL_FOLD9_CONTRACT_INPUTS, PTBXL_FOLD9_FEATURE_HANDOFF, *PTBXL_FOLD9_REQUIRED]\n",
+                1,
+            )
+            text = text.replace(
+                "        for path in [PTBXL_FOLD9_FEATURE_HANDOFF, *PTBXL_FOLD9_REQUIRED]\n",
+                "        for path in [*PTBXL_FOLD9_CONTRACT_INPUTS, PTBXL_FOLD9_FEATURE_HANDOFF, *PTBXL_FOLD9_REQUIRED]\n",
+                1,
+            )
             if "PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT" not in text:
                 fold9_cache_anchor = "RUN_PTBXL_FOLD9_EXPORT = 'auto'\n"
                 fold9_cache_block = """RUN_PTBXL_FOLD9_EXPORT = 'auto'
@@ -1776,10 +2030,51 @@ PTBXL_FOLD9_FEATURE_PARITY_RECORDS = 4
                 if fold9_command_anchor not in text:
                     raise RuntimeError("Notebook 02 PTB-XL fold 9 feature command anchor missing")
                 text = text.replace(fold9_command_anchor, fold9_command_with_features, 1)
-            text = text.replace(
-                "artifact_mirror.py publish --verify-existing size --mirror-root \"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"",
-                "artifact_mirror.py publish --verify-existing size --refresh-existing-prefix \"predictions/external_feature_cache\" --mirror-root \"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"",
+            fold9_inference_anchor = (
+                "'python -u scripts/revision/03_generate_external_predictions.py '\n"
+                "        '--dataset ptbxl --ptbxl-folds 9 --output-tag fold9 '"
             )
+            fold9_inference_replacement = (
+                "'python -u scripts/revision/03_generate_external_predictions.py "
+                "--inference-only '\n"
+                "        '--dataset ptbxl --ptbxl-folds 9 --output-tag fold9 '"
+            )
+            if "03_generate_external_predictions.py --inference-only" not in text:
+                if fold9_inference_anchor not in text:
+                    raise RuntimeError("Notebook 02 PTB-XL fold 9 inference-only anchor missing")
+                text = text.replace(
+                    fold9_inference_anchor,
+                    fold9_inference_replacement,
+                    1,
+                )
+            fold9_publish_anchor = (
+                "f'python -u scripts/revision/artifact_mirror.py publish "
+                "--verify-existing size --refresh-existing-prefix "
+                "\"predictions/external_feature_cache\" --mirror-root "
+                "\"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"'"
+            )
+            fold9_publish_replacement = (
+                "f'python -u scripts/revision/artifact_mirror.py publish "
+                "--verify-existing size --source-conflict-policy source "
+                "--include-path \"experimental/external/ptbxl/"
+                "ptbxl_full_fold9_predictions.npz\" "
+                "--include-path \"experimental/external/ptbxl/"
+                "ptbxl_full_fold9_slice_predictions.npz\" "
+                "--include-path \"experimental/external/ptbxl/"
+                "ptbxl_full_fold9_prediction_summary.json\" "
+                "--include-path \"experimental/external/ptbxl/"
+                "ptbxl_full_fold9_prediction_run_manifest.json\" "
+                "--include-path \"experimental/external/ptbxl/"
+                "ptbxl_full_fold9_class_summary.csv\" "
+                "--mirror-root "
+                "\"{DRIVE_ROOT / \"revision_artifacts\" / \"reports\" / \"revision\"}\"'"
+            )
+            if fold9_publish_anchor in text:
+                text = text.replace(
+                    fold9_publish_anchor,
+                    fold9_publish_replacement,
+                    1,
+                )
         if "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT" in text:
             comparator_cache_assignment = (
                 "EXTERNAL_COMPARATOR_CACHE_DIR = DRIVE_ROOT / 'revision_artifacts' / 'reports' / "

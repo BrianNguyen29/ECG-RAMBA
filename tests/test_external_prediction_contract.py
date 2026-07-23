@@ -1,6 +1,11 @@
+import ast
+import hashlib
 import importlib
+import inspect
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +23,261 @@ external = importlib.import_module("scripts.revision.03_generate_external_predic
 
 
 class ExternalPredictionContractTests(unittest.TestCase):
+    def test_feature_writer_lock_covers_atomic_finalize_and_partial_cleanup(self):
+        tree = ast.parse(inspect.getsource(external.generate_features))
+        writer_locks = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Call)
+                and isinstance(item.context_expr.func, ast.Name)
+                and item.context_expr.func.id == "exclusive_cache_writer"
+                for item in node.items
+            )
+        ]
+        self.assertEqual(len(writer_locks), 1)
+        calls = {
+            node.func.id
+            for node in ast.walk(writer_locks[0])
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("save_npz_compressed_atomic", calls)
+        self.assertIn("cleanup_rocket_resume", calls)
+
+    def test_two_phase_cli_is_mutually_exclusive(self):
+        with patch.object(
+            sys,
+            "argv",
+            ["03_generate_external_predictions.py", "--dataset", "ptbxl", "--features-only"],
+        ):
+            args = external.parse_args()
+        self.assertTrue(args.features_only)
+        self.assertFalse(args.inference_only)
+
+        with patch.object(
+            sys,
+            "argv",
+            [
+                "03_generate_external_predictions.py",
+                "--dataset",
+                "ptbxl",
+                "--features-only",
+                "--inference-only",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                external.parse_args()
+
+    def test_two_phase_control_plane_preserves_v12_numerical_cache_identity(self):
+        self.assertEqual(
+            external.EXTERNAL_FEATURE_NUMERICAL_SOURCE_SHA256,
+            "62ec341bdb2c0607e57c01e57d7fe93f5a885455cea0d47048f115838c418eaa",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "source.zip"
+            archive.write_bytes(b"source")
+            pca = root / "fold1_pca.joblib"
+            pca.write_bytes(b"pca")
+            signals = np.zeros((2, 12, 5000), dtype=np.float32)
+            record_ids = np.asarray(["record-a", "record-b"])
+            cache_dir = root / "cache"
+            with patch.dict(
+                os.environ,
+                {external.EXTERNAL_FEATURE_CACHE_DIR_ENV: str(cache_dir)},
+                clear=False,
+            ):
+                _, contract = external.feature_cache_path(
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cpu",
+                )
+        self.assertEqual(
+            contract["extractor_source_sha256"],
+            external.EXTERNAL_FEATURE_NUMERICAL_SOURCE_SHA256,
+        )
+
+    def test_v12_numerical_source_attestation_matches_release_bundle(self):
+        project_root = Path(__file__).resolve().parents[1]
+        ref = "ecg-ramba-revision-20260723-v12"
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            cwd=project_root,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            self.skipTest(f"release tag {ref} is unavailable")
+        paths = [
+            "scripts/revision/03_generate_external_predictions.py",
+            "src/features.py",
+            "src/data_loader.py",
+        ]
+        digest = hashlib.sha256()
+        for label in sorted(paths):
+            payload = subprocess.check_output(
+                ["git", "show", f"{ref}:{label}"],
+                cwd=project_root,
+            )
+            encoded = label.encode("utf-8")
+            digest.update(len(encoded).to_bytes(4, "little"))
+            digest.update(encoded)
+            digest.update(hashlib.sha256(payload).digest())
+        self.assertEqual(
+            digest.hexdigest(),
+            external.EXTERNAL_FEATURE_NUMERICAL_SOURCE_SHA256,
+        )
+
+    def test_gpu_consumer_uses_cpu_producer_runtime_for_cache_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "source.zip"
+            archive.write_bytes(b"source")
+            pca = root / "fold1_pca.joblib"
+            pca.write_bytes(b"pca")
+            signals = np.zeros((2, 12, 5000), dtype=np.float32)
+            record_ids = np.asarray(["record-a", "record-b"])
+            with patch.dict(
+                os.environ,
+                {external.EXTERNAL_FEATURE_CACHE_DIR_ENV: str(root / "cache")},
+                clear=False,
+            ):
+                cpu_path, _ = external.feature_cache_path(
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cpu",
+                    producer_torch_version="2.11.0+cpu",
+                    producer_numpy_version="2.0.0",
+                )
+                cuda_local_path, _ = external.feature_cache_path(
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cpu",
+                    producer_torch_version="2.11.0+cu128",
+                    producer_numpy_version="2.0.0",
+                )
+                consumer_path, _ = external.feature_cache_path(
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cpu",
+                    producer_torch_version="2.11.0+cpu",
+                    producer_numpy_version="2.0.0",
+                )
+        self.assertNotEqual(cpu_path, cuda_local_path)
+        self.assertEqual(cpu_path, consumer_path)
+
+    def test_inference_only_fails_before_feature_computation_when_cache_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "source.zip"
+            archive.write_bytes(b"source")
+            pca = root / "fold1_pca.joblib"
+            pca.write_bytes(b"pca")
+            signals = np.zeros((2, 12, 5000), dtype=np.float32)
+            record_ids = np.asarray(["record-a", "record-b"])
+            with patch.dict(
+                os.environ,
+                {
+                    external.EXTERNAL_FEATURE_CACHE_DIR_ENV: str(
+                        root / "canonical" / "external_feature_cache"
+                    )
+                },
+                clear=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "--features-only"):
+                    external.generate_features(
+                        "cpsc2021",
+                        archive,
+                        signals,
+                        record_ids,
+                        [pca],
+                        force=False,
+                        feature_device="cpu",
+                        feature_batch_size=64,
+                        feature_parity_records=4,
+                        require_existing=True,
+                    )
+
+    def test_feature_handoff_is_sha_bound_and_requires_cpu_backend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "source.zip"
+            archive.write_bytes(b"source")
+            pca = root / "fold1_pca.joblib"
+            pca.write_bytes(b"pca")
+            feature_cache = root / "features.npz"
+            feature_cache.write_bytes(b"feature-cache-v1")
+            runtime = {
+                "feature_device": "cpu",
+                "torch_version": "2.11.0+cpu",
+                "numpy_version": "2.0.0",
+                "backend_contract_capability": (
+                    external.EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY
+                ),
+                "backend_contract_schema_version": (
+                    external.EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION
+                ),
+            }
+            kwargs = {
+                "dataset": "ptbxl",
+                "output_tag": "fold9",
+                "checkpoint_kind": "final_ema",
+                "canonical": {"oof_sha256": "a" * 64, "freeze_sha256": "b" * 64},
+                "archive": archive,
+                "source_archive_sha256": external.sha256_file(archive),
+                "source_config_hash": "config",
+                "record_ids": np.asarray(["r1", "r2"]),
+                "group_ids": np.asarray(["p1", "p2"]),
+                "split_ids": np.asarray(["ptbxl_fold9", "ptbxl_fold9"]),
+                "load_summary": {
+                    "label_protocol": "mapped",
+                    "group_unit": "patient_id",
+                },
+                "pca_paths": [pca],
+                "feature_cache": feature_cache,
+                "feature_cache_hit": False,
+                "feature_runtime": runtime,
+            }
+            payload = external.feature_handoff_payload(**kwargs)
+            handoff = root / "handoff.json"
+            handoff.write_text(json.dumps(payload), encoding="utf-8")
+            seed = external.load_feature_handoff_seed(
+                handoff,
+                dataset="ptbxl",
+                output_tag="fold9",
+                checkpoint_kind="final_ema",
+                canonical=kwargs["canonical"],
+            )
+            self.assertEqual(seed["feature_runtime"]["torch_version"], runtime["torch_version"])
+            observed = external.validate_feature_handoff(handoff, payload)
+            self.assertEqual(observed["status"], "feature_cache_ready")
+
+            feature_cache.write_bytes(b"feature-cache-v2-is-different")
+            changed = external.feature_handoff_payload(**kwargs)
+            with self.assertRaisesRegex(RuntimeError, "feature_cache"):
+                external.validate_feature_handoff(handoff, changed)
+
+            feature_cache.write_bytes(b"feature-cache-v1")
+            cuda_payload = external.feature_handoff_payload(
+                **{**kwargs, "feature_runtime": {**runtime, "feature_device": "cuda"}}
+            )
+            handoff.write_text(json.dumps(cuda_payload), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "feature_runtime"):
+                external.validate_feature_handoff(handoff, cuda_payload)
+
     def test_external_checkpoint_files_must_match_oof_run_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -258,6 +518,54 @@ class ExternalPredictionContractTests(unittest.TestCase):
             external.cleanup_rocket_resume(changed, changed_raw, changed_progress)
             self.assertFalse(raw_path.exists())
             self.assertFalse(progress_path.exists())
+
+    def test_rocket_resume_recomputes_a_completed_batch_when_checksum_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "features.npz"
+            contract = {
+                "archive_sha256": "archive-a",
+                "record_id_fingerprint": "records-a",
+                "rocket_feature_value_contract": external.EXTERNAL_FEATURE_VALUE_CONTRACT,
+            }
+            raw, raw_path, progress_path, completed, resume_contract = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                    feature_device="cpu",
+                )
+            )
+            raw[:2] = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float16)
+            raw.flush()
+            completed.add(0)
+            external.save_rocket_resume_progress(
+                progress_path,
+                resume_contract,
+                completed,
+                raw_features=raw,
+                batch_size=2,
+                n_records=3,
+            )
+            raw[0, 0] = np.float16(9.0)
+            raw.flush()
+            owner = getattr(raw, "_mmap", None)
+            if owner is not None:
+                owner.close()
+
+            reopened, raw_path, progress_path, completed, _ = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                    feature_device="cpu",
+                )
+            )
+            self.assertEqual(completed, set())
+            external.cleanup_rocket_resume(reopened, raw_path, progress_path)
 
     def test_rocket_feature_partial_cache_never_crosses_device_backends(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -43,7 +43,8 @@ consumers and deliberately cannot establish or rotate authority.
 | 1 | `00_colab_bootstrap.ipynb` | CPU | Mount Drive, clone the clean authority commit, run source/storage audit. CUDA is not required. |
 | 2 | `01_a0_protocol_audit.ipynb` | CPU | Run protocol audit and resolve any A0 blocker. |
 | Optional | `02a_retrain_best_ema.ipynb` | A100 High-RAM | Use only when the fixed checkpoint protocol itself cannot be authenticated or a paper-level retrain is intentionally opened. It is not part of a normal cached evidence refresh. |
-| 3 | `02_predictions_and_external_eval.ipynb` | A100 only when inference is missing | Restore authenticated caches first. Generate only missing OOF/external folds. Regenerate the SHA-bound Chapman patient/group sidecar and run strict freeze and external gates. |
+| 3a | `02_predictions_and_external_eval.ipynb` external feature phase | CPU High-RAM | Run **CPU External Feature Preparation** for only the required dataset profile. It writes the source-bound fixed-seed ROCKET-family/PCA/HRV cache and SHA-bound handoff manifest to the canonical Drive mirror. |
+| 3b | `02_predictions_and_external_eval.ipynb` external inference phase | A100 High-RAM | Run **GPU External Prediction Inference** only after the CPU handoff passes. It uses `--inference-only`, cannot construct a missing feature cache, and publishes only prediction/evaluation artifacts. |
 | 4 | `03_calibration_and_ci.ipynb` | CPU High-RAM | Recompute calibration and the independent statistical oracle against the frozen OOF and authenticated patient/group contract. |
 | 5 | `04_baselines_and_component_checks.ipynb` | A100 for missing folds; CPU for paired ledgers | Reuse authenticated fold predictions/checkpoints. Train only missing folds. Regenerate paired effect-size ledgers. |
 | 6 | `02_predictions_and_external_eval.ipynb` second pass | A100 for missing representations; CPU for adaptation statistics | Export PTB-XL fold 9 adaptation pool, external representations, score calibration, and frozen-encoder-head learning curves. |
@@ -64,6 +65,27 @@ Each command must print and persist:
 - a durable log under the canonical mirror.
 
 After every expensive fold or stress prediction, require a successful mirror publish before disconnecting.
+
+Notebook 02 deliberately splits each Full external export into two runtime phases:
+
+1. On CPU High-RAM, run Setup, Install Base Dependencies, then **CPU External
+   Feature Preparation**. Do not run Install Model Dependencies. The default
+   profile is `cpsc_cpu_resume`; select another profile with
+   `ECG_RAMBA_EXTERNAL_FEATURE_PROFILE`. Keep
+   `ECG_RAMBA_EXTERNAL_FEATURE_BATCH_SIZE=64` while an existing CPSC partial
+   checkpoint is being resumed. Changing the batch size changes the resume
+   contract and cannot reuse completed batch offsets.
+2. Wait for `CPU FEATURE PHASE COMPLETE` and a successful mirror publish. The
+   final feature cache and `external_<dataset>_feature_cache_manifest.json`
+   must both pass SHA verification before disconnecting.
+3. Reconnect A100 High-RAM, run Setup, Install Base Dependencies, Install Model
+   Dependencies, skip the CPU feature cell, and run **GPU External Prediction
+   Inference**. The `--inference-only` runner fails closed if the cache or
+   handoff is absent, stale, non-CPU, or not bound to the current
+   OOF/freeze/archive/PCA/record order.
+4. PTB-XL fold 9 uses the same two-phase sequence in its dedicated CPU feature
+   and GPU inference cells. Protocol gates and adaptation statistics can return
+   to CPU after all prediction artifacts are mirrored.
 
 Notebook 02 discovers the base and Mamba installers through one exact
 capability/schema marker pair per installer. Notebook 00, 02a, 05, and 06 reject

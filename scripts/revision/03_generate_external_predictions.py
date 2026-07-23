@@ -84,9 +84,18 @@ EXTERNAL_FEATURE_ACCELERATION_CAPABILITY = "external_fixed_rocket_gpu_parity_che
 EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION = 1
 EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY = "external_rocket_backend_bound_cache_v1"
 EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION = 1
+EXTERNAL_TWO_PHASE_CAPABILITY = "external_feature_inference_handoff_v1"
+EXTERNAL_TWO_PHASE_SCHEMA_VERSION = 1
 EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION = 3
 EXTERNAL_FEATURE_VALUE_CONTRACT = "float16_storage_roundtrip_v1_training_pca_aligned"
 EXTERNAL_FEATURE_CACHE_DIR_ENV = "ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR"
+# Clone-independent source_bundle_sha256 from release v12 over this exporter,
+# src/features.py, and src/data_loader.py. Keep schema-v3 identity stable so the
+# active CPSC partial remains resumable. Any numerical change must increment
+# EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION and rotate this attestation.
+EXTERNAL_FEATURE_NUMERICAL_SOURCE_SHA256 = (
+    "62ec341bdb2c0607e57c01e57d7fe93f5a885455cea0d47048f115838c418eaa"
+)
 CANONICAL_ROCKET_FEATURE_DEVICE = "cpu"
 DEFAULT_ROCKET_CPU_BATCH_SIZE = 64
 DEFAULT_ROCKET_CUDA_BATCH_SIZE = 128
@@ -127,6 +136,23 @@ def patch_wfdb_annotation_numpy2_overflow() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["ptbxl", "georgia", "cpsc2021"], required=True)
+    phase = parser.add_mutually_exclusive_group()
+    phase.add_argument(
+        "--features-only",
+        action="store_true",
+        help=(
+            "Prepare and attest the canonical CPU ROCKET/PCA/HRV cache, then stop "
+            "before ECG-RAMBA model construction or inference."
+        ),
+    )
+    phase.add_argument(
+        "--inference-only",
+        action="store_true",
+        help=(
+            "Require an authenticated completed feature-cache handoff and run only "
+            "the downstream ECG-RAMBA ensemble inference/export."
+        ),
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument(
         "--feature-device",
@@ -1379,6 +1405,8 @@ def feature_cache_path(
     record_ids: np.ndarray,
     *,
     feature_device: str = CANONICAL_ROCKET_FEATURE_DEVICE,
+    producer_torch_version: str | None = None,
+    producer_numpy_version: str | None = None,
 ) -> tuple[Path, dict[str, str]]:
     feature_device = str(feature_device).strip().lower()
     if feature_device not in {"cpu", "cuda"}:
@@ -1403,9 +1431,13 @@ def feature_cache_path(
     pca_fingerprint = hashlib.sha256(
         ":".join(file_fingerprint(path) for path in pca_paths).encode()
     ).hexdigest()[:16]
-    source_sha = source_bundle_sha256(
-        [Path(__file__).resolve(), PROJECT_ROOT / "src" / "features.py", PROJECT_ROOT / "src" / "data_loader.py"]
-    )
+    # This is a numerical implementation identity, not the hash of the runner's
+    # orchestration code. The signal content hash below already captures any
+    # preprocessing change, while this stable identity lets a reviewed
+    # features-only/inference-only control-plane update resume the v12 cache.
+    source_sha = EXTERNAL_FEATURE_NUMERICAL_SOURCE_SHA256
+    torch_version = str(producer_torch_version or torch.__version__)
+    numpy_version = str(producer_numpy_version or np.__version__)
     contract = {
         "archive_sha256": sha256_file(archive),
         "signal_sha256": ndarray_sha256(np.asarray(signals, dtype=np.float32)),
@@ -1414,8 +1446,8 @@ def feature_cache_path(
         "record_order_sha256": record_id_fingerprint(record_ids),
         "rocket_feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
         "rocket_feature_device": feature_device,
-        "rocket_torch_version": str(torch.__version__),
-        "rocket_numpy_version": str(np.__version__),
+        "rocket_torch_version": torch_version,
+        "rocket_numpy_version": numpy_version,
     }
     contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
     path = cache_dir / (
@@ -1524,6 +1556,11 @@ def quarantine_rocket_resume(paths: tuple[Path, Path], reason: str) -> None:
         print(f"Quarantined stale ROCKET partial: {path.name} -> {candidate.name}")
 
 
+def rocket_resume_batch_sha256(raw: np.ndarray, start: int, stop: int) -> str:
+    batch = np.ascontiguousarray(raw[start:stop], dtype=np.float16)
+    return ndarray_sha256(batch)
+
+
 def open_rocket_resume_cache(
     cache_path: Path,
     cache_contract: dict[str, str],
@@ -1548,18 +1585,59 @@ def open_rocket_resume_cache(
             progress = json.loads(progress_path.read_text(encoding="utf-8"))
             raw = np.load(raw_path, mmap_mode="r+")
             completed = {int(value) for value in progress.get("completed_starts", [])}
+            stored_hashes = {
+                int(key): str(value)
+                for key, value in (progress.get("batch_sha256") or {}).items()
+            }
             valid = (
                 progress.get("resume_contract") == expected
                 and raw.shape == (n_records, n_features)
                 and raw.dtype == np.float16
-                and all(0 <= value < n_records for value in completed)
+                and all(
+                    0 <= value < n_records and value % batch_size == 0
+                    for value in completed
+                )
             )
             if valid:
+                verified: set[int] = set()
+                verified_hashes: dict[int, str] = {}
+                for start in sorted(completed):
+                    stop = min(n_records, start + batch_size)
+                    batch = np.asarray(raw[start:stop])
+                    observed_hash = rocket_resume_batch_sha256(raw, start, stop)
+                    expected_hash = stored_hashes.get(start)
+                    legacy_batch_valid = bool(
+                        np.isfinite(batch).all() and np.any(batch != 0)
+                    )
+                    if (
+                        expected_hash == observed_hash
+                        or expected_hash is None
+                        and legacy_batch_valid
+                    ):
+                        verified.add(start)
+                        verified_hashes[start] = observed_hash
+                discarded = sorted(completed - verified)
+                if discarded:
+                    print(
+                        "ROCKET resume verification will recompute invalid batches: "
+                        f"{discarded[:10]}{'...' if len(discarded) > 10 else ''}"
+                    )
+                save_json(
+                    progress_path,
+                    {
+                        "resume_contract": expected,
+                        "completed_starts": sorted(verified),
+                        "batch_sha256": {
+                            str(key): value
+                            for key, value in sorted(verified_hashes.items())
+                        },
+                    },
+                )
                 print(
                     "Resuming source-bound ROCKET feature checkpoint: "
-                    f"completed_batches={len(completed)} path={raw_path}"
+                    f"completed_batches={len(verified)} path={raw_path}"
                 )
-                return raw, raw_path, progress_path, completed, expected
+                return raw, raw_path, progress_path, verified, expected
             mmap_owner = getattr(raw, "_mmap", None)
             if mmap_owner is not None:
                 mmap_owner.close()
@@ -1580,6 +1658,7 @@ def open_rocket_resume_cache(
         {
             "resume_contract": expected,
             "completed_starts": [],
+            "batch_sha256": {},
         },
     )
     print(f"Created source-bound ROCKET feature checkpoint: {raw_path}")
@@ -1590,12 +1669,43 @@ def save_rocket_resume_progress(
     progress_path: Path,
     resume_contract: dict[str, object],
     completed_starts: set[int],
+    *,
+    raw_features: np.ndarray | None = None,
+    batch_size: int | None = None,
+    n_records: int | None = None,
 ) -> None:
+    hashes: dict[int, str] = {}
+    if progress_path.exists():
+        try:
+            current = json.loads(progress_path.read_text(encoding="utf-8"))
+            hashes = {
+                int(key): str(value)
+                for key, value in (current.get("batch_sha256") or {}).items()
+                if int(key) in completed_starts
+            }
+        except (OSError, ValueError, json.JSONDecodeError):
+            hashes = {}
+    if raw_features is not None:
+        if not batch_size or n_records is None:
+            raise ValueError(
+                "batch_size and n_records are required when hashing ROCKET resume batches"
+            )
+        for start in completed_starts:
+            if start not in hashes:
+                stop = min(int(n_records), int(start) + int(batch_size))
+                hashes[start] = rocket_resume_batch_sha256(
+                    raw_features,
+                    int(start),
+                    stop,
+                )
     save_json(
         progress_path,
         {
             "resume_contract": resume_contract,
             "completed_starts": sorted(int(value) for value in completed_starts),
+            "batch_sha256": {
+                str(key): value for key, value in sorted(hashes.items())
+            },
         },
     )
 
@@ -1722,6 +1832,8 @@ def generate_features(
     feature_device: str,
     feature_batch_size: int,
     feature_parity_records: int,
+    require_existing: bool = False,
+    producer_runtime: dict[str, object] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, Path, bool, dict[str, object]]:
     device = resolve_rocket_feature_device(feature_device)
     batch_size = resolve_rocket_feature_batch_size(device, feature_batch_size)
@@ -1732,51 +1844,85 @@ def generate_features(
         pca_paths,
         record_ids,
         feature_device=device,
+        producer_torch_version=(
+            str(producer_runtime["torch_version"])
+            if producer_runtime and producer_runtime.get("torch_version")
+            else None
+        ),
+        producer_numpy_version=(
+            str(producer_runtime["numpy_version"])
+            if producer_runtime and producer_runtime.get("numpy_version")
+            else None
+        ),
     )
     print(f"External ROCKET-family feature cache: {cache_path}")
     hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
+    cache_rejection = "cache_missing"
     if cache_path.exists() and not force:
-        with np.load(cache_path, allow_pickle=False) as data:
-            schema = int(data["cache_schema_version"]) if "cache_schema_version" in data.files else 0
-            hydra = [data[key] for key in hydra_keys] if all(key in data.files for key in hydra_keys) else []
-            hrv = data["X_hrv"]
-            observed_contract = {
-                key: str(data[key].item()) if key in data.files else ""
-                for key in cache_contract
-            }
-            if (
-                schema == EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION
-                and observed_contract == cache_contract
-                and len(hydra) == len(pca_paths)
-                and all(
-                    key in data.files
-                    for key in (
-                        "feature_device",
-                        "feature_batch_size",
-                        "feature_runtime_json",
-                        "rocket_feature_value_contract",
-                    )
-                )
-                and all(values.dtype == np.float32 for values in hydra)
-                and hrv.dtype == np.float32
-                and all(len(values) == len(signals) for values in hydra)
-            ):
-                print(f"Loaded float32 external feature cache: {cache_path}")
-                try:
-                    runtime = json.loads(str(data["feature_runtime_json"].item()))
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise RuntimeError(
-                        f"External feature cache runtime provenance is invalid: {cache_path}"
-                    ) from exc
-                runtime.update(
-                    {
-                        "status": "cached",
-                        "feature_device": str(data["feature_device"].item()),
-                        "feature_batch_size": int(data["feature_batch_size"].item()),
-                        "feature_value_contract": str(data["rocket_feature_value_contract"].item()),
+        try:
+            with np.load(cache_path, allow_pickle=False) as data:
+                files = set(data.files)
+                required = {
+                    "cache_schema_version",
+                    "X_hrv",
+                    "feature_device",
+                    "feature_batch_size",
+                    "feature_runtime_json",
+                    "rocket_feature_value_contract",
+                    *hydra_keys,
+                    *cache_contract,
+                }
+                missing = sorted(required - files)
+                if missing:
+                    cache_rejection = "missing_keys=" + ",".join(missing)
+                else:
+                    schema = int(data["cache_schema_version"])
+                    hydra = [np.asarray(data[key], dtype=np.float32) for key in hydra_keys]
+                    hrv = np.asarray(data["X_hrv"], dtype=np.float32)
+                    observed_contract = {
+                        key: str(data[key].item())
+                        for key in cache_contract
                     }
-                )
-                return hydra, hrv, cache_path, True, runtime
+                    valid = (
+                        schema == EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION
+                        and observed_contract == cache_contract
+                        and all(values.dtype == np.float32 for values in hydra)
+                        and hrv.dtype == np.float32
+                        and all(len(values) == len(signals) for values in hydra)
+                        and len(hrv) == len(signals)
+                        and all(np.isfinite(values).all() for values in hydra)
+                        and np.isfinite(hrv).all()
+                    )
+                    if valid:
+                        print(f"Loaded float32 external feature cache: {cache_path}")
+                        try:
+                            runtime = json.loads(str(data["feature_runtime_json"].item()))
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise RuntimeError(
+                                f"External feature cache runtime provenance is invalid: {cache_path}"
+                            ) from exc
+                        runtime.update(
+                            {
+                                "status": "cached",
+                                "feature_device": str(data["feature_device"].item()),
+                                "feature_batch_size": int(data["feature_batch_size"].item()),
+                                "feature_value_contract": str(
+                                    data["rocket_feature_value_contract"].item()
+                                ),
+                            }
+                        )
+                        return hydra, hrv, cache_path, True, runtime
+                    cache_rejection = "schema_contract_shape_dtype_or_finite_mismatch"
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            cache_rejection = f"unreadable={type(exc).__name__}:{exc}"
+
+    if require_existing:
+        raise RuntimeError(
+            "Inference-only mode requires a complete authenticated external feature cache, "
+            f"but reuse was rejected ({cache_rejection}): {cache_path}. "
+            "Run this exporter with --features-only on a CPU runtime first, publish the "
+            "feature handoff, then reconnect the GPU runtime."
+        )
 
     if feature_parity_records <= 0:
         raise ValueError("--feature-parity-records must be positive")
@@ -1838,7 +1984,14 @@ def generate_features(
                         raw_features[start:stop] = training_pca_compatible_rocket_values(values)
                         raw_features.flush()
                         completed_starts.add(start)
-                        save_rocket_resume_progress(progress_path, resume_contract, completed_starts)
+                        save_rocket_resume_progress(
+                            progress_path,
+                            resume_contract,
+                            completed_starts,
+                            raw_features=raw_features,
+                            batch_size=batch_size,
+                            n_records=len(signals),
+                        )
             finally:
                 if previous is not None:
                     restore_cuda_rocket_runtime(previous)
@@ -1847,34 +2000,35 @@ def generate_features(
                 if device == "cuda":
                     torch.cuda.empty_cache()
 
-    if raw_features.shape != (len(signals), n_features) or not np.isfinite(raw_features).all():
-        raise RuntimeError(
-            f"Invalid external ROCKET feature checkpoint: shape={raw_features.shape}, "
-            f"finite={bool(np.isfinite(raw_features).all())}"
-        )
-    hydra = transform_external_rocket_features(raw_features, pca_paths, batch_size=batch_size)
-    hrv = np.empty((len(signals), int(CONFIG["hrv_dim"])), dtype=np.float32)
-    for index, signal in enumerate(tqdm(signals, desc="HRV36")):
-        hrv[index] = checkpoint_compatible_hrv36(signal)
-    payload = {
-        "X_hrv": hrv,
-        "cache_schema_version": np.asarray(EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION, dtype=np.int16),
-        "config_hash": np.asarray(EVALUATION_CONFIG_HASH),
-        "pca_paths": np.asarray([str(path) for path in pca_paths]),
-        "pca_sha256": np.asarray([sha256_file(path) for path in pca_paths]),
-        "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
-        "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
-        "feature_device": np.asarray(str(runtime["feature_device"])),
-        "feature_batch_size": np.asarray(int(runtime["feature_batch_size"]), dtype=np.int32),
-        "feature_runtime_json": np.asarray(json.dumps(runtime, sort_keys=True)),
-    }
-    payload.update({key: np.asarray(value) for key, value in cache_contract.items()})
-    payload.update({key: values for key, values in zip(hydra_keys, hydra)})
-    # Feature construction can run for hours on CPSC2021. A partial cache must
-    # never be mistaken for a valid reusable cache after a Colab disconnect.
-    save_npz_compressed_atomic(cache_path, **payload)
-    cleanup_rocket_resume(raw_features, raw_path, progress_path)
-    return hydra, hrv, cache_path, False, runtime
+        if raw_features.shape != (len(signals), n_features) or not np.isfinite(raw_features).all():
+            raise RuntimeError(
+                f"Invalid external ROCKET feature checkpoint: shape={raw_features.shape}, "
+                f"finite={bool(np.isfinite(raw_features).all())}"
+            )
+        hydra = transform_external_rocket_features(raw_features, pca_paths, batch_size=batch_size)
+        hrv = np.empty((len(signals), int(CONFIG["hrv_dim"])), dtype=np.float32)
+        for index, signal in enumerate(tqdm(signals, desc="HRV36")):
+            hrv[index] = checkpoint_compatible_hrv36(signal)
+        payload = {
+            "X_hrv": hrv,
+            "cache_schema_version": np.asarray(EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION, dtype=np.int16),
+            "config_hash": np.asarray(EVALUATION_CONFIG_HASH),
+            "pca_paths": np.asarray([str(path) for path in pca_paths]),
+            "pca_sha256": np.asarray([sha256_file(path) for path in pca_paths]),
+            "hrv_semantics": np.asarray("checkpoint_compatible_amplitude_slots_zero"),
+            "record_id_fingerprint": np.asarray(record_id_fingerprint(record_ids)),
+            "feature_device": np.asarray(str(runtime["feature_device"])),
+            "feature_batch_size": np.asarray(int(runtime["feature_batch_size"]), dtype=np.int32),
+            "feature_runtime_json": np.asarray(json.dumps(runtime, sort_keys=True)),
+        }
+        payload.update({key: np.asarray(value) for key, value in cache_contract.items()})
+        payload.update({key: values for key, values in zip(hydra_keys, hydra)})
+        # Keep the writer lock through PCA/HRV projection, atomic finalization,
+        # and cleanup. Otherwise another runtime can open the completed partial
+        # memmap after extraction and race with its deletion here.
+        save_npz_compressed_atomic(cache_path, **payload)
+        cleanup_rocket_resume(raw_features, raw_path, progress_path)
+        return hydra, hrv, cache_path, False, runtime
 
 
 def build_slices(
@@ -2172,8 +2326,202 @@ def update_external_summary(dataset: str, protocol: str, n_records: int, metrics
     return path
 
 
+def feature_handoff_manifest_path(dataset: str, output_tag: str) -> Path:
+    suffix = f"_{output_tag}" if output_tag else ""
+    return MANIFEST_DIR / f"external_{dataset}{suffix}_feature_cache_manifest.json"
+
+
+def load_feature_handoff_seed(
+    path: Path,
+    *,
+    dataset: str,
+    output_tag: str,
+    checkpoint_kind: str,
+    canonical: dict[str, str],
+) -> dict[str, object]:
+    """Load only the producer runtime identity needed to locate its cache.
+
+    CPU and CUDA Colab runtimes can expose different Torch build strings. The
+    consumer must therefore derive the cache key from the authenticated CPU
+    producer identity rather than from its local CUDA build. Full archive,
+    signal, PCA, record-order, cache-SHA, and runner validation still occurs
+    after the dataset has been loaded.
+    """
+
+    if not path.exists() or path.stat().st_size <= 0:
+        raise FileNotFoundError(
+            f"Feature-cache handoff manifest is missing: {path}. Run --features-only first."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "capability": EXTERNAL_TWO_PHASE_CAPABILITY,
+        "schema_version": EXTERNAL_TWO_PHASE_SCHEMA_VERSION,
+        "status": "feature_cache_ready",
+        "dataset": dataset,
+        "output_tag": output_tag,
+        "checkpoint_kind": checkpoint_kind,
+        "canonical_contract": canonical,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
+    }
+    errors = [key for key, value in expected.items() if payload.get(key) != value]
+    runtime = payload.get("feature_runtime") or {}
+    if runtime.get("feature_device") != CANONICAL_ROCKET_FEATURE_DEVICE:
+        errors.append("feature_runtime.feature_device")
+    for key in ("torch_version", "numpy_version"):
+        if not str(runtime.get(key) or "").strip():
+            errors.append(f"feature_runtime.{key}")
+    if errors:
+        raise RuntimeError(
+            f"Feature-cache handoff seed mismatch in {path}: {sorted(set(errors))}. "
+            "Rerun --features-only under the current pinned authority."
+        )
+    return payload
+
+
+def string_sequence_sha256(values: np.ndarray) -> str:
+    payload = "\n".join(str(value) for value in np.asarray(values).reshape(-1))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def feature_handoff_payload(
+    *,
+    dataset: str,
+    output_tag: str,
+    checkpoint_kind: str,
+    canonical: dict[str, str],
+    archive: Path,
+    source_archive_sha256: str,
+    source_config_hash: str,
+    record_ids: np.ndarray,
+    group_ids: np.ndarray,
+    split_ids: np.ndarray,
+    load_summary: dict[str, object],
+    pca_paths: list[Path],
+    feature_cache: Path,
+    feature_cache_hit: bool,
+    feature_runtime: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "capability": EXTERNAL_TWO_PHASE_CAPABILITY,
+        "schema_version": EXTERNAL_TWO_PHASE_SCHEMA_VERSION,
+        "status": "feature_cache_ready",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "dataset": dataset,
+        "output_tag": output_tag,
+        "checkpoint_kind": checkpoint_kind,
+        "canonical_contract": canonical,
+        "source_config_hash": source_config_hash,
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
+        "archive": {
+            "path": str(archive),
+            "size_bytes": int(archive.stat().st_size),
+            "sha256": source_archive_sha256,
+        },
+        "records": {
+            "count": int(len(record_ids)),
+            "record_order_sha256": string_sequence_sha256(record_ids),
+            "group_order_sha256": string_sequence_sha256(group_ids),
+            "split_order_sha256": string_sequence_sha256(split_ids),
+            "split_ids": sorted(str(value) for value in np.unique(split_ids)),
+        },
+        "load_protocol": {
+            "label_protocol": load_summary.get("label_protocol"),
+            "group_unit": load_summary.get("group_unit"),
+        },
+        "pca": [
+            {
+                "fold": fold,
+                "path": str(path),
+                "size_bytes": int(path.stat().st_size),
+                "sha256": sha256_file(path),
+            }
+            for fold, path in enumerate(pca_paths, start=1)
+        ],
+        "feature_cache": {
+            "path": str(feature_cache),
+            "size_bytes": int(feature_cache.stat().st_size),
+            "sha256": sha256_file(feature_cache),
+            "cache_hit": bool(feature_cache_hit),
+        },
+        "feature_runtime": feature_runtime,
+        "handoff": {
+            "producer_phase": "features_only_or_full",
+            "consumer_phase": "inference_only_or_full",
+            "requires_gpu_for_consumer": True,
+        },
+    }
+
+
+def validate_feature_handoff(
+    path: Path,
+    expected: dict[str, object],
+) -> dict[str, object]:
+    if not path.exists() or path.stat().st_size <= 0:
+        raise FileNotFoundError(
+            f"Feature-cache handoff manifest is missing: {path}. Run --features-only first."
+        )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    errors: list[str] = []
+    for key in (
+        "capability",
+        "schema_version",
+        "status",
+        "dataset",
+        "output_tag",
+        "checkpoint_kind",
+        "canonical_contract",
+        "source_config_hash",
+        "runner_sha256",
+        "archive",
+        "records",
+        "pca",
+    ):
+        if payload.get(key) != expected.get(key):
+            errors.append(key)
+    observed_cache = payload.get("feature_cache") or {}
+    expected_cache = expected.get("feature_cache") or {}
+    for key in ("path", "size_bytes", "sha256"):
+        if observed_cache.get(key) != expected_cache.get(key):
+            errors.append(f"feature_cache.{key}")
+    runtime = payload.get("feature_runtime") or {}
+    if runtime.get("feature_device") != CANONICAL_ROCKET_FEATURE_DEVICE:
+        errors.append("feature_runtime.feature_device")
+    if (
+        runtime.get("backend_contract_capability")
+        != EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY
+        or runtime.get("backend_contract_schema_version")
+        != EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION
+    ):
+        errors.append("feature_runtime.backend_contract")
+    if errors:
+        raise RuntimeError(
+            f"Feature-cache handoff contract mismatch in {path}: {sorted(set(errors))}. "
+            "Run --features-only under the current pinned authority before GPU inference."
+        )
+    return payload
+
+
 def main() -> None:
     args = parse_args()
+    execution_phase = (
+        "features_only"
+        if args.features_only
+        else "inference_only"
+        if args.inference_only
+        else "full"
+    )
+    if args.inference_only and args.force_features:
+        raise ValueError("--inference-only cannot be combined with --force-features")
+    if args.features_only and resolve_rocket_feature_device(args.feature_device) != "cpu":
+        raise RuntimeError(
+            "The durable features-only handoff must use --feature-device cpu. "
+            "CUDA remains a noncanonical sensitivity path and cannot produce the primary handoff."
+        )
+    if args.inference_only and (DEVICE != "cuda" or not torch.cuda.is_available()):
+        raise RuntimeError(
+            "--inference-only requires a CUDA runtime for the ECG-RAMBA/Mamba ensemble. "
+            "Run --features-only on CPU, then reconnect an A100 runtime."
+        )
     canonical = canonical_contract()
     if args.dataset != "ptbxl" and str(args.ptbxl_folds).strip() != "10":
         raise ValueError("--ptbxl-folds is valid only for --dataset ptbxl")
@@ -2182,6 +2530,18 @@ def main() -> None:
     if args.dataset == "ptbxl" and selected_ptb_folds != (10,) and not output_tag:
         output_tag = "folds" + "_".join(str(value) for value in selected_ptb_folds)
     ensure_revision_dirs()
+    handoff_path = feature_handoff_manifest_path(args.dataset, output_tag)
+    inference_handoff = (
+        load_feature_handoff_seed(
+            handoff_path,
+            dataset=args.dataset,
+            output_tag=output_tag,
+            checkpoint_kind=args.checkpoint_kind,
+            canonical=canonical,
+        )
+        if args.inference_only
+        else None
+    )
     if not args.allow_experimental:
         raise RuntimeError(
             "External evaluation is intentionally blocked from manuscript use. "
@@ -2225,7 +2585,55 @@ def main() -> None:
         feature_device=args.feature_device,
         feature_batch_size=args.feature_batch_size,
         feature_parity_records=args.feature_parity_records,
+        require_existing=args.inference_only,
+        producer_runtime=(
+            inference_handoff.get("feature_runtime") if inference_handoff else None
+        ),
     )
+    expected_handoff = feature_handoff_payload(
+        dataset=args.dataset,
+        output_tag=output_tag,
+        checkpoint_kind=args.checkpoint_kind,
+        canonical=canonical,
+        archive=archive,
+        source_archive_sha256=args.source_archive_sha256,
+        source_config_hash=source_config_hash,
+        record_ids=record_ids,
+        group_ids=group_ids,
+        split_ids=split_ids,
+        load_summary=load_summary,
+        pca_paths=pca_paths,
+        feature_cache=feature_cache,
+        feature_cache_hit=feature_cache_hit,
+        feature_runtime=feature_runtime,
+    )
+    if args.inference_only:
+        validate_feature_handoff(handoff_path, expected_handoff)
+        print(f"Authenticated feature-cache handoff: {handoff_path}")
+    else:
+        save_json(handoff_path, expected_handoff)
+        print(f"Wrote feature-cache handoff: {handoff_path}")
+
+    if args.features_only:
+        print(
+            json.dumps(
+                {
+                    "status": "feature_cache_ready",
+                    "execution_phase": execution_phase,
+                    "dataset": args.dataset,
+                    "output_tag": output_tag,
+                    "n_records": int(len(record_ids)),
+                    "feature_cache": str(feature_cache),
+                    "feature_cache_sha256": expected_handoff["feature_cache"]["sha256"],
+                    "handoff_manifest": str(handoff_path),
+                    "feature_runtime": feature_runtime,
+                },
+                indent=2,
+            )
+        )
+        print("Feature preparation complete. No ECG-RAMBA model was constructed or evaluated.")
+        return
+
     xs, xhr, slice_record_index, slice_index = build_slices(signals, hrv)
     model_slice_probs = infer_ensemble(
         xs,
@@ -2361,6 +2769,9 @@ def main() -> None:
         "feature_cache": str(feature_cache),
         "feature_cache_hit": feature_cache_hit,
         "feature_runtime": feature_runtime,
+        "execution_phase": execution_phase,
+        "feature_handoff_manifest": str(handoff_path),
+        "feature_handoff_manifest_sha256": sha256_file(handoff_path),
         "hrv_semantics": "checkpoint_compatible_amplitude_slots_zero",
         "load_summary": load_summary,
         "prediction_file": str(prediction_path),
