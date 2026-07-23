@@ -49,8 +49,11 @@ from src.aggregation import aggregate_record_probabilities  # noqa: E402
 
 DATASETS = ("ptbxl", "georgia", "cpsc2021")
 NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"
-NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1
-GATE_SCHEMA_VERSION = 7
+NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 2
+GATE_SCHEMA_VERSION = 8
+EXPECTED_FEATURE_DEVICE = "cpu"
+EXPECTED_FEATURE_BACKEND_CAPABILITY = "external_rocket_backend_bound_cache_v1"
+EXPECTED_FEATURE_BACKEND_SCHEMA_VERSION = 1
 GATE_RUNNER_PATH = Path(__file__).resolve()
 METRIC_IMPLEMENTATION_PATH = PROJECT_ROOT / "scripts" / "revision" / "common.py"
 AGGREGATION_IMPLEMENTATION_PATH = PROJECT_ROOT / "src" / "aggregation.py"
@@ -409,6 +412,12 @@ def validate_dataset(
 
     summary = read_json(summary_path)
     manifest = read_json(manifest_path)
+    summary_feature_runtime = summary.get("feature_runtime")
+    if not isinstance(summary_feature_runtime, dict):
+        summary_feature_runtime = {}
+    manifest_feature_runtime = manifest.get("feature_runtime")
+    if not isinstance(manifest_feature_runtime, dict):
+        manifest_feature_runtime = {}
     with np.load(prediction_path, allow_pickle=False) as data:
         prediction_keys = set(data.files)
         y_true = np.asarray(data["y_true"], dtype=np.float32)
@@ -504,6 +513,18 @@ def validate_dataset(
     )
     checks["manifest_marked_experimental"] = (
         manifest.get("evidence_status") == "experimental" and manifest.get("manuscript_ready") is False
+    )
+    checks["canonical_feature_device"] = (
+        summary_feature_runtime.get("feature_device") == EXPECTED_FEATURE_DEVICE
+    )
+    checks["feature_backend_contract_current"] = (
+        summary_feature_runtime.get("backend_contract_capability")
+        == EXPECTED_FEATURE_BACKEND_CAPABILITY
+        and summary_feature_runtime.get("backend_contract_schema_version", 0)
+        == EXPECTED_FEATURE_BACKEND_SCHEMA_VERSION
+    )
+    checks["summary_manifest_feature_runtime_match"] = (
+        summary_feature_runtime == manifest_feature_runtime
     )
     checks["aggregation_power_mean_q"] = aggregation_method == "power_mean" and math.isclose(
         aggregation_q,
@@ -625,6 +646,15 @@ def validate_dataset(
         issues.append("summary artifact must remain evidence_status=experimental/manuscript_ready=false")
     if not checks["manifest_marked_experimental"]:
         issues.append("manifest artifact must remain evidence_status=experimental/manuscript_ready=false")
+    if not checks["canonical_feature_device"]:
+        issues.append(
+            "external ROCKET-family features must use the canonical CPU backend; "
+            f"observed={summary_feature_runtime.get('feature_device')!r}"
+        )
+    if not checks["feature_backend_contract_current"]:
+        issues.append("external feature backend provenance contract is missing or stale")
+    if not checks["summary_manifest_feature_runtime_match"]:
+        issues.append("summary/manifest feature runtime provenance mismatch")
     if not checks["aggregation_power_mean_q"]:
         issues.append("external predictions must use shared Power Mean Q protocol")
     if not checks["fixed_threshold_0p5"]:
@@ -855,6 +885,7 @@ def validate_dataset(
             "threshold": args.threshold,
             "n_bins": args.n_bins,
             "n_boot": args.n_boot,
+            "feature_device": summary_feature_runtime.get("feature_device", ""),
             **metrics,
             **{f"calibration_{key}": value for key, value in calib.items()},
         }
@@ -920,6 +951,11 @@ def validate_dataset(
             "bootstrap_unit": "patient/source-record group",
             "metric_implementation": artifact(METRIC_IMPLEMENTATION_PATH),
             "single_label_metric_semantics": "positive_label_multilabel_reduction",
+            "feature_backend": {
+                "device": summary_feature_runtime.get("feature_device", ""),
+                "capability": summary_feature_runtime.get("backend_contract_capability", ""),
+                "schema_version": summary_feature_runtime.get("backend_contract_schema_version", 0),
+            },
             "group_unit": group_unit,
             "threshold": args.threshold,
             "n_bins": args.n_bins,

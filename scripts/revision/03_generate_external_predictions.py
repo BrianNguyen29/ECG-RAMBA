@@ -1762,12 +1762,20 @@ def generate_features(
                 and all(len(values) == len(signals) for values in hydra)
             ):
                 print(f"Loaded float32 external feature cache: {cache_path}")
-                runtime = {
-                    "status": "cached",
-                    "feature_device": str(data["feature_device"].item()),
-                    "feature_batch_size": int(data["feature_batch_size"].item()),
-                    "feature_value_contract": str(data["rocket_feature_value_contract"].item()),
-                }
+                try:
+                    runtime = json.loads(str(data["feature_runtime_json"].item()))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise RuntimeError(
+                        f"External feature cache runtime provenance is invalid: {cache_path}"
+                    ) from exc
+                runtime.update(
+                    {
+                        "status": "cached",
+                        "feature_device": str(data["feature_device"].item()),
+                        "feature_batch_size": int(data["feature_batch_size"].item()),
+                        "feature_value_contract": str(data["rocket_feature_value_contract"].item()),
+                    }
+                )
                 return hydra, hrv, cache_path, True, runtime
 
     if feature_parity_records <= 0:

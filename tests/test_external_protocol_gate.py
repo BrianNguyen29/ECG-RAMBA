@@ -138,6 +138,12 @@ class ExternalProtocolGateTests(unittest.TestCase):
                 "dataset,class_name\nptbxl,NORM\n",
                 encoding="utf-8",
             )
+            feature_runtime = {
+                "status": "generated",
+                "feature_device": "cpu",
+                "backend_contract_capability": gate.EXPECTED_FEATURE_BACKEND_CAPABILITY,
+                "backend_contract_schema_version": gate.EXPECTED_FEATURE_BACKEND_SCHEMA_VERSION,
+            }
             summary = {
                 "dataset": "ptbxl",
                 "evidence_status": "experimental",
@@ -146,6 +152,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
                 "n_classes": 4,
                 "checkpoint_kind": "final_ema",
                 "threshold": 0.5,
+                "feature_runtime": feature_runtime,
                 "load_summary": {
                     "label_protocol": gate.EXPECTED_EXTERNAL_PROTOCOLS["ptbxl"],
                     "unsupported_superclasses": {"HYP": 2},
@@ -159,6 +166,7 @@ class ExternalProtocolGateTests(unittest.TestCase):
             manifest = {
                 "evidence_status": "experimental",
                 "manuscript_ready": False,
+                "feature_runtime": feature_runtime,
                 "archive": {
                     "path": str(archive),
                     "size_bytes": archive.stat().st_size,
@@ -212,6 +220,36 @@ class ExternalProtocolGateTests(unittest.TestCase):
             self.assertEqual(cached_payload["gate_cache_key"], payload["gate_cache_key"])
             self.assertEqual(cached_metrics, [])
             self.assertEqual(cached_labels, [])
+
+            # An otherwise complete artifact set cannot become manuscript-ready
+            # when its ROCKET-family features were produced by the CUDA sensitivity path.
+            cuda_runtime = dict(feature_runtime, feature_device="cuda")
+            (output / "ptbxl_full_prediction_summary.json").write_text(
+                json.dumps(dict(summary, feature_runtime=cuda_runtime)),
+                encoding="utf-8",
+            )
+            (output / "ptbxl_full_prediction_run_manifest.json").write_text(
+                json.dumps(dict(manifest, feature_runtime=cuda_runtime)),
+                encoding="utf-8",
+            )
+            args.reuse_existing = False
+            with (
+                patch.object(gate, "METRIC_DIR", metrics_dir),
+                patch.object(gate, "TABLE_DIR", tables_dir),
+                patch.object(gate, "MANIFEST_DIR", manifests_dir),
+                patch.dict(gate.PATHS, {"ptb_zip": str(archive)}),
+            ):
+                cuda_payload, _, _ = gate.validate_dataset("ptbxl", args, oof_checkpoints)
+            self.assertFalse(cuda_payload["protocol_gate_passed"])
+            self.assertIn("canonical CPU backend", "; ".join(cuda_payload["issues"]))
+            (output / "ptbxl_full_prediction_summary.json").write_text(
+                json.dumps(summary),
+                encoding="utf-8",
+            )
+            (output / "ptbxl_full_prediction_run_manifest.json").write_text(
+                json.dumps(manifest),
+                encoding="utf-8",
+            )
 
             # A semantic mutation must not pass merely because dimensions and files still exist.
             mutated = y_prob.copy()

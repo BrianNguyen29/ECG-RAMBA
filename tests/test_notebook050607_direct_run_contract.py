@@ -344,7 +344,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY = "external_gate_full10s_grouped_v1"',
             gate_source,
         )
-        self.assertIn("NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 1", gate_source)
+        self.assertIn("NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION = 2", gate_source)
 
     def test_notebook02_shares_the_exact_sized_cpsc_window_cache(self):
         _, source = notebook_source("02_predictions_and_external_eval.ipynb")

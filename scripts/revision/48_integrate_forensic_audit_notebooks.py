@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v11"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v12"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -44,7 +44,7 @@ REVISION_CAPABILITY_REQUIREMENTS = {
     },
     'scripts/revision/18_external_protocol_gate.py': {
         'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
-        'NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION': 1,
+        'NOTEBOOK_02_EXTERNAL_GATE_SCHEMA_VERSION': 2,
     },
     'scripts/revision/external_reuse_contract.py': {
         'EXTERNAL_REUSE_CAPABILITY': 'source_bound_external_reuse_v2_dataset_scoped_attestation',
