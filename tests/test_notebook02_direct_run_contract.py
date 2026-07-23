@@ -56,7 +56,7 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
         self.assertIn("'exports': {'ptbxl': False, 'georgia': False, 'cpsc2021': 'auto'}", self.source)
         self.assertIn("'allow_export_failures': False", self.source)
         self.assertIn("EXTERNAL_FEATURE_DEVICE = EXTERNAL_RUN_CONFIG['feature_device']", self.source)
-        self.assertIn("EXTERNAL_FEATURE_BATCH_SIZE = 256", self.source)
+        self.assertIn("EXTERNAL_FEATURE_BATCH_SIZE = 64", self.source)
         self.assertIn("EXTERNAL_FEATURE_PARITY_RECORDS = 4", self.source)
         self.assertIn("f'--feature-device {EXTERNAL_FEATURE_DEVICE} '", self.source)
         self.assertIn("f'--feature-batch-size {EXTERNAL_FEATURE_BATCH_SIZE} '", self.source)
@@ -79,10 +79,12 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
             "Recovering source-bound external outputs after an interrupted mirror publish",
             self.source,
         )
-        self.assertIn("PTBXL_FOLD9_FEATURE_DEVICE = 'auto'", self.source)
+        self.assertIn("PTBXL_FOLD9_FEATURE_DEVICE = 'cpu'", self.source)
+        self.assertIn("PTBXL_FOLD9_FEATURE_BATCH_SIZE = 64", self.source)
         self.assertIn("f'--feature-device {PTBXL_FOLD9_FEATURE_DEVICE} '", self.source)
         self.assertIn("PTBXL_FOLD9_EXTERNAL_FEATURE_CACHE_ROOT", self.source)
         self.assertIn("external_fixed_rocket_gpu_parity_checked_v1", self.source)
+        self.assertIn("external_rocket_backend_bound_cache_v1", self.source)
 
     def test_external_gate_and_handoff_follow_the_explicit_dataset_selection(self):
         self.assertIn("EXTERNAL_GATE_DATASET_LIST =", self.source)

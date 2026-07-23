@@ -82,9 +82,12 @@ CPSC_EXACT_ELIGIBLE_WINDOW_CAPACITY_CAPABILITY = "annotation_prescan_exact_prima
 CPSC_WINDOW_CACHE_SCHEMA_VERSION = 3
 EXTERNAL_FEATURE_ACCELERATION_CAPABILITY = "external_fixed_rocket_gpu_parity_checked_v1"
 EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION = 1
+EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY = "external_rocket_backend_bound_cache_v1"
+EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION = 1
 EXTERNAL_FEATURE_CACHE_SCHEMA_VERSION = 3
 EXTERNAL_FEATURE_VALUE_CONTRACT = "float16_storage_roundtrip_v1_training_pca_aligned"
 EXTERNAL_FEATURE_CACHE_DIR_ENV = "ECG_RAMBA_EXTERNAL_FEATURE_CACHE_DIR"
+CANONICAL_ROCKET_FEATURE_DEVICE = "cpu"
 DEFAULT_ROCKET_CPU_BATCH_SIZE = 64
 DEFAULT_ROCKET_CUDA_BATCH_SIZE = 128
 
@@ -130,8 +133,9 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "cpu", "cuda"],
         default="auto",
         help=(
-            "Device for the fixed-seed ROCKET-family feature transform. CUDA is used only "
-            "after a deterministic CPU/GPU float16-roundtrip parity check."
+            "Device for the fixed-seed ROCKET-family feature transform. auto resolves to "
+            "the canonical CPU implementation. CUDA is an explicit accelerated sensitivity "
+            "path and is used only after a deterministic CPU/GPU float16-roundtrip parity check."
         ),
     )
     parser.add_argument(
@@ -1373,7 +1377,15 @@ def feature_cache_path(
     signals: np.ndarray,
     pca_paths: list[Path],
     record_ids: np.ndarray,
+    *,
+    feature_device: str = CANONICAL_ROCKET_FEATURE_DEVICE,
 ) -> tuple[Path, dict[str, str]]:
+    feature_device = str(feature_device).strip().lower()
+    if feature_device not in {"cpu", "cuda"}:
+        raise ValueError(
+            "feature_cache_path requires a resolved feature_device of cpu or cuda; "
+            f"observed {feature_device!r}"
+        )
     configured_cache_dir = os.environ.get(EXTERNAL_FEATURE_CACHE_DIR_ENV, "").strip()
     if configured_cache_dir:
         cache_dir = Path(configured_cache_dir).expanduser()
@@ -1401,6 +1413,9 @@ def feature_cache_path(
         "config_sha256": EVALUATION_CONFIG_HASH,
         "record_order_sha256": record_id_fingerprint(record_ids),
         "rocket_feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
+        "rocket_feature_device": feature_device,
+        "rocket_torch_version": str(torch.__version__),
+        "rocket_numpy_version": str(np.__version__),
     }
     contract_sha = hashlib.sha256(json.dumps(contract, sort_keys=True).encode("utf-8")).hexdigest()
     path = cache_dir / (
@@ -1412,13 +1427,18 @@ def feature_cache_path(
 
 
 def resolve_rocket_feature_device(requested: str) -> str:
-    """Choose a device without silently accepting an unavailable CUDA request."""
+    """Resolve auto to the training-aligned CPU transform.
+
+    CUDA remains available as an explicit, parity-gated sensitivity path. Exact
+    float16 equality on a small audit sample is not sufficient to make it the
+    canonical producer for all records.
+    """
 
     requested = str(requested).strip().lower()
     if requested not in {"auto", "cpu", "cuda"}:
         raise ValueError(f"Unsupported ROCKET feature device: {requested}")
     if requested == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return CANONICAL_ROCKET_FEATURE_DEVICE
     if requested == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
             "--feature-device cuda was requested, but CUDA is unavailable. "
@@ -1470,15 +1490,19 @@ def rocket_resume_contract(
     n_records: int,
     n_features: int,
     batch_size: int,
+    feature_device: str,
 ) -> dict[str, object]:
     return {
         "schema_version": EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION,
+        "backend_contract_capability": EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY,
+        "backend_contract_schema_version": EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION,
         "feature_cache_contract": cache_contract,
         "n_records": int(n_records),
         "n_features": int(n_features),
         # Completed batches are stored by start offset, so a different batch
         # partition cannot safely reuse a partial matrix after interruption.
         "batch_size": int(batch_size),
+        "feature_device": str(feature_device),
         "storage_dtype": "float16",
         "feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
     }
@@ -1507,6 +1531,7 @@ def open_rocket_resume_cache(
     n_records: int,
     n_features: int,
     batch_size: int,
+    feature_device: str,
 ) -> tuple[np.memmap, Path, Path, set[int], dict[str, object]]:
     """Open a source-bound float16 raw-feature checkpoint or create a new one."""
 
@@ -1516,6 +1541,7 @@ def open_rocket_resume_cache(
         n_records=n_records,
         n_features=n_features,
         batch_size=batch_size,
+        feature_device=feature_device,
     )
     if raw_path.exists() or progress_path.exists():
         try:
@@ -1697,7 +1723,16 @@ def generate_features(
     feature_batch_size: int,
     feature_parity_records: int,
 ) -> tuple[list[np.ndarray], np.ndarray, Path, bool, dict[str, object]]:
-    cache_path, cache_contract = feature_cache_path(dataset, archive, signals, pca_paths, record_ids)
+    device = resolve_rocket_feature_device(feature_device)
+    batch_size = resolve_rocket_feature_batch_size(device, feature_batch_size)
+    cache_path, cache_contract = feature_cache_path(
+        dataset,
+        archive,
+        signals,
+        pca_paths,
+        record_ids,
+        feature_device=device,
+    )
     print(f"External ROCKET-family feature cache: {cache_path}")
     hydra_keys = [f"X_hydra_fold{fold}" for fold in range(1, len(pca_paths) + 1)]
     if cache_path.exists() and not force:
@@ -1735,18 +1770,21 @@ def generate_features(
                 }
                 return hydra, hrv, cache_path, True, runtime
 
-    device = resolve_rocket_feature_device(feature_device)
-    batch_size = resolve_rocket_feature_batch_size(device, feature_batch_size)
     if feature_parity_records <= 0:
         raise ValueError("--feature-parity-records must be positive")
     runtime: dict[str, object] = {
         "status": "generated",
         "capability": EXTERNAL_FEATURE_ACCELERATION_CAPABILITY,
         "schema_version": EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION,
+        "backend_contract_capability": EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY,
+        "backend_contract_schema_version": EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION,
+        "canonical_feature_device": CANONICAL_ROCKET_FEATURE_DEVICE,
         "requested_device": str(feature_device),
         "feature_device": device,
         "feature_batch_size": batch_size,
         "feature_value_contract": EXTERNAL_FEATURE_VALUE_CONTRACT,
+        "torch_version": str(torch.__version__),
+        "numpy_version": str(np.__version__),
     }
     if device == "cuda":
         runtime["cuda_parity"] = verify_cuda_rocket_parity(
@@ -1768,6 +1806,7 @@ def generate_features(
             n_records=len(signals),
             n_features=n_features,
             batch_size=batch_size,
+            feature_device=device,
         )
         pending_starts = [
             start for start in range(0, len(signals), batch_size) if start not in completed_starts

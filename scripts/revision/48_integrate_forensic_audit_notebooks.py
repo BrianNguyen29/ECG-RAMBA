@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v10"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v11"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -39,6 +39,8 @@ REVISION_CAPABILITY_REQUIREMENTS = {
         'NOTEBOOK_02_EXTERNAL_EXPORT_SCHEMA_VERSION': 1,
         'EXTERNAL_FEATURE_ACCELERATION_CAPABILITY': 'external_fixed_rocket_gpu_parity_checked_v1',
         'EXTERNAL_FEATURE_ACCELERATION_SCHEMA_VERSION': 1,
+        'EXTERNAL_FEATURE_BACKEND_CONTRACT_CAPABILITY': 'external_rocket_backend_bound_cache_v1',
+        'EXTERNAL_FEATURE_BACKEND_CONTRACT_SCHEMA_VERSION': 1,
     },
     'scripts/revision/18_external_protocol_gate.py': {
         'NOTEBOOK_02_EXTERNAL_GATE_CAPABILITY': 'external_gate_full10s_grouped_v1',
@@ -1572,12 +1574,10 @@ for dataset in external_handoff_datasets:
             if "EXTERNAL_FEATURE_DEVICE =" not in text:
                 feature_config = """EXTERNAL_BATCH_SIZE = 128
 # The fixed-seed ROCKET-family feature transform is the external-export bottleneck.
-# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which
-# preserves the input precision used when fitting the frozen fold PCA objects.
-EXTERNAL_FEATURE_DEVICE = 'auto'
-# A100 40 GB: 256 keeps the largest convolution activation below the available
-# memory budget. Reduce to 128 only after a real CUDA out-of-memory error.
-EXTERNAL_FEATURE_BATCH_SIZE = 256
+# CPU is canonical because the frozen fold PCA objects were fitted from CPU-produced
+# float16-roundtrip features. A100 remains available for downstream model inference.
+EXTERNAL_FEATURE_DEVICE = 'cpu'
+EXTERNAL_FEATURE_BATCH_SIZE = 64
 EXTERNAL_FEATURE_PARITY_RECORDS = 4
 """
                 text, config_replacements = re.subn(
@@ -1588,10 +1588,8 @@ EXTERNAL_FEATURE_PARITY_RECORDS = 4
                 )
                 if config_replacements != 1:
                     raise RuntimeError("Notebook 02 external feature configuration anchor missing")
-            text = text.replace(
-                "EXTERNAL_FEATURE_BATCH_SIZE = 128\n",
-                "EXTERNAL_FEATURE_BATCH_SIZE = 256\n",
-            )
+            text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 128\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
+            text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 256\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
             if "EXTERNAL_RUN_PROFILE =" not in text:
                 external_profile_pattern = re.compile(
                     r"# PTB-XL is already manuscript-gated; Georgia/CPSC2021 will run only when their prediction artifacts are missing\.\n"
@@ -1631,14 +1629,14 @@ EXTERNAL_RUN_PROFILES = {
         'exports': {'ptbxl': False, 'georgia': False, 'cpsc2021': 'auto'},
         'gate_datasets': 'cpsc2021',
         'restore_datasets': ['cpsc2021'],
-        'feature_device': 'cuda',
+        'feature_device': 'cpu',
         'allow_export_failures': False,
     },
     'full_reviewer_a100': {
         'exports': {'ptbxl': 'auto', 'georgia': 'auto', 'cpsc2021': 'auto'},
         'gate_datasets': 'ptbxl,georgia,cpsc2021',
         'restore_datasets': ['ptbxl', 'georgia', 'cpsc2021'],
-        'feature_device': 'cuda',
+        'feature_device': 'cpu',
         'allow_export_failures': False,
     },
     'cpu_gate_cpsc': {
@@ -1670,12 +1668,10 @@ RUN_GEORGIA_EXPORT = EXTERNAL_RUN_CONFIG['exports']['georgia']
 RUN_CPSC2021_EXPORT = EXTERNAL_RUN_CONFIG['exports']['cpsc2021']
 EXTERNAL_BATCH_SIZE = 128
 # The fixed-seed ROCKET-family feature transform is the external-export bottleneck.
-# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which
-# preserves the input precision used when fitting the frozen fold PCA objects.
-# A100 40 GB: batch 256 is the validated default. Reducing it to 128 after a real
-# CUDA OOM intentionally creates a new partial-cache contract rather than mixing batches.
+# CPU is canonical because the frozen fold PCA objects were fitted from CPU-produced
+# float16-roundtrip features. A100 remains available for downstream model inference.
 EXTERNAL_FEATURE_DEVICE = EXTERNAL_RUN_CONFIG['feature_device']
-EXTERNAL_FEATURE_BATCH_SIZE = 256
+EXTERNAL_FEATURE_BATCH_SIZE = 64
 EXTERNAL_FEATURE_PARITY_RECORDS = 4
 EXTERNAL_LIMIT_RECORDS = 0
 ALLOW_EXTERNAL_EXPORT_FAILURES = EXTERNAL_RUN_CONFIG['allow_export_failures']
@@ -1703,6 +1699,18 @@ print(
                 )
                 if profile_replacements != 1:
                     raise RuntimeError("Notebook 02 external run-profile configuration anchor missing")
+            # Upgrade already integrated profiles. CUDA remains an explicit runner
+            # sensitivity path, but manuscript evidence uses the training-aligned CPU backend.
+            text = text.replace("'feature_device': 'cuda'", "'feature_device': 'cpu'")
+            text = text.replace(
+                "# CUDA is accepted only after an exact float16-roundtrip CPU/GPU parity check, which\n"
+                "# preserves the input precision used when fitting the frozen fold PCA objects.\n"
+                "# A100 40 GB: batch 256 is the validated default. Reducing it to 128 after a real\n"
+                "# CUDA OOM intentionally creates a new partial-cache contract rather than mixing batches.\n",
+                "# CPU is canonical because the frozen fold PCA objects were fitted from CPU-produced\n"
+                "# float16-roundtrip features. A100 remains available for downstream model inference.\n",
+            )
+            text = text.replace("EXTERNAL_FEATURE_BATCH_SIZE = 256\n", "EXTERNAL_FEATURE_BATCH_SIZE = 64\n")
             external_command_anchor = (
                 "        f'--dataset {dataset} --checkpoint-kind final_ema --batch-size {EXTERNAL_BATCH_SIZE} '\n"
                 "        '--allow-experimental'"
@@ -1745,17 +1753,16 @@ print('Canonical PTB-XL fold-9 feature cache root:', PTBXL_FOLD9_EXTERNAL_FEATUR
             if "PTBXL_FOLD9_FEATURE_DEVICE =" not in text:
                 fold9_config_anchor = "PTBXL_FOLD9_BATCH_SIZE = 128\n"
                 fold9_config = """PTBXL_FOLD9_BATCH_SIZE = 128
-PTBXL_FOLD9_FEATURE_DEVICE = 'auto'
-PTBXL_FOLD9_FEATURE_BATCH_SIZE = 256
+PTBXL_FOLD9_FEATURE_DEVICE = 'cpu'
+PTBXL_FOLD9_FEATURE_BATCH_SIZE = 64
 PTBXL_FOLD9_FEATURE_PARITY_RECORDS = 4
 """
                 if fold9_config_anchor not in text:
                     raise RuntimeError("Notebook 02 PTB-XL fold 9 feature configuration anchor missing")
                 text = text.replace(fold9_config_anchor, fold9_config, 1)
-            text = text.replace(
-                "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 128\n",
-                "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 256\n",
-            )
+            text = text.replace("PTBXL_FOLD9_FEATURE_DEVICE = 'auto'\n", "PTBXL_FOLD9_FEATURE_DEVICE = 'cpu'\n")
+            text = text.replace("PTBXL_FOLD9_FEATURE_BATCH_SIZE = 128\n", "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 64\n")
+            text = text.replace("PTBXL_FOLD9_FEATURE_BATCH_SIZE = 256\n", "PTBXL_FOLD9_FEATURE_BATCH_SIZE = 64\n")
             fold9_command_anchor = (
                 "f'--checkpoint-kind final_ema --batch-size {PTBXL_FOLD9_BATCH_SIZE} --allow-experimental'"
             )

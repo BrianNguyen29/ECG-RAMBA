@@ -123,6 +123,9 @@ class ExternalPredictionContractTests(unittest.TestCase):
             self.assertEqual(external.resolve_rocket_feature_device("cpu"), "cpu")
             with self.assertRaises(RuntimeError):
                 external.resolve_rocket_feature_device("cuda")
+        with patch.object(external.torch.cuda, "is_available", return_value=True):
+            self.assertEqual(external.resolve_rocket_feature_device("auto"), "cpu")
+            self.assertEqual(external.resolve_rocket_feature_device("cuda"), "cuda")
         self.assertEqual(
             external.resolve_rocket_feature_batch_size("cpu", 0),
             external.DEFAULT_ROCKET_CPU_BATCH_SIZE,
@@ -152,10 +155,30 @@ class ExternalPredictionContractTests(unittest.TestCase):
                 clear=False,
             ):
                 path, _ = external.feature_cache_path(
-                    "cpsc2021", archive, signals, [pca], record_ids
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cpu",
                 )
             self.assertEqual(path.parent, canonical_cache)
             self.assertTrue(canonical_cache.is_dir())
+            with patch.dict(
+                os.environ,
+                {external.EXTERNAL_FEATURE_CACHE_DIR_ENV: str(canonical_cache)},
+                clear=False,
+            ):
+                cuda_path, cuda_contract = external.feature_cache_path(
+                    "cpsc2021",
+                    archive,
+                    signals,
+                    [pca],
+                    record_ids,
+                    feature_device="cuda",
+                )
+            self.assertNotEqual(path, cuda_path)
+            self.assertEqual(cuda_contract["rocket_feature_device"], "cuda")
 
             with patch.dict(
                 os.environ,
@@ -163,7 +186,14 @@ class ExternalPredictionContractTests(unittest.TestCase):
                 clear=False,
             ):
                 with self.assertRaises(ValueError):
-                    external.feature_cache_path("cpsc2021", archive, signals, [pca], record_ids)
+                    external.feature_cache_path(
+                        "cpsc2021",
+                        archive,
+                        signals,
+                        [pca],
+                        record_ids,
+                        feature_device="cpu",
+                    )
 
     def test_rocket_feature_partial_cache_resumes_only_matching_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -180,6 +210,7 @@ class ExternalPredictionContractTests(unittest.TestCase):
                     n_records=3,
                     n_features=2,
                     batch_size=2,
+                    feature_device="cpu",
                 )
             )
             raw[0] = np.asarray([1.0, 2.0], dtype=np.float16)
@@ -197,6 +228,7 @@ class ExternalPredictionContractTests(unittest.TestCase):
                     n_records=3,
                     n_features=2,
                     batch_size=2,
+                    feature_device="cpu",
                 )
             )
             self.assertEqual((raw_path_2, progress_path_2), (raw_path, progress_path))
@@ -217,6 +249,7 @@ class ExternalPredictionContractTests(unittest.TestCase):
                     n_records=3,
                     n_features=2,
                     batch_size=1,
+                    feature_device="cpu",
                 )
             )
             self.assertEqual(changed_completed, set())
@@ -225,6 +258,49 @@ class ExternalPredictionContractTests(unittest.TestCase):
             external.cleanup_rocket_resume(changed, changed_raw, changed_progress)
             self.assertFalse(raw_path.exists())
             self.assertFalse(progress_path.exists())
+
+    def test_rocket_feature_partial_cache_never_crosses_device_backends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "features.npz"
+            contract = {
+                "archive_sha256": "archive-a",
+                "record_id_fingerprint": "records-a",
+                "rocket_feature_value_contract": external.EXTERNAL_FEATURE_VALUE_CONTRACT,
+                "rocket_feature_device": "cpu",
+            }
+            raw, raw_path, progress_path, completed, resume_contract = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                    feature_device="cpu",
+                )
+            )
+            raw[0] = np.asarray([1.0, 2.0], dtype=np.float16)
+            raw.flush()
+            completed.add(0)
+            external.save_rocket_resume_progress(progress_path, resume_contract, completed)
+            owner = getattr(raw, "_mmap", None)
+            if owner is not None:
+                owner.close()
+
+            cuda_contract = dict(contract, rocket_feature_device="cuda")
+            changed, changed_raw, changed_progress, changed_completed, observed = (
+                external.open_rocket_resume_cache(
+                    cache_path,
+                    cuda_contract,
+                    n_records=3,
+                    n_features=2,
+                    batch_size=2,
+                    feature_device="cuda",
+                )
+            )
+            self.assertEqual(changed_completed, set())
+            self.assertEqual(observed["feature_device"], "cuda")
+            self.assertTrue(list(cache_path.parent.glob(f"{raw_path.name}.stale.*")))
+            external.cleanup_rocket_resume(changed, changed_raw, changed_progress)
 
     def test_cpsc_annotation_failure_is_not_converted_to_negative(self):
         with patch.object(external.wfdb, "rdann", side_effect=FileNotFoundError("missing atr")):

@@ -1179,10 +1179,10 @@ RUN_PTBXL_EXPORT = False
 RUN_GEORGIA_EXPORT = False
 RUN_CPSC2021_EXPORT = False
 EXTERNAL_BATCH_SIZE = 64
-# CUDA is accepted only after the exporter verifies exact float16-roundtrip
-# parity against the CPU transform used to fit the frozen fold PCA models.
-EXTERNAL_FEATURE_DEVICE = 'auto'
-EXTERNAL_FEATURE_BATCH_SIZE = 256
+# CPU is canonical because the frozen fold PCA objects were fitted from
+# CPU-produced float16-roundtrip ROCKET-family features.
+EXTERNAL_FEATURE_DEVICE = 'cpu'
+EXTERNAL_FEATURE_BATCH_SIZE = 64
 EXTERNAL_FEATURE_PARITY_RECORDS = 4
 EXTERNAL_LIMIT_RECORDS = 0
 # Completed external feature caches belong to the canonical artifact root. This
