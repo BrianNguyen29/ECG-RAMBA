@@ -385,6 +385,12 @@ class ArtifactMirrorStorageSafetyTests(unittest.TestCase):
             )
             self.assertEqual(len(quarantined), 1)
             self.assertEqual(quarantined[0].read_bytes(), b"truncated")
+            os.utime(quarantined[0], (old_epoch, old_epoch))
+            self._publish(revision, mirror, verify_existing="size")
+            quarantined_after_second_publish = list(
+                partial.parent.glob(".artifact_mirror.quarantined_partial.*")
+            )
+            self.assertEqual(quarantined_after_second_publish, quarantined)
             self.assertTrue(recent_partial.exists())
             self.assertTrue(locked_partial.exists())
             self.assertTrue(locked_partial_lock.exists())

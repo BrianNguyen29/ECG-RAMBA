@@ -547,6 +547,11 @@ def _quarantine_stale_orphan_partials(
     for candidate in sorted(mirror_root.rglob("*")):
         if not candidate.is_file() or ".partial." not in candidate.name:
             continue
+        # Quarantine names intentionally preserve part of the original partial
+        # filename for diagnosis. Never treat an already quarantined file as a
+        # new orphan on a later publish.
+        if candidate.name.startswith(".artifact_mirror.quarantined_partial."):
+            continue
         if candidate.name.endswith(f".partial.{active_run_id}"):
             continue
         try:

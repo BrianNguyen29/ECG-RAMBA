@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v9"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v10"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -3395,9 +3395,19 @@ def integrate_notebook00_authority_manifest_publish() -> None:
         'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
         '--mirror-root "{CANONICAL_REVISION_MIRROR}"\','
     )
+    current = (
+        'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+        '--refresh-existing-prefix manifests/notebook_code_authority.json '
+        '--include-path manifests/artifact_source_audit.json '
+        '--include-path tables/table_artifact_source_audit.csv '
+        '--mirror-root "{CANONICAL_REVISION_MIRROR}"\','
+    )
     new = (
         'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
         '--refresh-existing-prefix manifests/notebook_code_authority.json '
+        '--refresh-existing-prefix predictions/external_feature_cache '
+        '--refresh-existing-prefix predictions/cpsc_window_cache/'
+        'cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz '
         '--include-path manifests/artifact_source_audit.json '
         '--include-path tables/table_artifact_source_audit.csv '
         '--mirror-root "{CANONICAL_REVISION_MIRROR}"\','
@@ -3408,6 +3418,10 @@ def integrate_notebook00_authority_manifest_publish() -> None:
         if "artifact_source_audit_mirror_publish.log" not in text:
             continue
         if new in text:
+            matched += 1
+            continue
+        if current in text:
+            set_source(cell, text.replace(current, new, 1))
             matched += 1
             continue
         if old not in text:

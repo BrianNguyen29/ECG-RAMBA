@@ -421,6 +421,21 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             self.assertNotIn("_AUTHORITY_BOOTSTRAP_ALLOWED = True", source)
             self.assertIn("_AUTHORITY_BOOTSTRAP_ALLOWED = False", source)
 
+    def test_notebook00_scoped_audit_publish_repairs_direct_cpsc_cache_attestation(self):
+        _, source = notebook_source("00_colab_bootstrap.ipynb")
+        self.assertIn("artifact_source_audit_mirror_publish.log", source)
+        self.assertIn(
+            "--refresh-existing-prefix predictions/external_feature_cache",
+            source,
+        )
+        self.assertIn(
+            "--refresh-existing-prefix predictions/cpsc_window_cache/"
+            "cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz",
+            source,
+        )
+        self.assertIn("--include-path manifests/artifact_source_audit.json", source)
+        self.assertIn("--include-path tables/table_artifact_source_audit.csv", source)
+
     def test_code_authority_manifest_fails_closed_and_pins_moving_branch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
