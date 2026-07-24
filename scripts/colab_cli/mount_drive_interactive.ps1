@@ -50,8 +50,15 @@ $Process = [System.Diagnostics.Process]::new()
 $Process.StartInfo = $ProcessInfo
 [void]$Process.Start()
 
+$ObservedMountError = $false
 while (($Line = $Process.StandardOutput.ReadLine()) -ne $null) {
     Write-Host $Line
+    if (
+        $Line -match "\[colab\] Error propagating:" -or
+        $Line -match "ValueError.*mount failed"
+    ) {
+        $ObservedMountError = $true
+    }
     if ($Line -match "^https://accounts\.google\.com/") {
         Start-Process $Line
         if ($AutoConfirmAfterSeconds -gt 0) {
@@ -69,7 +76,21 @@ while (($Line = $Process.StandardOutput.ReadLine()) -ne $null) {
 }
 
 $Process.WaitForExit()
-if ($Process.ExitCode -ne 0) {
-    throw "Colab Drive mount failed with exit code $($Process.ExitCode)."
+$VerifyOutput = & wsl.exe -d $Distro --exec $ColabExecutable `
+    "--auth=$Auth" ls -s $Session /content/drive/MyDrive 2>&1
+$VerifyExitCode = $LASTEXITCODE
+if (
+    $Process.ExitCode -ne 0 -or
+    $ObservedMountError -or
+    $VerifyExitCode -ne 0
+) {
+    if ($VerifyOutput) {
+        Write-Host ($VerifyOutput | Out-String)
+    }
+    throw (
+        "Colab Drive mount verification failed. " +
+        "cli_exit=$($Process.ExitCode) observed_mount_error=$ObservedMountError " +
+        "verify_exit=$VerifyExitCode"
+    )
 }
 Write-Host "Google Drive mounted for Colab session: $Session"

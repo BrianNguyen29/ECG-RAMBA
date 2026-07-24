@@ -101,6 +101,11 @@ confirmation delay and complete consent before the countdown expires:
   -AutoConfirmAfterSeconds 120
 ```
 
+The bridge performs a postcondition check by listing
+`/content/drive/MyDrive`. This is required because Colab CLI 0.6.0 can return
+exit code zero after a credential-propagation error even though Drive was not
+mounted.
+
 ## Running one stage
 
 ```powershell

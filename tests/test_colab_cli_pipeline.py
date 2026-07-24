@@ -79,6 +79,9 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn("RedirectStandardInput = $true", source)
         self.assertIn("^https://accounts\\.google\\.com/", source)
         self.assertIn("AutoConfirmAfterSeconds", source)
+        self.assertIn("/content/drive/MyDrive", source)
+        self.assertIn("$ObservedMountError", source)
+        self.assertIn("$VerifyExitCode", source)
 
     def test_cpu_feature_stage_does_not_include_gpu_inference(self):
         stage = self.module.stage_by_id(
