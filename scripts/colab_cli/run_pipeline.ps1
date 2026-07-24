@@ -8,6 +8,8 @@ param(
     [ValidateSet("oauth2", "adc")]
     [string]$Auth = "oauth2",
     [string]$Distro = "Ubuntu",
+    [ValidateRange(0, 600)]
+    [int]$AutoConfirmAfterSeconds = 0,
     [switch]$Keep,
     [switch]$NoMount,
     [switch]$Remount,
@@ -54,7 +56,8 @@ if ($Action -eq "mount") {
     & (Join-Path $PSScriptRoot "mount_drive_interactive.ps1") `
         -Session $SessionName `
         -Auth $Auth `
-        -Distro $Distro
+        -Distro $Distro `
+        -AutoConfirmAfterSeconds $AutoConfirmAfterSeconds
     exit $LASTEXITCODE
 }
 

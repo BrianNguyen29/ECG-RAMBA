@@ -73,8 +73,12 @@ class ColabCliPipelineTests(unittest.TestCase):
             ROOT / "scripts" / "colab_cli" / "mount_drive_interactive.ps1"
         ).read_text(encoding="utf-8")
         self.assertIn("drivemount", source)
+        self.assertIn("script -qefc", source)
+        self.assertIn("/dev/tty", source)
+        self.assertIn("$ProcessInfo.ArgumentList.Add", source)
         self.assertIn("RedirectStandardInput = $true", source)
         self.assertIn("^https://accounts\\.google\\.com/", source)
+        self.assertIn("AutoConfirmAfterSeconds", source)
 
     def test_cpu_feature_stage_does_not_include_gpu_inference(self):
         stage = self.module.stage_by_id(

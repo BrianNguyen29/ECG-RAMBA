@@ -87,8 +87,19 @@ the Windows interactive bridge after the named session has been provisioned:
 .\scripts\colab_cli\run_pipeline.ps1 -Action run -Stage nb00_cpu -NoMount
 ```
 
-The bridge invokes the official `colab drivemount` command inside WSL, opens
-the returned Google consent URL, and keeps stdin open until Enter is pressed.
+The bridge invokes the official `colab drivemount` command inside a WSL
+pseudo-terminal, opens the returned Google consent URL, and keeps stdin open
+until Enter is pressed. The pseudo-terminal is required because Colab CLI
+0.6.0 reads this acknowledgement directly from `/dev/tty`.
+When launched by an agent without an attached console, use a bounded automatic
+confirmation delay and complete consent before the countdown expires:
+
+```powershell
+.\scripts\colab_cli\run_pipeline.ps1 `
+  -Action mount `
+  -Stage nb00_cpu `
+  -AutoConfirmAfterSeconds 120
+```
 
 ## Running one stage
 
