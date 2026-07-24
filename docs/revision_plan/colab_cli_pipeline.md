@@ -26,6 +26,8 @@ The canonical artifact root remains:
 - Before building, every source notebook is checked against the annotated
   authority tag; the generated stage is parsed directly from that immutable
   Git blob rather than mutable working-tree bytes.
+- Each generated stage records SHA256 for the pipeline manifest, stage builder,
+  launcher, and immutable source-notebook blob.
 - Generated stage notebooks contain the source notebook SHA256.
 - A stage prints a completion marker only after all selected cells finish.
 - A zero CLI exit code is accepted only when that exact completion marker is

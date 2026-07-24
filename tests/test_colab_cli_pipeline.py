@@ -111,6 +111,9 @@ class ColabCliPipelineTests(unittest.TestCase):
         contract = notebook["metadata"]["ecg_ramba_colab_cli"]
         self.assertEqual(contract["stage_id"], "nb03_cpu")
         self.assertEqual(len(contract["source_notebook_sha256"]), 64)
+        self.assertEqual(len(contract["pipeline_manifest_sha256"]), 64)
+        self.assertEqual(len(contract["stage_builder_sha256"]), 64)
+        self.assertEqual(len(contract["pipeline_launcher_sha256"]), 64)
         self.assertEqual(reloaded["metadata"]["ecg_ramba_colab_cli"], contract)
         for cell in notebook["cells"]:
             if cell["cell_type"] == "code":

@@ -166,11 +166,17 @@ def configuration_cell(
     manifest: dict[str, Any],
     stage: dict[str, Any],
     source_sha256: str,
+    manifest_sha256: str,
+    builder_sha256: str,
+    launcher_sha256: str,
 ) -> dict[str, Any]:
     environment = {
         "ECG_RAMBA_AUTHORITY_COMMIT": manifest["authority"]["git_commit"],
         "ECG_RAMBA_AUTHORITY_REF": manifest["authority"]["git_ref"],
         "ECG_RAMBA_COLAB_CLI_STAGE": stage["id"],
+        "ECG_RAMBA_COLAB_CLI_MANIFEST_SHA256": manifest_sha256,
+        "ECG_RAMBA_COLAB_CLI_BUILDER_SHA256": builder_sha256,
+        "ECG_RAMBA_COLAB_CLI_LAUNCHER_SHA256": launcher_sha256,
         **{str(key): str(value) for key, value in stage.get("environment", {}).items()},
     }
     expected_hardware = stage["hardware"]
@@ -275,7 +281,26 @@ def build_stage_notebook(
         ]
 
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
-    config = configuration_cell(manifest, stage, source_sha256)
+    manifest_sha256 = hashlib.sha256(
+        json.dumps(
+            manifest,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    builder_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    launcher_sha256 = hashlib.sha256(
+        Path(__file__).with_name("pipeline.py").read_bytes()
+    ).hexdigest()
+    config = configuration_cell(
+        manifest,
+        stage,
+        source_sha256,
+        manifest_sha256,
+        builder_sha256,
+        launcher_sha256,
+    )
     insert_at = 1 if selected and selected[0].get("cell_type") == "markdown" else 0
     selected.insert(insert_at, config)
     selected.append(completion_cell(stage))
@@ -288,6 +313,9 @@ def build_stage_notebook(
         "stage_id": stage["id"],
         "source_notebook": stage["notebook"],
         "source_notebook_sha256": source_sha256,
+        "pipeline_manifest_sha256": manifest_sha256,
+        "stage_builder_sha256": builder_sha256,
+        "pipeline_launcher_sha256": launcher_sha256,
         "mode": stage["mode"],
         "sections": stage.get("sections", []),
         "hardware": stage["hardware"],
