@@ -107,21 +107,21 @@ def validate_authority_sources(
         source_path = repo_root / relative
         if not source_path.is_file():
             continue
-        difference = subprocess.run(
-            ["git", "diff", "--quiet", commit, "--", Path(relative).as_posix()],
-            cwd=repo_root,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        if difference.returncode == 1:
-            errors.append(
-                f"{relative}: working tree differs from authority commit {commit}"
+        try:
+            authority_notebook = json.loads(
+                authority_blob_bytes(repo_root, manifest, relative).decode("utf-8")
             )
-        elif difference.returncode:
+            working_notebook = json.loads(
+                source_path.read_text(encoding="utf-8")
+            )
+        except Exception as exc:
             errors.append(
-                f"{relative}: authority diff failed: "
-                + difference.stdout.decode("utf-8", errors="replace").strip()
+                f"{relative}: authority comparison failed: {exc}"
+            )
+            continue
+        if working_notebook != authority_notebook:
+            errors.append(
+                f"{relative}: notebook JSON differs from authority commit {commit}"
             )
     return errors
 

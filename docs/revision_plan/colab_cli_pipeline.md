@@ -25,7 +25,8 @@ The canonical artifact root remains:
 - The current immutable code-authority commit/ref is injected into every stage.
 - Before building, every source notebook is checked against the annotated
   authority tag; the generated stage is parsed directly from that immutable
-  Git blob rather than mutable working-tree bytes.
+  Git blob rather than mutable working-tree bytes. The check compares notebook
+  JSON semantics so Windows CRLF conversion cannot create a false mismatch.
 - Each generated stage records SHA256 for the pipeline manifest, stage builder,
   launcher, and immutable source-notebook blob.
 - Generated stage notebooks contain the source notebook SHA256.
