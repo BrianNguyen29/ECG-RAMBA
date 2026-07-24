@@ -6,7 +6,7 @@
     "git_ref": "refs/tags/ecg-ramba-revision-20260723-v13"
   },
   "canonical_drive_root": "/content/drive/MyDrive/ECG-Ramba",
-  "default_auth": "adc",
+  "default_auth": "oauth2",
   "stages": [
     {
       "id": "nb00_cpu",

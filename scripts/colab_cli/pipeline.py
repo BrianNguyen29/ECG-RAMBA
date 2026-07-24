@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MANIFEST = REPO_ROOT / "configs" / "colab_cli_pipeline.json"
 DEFAULT_BUILD_ROOT = Path.home() / ".cache" / "ecg-ramba-colab-cli" / "stages"
 LOCAL_LOG_ROOT = REPO_ROOT / "reports" / "revision" / "logs" / "colab_cli"
-REQUIRED_ADC_SCOPES = {
+REQUIRED_COLAB_SCOPES = {
     "openid",
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -98,21 +98,26 @@ def validate_auth(base: list[str], auth: str) -> int:
         print(result.stdout.rstrip())
     if result.returncode:
         return result.returncode
-    if auth != "adc":
-        return 0
     missing = sorted(
-        scope for scope in REQUIRED_ADC_SCOPES if scope not in result.stdout
+        scope for scope in REQUIRED_COLAB_SCOPES if scope not in result.stdout
     )
     if missing:
+        remediation = (
+            "Run scripts/colab_cli/setup_oauth2.sh inside WSL, then retry "
+            "auth-check."
+            if auth == "oauth2"
+            else "Run scripts/colab_cli/setup_adc.sh inside WSL, then retry "
+            "auth-check."
+        )
         print(
-            "ADC is missing Colab-required scopes:\n- "
+            f"{auth.upper()} is missing Colab-required scopes:\n- "
             + "\n- ".join(missing)
-            + "\nRun scripts/colab_cli/setup_adc.sh inside WSL, then retry "
-            "auth-check.",
+            + "\n"
+            + remediation,
             file=sys.stderr,
         )
         return 2
-    print("ADC scope preflight: OK")
+    print(f"{auth.upper()} scope preflight: OK")
     return 0
 
 

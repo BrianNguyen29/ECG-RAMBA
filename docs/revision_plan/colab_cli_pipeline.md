@@ -54,17 +54,26 @@ Windows. Verify the plan:
 .\scripts\colab_cli\run_pipeline.ps1 -Action plan
 ```
 
-Configure ADC once. This is interactive and requires a browser:
+Configure Colab CLI OAuth2 once. This is an official remote copy/paste flow and
+requires a browser:
 
 ```powershell
 .\scripts\colab_cli\run_pipeline.ps1 -Action auth-setup
 .\scripts\colab_cli\run_pipeline.ps1 -Action auth-check
 ```
 
-The setup requests the four scopes required by the Colab assignment and
-keep-alive services. `auth-check` fails before allocating a VM if any scope is
-missing. OAuth2 remains available with `-Auth oauth2`, but ADC is the default
-for this automation.
+The setup uses only `colab --auth=oauth2 whoami`; it does not require `gcloud`.
+Colab CLI prints a Google authorization URL, waits for the returned code, and
+caches the refresh token under `~/.config/colab-cli/token.json`. The setup
+requests the scopes required by the Colab assignment and keep-alive services.
+`auth-check` fails before allocating a VM if any required scope is missing.
+
+ADC remains available as a fallback:
+
+```powershell
+.\scripts\colab_cli\run_pipeline.ps1 -Action auth-setup -Auth adc
+.\scripts\colab_cli\run_pipeline.ps1 -Action auth-check -Auth adc
+```
 
 Drive mount is a separate VM-side consent flow. Each newly provisioned session
 will pause at `colab drivemount`; complete the browser consent and return to the

@@ -65,8 +65,8 @@ class ColabCliPipelineTests(unittest.TestCase):
         )
         self.assertFalse(stage["enabled"])
 
-    def test_adc_is_the_default_authentication_mode(self):
-        self.assertEqual(self.manifest["default_auth"], "adc")
+    def test_oauth2_is_the_default_authentication_mode(self):
+        self.assertEqual(self.manifest["default_auth"], "oauth2")
 
     def test_cpu_feature_stage_does_not_include_gpu_inference(self):
         stage = self.module.stage_by_id(
@@ -177,7 +177,7 @@ class ColabCliPipelineTests(unittest.TestCase):
                 )
 
     def test_adc_scope_preflight_detects_missing_colaboratory_scope(self):
-        complete = "\n".join(sorted(self.pipeline.REQUIRED_ADC_SCOPES))
+        complete = "\n".join(sorted(self.pipeline.REQUIRED_COLAB_SCOPES))
         missing = complete.replace(
             "https://www.googleapis.com/auth/colaboratory", ""
         )
@@ -201,6 +201,38 @@ class ColabCliPipelineTests(unittest.TestCase):
         ):
             self.assertEqual(
                 self.pipeline.validate_auth(["colab", "--auth=adc"], "adc"),
+                0,
+            )
+
+    def test_oauth2_scope_preflight_detects_missing_colaboratory_scope(self):
+        complete = "\n".join(sorted(self.pipeline.REQUIRED_COLAB_SCOPES))
+        missing = complete.replace(
+            "https://www.googleapis.com/auth/colaboratory", ""
+        )
+        with mock.patch.object(
+            self.pipeline,
+            "run_capture",
+            return_value=type(
+                "Result", (), {"returncode": 0, "stdout": missing}
+            )(),
+        ):
+            self.assertEqual(
+                self.pipeline.validate_auth(
+                    ["colab", "--auth=oauth2"], "oauth2"
+                ),
+                2,
+            )
+        with mock.patch.object(
+            self.pipeline,
+            "run_capture",
+            return_value=type(
+                "Result", (), {"returncode": 0, "stdout": complete}
+            )(),
+        ):
+            self.assertEqual(
+                self.pipeline.validate_auth(
+                    ["colab", "--auth=oauth2"], "oauth2"
+                ),
                 0,
             )
 

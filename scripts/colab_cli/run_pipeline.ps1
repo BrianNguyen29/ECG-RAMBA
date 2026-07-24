@@ -6,7 +6,7 @@ param(
     [string]$FromStage,
     [string]$ToStage,
     [ValidateSet("oauth2", "adc")]
-    [string]$Auth = "adc",
+    [string]$Auth = "oauth2",
     [string]$Distro = "Ubuntu",
     [switch]$Keep,
     [switch]$NoMount,
@@ -32,7 +32,12 @@ if ($Action -eq "install") {
 }
 
 if ($Action -eq "auth-setup") {
-    $Command = "cd $(Quote-Bash $WslRepoRoot) && bash scripts/colab_cli/setup_adc.sh"
+    if ($Auth -eq "oauth2") {
+        $SetupScript = "scripts/colab_cli/setup_oauth2.sh"
+    } else {
+        $SetupScript = "scripts/colab_cli/setup_adc.sh"
+    }
+    $Command = "cd $(Quote-Bash $WslRepoRoot) && bash $(Quote-Bash $SetupScript)"
     & wsl.exe -d $Distro -- bash -lc $Command
     exit $LASTEXITCODE
 }
