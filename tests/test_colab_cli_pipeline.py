@@ -68,6 +68,14 @@ class ColabCliPipelineTests(unittest.TestCase):
     def test_oauth2_is_the_default_authentication_mode(self):
         self.assertEqual(self.manifest["default_auth"], "oauth2")
 
+    def test_windows_drive_mount_bridge_uses_official_cli(self):
+        source = (
+            ROOT / "scripts" / "colab_cli" / "mount_drive_interactive.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("drivemount", source)
+        self.assertIn("RedirectStandardInput = $true", source)
+        self.assertIn("^https://accounts\\.google\\.com/", source)
+
     def test_cpu_feature_stage_does_not_include_gpu_inference(self):
         stage = self.module.stage_by_id(
             self.manifest, "nb02_features_cpu"

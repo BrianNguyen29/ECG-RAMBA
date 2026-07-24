@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("install", "auth-setup", "plan", "validate", "auth-check", "sessions", "build", "run", "run-all")]
+    [ValidateSet("install", "auth-setup", "mount", "plan", "validate", "auth-check", "sessions", "build", "run", "run-all")]
     [string]$Action = "plan",
     [string]$Stage,
     [string]$FromStage,
@@ -39,6 +39,22 @@ if ($Action -eq "auth-setup") {
     }
     $Command = "cd $(Quote-Bash $WslRepoRoot) && bash $(Quote-Bash $SetupScript)"
     & wsl.exe -d $Distro -- bash -lc $Command
+    exit $LASTEXITCODE
+}
+
+if ($Action -eq "mount") {
+    if (-not $Stage) {
+        throw "-Stage is required for -Action mount."
+    }
+    $CompactStage = ($Stage.ToLowerInvariant() -replace "[^a-z0-9]", "-").Trim("-")
+    $SessionName = ("ecgr-" + $CompactStage)
+    if ($SessionName.Length -gt 48) {
+        $SessionName = $SessionName.Substring(0, 48)
+    }
+    & (Join-Path $PSScriptRoot "mount_drive_interactive.ps1") `
+        -Session $SessionName `
+        -Auth $Auth `
+        -Distro $Distro
     exit $LASTEXITCODE
 }
 

@@ -79,6 +79,17 @@ Drive mount is a separate VM-side consent flow. Each newly provisioned session
 will pause at `colab drivemount`; complete the browser consent and return to the
 PowerShell terminal. This cannot be made unattended by Colab CLI.
 
+For agent-launched or redirected terminals where stdin is not preserved, use
+the Windows interactive bridge after the named session has been provisioned:
+
+```powershell
+.\scripts\colab_cli\run_pipeline.ps1 -Action mount -Stage nb00_cpu
+.\scripts\colab_cli\run_pipeline.ps1 -Action run -Stage nb00_cpu -NoMount
+```
+
+The bridge invokes the official `colab drivemount` command inside WSL, opens
+the returned Google consent URL, and keeps stdin open until Enter is pressed.
+
 ## Running one stage
 
 ```powershell
