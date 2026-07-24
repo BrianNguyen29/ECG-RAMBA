@@ -167,6 +167,17 @@ python -u scripts/revision/47_forensic_notebook_audit.py --canonical-root report
 
 For detailed reproduction instructions, see **[EXPERIMENTS.md](EXPERIMENTS.md)**.
 
+### Colab CLI Revision Pipeline
+
+The reviewed Notebook 00-07 sequence can be executed from Windows through
+WSL2 and the official Google Colab CLI. The launcher separates CPU feature
+preparation from A100 inference, preserves executed notebooks and logs, reuses
+canonical Drive artifacts, and leaves failed sessions active for diagnosis.
+
+See
+[`docs/revision_plan/colab_cli_pipeline.md`](docs/revision_plan/colab_cli_pipeline.md)
+for authentication, staged execution, resume, and cleanup commands.
+
 ---
 
 ## 📂 Project Structure

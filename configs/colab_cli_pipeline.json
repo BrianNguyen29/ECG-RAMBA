@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "pipeline_id": "ecg_ramba_revision_colab_cli_v1",
+  "authority": {
+    "git_commit": "d5d2c14c50585599ad792083bb41f340a9b94e36",
+    "git_ref": "refs/tags/ecg-ramba-revision-20260723-v13"
+  },
+  "canonical_drive_root": "/content/drive/MyDrive/ECG-Ramba",
+  "default_auth": "adc",
+  "stages": [
+    {
+      "id": "nb00_cpu",
+      "notebook": "notebooks/00_colab_bootstrap.ipynb",
+      "mode": "full",
+      "hardware": "cpu",
+      "timeout_seconds": 7200,
+      "enabled": true,
+      "depends_on": [],
+      "environment": {
+        "ECG_RAMBA_INSTALL_MAMBA_IN_NOTEBOOK00": "0"
+      }
+    },
+    {
+      "id": "nb01_cpu",
+      "notebook": "notebooks/01_a0_protocol_audit.ipynb",
+      "mode": "full",
+      "hardware": "cpu",
+      "timeout_seconds": 7200,
+      "enabled": true,
+      "depends_on": [
+        "nb00_cpu"
+      ],
+      "environment": {}
+    },
+    {
+      "id": "nb02a_retrain_a100",
+      "notebook": "notebooks/02a_retrain_best_ema.ipynb",
+      "mode": "full",
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": false,
+      "depends_on": [
+        "nb01_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_RUN_RETRAIN": "1",
+        "ECG_RAMBA_RESUME_TRAINING": "1"
+      }
+    },
+    {
+      "id": "nb02_features_cpu",
+      "notebook": "notebooks/02_predictions_and_external_eval.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Install Base Dependencies",
+        "## Restore And Verify Stable Drive Artifacts",
+        "## Prediction Contract",
+        "## CPU External Feature Preparation",
+        "## PTB-XL Fold 9 CPU Feature Preparation"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 43200,
+      "enabled": true,
+      "depends_on": [
+        "nb01_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "all_external_cpu",
+        "ECG_RAMBA_EXTERNAL_FEATURE_BATCH_SIZE": "64",
+        "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "1"
+      }
+    },
+    {
+      "id": "nb02_a100",
+      "notebook": "notebooks/02_predictions_and_external_eval.ipynb",
+      "mode": "full",
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb02_features_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
+        "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "full_reviewer_a100"
+      }
+    },
+    {
+      "id": "nb03_cpu",
+      "notebook": "notebooks/03_calibration_and_ci.ipynb",
+      "mode": "full",
+      "hardware": "cpu",
+      "timeout_seconds": 21600,
+      "enabled": true,
+      "depends_on": [
+        "nb02_a100"
+      ],
+      "environment": {}
+    },
+    {
+      "id": "nb04_a100",
+      "notebook": "notebooks/04_baselines_and_component_checks.ipynb",
+      "mode": "full",
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb03_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_RESTORE_OPTIONAL_BASELINE_ARTIFACTS": "1"
+      }
+    },
+    {
+      "id": "nb05_predictions_a100",
+      "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## HRV Domain Evidence",
+        "## Robustness Stress-Test Ledger",
+        "## Comparator Stress Prediction Generation"
+      ],
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb04_a100"
+      ],
+      "environment": {
+        "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
+        "ECG_RAMBA_COMPARATOR_STRESS_COMPARATORS": "resnet,raw_mamba,transformer",
+        "ECG_RAMBA_COMPARATOR_STRESS_TESTS": "snr20db,snr10db,snr5db,random_3_lead_dropout,precordial_dropout,resample_250hz",
+        "ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE": "256"
+      }
+    },
+    {
+      "id": "nb05_finalize_cpu",
+      "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
+      "mode": "full",
+      "hardware": "cpu",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb05_predictions_a100"
+      ],
+      "environment": {
+        "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
+        "ECG_RAMBA_ROBUSTNESS_MULTI_COMPARATORS": "minirocket,resnet,raw_mamba,transformer",
+        "ECG_RAMBA_ROBUSTNESS_MULTI_FINAL_N_BOOT": "10000",
+        "ECG_RAMBA_ROBUSTNESS_MULTI_BOOTSTRAP_JOBS": "auto"
+      }
+    },
+    {
+      "id": "nb06_a100",
+      "notebook": "notebooks/06_pooling_and_representation.ipynb",
+      "mode": "full",
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb05_finalize_cpu"
+      ],
+      "environment": {}
+    },
+    {
+      "id": "nb07_cpu",
+      "notebook": "notebooks/07_results_freeze.ipynb",
+      "mode": "full",
+      "hardware": "cpu",
+      "timeout_seconds": 43200,
+      "enabled": true,
+      "depends_on": [
+        "nb06_a100"
+      ],
+      "environment": {
+        "ECG_RAMBA_SUBMISSION_MODE": "clean"
+      }
+    }
+  ]
+}
