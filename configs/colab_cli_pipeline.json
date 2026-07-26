@@ -119,7 +119,7 @@
       "notebook": "notebooks/03_calibration_and_ci.ipynb",
       "mode": "full",
       "hardware": "cpu",
-      "timeout_seconds": 21600,
+      "timeout_seconds": 86400,
       "enabled": true,
       "depends_on": [
         "nb02_adaptation_a100"
