@@ -77,6 +77,66 @@ class ExternalComparatorContractTests(unittest.TestCase):
             self.assertNotEqual(paired.metric_cache_key(contract), paired.metric_cache_key(changed_group))
             self.assertEqual(contract["canonical_group_sidecar_sha256"], "d" * 64)
 
+    def test_external_runner_and_paired_gate_share_canonical_contract_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            oof = root / "oof_final_ema_predictions.npz"
+            np.savez_compressed(oof, y_true=np.zeros((3, 2), dtype=np.float32))
+            sidecar = root / "oof_final_ema_group_sidecar.npz"
+            np.savez_compressed(sidecar, group_id=np.asarray(["g1", "g2", "g3"]))
+            group_contract = {
+                "status": "verified",
+                "group_semantics": external_runner.CHAPMAN_GROUP_SEMANTICS,
+                "group_semantics_reference": external_runner.CHAPMAN_GROUP_REFERENCE,
+                "bootstrap_unit": external_runner.AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+                "one_record_per_group": True,
+                "n_records": 3,
+                "n_groups": 3,
+                "sidecar": {
+                    "path": str(sidecar),
+                    "sha256": external_runner.sha256_file(sidecar),
+                },
+            }
+            freeze = root / "oof_final_ema_freeze_manifest.json"
+            freeze.write_text(
+                json.dumps(
+                    {
+                        "status": "frozen",
+                        "manuscript_ready": True,
+                        "validated_records": 3,
+                        "artifacts": [
+                            {
+                                "path": str(oof),
+                                "sha256": external_runner.sha256_file(oof),
+                            }
+                        ],
+                        "group_contract": group_contract,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            contract = external_runner.canonical_contract(
+                SimpleNamespace(oof_predictions=oof, freeze_manifest=freeze)
+            )
+            self.assertEqual(
+                set(contract),
+                {
+                    "oof_sha256",
+                    "freeze_sha256",
+                    "group_contract_sha256",
+                    "group_sidecar_sha256",
+                    "bootstrap_unit",
+                },
+            )
+            self.assertEqual(
+                contract["group_contract_sha256"],
+                paired.canonical_json_sha256(group_contract),
+            )
+            self.assertEqual(
+                contract["bootstrap_unit"],
+                paired.AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+            )
+
     def test_external_bootstrap_cache_requires_exact_finite_count(self):
         valid = {
             "n_boot_valid": 10,
@@ -111,7 +171,7 @@ class ExternalComparatorContractTests(unittest.TestCase):
                 checkpoint_sha256=np.asarray("a" * 64),
                 input_fingerprint=np.asarray("b" * 64),
                 dataset_contract_sha256=np.asarray("c" * 64),
-                protocol_version=np.asarray(external_runner.PROTOCOL_VERSION),
+                protocol_version=np.asarray(external_runner.FOLD_CACHE_PROTOCOL_VERSION),
             )
             kwargs = dict(
                 dataset="ptbxl",

@@ -33,6 +33,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from configs.config import CLASSES, CONFIG  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
+    AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    CHAPMAN_GROUP_REFERENCE,
+    CHAPMAN_GROUP_SEMANTICS,
     EXPERIMENTAL_DIR,
     MANIFEST_DIR,
     METRIC_DIR,
@@ -51,7 +54,8 @@ from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabil
 from src.training_data import build_slice_index  # noqa: E402
 
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
+FOLD_CACHE_PROTOCOL_VERSION = 2
 CACHE_ONLY_CPU_AGGREGATION_CAPABILITY = "validated_external_fold_cache_aggregation_v2_dataset_sidecar"
 CPSC_DISK_BACKED_INFERENCE_CAPABILITY = "cpsc_disk_backed_comparator_inference_v1"
 DATASET_CONTRACT_SCHEMA_VERSION = 1
@@ -251,7 +255,7 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(resolve(path).read_text(encoding="utf-8"))
 
 
-def canonical_contract(args: argparse.Namespace) -> dict[str, str]:
+def canonical_contract(args: argparse.Namespace) -> dict[str, Any]:
     oof = resolve(args.oof_predictions)
     freeze = resolve(args.freeze_manifest)
     if not oof.exists() or not freeze.exists():
@@ -267,12 +271,45 @@ def canonical_contract(args: argparse.Namespace) -> dict[str, str]:
             break
     if expected != oof_sha:
         raise RuntimeError(f"Freeze OOF SHA mismatch: {expected} != {oof_sha}")
-    return {"oof_sha256": oof_sha, "freeze_sha256": sha256_file(freeze)}
+    group = payload.get("group_contract") or {}
+    sidecar = group.get("sidecar") or {}
+    sidecar_path = resolve(Path(str(sidecar.get("path") or "")))
+    errors = []
+    if group.get("status") != "verified":
+        errors.append("status")
+    if group.get("group_semantics") != CHAPMAN_GROUP_SEMANTICS:
+        errors.append("group_semantics")
+    if group.get("group_semantics_reference") != CHAPMAN_GROUP_REFERENCE:
+        errors.append("group_semantics_reference")
+    if group.get("bootstrap_unit") != AUTHENTICATED_RECORD_BOOTSTRAP_UNIT:
+        errors.append("bootstrap_unit")
+    if group.get("one_record_per_group") is not True:
+        errors.append("one_record_per_group")
+    if int(group.get("n_records", -1)) != int(payload.get("validated_records", -2)):
+        errors.append("n_records")
+    if int(group.get("n_groups", -1)) != int(payload.get("validated_records", -2)):
+        errors.append("n_groups")
+    if not str(sidecar.get("path") or "") or not sidecar_path.is_file():
+        errors.append("group_sidecar_missing")
+    elif not sidecar.get("sha256") or sha256_file(sidecar_path) != sidecar.get("sha256"):
+        errors.append("group_sidecar_sha256")
+    if errors:
+        raise RuntimeError(
+            "Canonical freeze lacks an authenticated live patient/group contract: "
+            + ", ".join(errors)
+        )
+    return {
+        "oof_sha256": oof_sha,
+        "freeze_sha256": sha256_file(freeze),
+        "group_contract_sha256": stable_json_sha256(group),
+        "group_sidecar_sha256": sidecar["sha256"],
+        "bootstrap_unit": AUTHENTICATED_RECORD_BOOTSTRAP_UNIT,
+    }
 
 
 def validate_in_domain_comparator(
     comparator: str,
-    contract: dict[str, str],
+    contract: dict[str, Any],
 ) -> dict[str, Any]:
     summary_path = METRIC_DIR / SUMMARY_FILENAMES[comparator]
     manifest_path = MANIFEST_DIR / MANIFEST_FILENAMES[comparator]
@@ -693,7 +730,7 @@ def cache_matches(
                 and str(data["checkpoint_sha256"].item()) == checkpoint_sha
                 and str(data["input_fingerprint"].item()) == input_fingerprint
                 and str(data["dataset_contract_sha256"].item()) == dataset_contract_sha256
-                and int(data["protocol_version"].item()) == PROTOCOL_VERSION
+                and int(data["protocol_version"].item()) == FOLD_CACHE_PROTOCOL_VERSION
                 and np.array_equal(np.asarray(data["class_names"]).astype(str), class_names.astype(str))
                 and np.array_equal(
                     np.asarray(data["slice_record_index"], dtype=np.int64),
@@ -945,7 +982,7 @@ def run_dataset(
                 checkpoint_sha256=np.asarray(checkpoint_hashes[fold - 1]),
                 input_fingerprint=np.asarray(input_fingerprint),
                 dataset_contract_sha256=np.asarray(dataset_contract_sha),
-                protocol_version=np.asarray(PROTOCOL_VERSION, dtype=np.int16),
+                protocol_version=np.asarray(FOLD_CACHE_PROTOCOL_VERSION, dtype=np.int16),
                 created_utc=np.asarray(now_utc()),
             )
             print(f"Wrote fold cache: {fold_cache}", flush=True)
