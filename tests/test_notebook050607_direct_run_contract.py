@@ -294,9 +294,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
     def test_notebook03_authenticates_every_matched_calibration_input(self):
         _, source = notebook_source("03_calibration_and_ci.ipynb")
         for token in (
+            "SCHEMA_VERSION = 7",
             "PROTOCOL = MATCHED_CALIBRATION_PROTOCOL",
+            'MATCHED_CALIBRATION_CAPABILITY = "conditional_posthoc_oof_calibration_v1"',
             "cannot reverse within-fold score ordering",
-            "fully nested deploy-time calibration estimate",
             "require_canonical_matched_input",
             "Canonical matched calibration inputs authenticated:",
             "Deferred matched calibration audit until Notebook 04 publishes",

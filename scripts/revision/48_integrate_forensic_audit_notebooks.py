@@ -112,6 +112,8 @@ REVISION_TOKEN_REQUIREMENTS = {
         'CACHE_ONLY_CPU_AGGREGATION_CAPABILITY',
         'CPSC_DISK_BACKED_INFERENCE_CAPABILITY',
         'DATASET_CONTRACT_SCHEMA_VERSION',
+        'FOLD_CACHE_PROTOCOL_VERSION',
+        'group_contract_sha256',
         'skipping archive extraction and signal loading',
     ],
     'scripts/revision/32_paired_external_comparators.py': [
@@ -3709,6 +3711,7 @@ def integrate_notebook00_authority_manifest_publish() -> None:
         'f\'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
         '--refresh-existing-prefix manifests/notebook_code_authority.json '
         '--refresh-existing-prefix predictions/external_feature_cache '
+        '--refresh-existing-prefix predictions/external_comparator_folds '
         '--refresh-existing-prefix predictions/cpsc_window_cache/'
         'cpsc2021_preprocessed_windows_source_bound_v3.npy.contract.npz '
         '--include-path manifests/artifact_source_audit.json '

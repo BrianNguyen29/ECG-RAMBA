@@ -51,6 +51,7 @@ from scripts.revision.common import (  # noqa: E402
 
 SCHEMA_VERSION = 7
 PROTOCOL = MATCHED_CALIBRATION_PROTOCOL
+MATCHED_CALIBRATION_CAPABILITY = "conditional_posthoc_oof_calibration_v1"
 PLATT_C = 1e6
 PLATT_MIN_SLOPE = 1e-8
 DEFAULT_MODELS = {

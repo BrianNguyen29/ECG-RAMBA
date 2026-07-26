@@ -180,18 +180,53 @@ def preserve_executed_notebook(
     notebook_path: Path,
     stage_id: str,
     run_id: str,
-) -> None:
+) -> Path | None:
     executed = notebook_path.with_name(notebook_path.stem + "_output.ipynb")
     if not executed.is_file():
         print(
             "WARNING: Colab CLI did not produce the expected executed notebook:",
             executed,
         )
-        return
+        return None
     destination = stage_log_dir(stage_id) / f"{run_id}_output.ipynb"
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(executed, destination)
     print("Preserved executed stage notebook:", destination)
+    return destination
+
+
+def executed_notebook_errors(notebook_path: Path) -> list[str]:
+    try:
+        payload = json.loads(notebook_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Could not inspect executed notebook {notebook_path}: {exc}"
+        ) from exc
+
+    errors: list[str] = []
+    cells = payload.get("cells")
+    if not isinstance(cells, list):
+        raise RuntimeError(
+            f"Executed notebook has no valid cells array: {notebook_path}"
+        )
+    for cell_index, cell in enumerate(cells):
+        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+            continue
+        outputs = cell.get("outputs", [])
+        if not isinstance(outputs, list):
+            raise RuntimeError(
+                f"Executed notebook code cell {cell_index} has invalid outputs"
+            )
+        for output in outputs:
+            if not isinstance(output, dict) or output.get("output_type") != "error":
+                continue
+            error_name = str(output.get("ename", "Error"))
+            error_value = str(output.get("evalue", "")).strip()
+            summary = f"cell {cell_index}: {error_name}"
+            if error_value:
+                summary += f": {error_value}"
+            errors.append(summary)
+    return errors
 
 
 def stop_session(base: list[str], name: str) -> None:
@@ -285,7 +320,7 @@ def execute_stage(
             str(stage["timeout_seconds"]),
         ]
         return_code = run_stream(exec_command, command_log)
-        preserve_executed_notebook(
+        executed_notebook = preserve_executed_notebook(
             notebook_path,
             stage["id"],
             run_id,
@@ -297,6 +332,33 @@ def execute_stage(
                 f"Session {name} remains active for inspection."
             )
             return return_code
+        if executed_notebook is None:
+            print(
+                f"Stage {stage['id']} returned zero but no executed notebook "
+                "was available for cell-error inspection. Session "
+                f"{name} remains active for inspection.",
+                file=sys.stderr,
+            )
+            return 4
+        try:
+            notebook_errors = executed_notebook_errors(executed_notebook)
+        except RuntimeError as exc:
+            print(
+                f"Stage {stage['id']} returned zero but its executed notebook "
+                f"could not be validated: {exc}. Session {name} remains active "
+                "for inspection.",
+                file=sys.stderr,
+            )
+            return 4
+        if notebook_errors:
+            print(
+                f"Stage {stage['id']} returned zero but its executed notebook "
+                "contains cell errors:\n- "
+                + "\n- ".join(notebook_errors)
+                + f"\nSession {name} remains active for inspection.",
+                file=sys.stderr,
+            )
+            return 4
         if not completed_stage_log(command_log, stage["id"]):
             print(
                 f"Stage {stage['id']} returned zero but its completion marker is "

@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -178,7 +179,7 @@ class ColabCliPipelineTests(unittest.TestCase):
             with mock.patch.object(
                 self.pipeline, "LOCAL_LOG_ROOT", root / "logs"
             ):
-                self.pipeline.preserve_executed_notebook(
+                preserved = self.pipeline.preserve_executed_notebook(
                     source,
                     "nb00_cpu",
                     "run-1",
@@ -186,10 +187,127 @@ class ColabCliPipelineTests(unittest.TestCase):
                 destination = (
                     root / "logs" / "nb00_cpu" / "run-1_output.ipynb"
                 )
+                self.assertEqual(preserved, destination)
                 self.assertEqual(
                     destination.read_text(encoding="utf-8"),
                     '{"executed": true}',
                 )
+
+    def test_executed_notebook_error_outputs_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            notebook_path = Path(directory) / "failed.ipynb"
+            notebook_path.write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {
+                                "cell_type": "code",
+                                "outputs": [
+                                    {
+                                        "output_type": "error",
+                                        "ename": "RuntimeError",
+                                        "evalue": "contract mismatch",
+                                        "traceback": [],
+                                    }
+                                ],
+                            },
+                            {
+                                "cell_type": "code",
+                                "outputs": [
+                                    {
+                                        "output_type": "stream",
+                                        "name": "stdout",
+                                        "text": "completion marker",
+                                    }
+                                ],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.pipeline.executed_notebook_errors(notebook_path),
+                ["cell 0: RuntimeError: contract mismatch"],
+            )
+
+    def test_clean_executed_notebook_has_no_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            notebook_path = Path(directory) / "clean.ipynb"
+            notebook_path.write_text(
+                json.dumps(
+                    {
+                        "cells": [
+                            {
+                                "cell_type": "code",
+                                "outputs": [
+                                    {
+                                        "output_type": "stream",
+                                        "name": "stdout",
+                                        "text": "ok",
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                self.pipeline.executed_notebook_errors(notebook_path),
+                [],
+            )
+
+    def test_execute_stage_rejects_cell_errors_even_with_zero_exit(self):
+        stage = {
+            "id": "nb03_cpu",
+            "enabled": True,
+            "hardware": "cpu",
+            "timeout_seconds": 60,
+        }
+        args = SimpleNamespace(
+            include_disabled=False,
+            build_root=Path("build"),
+            auth="oauth2",
+            session="existing-session",
+            dry_run=False,
+            no_mount=True,
+            remount=False,
+            keep=True,
+        )
+        with (
+            mock.patch.object(
+                self.pipeline,
+                "build_stage",
+                return_value=Path("nb03_cpu.ipynb"),
+            ),
+            mock.patch.object(
+                self.pipeline,
+                "colab_base",
+                return_value=["colab", "--auth=oauth2"],
+            ),
+            mock.patch.object(
+                self.pipeline,
+                "session_exists",
+                return_value=True,
+            ),
+            mock.patch.object(self.pipeline, "run_stream", return_value=0),
+            mock.patch.object(
+                self.pipeline,
+                "preserve_executed_notebook",
+                return_value=Path("nb03_cpu_output.ipynb"),
+            ),
+            mock.patch.object(self.pipeline, "export_session_log"),
+            mock.patch.object(
+                self.pipeline,
+                "executed_notebook_errors",
+                return_value=["cell 3: RuntimeError: stale contract"],
+            ),
+        ):
+            self.assertEqual(
+                self.pipeline.execute_stage(self.manifest, stage, args),
+                4,
+            )
 
     def test_adc_scope_preflight_detects_missing_colaboratory_scope(self):
         complete = "\n".join(sorted(self.pipeline.REQUIRED_COLAB_SCOPES))
