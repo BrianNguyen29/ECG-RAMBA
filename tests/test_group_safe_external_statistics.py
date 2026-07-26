@@ -169,7 +169,13 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
                 "sha256": "b" * 64,
             }
             manifest_path = dataset_root / "ptbxl_full_fold9_prediction_run_manifest.json"
-            canonical = {"oof_sha256": "c" * 64, "freeze_sha256": "d" * 64}
+            exporter_canonical = {"oof_sha256": "c" * 64, "freeze_sha256": "d" * 64}
+            canonical = {
+                **exporter_canonical,
+                "group_contract_sha256": "e" * 64,
+                "group_sidecar_sha256": "f" * 64,
+                "bootstrap_unit": "authenticated_source_patient_record",
+            }
             manifest_path.write_text(
                 json.dumps(
                     {
@@ -180,7 +186,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
                             / "revision"
                             / "03_generate_external_predictions.py"
                         ),
-                        "canonical_contract": canonical,
+                        "canonical_contract": exporter_canonical,
                         "outputs": {prediction.name: {"sha256": source["sha256"]}},
                         "archive": {
                             "size_bytes": archive["size_bytes"],
@@ -206,6 +212,7 @@ class GroupSafeExternalStatisticsTests(unittest.TestCase):
             )
             self.assertEqual(provenance["manifest_sha256"], representations.sha256_file(manifest_path))
             self.assertEqual(provenance["archive"]["sha256"], archive["sha256"])
+            self.assertEqual(provenance["authenticated_live_contract"], canonical)
 
             with self.assertRaises(RuntimeError):
                 representations.validate_source_provenance(

@@ -277,10 +277,19 @@ def validate_source_provenance(
         prediction_row = outputs.get(source["path"].name) or {}
         manifest_archive = manifest.get("archive") or {}
         external_runner = PROJECT_ROOT / "scripts" / "revision" / "03_generate_external_predictions.py"
+        # The Full exporter predates the authenticated group sidecar and records
+        # only the canonical OOF/freeze hashes. The live ``canonical`` contract
+        # has additional group fields validated above by canonical_contract().
+        # Compare the manifest against the exact exporter-owned projection, then
+        # bind the complete live contract into downstream representation caches.
+        full_export_contract = {
+            key: canonical[key]
+            for key in ("oof_sha256", "freeze_sha256")
+        }
         if (
             prediction_row.get("sha256") != source["sha256"]
             or manifest.get("runner_sha256") != sha256_file(external_runner)
-            or manifest.get("canonical_contract") != canonical
+            or manifest.get("canonical_contract") != full_export_contract
         ):
             raise RuntimeError(
                 f"{model}: source prediction is not authenticated by the current runner/canonical contract"
@@ -319,6 +328,7 @@ def validate_source_provenance(
             "archive": archive_contract,
             "runner_sha256": manifest.get("runner_sha256"),
             "canonical_contract": manifest.get("canonical_contract"),
+            "authenticated_live_contract": canonical,
             "protocol_gate": gate_contract,
         }
 
