@@ -2,8 +2,8 @@
   "schema_version": 1,
   "pipeline_id": "ecg_ramba_revision_colab_cli_v1",
   "authority": {
-    "git_commit": "120136735bba9f81253fb3e83c99dae391afd4ed",
-    "git_ref": "refs/tags/ecg-ramba-revision-20260726-v18"
+    "git_commit": "dcab1e26ec5bfdebc9013db197456934eb1c2e63",
+    "git_ref": "refs/tags/ecg-ramba-revision-20260726-v19"
   },
   "canonical_drive_root": "/content/drive/MyDrive/ECG-Ramba",
   "default_auth": "oauth2",
@@ -88,6 +88,33 @@
       }
     },
     {
+      "id": "nb02_adaptation_a100",
+      "notebook": "notebooks/02_predictions_and_external_eval.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Install Base Dependencies",
+        "## Install Model Dependencies",
+        "## Restore And Verify Stable Drive Artifacts",
+        "## Prediction Contract",
+        "## External Frozen-Encoder Representation Extraction",
+        "## True Few-Shot Frozen-Encoder Head Adaptation",
+        "## Reviewer Evidence Completion Matrix And Inventory",
+        "## Mirror Artifacts To Stable Drive Cache"
+      ],
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb02_a100"
+      ],
+      "environment": {
+        "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
+        "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "adaptation_recovery_a100"
+      }
+    },
+    {
       "id": "nb03_cpu",
       "notebook": "notebooks/03_calibration_and_ci.ipynb",
       "mode": "full",
@@ -95,7 +122,7 @@
       "timeout_seconds": 21600,
       "enabled": true,
       "depends_on": [
-        "nb02_a100"
+        "nb02_adaptation_a100"
       ],
       "environment": {}
     },
