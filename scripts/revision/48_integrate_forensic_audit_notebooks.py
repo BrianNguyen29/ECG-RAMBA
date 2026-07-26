@@ -1108,7 +1108,7 @@ run(
     log_path='reports/revision/logs/ptbxl_adaptation_analysis_lock.log',
 )
 run(
-    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
     f'--source-conflict-policy source --include-path "manifests/ptbxl_adaptation_analysis_lock.json" '
     f'--include-path "manifests/ptbxl_adaptation_analysis_lock_source_attestation.json" '
     f'--mirror-root "{MIRROR_REVISION_ROOT}"',
@@ -2392,7 +2392,7 @@ paired_refresh_publish_args = ' '.join(
     for path in PAIRED_REFRESH_OUTPUTS if path.exists() and path.stat().st_size > 0
 )
 run(
-    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+    f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
     f'--source-conflict-policy source {paired_refresh_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
     log_path='reports/revision/logs/in_domain_paired_contract_refresh_mirror_publish.log',
 )
@@ -2458,7 +2458,8 @@ else:
         )
         print(f'Publishing external comparator outputs immediately for dataset={dataset}')
         run(
-            f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+            f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
+            f'--refresh-existing-prefix predictions/external_comparator_folds '
             f'--source-conflict-policy source {dataset_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
             log_path=f'reports/revision/logs/external_learned_comparators_{dataset}_mirror_publish.log',
         )
@@ -2532,7 +2533,7 @@ if ptbxl_protocol_should_run:
         for path in PTBXL_FOLD_PROTOCOL_REQUIRED
     )
     run(
-        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing full '
+        f'python -u scripts/revision/artifact_mirror.py publish --verify-existing size '
         f'--source-conflict-policy source {audit_publish_args} --mirror-root "{MIRROR_REVISION_ROOT}"',
         log_path='reports/revision/logs/ptbxl_fold_protocol_audit_mirror_publish.log',
     )
