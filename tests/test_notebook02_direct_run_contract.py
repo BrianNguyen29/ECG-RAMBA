@@ -217,6 +217,29 @@ class Notebook02DirectRunContractTests(unittest.TestCase):
             self.source,
         )
 
+    def test_external_representation_publish_refresh_is_scoped_and_resumable(self):
+        self.assertIn("def external_representation_publish_command(tag=''):", self.source)
+        self.assertIn(
+            '--include-prefix "predictions/external_representation_folds"',
+            self.source,
+        )
+        self.assertIn(
+            '--refresh-existing-prefix "predictions/external_representation_folds"',
+            self.source,
+        )
+        self.assertIn("--source-conflict-policy source", self.source)
+        self.assertIn("external_representation_publish_command()", self.source)
+        self.assertIn(
+            "external_representation_publish_command('fold9')",
+            self.source,
+        )
+        self.assertLess(
+            self.source.index("external_representation_publish_command()"),
+            self.source.index(
+                "run(extract_base + ' --ptbxl-folds 9 --output-tag fold9'"
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
