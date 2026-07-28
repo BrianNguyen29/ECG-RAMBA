@@ -45,6 +45,10 @@ from src.training_data import build_slice_index  # noqa: E402
 
 PROTOCOL_VERSION = 2
 REPRESENTATION_PROTOCOL = "frozen_encoder_external_record_representation_v2_source_bound"
+EXTERNAL_REPRESENTATION_FEATURE_HANDOFF_CAPABILITY = (
+    "authenticated_cpu_feature_handoff_consumer"
+)
+EXTERNAL_REPRESENTATION_FEATURE_HANDOFF_SCHEMA_VERSION = 1
 MODEL_STEMS = {
     "full": "ecg_ramba_full",
     "resnet": "resnet1d_cnn",
@@ -703,13 +707,59 @@ def main() -> None:
             args.checkpoint_kind,
             expected_record_fp,
         )
-        hydra, hrv, feature_cache, feature_cache_hit = external.generate_features(
+        export_canonical = {
+            key: canonical[key] for key in ("oof_sha256", "freeze_sha256")
+        }
+        feature_handoff_path = external.feature_handoff_manifest_path(
+            args.dataset,
+            tag_for(args),
+        )
+        feature_handoff_seed = external.load_feature_handoff_seed(
+            feature_handoff_path,
+            dataset=args.dataset,
+            output_tag=tag_for(args),
+            checkpoint_kind=args.checkpoint_kind,
+            canonical=export_canonical,
+        )
+        (
+            hydra,
+            hrv,
+            feature_cache,
+            feature_cache_hit,
+            feature_runtime,
+        ) = external.generate_features(
             args.dataset,
             archive,
             signals,
             base_source["record_id"],
             pca_paths,
             False,
+            feature_device=external.CANONICAL_ROCKET_FEATURE_DEVICE,
+            feature_batch_size=0,
+            feature_parity_records=4,
+            require_existing=True,
+            producer_runtime=feature_handoff_seed["feature_runtime"],
+        )
+        expected_feature_handoff = external.feature_handoff_payload(
+            dataset=args.dataset,
+            output_tag=tag_for(args),
+            checkpoint_kind=args.checkpoint_kind,
+            canonical=export_canonical,
+            archive=archive,
+            source_archive_sha256=archive_contract["sha256"],
+            source_config_hash=source_hash,
+            record_ids=base_source["record_id"],
+            group_ids=base_source["group_id"],
+            split_ids=base_source["split_id"],
+            load_summary=load_summary,
+            pca_paths=pca_paths,
+            feature_cache=feature_cache,
+            feature_cache_hit=feature_cache_hit,
+            feature_runtime=feature_runtime,
+        )
+        authenticated_feature_handoff = external.validate_feature_handoff(
+            feature_handoff_path,
+            expected_feature_handoff,
         )
         xs, xhr, full_slice_record_index, _slice_index = external.build_slices(signals, hrv)
         if not np.array_equal(full_slice_record_index, slice_record_ids):
@@ -722,6 +772,13 @@ def main() -> None:
             "feature_cache": str(feature_cache),
             "feature_cache_sha256": sha256_file(feature_cache),
             "feature_cache_hit": feature_cache_hit,
+            "feature_runtime": feature_runtime,
+            "feature_handoff": {
+                "path": str(feature_handoff_path),
+                "sha256": sha256_file(feature_handoff_path),
+                "capability": authenticated_feature_handoff.get("capability"),
+                "schema_version": authenticated_feature_handoff.get("schema_version"),
+            },
         }
 
     status_rows: list[dict[str, Any]] = []
@@ -846,6 +903,14 @@ def main() -> None:
                         "path": full_aux["feature_cache"],
                         "sha256": full_aux["feature_cache_sha256"],
                         "cache_hit": full_aux["feature_cache_hit"],
+                        "runtime": full_aux["feature_runtime"],
+                        "handoff": full_aux["feature_handoff"],
+                        "consumer_capability": (
+                            EXTERNAL_REPRESENTATION_FEATURE_HANDOFF_CAPABILITY
+                        ),
+                        "consumer_schema_version": (
+                            EXTERNAL_REPRESENTATION_FEATURE_HANDOFF_SCHEMA_VERSION
+                        ),
                     }
                     if model_name == "full" and full_aux is not None
                     else None

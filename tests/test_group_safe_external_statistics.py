@@ -1,4 +1,6 @@
+import ast
 import importlib
+import inspect
 import json
 import tempfile
 import unittest
@@ -18,6 +20,51 @@ analysis_lock_runner = importlib.import_module("scripts.revision.51_ptbxl_adapta
 
 
 class GroupSafeExternalStatisticsTests(unittest.TestCase):
+    def test_external_representation_consumes_authenticated_cpu_feature_handoff(self):
+        tree = ast.parse(inspect.getsource(representations.main))
+        generate_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "external"
+            and node.func.attr == "generate_features"
+        ]
+        self.assertEqual(len(generate_calls), 1)
+        keywords = {keyword.arg for keyword in generate_calls[0].keywords}
+        self.assertTrue(
+            {
+                "feature_device",
+                "feature_batch_size",
+                "feature_parity_records",
+                "require_existing",
+                "producer_runtime",
+            }.issubset(keywords)
+        )
+
+        external_calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "external"
+        }
+        self.assertIn("load_feature_handoff_seed", external_calls)
+        self.assertIn("validate_feature_handoff", external_calls)
+
+        assignments = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and node.value is generate_calls[0]
+        ]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(len(assignments[0].targets), 1)
+        self.assertIsInstance(assignments[0].targets[0], ast.Tuple)
+        self.assertEqual(len(assignments[0].targets[0].elts), 5)
+
     def test_adaptation_manifests_are_bound_to_temporally_qualified_analysis_lock(self):
         args = SimpleNamespace(
             models="full,resnet,raw_mamba,transformer",
