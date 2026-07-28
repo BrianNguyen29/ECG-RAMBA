@@ -169,6 +169,29 @@ class ColabCliPipelineTests(unittest.TestCase):
                 self.pipeline.completed_stage_log(log_path, "nb00_cpu")
             )
 
+    def test_session_exists_rejects_cli_not_found_with_zero_exit_code(self):
+        missing = SimpleNamespace(
+            returncode=0,
+            stdout="[ecgr-missing] Session not found.\n",
+            stderr="",
+        )
+        active = SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "[ecgr-active] gpu-a100 | Hardware: A100 | "
+                "Variant: GPU | Status: IDLE\n"
+            ),
+            stderr="",
+        )
+        with mock.patch.object(self.pipeline, "run_capture", return_value=missing):
+            self.assertFalse(
+                self.pipeline.session_exists(["colab"], "ecgr-missing")
+            )
+        with mock.patch.object(self.pipeline, "run_capture", return_value=active):
+            self.assertTrue(
+                self.pipeline.session_exists(["colab"], "ecgr-active")
+            )
+
     def test_executed_notebook_is_preserved_with_run_id(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

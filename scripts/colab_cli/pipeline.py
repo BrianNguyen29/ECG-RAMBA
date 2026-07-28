@@ -138,7 +138,14 @@ def stage_log_dir(stage_id: str) -> Path:
 
 def session_exists(base: list[str], name: str) -> bool:
     result = run_capture(base + ["status", "-s", name])
-    return result.returncode == 0
+    output = "\n".join(
+        value
+        for value in (result.stdout, result.stderr)
+        if value
+    ).lower()
+    if "session" in output and "not found" in output:
+        return False
+    return result.returncode == 0 and f"[{name.lower()}]" in output
 
 
 def create_session(base: list[str], stage: dict[str, Any], name: str) -> None:
