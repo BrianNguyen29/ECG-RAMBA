@@ -317,6 +317,20 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook03_defers_stale_paired_assets_until_notebook04(self):
+        _, source = notebook_source("03_calibration_and_ci.ipynb")
+        for token in (
+            "stale_presentation_pairs",
+            "pair_full_sha != presentation_oof_sha",
+            "pair_freeze_sha != presentation_freeze_sha",
+            "Reviewer presentation assets remain deferred; Notebook 07 retains the final strict gate.",
+        ):
+            self.assertIn(token, source)
+        self.assertLess(
+            source.index("stale_presentation_pairs"),
+            source.index("29_reviewer_presentation_assets.py"),
+        )
+
     def test_notebook06_finds_current_notebook02_mamba_installer(self):
         payload = notebook_payload("02_predictions_and_external_eval.ipynb")
         capability = "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'"
