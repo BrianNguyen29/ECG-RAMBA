@@ -308,6 +308,15 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook03_restores_reviewer_presentation_calibration_tables(self):
+        _, source = notebook_source("03_calibration_and_ci.ipynb")
+        for token in (
+            "tables/reliability_bins_oof_final_ema_predictions.csv",
+            "tables/calibration_by_class_oof_final_ema_predictions.csv",
+            "29_reviewer_presentation_assets.py",
+        ):
+            self.assertIn(token, source)
+
     def test_notebook06_finds_current_notebook02_mamba_installer(self):
         payload = notebook_payload("02_predictions_and_external_eval.ipynb")
         capability = "MAMBA_INSTALLER_CAPABILITY = 'ecg_ramba_mamba_installer_v1'"
