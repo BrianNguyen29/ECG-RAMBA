@@ -130,6 +130,11 @@ class ColabCliPipelineTests(unittest.TestCase):
             "## True Few-Shot Frozen-Encoder Head Adaptation",
         }
         self.assertTrue(required_sections.issubset(set(stage["sections"])))
+        self.assertIn("## GPU External Prediction Inference", stage["sections"])
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_EXTERNAL_RUN_PROFILE"],
+            "cpu_gate_all",
+        )
         with tempfile.TemporaryDirectory() as directory:
             notebook = self.module.build_stage_notebook(
                 ROOT,
@@ -141,6 +146,9 @@ class ColabCliPipelineTests(unittest.TestCase):
             "".join(cell.get("source", [])) for cell in notebook["cells"]
         )
         self.assertIn("def _comparator_artifacts", source)
+        self.assertIn("external_archives = {}", source)
+        self.assertIn("import pandas as pd", source)
+        self.assertIn("def _restore_report_artifact", source)
 
     def test_adaptation_cpu_reuse_omits_model_installer_and_keeps_gates(self):
         stage = self.module.stage_by_id(
@@ -157,6 +165,34 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn(
             "## External Frozen-Encoder Representation Extraction",
             stage["sections"],
+        )
+        self.assertIn("## GPU External Prediction Inference", stage["sections"])
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_EXTERNAL_RUN_PROFILE"],
+            "cpu_gate_all",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            notebook = self.module.build_stage_notebook(
+                ROOT,
+                self.manifest,
+                stage,
+                Path(directory) / "stage.ipynb",
+            )
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+        )
+        self.assertIn("external_archives = {}", source)
+        self.assertIn("import pandas as pd", source)
+        self.assertIn("def _restore_report_artifact", source)
+
+    def test_adaptation_a100_includes_cache_restore_dependency_section(self):
+        stage = self.module.stage_by_id(
+            self.manifest, "nb02_adaptation_a100"
+        )
+        self.assertIn("## GPU External Prediction Inference", stage["sections"])
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_EXTERNAL_RUN_PROFILE"],
+            "cpu_gate_all",
         )
 
     def test_generated_notebook_is_clean_and_source_bound(self):

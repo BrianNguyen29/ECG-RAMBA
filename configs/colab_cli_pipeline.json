@@ -97,6 +97,7 @@
         "## Install Model Dependencies",
         "## Restore And Verify Stable Drive Artifacts",
         "## Prediction Contract",
+        "## GPU External Prediction Inference",
         "## PTB-XL Adaptation Analysis Lock",
         "## External Learned-Comparator Zero-Target-Label Inference",
         "## PTB-XL Fold 9/10 Patient and Unsupported-Only Audit",
@@ -116,7 +117,7 @@
       "environment": {
         "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
         "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
-        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "adaptation_recovery_a100"
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "cpu_gate_all"
       }
     },
     {
@@ -129,6 +130,7 @@
         "## Install Model Dependencies",
         "## Restore And Verify Stable Drive Artifacts",
         "## Prediction Contract",
+        "## GPU External Prediction Inference",
         "## PTB-XL Adaptation Analysis Lock",
         "## External Learned-Comparator Zero-Target-Label Inference",
         "## PTB-XL Fold 9/10 Patient and Unsupported-Only Audit",
@@ -148,7 +150,7 @@
       "environment": {
         "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
         "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
-        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "adaptation_recovery_gpu",
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "cpu_gate_all",
         "ECG_RAMBA_GPU_FALLBACK": "1"
       }
     },
@@ -161,6 +163,7 @@
         "## Install Base Dependencies",
         "## Restore And Verify Stable Drive Artifacts",
         "## Prediction Contract",
+        "## GPU External Prediction Inference",
         "## PTB-XL Adaptation Analysis Lock",
         "## External Learned-Comparator Zero-Target-Label Inference",
         "## PTB-XL Fold 9/10 Patient and Unsupported-Only Audit",
@@ -180,7 +183,7 @@
       "environment": {
         "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
         "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
-        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "adaptation_recovery_cpu_reuse",
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "cpu_gate_all",
         "ECG_RAMBA_CPU_REUSE_ONLY": "1"
       }
     },
