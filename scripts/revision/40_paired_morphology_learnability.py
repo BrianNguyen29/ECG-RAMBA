@@ -96,6 +96,9 @@ def canonical_json_sha256(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+BOOTSTRAP_UNIT_LABEL = "Chapman record/subject"
+
+
 def authenticated_group_contract(freeze_info: dict) -> dict:
     group = freeze_info.get("group_contract") or {}
     sidecar = group.get("sidecar") or {}
@@ -112,11 +115,14 @@ def authenticated_group_contract(freeze_info: dict) -> dict:
     }
     if (
         required["status"] != "verified"
+        or not isinstance(required["bootstrap_unit"], str)
+        or not required["bootstrap_unit"].strip()
         or required["one_record_per_group"] is not True
         or int(required["n_records"] or -1) != int(required["n_groups"] or -2)
         or not required["group_sidecar_sha256"]
     ):
         raise RuntimeError("Morphology paired output lacks a verified one-record-per-group contract")
+    required["bootstrap_unit_label"] = BOOTSTRAP_UNIT_LABEL
     required["group_contract_sha256"] = canonical_json_sha256(group)
     return required
 

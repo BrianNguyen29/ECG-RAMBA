@@ -168,6 +168,12 @@ class PairedInferenceClaimScopeTests(unittest.TestCase):
             module = load_revision_script(module_name, filename)
             contract = module.authenticated_group_contract({"group_contract": group})
             self.assertEqual(contract["group_sidecar_sha256"], "a" * 64)
+            if filename == "40_paired_morphology_learnability.py":
+                self.assertEqual(contract["bootstrap_unit_label"], "Chapman record/subject")
+                with self.assertRaisesRegex(RuntimeError, "one-record-per-group"):
+                    module.authenticated_group_contract(
+                        {"group_contract": {**group, "bootstrap_unit": None}}
+                    )
             module.validate_paired_interval(valid_ci, [{} for _ in range(10)], 10)
             with self.assertRaisesRegex(RuntimeError, "incomplete"):
                 module.validate_paired_interval(valid_ci, [{} for _ in range(9)], 10)
