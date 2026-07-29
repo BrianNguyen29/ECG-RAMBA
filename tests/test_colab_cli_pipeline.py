@@ -116,6 +116,32 @@ class ColabCliPipelineTests(unittest.TestCase):
         )
         self.assertEqual(stage["hardware"], "a100")
 
+    def test_adaptation_gpu_fallback_is_explicit_and_dependency_complete(self):
+        stage = self.module.stage_by_id(
+            self.manifest, "nb02_adaptation_gpu"
+        )
+        self.assertFalse(stage["enabled"])
+        self.assertEqual(stage["hardware"], "gpu")
+        self.assertEqual(stage["environment"]["ECG_RAMBA_GPU_FALLBACK"], "1")
+        required_sections = {
+            "## External Learned-Comparator Zero-Target-Label Inference",
+            "## Paired External Comparator Audit",
+            "## External Frozen-Encoder Representation Extraction",
+            "## True Few-Shot Frozen-Encoder Head Adaptation",
+        }
+        self.assertTrue(required_sections.issubset(set(stage["sections"])))
+        with tempfile.TemporaryDirectory() as directory:
+            notebook = self.module.build_stage_notebook(
+                ROOT,
+                self.manifest,
+                stage,
+                Path(directory) / "stage.ipynb",
+            )
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+        )
+        self.assertIn("def _comparator_artifacts", source)
+
     def test_generated_notebook_is_clean_and_source_bound(self):
         stage = self.module.stage_by_id(self.manifest, "nb03_cpu")
         with tempfile.TemporaryDirectory() as directory:

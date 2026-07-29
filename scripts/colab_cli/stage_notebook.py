@@ -34,7 +34,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
         unknown = set(stage.get("depends_on", [])) - known
         if unknown:
             raise ValueError(f"Stage {stage['id']} has unknown dependencies: {unknown}")
-        if stage.get("hardware") not in {"cpu", "a100"}:
+        if stage.get("hardware") not in {"cpu", "gpu", "a100"}:
             raise ValueError(f"Stage {stage['id']} has unsupported hardware")
         if stage.get("mode") not in {"full", "sections"}:
             raise ValueError(f"Stage {stage['id']} has unsupported mode")
@@ -206,6 +206,10 @@ except FileNotFoundError:
 if _STAGE_EXPECTED_HARDWARE == "a100" and "A100" not in _gpu_name:
     raise RuntimeError(
         f"{{_STAGE_ID}} requires an A100 runtime; observed GPU={{_gpu_name or 'none'}}"
+    )
+if _STAGE_EXPECTED_HARDWARE == "gpu" and not _gpu_name:
+    raise RuntimeError(
+        f"{{_STAGE_ID}} requires a CUDA GPU runtime; observed GPU=none"
     )
 
 print("COLAB CLI STAGE START")

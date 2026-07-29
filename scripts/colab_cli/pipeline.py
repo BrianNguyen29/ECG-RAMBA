@@ -152,6 +152,8 @@ def create_session(base: list[str], stage: dict[str, Any], name: str) -> None:
     command = base + ["new", "-s", name]
     if stage["hardware"] == "a100":
         command += ["--gpu", "A100"]
+    elif stage["hardware"] == "gpu":
+        command += ["--gpu", "T4"]
     print("$", render_command(command), flush=True)
     subprocess.run(command, check=True)
 
@@ -265,6 +267,8 @@ def dry_run_commands(
     create = base + ["new", "-s", name]
     if stage["hardware"] == "a100":
         create += ["--gpu", "A100"]
+    elif stage["hardware"] == "gpu":
+        create += ["--gpu", "T4"]
     return [
         create,
         base + ["drivemount", "-s", name, "/content/drive"],
