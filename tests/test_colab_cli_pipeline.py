@@ -142,6 +142,23 @@ class ColabCliPipelineTests(unittest.TestCase):
         )
         self.assertIn("def _comparator_artifacts", source)
 
+    def test_adaptation_cpu_reuse_omits_model_installer_and_keeps_gates(self):
+        stage = self.module.stage_by_id(
+            self.manifest, "nb02_adaptation_cpu_reuse"
+        )
+        self.assertFalse(stage["enabled"])
+        self.assertEqual(stage["hardware"], "cpu")
+        self.assertEqual(stage["environment"]["ECG_RAMBA_CPU_REUSE_ONLY"], "1")
+        self.assertNotIn("## Install Model Dependencies", stage["sections"])
+        self.assertIn(
+            "## External Learned-Comparator Zero-Target-Label Inference",
+            stage["sections"],
+        )
+        self.assertIn(
+            "## External Frozen-Encoder Representation Extraction",
+            stage["sections"],
+        )
+
     def test_generated_notebook_is_clean_and_source_bound(self):
         stage = self.module.stage_by_id(self.manifest, "nb03_cpu")
         with tempfile.TemporaryDirectory() as directory:

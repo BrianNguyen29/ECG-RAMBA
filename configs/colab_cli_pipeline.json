@@ -153,6 +153,38 @@
       }
     },
     {
+      "id": "nb02_adaptation_cpu_reuse",
+      "notebook": "notebooks/02_predictions_and_external_eval.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Install Base Dependencies",
+        "## Restore And Verify Stable Drive Artifacts",
+        "## Prediction Contract",
+        "## PTB-XL Adaptation Analysis Lock",
+        "## External Learned-Comparator Zero-Target-Label Inference",
+        "## PTB-XL Fold 9/10 Patient and Unsupported-Only Audit",
+        "## Paired External Comparator Audit",
+        "## Group-Safe Score Calibration",
+        "## External Frozen-Encoder Representation Extraction",
+        "## True Few-Shot Frozen-Encoder Head Adaptation",
+        "## Reviewer Evidence Completion Matrix And Inventory",
+        "## Mirror Artifacts To Stable Drive Cache"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 86400,
+      "enabled": false,
+      "depends_on": [
+        "nb02_adaptation_gpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_EXTERNAL_FEATURE_PROFILE": "off",
+        "ECG_RAMBA_RUN_PTBXL_FOLD9_FEATURES": "0",
+        "ECG_RAMBA_EXTERNAL_RUN_PROFILE": "adaptation_recovery_cpu_reuse",
+        "ECG_RAMBA_CPU_REUSE_ONLY": "1"
+      }
+    },
+    {
       "id": "nb03_cpu",
       "notebook": "notebooks/03_calibration_and_ci.ipynb",
       "mode": "full",
