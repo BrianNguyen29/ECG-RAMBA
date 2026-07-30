@@ -40,12 +40,20 @@ from scripts.revision.common import (  # noqa: E402
     save_json,
     sha256_file,
 )
+from scripts.revision.baseline_artifact_provenance import (  # noqa: E402
+    validate_baseline_producer_provenance,
+)
 
 
 FULL_LABEL = "Full ECG-RAMBA frozen OOF"
 COMPARATOR_LABEL = "Fixed-seed ROCKET-family MAX+PPV linear head"
 PAIRED_INFERENCE_SCHEMA_VERSION = 2
 EXPECTED_MINIROCKET_PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
+EXPECTED_ROCKET_FEATURE_CONTRACTS = {
+    "minirocket_raw",
+    "fixed_seed_rocket_family_max_ppv_20000",
+}
+EXPECTED_ROCKET_TRANSFORM = "fixed_seed_rocket_family_random_convolution_max_ppv"
 
 
 @dataclass(frozen=True)
@@ -283,19 +291,33 @@ def validate_minirocket_artifacts(
         raise FileNotFoundError(f"Missing MiniRocket manifest JSON: {manifest_path}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    producer = PROJECT_ROOT / "scripts" / "revision" / "10_minirocket_only_baseline.py"
-    producer_sha256 = sha256_file(producer)
-    for source_name, payload in (("summary", summary), ("manifest", manifest)):
-        if payload.get("runner_sha256") != producer_sha256:
-            raise RuntimeError(f"MiniRocket {source_name} producer runner SHA is stale.")
+    producer_provenance = validate_baseline_producer_provenance(
+        baseline_key="minirocket",
+        producer_path=PROJECT_ROOT / "scripts" / "revision" / "10_minirocket_only_baseline.py",
+        summary_path=summary_path,
+        manifest_path=manifest_path,
+        summary=summary,
+        manifest=manifest,
+    )
     for source_name, payload in [("summary", summary), ("manifest", manifest)]:
         if payload.get("protocol") != EXPECTED_MINIROCKET_PROTOCOL:
             raise ValueError(
                 f"MiniRocket {source_name} protocol mismatch: "
                 f"{payload.get('protocol')} != {EXPECTED_MINIROCKET_PROTOCOL}"
             )
-        if payload.get("feature_contract") != "minirocket_raw":
-            raise ValueError(f"MiniRocket {source_name} feature_contract must be minirocket_raw.")
+        if payload.get("feature_contract") not in EXPECTED_ROCKET_FEATURE_CONTRACTS:
+            raise ValueError(
+                f"Fixed-seed ROCKET-family {source_name} feature_contract is unsupported: "
+                f"{payload.get('feature_contract')}"
+            )
+        if payload.get("evaluated_transform_name") != EXPECTED_ROCKET_TRANSFORM:
+            raise ValueError(
+                f"Fixed-seed ROCKET-family {source_name} transform identity is missing or stale."
+            )
+        if payload.get("canonical_minirocket") is not False:
+            raise ValueError(
+                f"Fixed-seed ROCKET-family {source_name} must declare canonical_minirocket=false."
+            )
         if payload.get("feature_preprocessing") != "fold_train_standardization":
             raise ValueError(f"MiniRocket {source_name} must use fold_train_standardization.")
     if require_manuscript_ready and summary.get("manuscript_ready") is not True:
@@ -323,6 +345,7 @@ def validate_minirocket_artifacts(
         "protocol": summary.get("protocol"),
         "feature_contract": summary.get("feature_contract"),
         "feature_preprocessing": summary.get("feature_preprocessing"),
+        "producer_provenance": producer_provenance,
     }
 
 

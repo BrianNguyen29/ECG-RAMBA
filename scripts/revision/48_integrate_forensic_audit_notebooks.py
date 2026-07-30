@@ -132,6 +132,8 @@ REVISION_TOKEN_REQUIREMENTS = {
         'frozen_encoder_external_record_representation_v2_source_bound',
         'validate_source_provenance',
         'current runner/canonical contract',
+        'EXTERNAL_REPRESENTATION_FEATURE_HANDOFF_CAPABILITY',
+        'authenticated_cpu_feature_handoff_consumer',
     ],
     'scripts/revision/35_true_fewshot_head_adaptation.py': [
         'embedding_manifest_path',
@@ -2842,6 +2844,57 @@ def integrate_remaining_run_history() -> None:
         save(name, notebook)
 
 
+def integrate_notebook04_baseline_provenance_inputs() -> None:
+    """Restore the group sidecar and preflight the paired provenance helper."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    setup_cells = [
+        cell
+        for cell in notebook["cells"]
+        if "REQUIRED_REVISION_ARTIFACTS_FOR_04 = [" in source(cell)
+    ]
+    if len(setup_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 04 required-artifact setup cell count={len(setup_cells)}"
+        )
+    setup = setup_cells[0]
+    text = source(setup)
+    sidecar_entry = "    'manifests/oof_final_ema_group_sidecar.npz',\n"
+    required_start = text.index("REQUIRED_REVISION_ARTIFACTS_FOR_04 = [")
+    required_end = text.index("]\n", required_start)
+    required_block = text[required_start:required_end]
+    if "oof_final_ema_group_sidecar.npz" not in required_block:
+        anchor = "    'manifests/oof_final_ema_freeze_manifest.json',\n"
+        if anchor not in text:
+            raise RuntimeError("Notebook 04 freeze-manifest restore anchor missing")
+        text = text.replace(anchor, anchor + sidecar_entry, 1)
+    set_source(setup, text)
+
+    direct_cells = [
+        cell
+        for cell in notebook["cells"]
+        if "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {" in source(cell)
+    ]
+    if len(direct_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 04 direct-source setup cell count={len(direct_cells)}"
+        )
+    direct = direct_cells[0]
+    text = source(direct)
+    provenance_entry = (
+        "    'scripts/revision/baseline_artifact_provenance.py': (\n"
+        "        'reviewed_baseline_runner_compatibility_attestation_v1',\n"
+        "        'SCHEMA_VERSION = 1',\n"
+        "    ),\n"
+    )
+    if "scripts/revision/baseline_artifact_provenance.py" not in text:
+        anchor = "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {\n"
+        text = text.replace(anchor, anchor + provenance_entry, 1)
+    set_source(direct, text)
+    save(name, notebook)
+
+
 def integrate_notebook04_paired_reuse_contract() -> None:
     """Reject paired artifacts produced by legacy pseudo-significance runners."""
 
@@ -4048,6 +4101,9 @@ def validate() -> None:
         MAMBA_MARKER,
         MAMBA_SCHEMA_MARKER,
         "Could not locate exactly one canonical Mamba installer cell in Notebook 02.",
+        "scripts/revision/baseline_artifact_provenance.py",
+        "reviewed_baseline_runner_compatibility_attestation_v1",
+        "'manifests/oof_final_ema_group_sidecar.npz'",
     ):
         if token not in notebook04_text:
             raise RuntimeError(f"Notebook 04 Raw Mamba installer contract token missing: {token}")
@@ -4063,6 +4119,7 @@ def main() -> None:
     integrate_notebook04_mamba_installer_consumer()
     integrate_notebook02a_training_log()
     integrate_remaining_run_history()
+    integrate_notebook04_baseline_provenance_inputs()
     integrate_notebook04_paired_reuse_contract()
     integrate_notebook03_strict_inputs()
     integrate_notebook03_cpu_only_setup()

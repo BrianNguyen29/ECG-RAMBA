@@ -133,6 +133,30 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             self.assertIn(token, raw_mamba_cell)
         self.assertNotIn("'Mamba wheel environment' in candidate_source", raw_mamba_cell)
 
+    def test_paired_setup_restores_group_sidecar_and_provenance_helper(self):
+        setup_cell = next(
+            cell
+            for cell in self.code_cells
+            if "REQUIRED_REVISION_ARTIFACTS_FOR_04 = [" in cell
+        )
+        self.assertIn(
+            "'manifests/oof_final_ema_group_sidecar.npz'",
+            setup_cell,
+        )
+        direct_cell = next(
+            cell
+            for cell in self.code_cells
+            if "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {" in cell
+        )
+        self.assertIn(
+            "scripts/revision/baseline_artifact_provenance.py",
+            direct_cell,
+        )
+        self.assertIn(
+            "reviewed_baseline_runner_compatibility_attestation_v1",
+            direct_cell,
+        )
+
     def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
         for token in (
             "39_morphology_learnability_control.py",
