@@ -7,7 +7,16 @@ from unittest.mock import patch
 import numpy as np
 
 from configs.config import setup_paths
-from scripts.revision.common import aggregate_record_probabilities, power_mean, save_csv
+from scripts.revision.common import (
+    aggregate_record_probabilities,
+    brier_macro_only,
+    calibration_summary,
+    ece_macro_only,
+    f1_macro_only,
+    multilabel_metrics,
+    power_mean,
+    save_csv,
+)
 
 
 class PowerMeanTests(unittest.TestCase):
@@ -166,6 +175,44 @@ class CsvOutputTests(unittest.TestCase):
         self.assertEqual(saved[0]["comparator"], "")
         self.assertEqual(saved[1]["primary_value"], "")
         self.assertEqual(saved[1]["comparator"], "resnet")
+
+
+class ScalarMetricParityTests(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(20260730)
+        self.y_true = rng.binomial(1, 0.2, size=(2048, 7)).astype(np.int8)
+        self.y_prob = rng.random((2048, 7), dtype=np.float64)
+
+    def assert_scalar_equal(self, observed, expected):
+        self.assertAlmostEqual(observed, expected, places=14)
+
+    def test_specialized_metrics_match_full_summaries(self):
+        metrics = multilabel_metrics(self.y_true, self.y_prob, threshold=0.5)
+        calibration = calibration_summary(self.y_true, self.y_prob, n_bins=15)
+        self.assert_scalar_equal(f1_macro_only(self.y_true, self.y_prob, threshold=0.5), metrics["f1_macro"])
+        self.assert_scalar_equal(brier_macro_only(self.y_true, self.y_prob), calibration["brier_macro"])
+        self.assert_scalar_equal(ece_macro_only(self.y_true, self.y_prob, n_bins=15), calibration["ece_macro"])
+
+    def test_specialized_metrics_match_on_bootstrap_resamples(self):
+        rng = np.random.default_rng(42)
+        for _ in range(10):
+            idx = rng.integers(0, len(self.y_true), size=len(self.y_true))
+            y_true = self.y_true[idx]
+            y_prob = self.y_prob[idx]
+            metrics = multilabel_metrics(y_true, y_prob, threshold=0.5)
+            calibration = calibration_summary(y_true, y_prob, n_bins=15)
+            self.assert_scalar_equal(f1_macro_only(y_true, y_prob, threshold=0.5), metrics["f1_macro"])
+            self.assert_scalar_equal(brier_macro_only(y_true, y_prob), calibration["brier_macro"])
+            self.assert_scalar_equal(ece_macro_only(y_true, y_prob, n_bins=15), calibration["ece_macro"])
+
+    def test_single_label_semantics_match(self):
+        y_true = self.y_true[:, :1]
+        y_prob = self.y_prob[:, :1]
+        metrics = multilabel_metrics(y_true, y_prob, threshold=0.5)
+        calibration = calibration_summary(y_true, y_prob, n_bins=15)
+        self.assert_scalar_equal(f1_macro_only(y_true, y_prob, threshold=0.5), metrics["f1_macro"])
+        self.assert_scalar_equal(brier_macro_only(y_true, y_prob), calibration["brier_macro"])
+        self.assert_scalar_equal(ece_macro_only(y_true, y_prob, n_bins=15), calibration["ece_macro"])
 
 
 if __name__ == "__main__":

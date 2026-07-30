@@ -336,6 +336,50 @@ def calibration_summary(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15
     }
 
 
+def f1_macro_only(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> float:
+    """Compute only macro F1 without also evaluating ranking metrics."""
+    from sklearn.metrics import f1_score
+
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.shape != y_prob.shape:
+        raise ValueError(f"Shape mismatch: {y_true.shape} vs {y_prob.shape}")
+    y_pred = (y_prob >= threshold).astype(np.float32)
+    if y_true.shape[1] == 1:
+        return float(f1_score(y_true[:, 0], y_pred[:, 0], average="binary", zero_division=0))
+    return float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+
+
+def brier_macro_only(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Compute the same evaluable-class macro Brier score as calibration_summary."""
+    from sklearn.metrics import brier_score_loss
+
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.shape != y_prob.shape:
+        raise ValueError(f"Shape mismatch: {y_true.shape} vs {y_prob.shape}")
+    scores = [
+        brier_score_loss(y_true[:, c], y_prob[:, c])
+        for c in range(y_true.shape[1])
+        if len(np.unique(y_true[:, c])) >= 2
+    ]
+    return float(np.mean(scores)) if scores else math.nan
+
+
+def ece_macro_only(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 15) -> float:
+    """Compute the same evaluable-class macro ECE as calibration_summary."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if y_true.shape != y_prob.shape:
+        raise ValueError(f"Shape mismatch: {y_true.shape} vs {y_prob.shape}")
+    scores = [
+        ece_binary(y_true[:, c], y_prob[:, c], n_bins=n_bins)
+        for c in range(y_true.shape[1])
+        if len(np.unique(y_true[:, c])) >= 2
+    ]
+    return float(np.mean(scores)) if scores else math.nan
+
+
 def multilabel_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> dict:
     """Fixed-threshold multi-label metrics plus macro ROC-AUC/PR-AUC."""
     from sklearn.metrics import (
