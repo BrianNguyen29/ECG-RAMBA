@@ -2,8 +2,8 @@
   "schema_version": 1,
   "pipeline_id": "ecg_ramba_revision_colab_cli_v1",
   "authority": {
-    "git_commit": "da1718526db50c0a2d2700a38f315b66014f3583",
-    "git_ref": "refs/tags/ecg-ramba-revision-20260730-v30"
+    "git_commit": "3f806bd996c836cfc13247c6fef656ded4a054bd",
+    "git_ref": "refs/tags/ecg-ramba-revision-20260730-v31"
   },
   "canonical_drive_root": "/content/drive/MyDrive/ECG-Ramba",
   "default_auth": "oauth2",
