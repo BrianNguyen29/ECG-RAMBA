@@ -142,6 +142,19 @@ class PairedInferenceClaimScopeTests(unittest.TestCase):
             self.assertNotIn("full_significantly_better", text, name)
             self.assertNotIn("comparator_significantly_better", text, name)
 
+    def test_all_baseline_pair_rows_declare_pointwise_effect_size_scope(self) -> None:
+        names = [
+            "11_paired_full_vs_minirocket.py",
+            "15_paired_full_vs_resnet.py",
+            "17_paired_full_vs_raw_mamba.py",
+            "25_paired_full_vs_transformer.py",
+            "27_paired_full_vs_hybrid_morphology.py",
+        ]
+        declaration = 'row["inference_scope"] = "pointwise_percentile_ci_effect_size_only"'
+        for name in names:
+            text = (ROOT / "scripts" / "revision" / name).read_text(encoding="utf-8")
+            self.assertIn(declaration, text, name)
+
     def test_all_baseline_pairs_fail_closed_on_prediction_digest_and_protocol(self) -> None:
         names = [
             "11_paired_full_vs_minirocket.py",

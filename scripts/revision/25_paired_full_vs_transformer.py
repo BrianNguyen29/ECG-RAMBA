@@ -320,6 +320,7 @@ def main() -> None:
 
     paired_helpers.mark_pointwise_inference(rows)
     for row in rows:
+        row["inference_scope"] = "pointwise_percentile_ci_effect_size_only"
         row["safe_wording"] = safe_wording(row["metric_family"], row["interpretation"])
 
     out_table = resolve_path(args.out_table)
