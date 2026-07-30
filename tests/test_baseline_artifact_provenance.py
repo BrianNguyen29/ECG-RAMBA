@@ -13,6 +13,27 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class BaselineArtifactProvenanceTests(unittest.TestCase):
+    def test_current_authority_bundle_attestations_are_pinned(self) -> None:
+        for (
+            baseline_key,
+            attestation,
+        ) in provenance.REVIEWED_RUNNER_COMPATIBILITY.items():
+            with self.subTest(baseline_key=baseline_key):
+                self.assertEqual(
+                    provenance.current_authority_source_bundle_sha256(
+                        tuple(attestation["source_bundle_paths"])
+                    ),
+                    attestation["compatible_current_source_bundle_sha256"],
+                )
+
+    def test_resnet_exact_summary_digest_matches_reviewed_package(self) -> None:
+        self.assertEqual(
+            provenance.REVIEWED_RUNNER_COMPATIBILITY["resnet"][
+                "expected_summary_sha256"
+            ],
+            "3db0d738fc103cbceacc81f921c4e70eba3058b7617fa5549bfd7dfb7c6854f2",
+        )
+
     def write_package(
         self,
         root: Path,
