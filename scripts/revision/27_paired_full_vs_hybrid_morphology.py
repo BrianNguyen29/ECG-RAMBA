@@ -137,6 +137,7 @@ def validate_hybrid_morphology_artifacts(
         producer_path=PROJECT_ROOT / "scripts" / "revision" / "26_hybrid_morphology_baseline.py",
         summary_path=summary_path,
         manifest_path=manifest_path,
+        prediction_path=comparator.path,
         summary=summary,
         manifest=manifest,
     )
@@ -155,9 +156,9 @@ def validate_hybrid_morphology_artifacts(
         raise ValueError("Frozen-transform morphology MLP-head summary is not manuscript_ready=true.")
     artifact_sha = manifest.get("artifact_sha256", {})
     expected_pred_sha = artifact_sha.get("predictions")
-    if expected_pred_sha and expected_pred_sha != comparator.sha256:
+    if expected_pred_sha != comparator.sha256:
         raise RuntimeError(f"Frozen-transform morphology MLP-head prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}")
-    if comparator.metadata.get("protocol") not in (None, EXPECTED_HYBRID_PROTOCOL):
+    if comparator.metadata.get("protocol") != EXPECTED_HYBRID_PROTOCOL:
         raise ValueError(f"Frozen-transform morphology MLP-head prediction protocol mismatch: {comparator.metadata.get('protocol')}")
     if comparator.metadata.get("feature_contract") not in (None, EXPECTED_HYBRID_FEATURE_CONTRACT):
         raise ValueError(

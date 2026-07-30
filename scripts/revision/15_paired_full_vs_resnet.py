@@ -291,6 +291,7 @@ def validate_resnet_artifacts(
         producer_path=PROJECT_ROOT / "scripts" / "revision" / "14_resnet1d_cnn_baseline.py",
         summary_path=summary_path,
         manifest_path=manifest_path,
+        prediction_path=comparator.path,
         summary=summary,
         manifest=manifest,
     )
@@ -306,11 +307,11 @@ def validate_resnet_artifacts(
         raise ValueError("ResNet1D/CNN summary is not manuscript_ready=true.")
     artifact_sha = manifest.get("artifact_sha256", {})
     expected_pred_sha = artifact_sha.get("predictions")
-    if expected_pred_sha and expected_pred_sha != comparator.sha256:
+    if expected_pred_sha != comparator.sha256:
         raise RuntimeError(
             f"ResNet1D/CNN prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}"
         )
-    if comparator.metadata.get("protocol") not in (None, EXPECTED_RESNET_PROTOCOL):
+    if comparator.metadata.get("protocol") != EXPECTED_RESNET_PROTOCOL:
         raise ValueError(f"ResNet1D/CNN prediction metadata protocol mismatch: {comparator.metadata.get('protocol')}")
     return {
         "summary": {

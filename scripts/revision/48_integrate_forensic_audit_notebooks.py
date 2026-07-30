@@ -2884,11 +2884,19 @@ def integrate_notebook04_baseline_provenance_inputs() -> None:
     text = source(direct)
     provenance_entry = (
         "    'scripts/revision/baseline_artifact_provenance.py': (\n"
+        "        'reviewed_baseline_source_bundle_compatibility_attestation_v2',\n"
+        "        'SCHEMA_VERSION = 2',\n"
+        "    ),\n"
+    )
+    legacy_provenance_entry = (
+        "    'scripts/revision/baseline_artifact_provenance.py': (\n"
         "        'reviewed_baseline_runner_compatibility_attestation_v1',\n"
         "        'SCHEMA_VERSION = 1',\n"
         "    ),\n"
     )
-    if "scripts/revision/baseline_artifact_provenance.py" not in text:
+    if legacy_provenance_entry in text:
+        text = text.replace(legacy_provenance_entry, provenance_entry, 1)
+    elif "scripts/revision/baseline_artifact_provenance.py" not in text:
         anchor = "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {\n"
         text = text.replace(anchor, anchor + provenance_entry, 1)
     set_source(direct, text)
@@ -4102,7 +4110,7 @@ def validate() -> None:
         MAMBA_SCHEMA_MARKER,
         "Could not locate exactly one canonical Mamba installer cell in Notebook 02.",
         "scripts/revision/baseline_artifact_provenance.py",
-        "reviewed_baseline_runner_compatibility_attestation_v1",
+        "reviewed_baseline_source_bundle_compatibility_attestation_v2",
         "'manifests/oof_final_ema_group_sidecar.npz'",
     ):
         if token not in notebook04_text:

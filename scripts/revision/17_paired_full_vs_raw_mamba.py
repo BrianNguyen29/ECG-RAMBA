@@ -138,6 +138,7 @@ def validate_raw_mamba_artifacts(
         producer_path=PROJECT_ROOT / "scripts" / "revision" / "16_raw_mamba_baseline.py",
         summary_path=summary_path,
         manifest_path=manifest_path,
+        prediction_path=comparator.path,
         summary=summary,
         manifest=manifest,
     )
@@ -156,9 +157,9 @@ def validate_raw_mamba_artifacts(
         raise ValueError("Raw Mamba summary is not manuscript_ready=true.")
     artifact_sha = manifest.get("artifact_sha256", {})
     expected_pred_sha = artifact_sha.get("predictions")
-    if expected_pred_sha and expected_pred_sha != comparator.sha256:
+    if expected_pred_sha != comparator.sha256:
         raise RuntimeError(f"Raw Mamba prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}")
-    if comparator.metadata.get("protocol") not in (None, EXPECTED_RAW_MAMBA_PROTOCOL):
+    if comparator.metadata.get("protocol") != EXPECTED_RAW_MAMBA_PROTOCOL:
         raise ValueError(f"Raw Mamba prediction protocol mismatch: {comparator.metadata.get('protocol')}")
     if comparator.metadata.get("feature_contract") not in (None, EXPECTED_RAW_MAMBA_FEATURE_CONTRACT):
         raise ValueError(f"Raw Mamba prediction feature contract mismatch: {comparator.metadata.get('feature_contract')}")

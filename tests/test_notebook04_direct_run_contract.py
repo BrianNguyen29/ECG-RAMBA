@@ -153,7 +153,7 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             direct_cell,
         )
         self.assertIn(
-            "reviewed_baseline_runner_compatibility_attestation_v1",
+            "reviewed_baseline_source_bundle_compatibility_attestation_v2",
             direct_cell,
         )
 

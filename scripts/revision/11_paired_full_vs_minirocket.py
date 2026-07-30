@@ -296,6 +296,7 @@ def validate_minirocket_artifacts(
         producer_path=PROJECT_ROOT / "scripts" / "revision" / "10_minirocket_only_baseline.py",
         summary_path=summary_path,
         manifest_path=manifest_path,
+        prediction_path=comparator.path,
         summary=summary,
         manifest=manifest,
     )
@@ -324,11 +325,11 @@ def validate_minirocket_artifacts(
         raise ValueError("MiniRocket summary is not manuscript_ready=true.")
     artifact_sha = manifest.get("artifact_sha256", {})
     expected_pred_sha = artifact_sha.get("predictions")
-    if expected_pred_sha and expected_pred_sha != comparator.sha256:
+    if expected_pred_sha != comparator.sha256:
         raise RuntimeError(
             f"MiniRocket prediction SHA mismatch: {comparator.sha256} != {expected_pred_sha}"
         )
-    if comparator.metadata.get("protocol") not in (None, EXPECTED_MINIROCKET_PROTOCOL):
+    if comparator.metadata.get("protocol") != EXPECTED_MINIROCKET_PROTOCOL:
         raise ValueError(f"MiniRocket prediction metadata protocol mismatch: {comparator.metadata.get('protocol')}")
     return {
         "summary": {

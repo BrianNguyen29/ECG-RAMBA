@@ -142,6 +142,21 @@ class PairedInferenceClaimScopeTests(unittest.TestCase):
             self.assertNotIn("full_significantly_better", text, name)
             self.assertNotIn("comparator_significantly_better", text, name)
 
+    def test_all_baseline_pairs_fail_closed_on_prediction_digest_and_protocol(self) -> None:
+        names = [
+            "11_paired_full_vs_minirocket.py",
+            "15_paired_full_vs_resnet.py",
+            "17_paired_full_vs_raw_mamba.py",
+            "25_paired_full_vs_transformer.py",
+            "27_paired_full_vs_hybrid_morphology.py",
+        ]
+        for name in names:
+            text = (ROOT / "scripts" / "revision" / name).read_text(encoding="utf-8")
+            self.assertIn("prediction_path=comparator.path", text, name)
+            self.assertIn("if expected_pred_sha != comparator.sha256:", text, name)
+            self.assertNotIn("if expected_pred_sha and", text, name)
+            self.assertNotIn('metadata.get("protocol") not in (None,', text, name)
+
     def test_generic_paired_outputs_require_group_contract_and_exact_bootstrap(self) -> None:
         group = {
             "status": "verified",
