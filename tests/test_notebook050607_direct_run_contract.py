@@ -195,6 +195,13 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         self.assertIn("sha256_file(oof_prediction_path)", summary_cell)
         self.assertNotIn("sha256_file(record_path)", summary_cell)
 
+    def test_notebook05_restores_authenticated_oof_group_sidecar(self):
+        required = literal_notebook_assignment(
+            "05_hrv_domain_and_robustness.ipynb",
+            "REQUIRED_REVISION_ARTIFACTS_FOR_05",
+        )
+        self.assertIn("manifests/oof_final_ema_group_sidecar.npz", required)
+
     def test_notebook05_validates_stress_provenance_before_gpu_reuse(self):
         _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
         for token in (

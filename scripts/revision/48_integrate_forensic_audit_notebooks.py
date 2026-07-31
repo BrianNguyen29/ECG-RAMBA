@@ -3244,6 +3244,27 @@ def integrate_notebook05_hrv_group_contract() -> None:
 
     name = "05_hrv_domain_and_robustness.ipynb"
     notebook = load(name)
+    setup_cells = [
+        cell
+        for cell in notebook["cells"]
+        if "REQUIRED_REVISION_ARTIFACTS_FOR_05 = [" in source(cell)
+    ]
+    if len(setup_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 05 required-artifact setup candidates={len(setup_cells)}, expected 1"
+        )
+    setup = setup_cells[0]
+    setup_text = source(setup)
+    sidecar_entry = "    'manifests/oof_final_ema_group_sidecar.npz',\n"
+    required_start = setup_text.index("REQUIRED_REVISION_ARTIFACTS_FOR_05 = [")
+    required_end = setup_text.index("]\n", required_start)
+    if sidecar_entry not in setup_text[required_start:required_end]:
+        freeze_entry = "    'manifests/oof_final_ema_freeze_manifest.json',\n"
+        if freeze_entry not in setup_text[required_start:required_end]:
+            raise RuntimeError("Notebook 05 freeze-manifest restore anchor missing")
+        setup_text = setup_text.replace(freeze_entry, freeze_entry + sidecar_entry, 1)
+        set_source(setup, setup_text)
+
     matched = 0
     summary_anchor = "        baseline_summary = json.loads((revision_root / 'metrics' / 'hrv_only_baseline_summary.json').read_text(encoding='utf-8'))\n"
     summary_checks = '''        hrv_runner_path = Path('scripts/revision/09_hrv_domain_analysis.py')

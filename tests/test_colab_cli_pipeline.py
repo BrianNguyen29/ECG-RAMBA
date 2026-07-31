@@ -76,6 +76,17 @@ class ColabCliPipelineTests(unittest.TestCase):
             "snapshot",
         )
 
+    def test_notebook05_cpu_aggregation_keeps_full_reference_comparator(self):
+        stage = self.module.stage_by_id(self.manifest, "nb05_finalize_cpu")
+        comparators = stage["environment"][
+            "ECG_RAMBA_ROBUSTNESS_MULTI_COMPARATORS"
+        ].split(",")
+        self.assertEqual(comparators[0], "full")
+        self.assertEqual(
+            set(comparators),
+            {"full", "minirocket", "resnet", "raw_mamba", "transformer"},
+        )
+
     def test_windows_drive_mount_bridge_uses_official_cli(self):
         source = (
             ROOT / "scripts" / "colab_cli" / "mount_drive_interactive.ps1"

@@ -253,7 +253,7 @@
       ],
       "environment": {
         "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
-        "ECG_RAMBA_ROBUSTNESS_MULTI_COMPARATORS": "minirocket,resnet,raw_mamba,transformer",
+        "ECG_RAMBA_ROBUSTNESS_MULTI_COMPARATORS": "full,minirocket,resnet,raw_mamba,transformer",
         "ECG_RAMBA_ROBUSTNESS_MULTI_FINAL_N_BOOT": "10000",
         "ECG_RAMBA_ROBUSTNESS_MULTI_BOOTSTRAP_JOBS": "auto"
       }
