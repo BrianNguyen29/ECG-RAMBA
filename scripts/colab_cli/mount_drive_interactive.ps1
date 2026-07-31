@@ -35,12 +35,21 @@ $PtyCommand = "exec script -qefc $(Quote-Bash $ColabCommand) /dev/null"
 
 $ProcessInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $ProcessInfo.FileName = "wsl.exe"
-$ProcessInfo.ArgumentList.Add("-d")
-$ProcessInfo.ArgumentList.Add($Distro)
-$ProcessInfo.ArgumentList.Add("--exec")
-$ProcessInfo.ArgumentList.Add("bash")
-$ProcessInfo.ArgumentList.Add("-lc")
-$ProcessInfo.ArgumentList.Add($PtyCommand)
+if ($null -ne $ProcessInfo.ArgumentList) {
+    # PowerShell 7 / modern .NET: preserve each argument without shell re-parsing.
+    $ProcessInfo.ArgumentList.Add("-d")
+    $ProcessInfo.ArgumentList.Add($Distro)
+    $ProcessInfo.ArgumentList.Add("--exec")
+    $ProcessInfo.ArgumentList.Add("bash")
+    $ProcessInfo.ArgumentList.Add("-lc")
+    $ProcessInfo.ArgumentList.Add($PtyCommand)
+} else {
+    # Windows PowerShell 5.1 exposes ArgumentList as null. The PTY command uses
+    # single-quoted Bash content, so only embedded double quotes need escaping
+    # for the Windows process command line.
+    $EscapedPtyCommand = $PtyCommand.Replace('"', '\"')
+    $ProcessInfo.Arguments = "-d $Distro --exec bash -lc `"$EscapedPtyCommand`""
+}
 $ProcessInfo.UseShellExecute = $false
 $ProcessInfo.RedirectStandardOutput = $true
 $ProcessInfo.RedirectStandardInput = $true
