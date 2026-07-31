@@ -177,10 +177,16 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "artifact_status",
             "prediction artifact provenance grid is incomplete or invalid",
             "ROBUSTNESS_MULTI_DEFAULT_BOOTSTRAP_JOBS",
+            "_robustness_multi_bootstrap_jobs_raw == 'auto'",
+            "ECG_RAMBA_ROBUSTNESS_MULTI_BOOTSTRAP_JOBS must be auto or a positive integer.",
             "ROBUSTNESS_MULTI_INNER_THREADS",
             "total paired metric jobs",
         ):
             self.assertIn(token, source)
+        self.assertNotIn(
+            "ROBUSTNESS_MULTI_BOOTSTRAP_JOBS = int(os.environ.get(",
+            source,
+        )
         self.assertIn("'canonical_resume'", source)
         self.assertIn("Canonical six-stress robustness ledger is incomplete", source)
         self.assertIn("ROBUSTNESS_MULTI_STRICT = ROBUSTNESS_MULTI_RUN_PROFILE", source)
