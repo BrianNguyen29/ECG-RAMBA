@@ -129,7 +129,7 @@ class ArtifactSourceAuditTest(unittest.TestCase):
             source,
         )
 
-    def test_all_active_notebooks_fail_fast_on_stale_drive_mount(self):
+    def test_all_active_notebooks_wait_for_project_visibility_without_force_remount(self):
         notebook_dir = Path(__file__).resolve().parents[1] / "notebooks"
         active = [
             "00_colab_bootstrap.ipynb",
@@ -149,11 +149,15 @@ class ArtifactSourceAuditTest(unittest.TestCase):
             )
             with self.subTest(notebook=name):
                 self.assertIn("def _drive_root_ready", source)
-                self.assertIn("force_remount=True", source)
-                self.assertTrue(
-                    "Google Drive root is not readable" in source
-                    or "Google Drive root is not visible" in source
+                self.assertIn(
+                    "DRIVE_MOUNT_GUARD_CAPABILITY = 'mydrive_mount_then_project_visibility_v1'",
+                    source,
                 )
+                self.assertIn("DRIVE_MOUNT_GUARD_SCHEMA_VERSION = 1", source)
+                self.assertIn("MYDRIVE_ROOT = DRIVE_MOUNT / 'MyDrive'", source)
+                self.assertIn("ECG_RAMBA_DRIVE_PROJECT_WAIT_SECONDS", source)
+                self.assertIn("Drive visibility/path issue", source)
+                self.assertNotIn("force_remount=True", source)
                 self.assertIn(
                     "MIRROR_REVISION_ROOT = DRIVE_ROOT / 'revision_artifacts' / 'reports' / 'revision'",
                     source,

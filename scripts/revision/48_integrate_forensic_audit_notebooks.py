@@ -25,6 +25,23 @@ GROUP_SEMANTICS = "physionet_ecg_arrhythmia_one_patient_per_record_v1"
 GROUP_REFERENCE = "https://physionet.org/content/ecg-arrhythmia/1.0.0/"
 NOTEBOOK02_PREFLIGHT_START = "# BEGIN FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT"
 NOTEBOOK02_PREFLIGHT_END = "# END FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT"
+DRIVE_MOUNT_GUARD_MARKER = (
+    "DRIVE_MOUNT_GUARD_CAPABILITY = 'mydrive_mount_then_project_visibility_v1'"
+)
+DRIVE_MOUNT_GUARD_SCHEMA_MARKER = "DRIVE_MOUNT_GUARD_SCHEMA_VERSION = 1"
+
+
+ACTIVE_NOTEBOOKS = (
+    "00_colab_bootstrap.ipynb",
+    "01_a0_protocol_audit.ipynb",
+    "02_predictions_and_external_eval.ipynb",
+    "02a_retrain_best_ema.ipynb",
+    "03_calibration_and_ci.ipynb",
+    "04_baselines_and_component_checks.ipynb",
+    "05_hrv_domain_and_robustness.ipynb",
+    "06_pooling_and_representation.ipynb",
+    "07_results_freeze.ipynb",
+)
 
 
 NOTEBOOK02_CAPABILITY_PREFLIGHT = r'''# BEGIN FORENSIC NOTEBOOK 02 CAPABILITY PREFLIGHT
@@ -513,6 +530,154 @@ def load(name: str) -> dict:
 def save(name: str, notebook: dict) -> None:
     path = NOTEBOOK_DIR / name
     path.write_text(json.dumps(notebook, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def _drive_mount_guard_source(helper_name: str) -> str:
+    return f'''{DRIVE_MOUNT_GUARD_MARKER}
+{DRIVE_MOUNT_GUARD_SCHEMA_MARKER}
+import os as _drive_os
+import time as _drive_time
+
+MYDRIVE_ROOT = DRIVE_MOUNT / 'MyDrive'
+
+def {helper_name}(root, *, require_nonempty=False):
+    try:
+        if not root.is_dir():
+            return False
+        iterator = root.iterdir()
+        if require_nonempty:
+            next(iterator)
+        else:
+            # Force one filesystem operation so a stale mountpoint is rejected.
+            next(iterator, None)
+        return True
+    except Exception:
+        return False
+
+def _wait_for_drive_path(root, *, timeout_s, require_nonempty=False):
+    deadline = _drive_time.monotonic() + max(0, timeout_s)
+    while True:
+        if {helper_name}(root, require_nonempty=require_nonempty):
+            return True
+        if _drive_time.monotonic() >= deadline:
+            return False
+        _drive_time.sleep(1.0)
+
+# The CLI may mount Drive before this cell starts. Mount health is determined
+# from MyDrive itself, not from the project folder whose visibility can lag.
+if not _wait_for_drive_path(MYDRIVE_ROOT, timeout_s=2):
+    try:
+        from google.colab import drive
+    except ImportError as exc:
+        raise RuntimeError(
+            f'Google Drive is not mounted at {{MYDRIVE_ROOT}}, and google.colab is unavailable.'
+        ) from exc
+    try:
+        drive.mount(str(DRIVE_MOUNT))
+    except Exception as exc:
+        # A CLI-driven mount can become visible while drive.mount reports that
+        # the mountpoint is busy. Accept it only after a real filesystem check.
+        if not _wait_for_drive_path(MYDRIVE_ROOT, timeout_s=15):
+            raise RuntimeError(
+                f'Google Drive mount failed and MyDrive is still unreadable at {{MYDRIVE_ROOT}}. '
+                'Restart the runtime or use the Colab CLI Drive bridge once; automatic force-remount is disabled.'
+            ) from exc
+        print('MyDrive became readable after a concurrent mount attempt:', MYDRIVE_ROOT)
+else:
+    print('MyDrive already mounted and readable:', MYDRIVE_ROOT)
+
+project_wait_s = int(_drive_os.environ.get('ECG_RAMBA_DRIVE_PROJECT_WAIT_SECONDS', '180'))
+if not _wait_for_drive_path(DRIVE_ROOT, timeout_s=project_wait_s, require_nonempty=True):
+    raise FileNotFoundError(
+        f'MyDrive is mounted, but the ECG-Ramba project root did not become readable at {{DRIVE_ROOT}} '
+        f'within {{project_wait_s}} seconds. This is a Drive visibility/path issue, not a missing-cache signal. '
+        'Verify the folder name in MyDrive, then restart the runtime if DriveFS remains stale.'
+    )
+print('ECG-Ramba Drive project root is ready:', DRIVE_ROOT)
+'''
+
+
+def _replace_drive_mount_guard(text: str, helper_name: str) -> tuple[str, int]:
+    lines = text.splitlines(keepends=True)
+    replacement_count = 0
+    search_from = 0
+    signature = f"def {helper_name}(root):"
+    final_check = f"if not {helper_name}(DRIVE_ROOT):"
+    while True:
+        start = next(
+            (
+                index
+                for index in range(search_from, len(lines))
+                if lines[index].lstrip().startswith(signature)
+            ),
+            None,
+        )
+        if start is None:
+            break
+        indent = lines[start][: len(lines[start]) - len(lines[start].lstrip())]
+        final_candidates = [
+            index
+            for index in range(start + 1, len(lines))
+            if lines[index].startswith(indent + final_check)
+        ]
+        if not final_candidates:
+            raise RuntimeError(f"Drive guard final check missing for {helper_name}")
+        # Notebook 02a has both a top-level mount condition and a later
+        # top-level readiness assertion. The replacement must include both.
+        final_index = final_candidates[-1]
+        end = final_index + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if not stripped:
+                end += 1
+                continue
+            current_indent = len(lines[end]) - len(lines[end].lstrip())
+            if current_indent <= len(indent):
+                break
+            end += 1
+        replacement = textwrap.indent(_drive_mount_guard_source(helper_name), indent)
+        replacement_lines = replacement.splitlines(keepends=True)
+        if replacement_lines and not replacement_lines[-1].endswith("\n"):
+            replacement_lines[-1] += "\n"
+        lines[start:end] = replacement_lines
+        replacement_count += 1
+        search_from = start + len(replacement_lines)
+    return "".join(lines), replacement_count
+
+
+def integrate_drive_mount_guards() -> None:
+    for name in ACTIVE_NOTEBOOKS:
+        notebook = load(name)
+        total = 0
+        for cell in notebook["cells"]:
+            text = source(cell)
+            text = text.replace(
+                "Reconnect Drive with force_remount=True before external artifact restore/export.",
+                "Restart the runtime and reconnect Drive once before external artifact restore/export.",
+            )
+            text = text.replace(
+                "else:\n"
+                "    print('Drive root already visible:', DRIVE_ROOT)\n"
+                "if not _drive_root_ready(DRIVE_ROOT):\n"
+                "    raise RuntimeError(f'Google Drive root is not readable at {DRIVE_ROOT}. Restart/remount before continuing.')\n",
+                "",
+            )
+            if DRIVE_MOUNT_GUARD_MARKER in text:
+                set_source(cell, text)
+                continue
+            for helper_name in ("_drive_root_ready", "_direct_drive_root_ready"):
+                text, count = _replace_drive_mount_guard(text, helper_name)
+                total += count
+            set_source(cell, text)
+        expected = 2 if name in {
+            "02_predictions_and_external_eval.ipynb",
+            "07_results_freeze.ipynb",
+        } else 1
+        if total not in (0, expected):
+            raise RuntimeError(
+                f"Drive mount guard replacements in {name}={total}, expected {expected}"
+            )
+        save(name, notebook)
 
 
 def _legacy_authority_pin_source(*, bootstrap: bool) -> str:
@@ -4052,17 +4217,7 @@ def validate() -> None:
     ):
         if forbidden in notebook02_text:
             raise RuntimeError(f"Notebook 02 stale/mutable compatibility token remains: {forbidden}")
-    for name in (
-        "00_colab_bootstrap.ipynb",
-        "01_a0_protocol_audit.ipynb",
-        "02_predictions_and_external_eval.ipynb",
-        "02a_retrain_best_ema.ipynb",
-        "03_calibration_and_ci.ipynb",
-        "04_baselines_and_component_checks.ipynb",
-        "05_hrv_domain_and_robustness.ipynb",
-        "06_pooling_and_representation.ipynb",
-        "07_results_freeze.ipynb",
-    ):
+    for name in ACTIVE_NOTEBOOKS:
         notebook = load(name)
         text = "\n".join(source(cell) for cell in notebook["cells"])
         if RUN_HISTORY_MARKER not in text:
@@ -4075,6 +4230,23 @@ def validate() -> None:
             )
         if text.count(AUTHORITY_SCHEMA_MARKER) != expected_authority_count:
             raise RuntimeError(f"Code-authority schema marker count is invalid in {name}")
+        expected_drive_guard_count = 2 if name in {
+            "02_predictions_and_external_eval.ipynb",
+            "07_results_freeze.ipynb",
+        } else 1
+        if text.count(DRIVE_MOUNT_GUARD_MARKER) != expected_drive_guard_count:
+            raise RuntimeError(f"Drive mount guard count is invalid in {name}")
+        if text.count(DRIVE_MOUNT_GUARD_SCHEMA_MARKER) != expected_drive_guard_count:
+            raise RuntimeError(f"Drive mount guard schema count is invalid in {name}")
+        if "force_remount=True" in text:
+            raise RuntimeError(f"Automatic force-remount remains in {name}")
+        for token in (
+            "MYDRIVE_ROOT = DRIVE_MOUNT / 'MyDrive'",
+            "ECG_RAMBA_DRIVE_PROJECT_WAIT_SECONDS",
+            "This is a Drive visibility/path issue, not a missing-cache signal",
+        ):
+            if token not in text:
+                raise RuntimeError(f"Drive mount guard token missing from {name}: {token}")
         if name != "00_colab_bootstrap.ipynb" and "_AUTHORITY_BOOTSTRAP_ALLOWED = True" in text:
             raise RuntimeError(f"Downstream notebook may not establish or rotate authority: {name}")
     for name in (
@@ -4190,6 +4362,7 @@ def main() -> None:
     integrate_notebook00_authority_manifest_publish()
     integrate_notebook02a_checkpoint_and_pointer_contract()
     integrate_notebook07_final_gate()
+    integrate_drive_mount_guards()
     validate()
     print("Forensic notebook integration complete and validated.")
 

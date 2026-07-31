@@ -6,7 +6,11 @@ param(
     [string]$Auth = "oauth2",
     [string]$Distro = "Ubuntu",
     [ValidateRange(0, 600)]
-    [int]$AutoConfirmAfterSeconds = 0
+    [int]$AutoConfirmAfterSeconds = 0,
+    [ValidateRange(1, 120)]
+    [int]$VerifyAttempts = 60,
+    [ValidateRange(1, 30)]
+    [int]$VerifyDelaySeconds = 2
 )
 
 $ErrorActionPreference = "Stop"
@@ -85,9 +89,26 @@ while (($Line = $Process.StandardOutput.ReadLine()) -ne $null) {
 }
 
 $Process.WaitForExit()
-$VerifyOutput = & wsl.exe -d $Distro --exec $ColabExecutable `
-    "--auth=$Auth" ls -s $Session /content/drive/MyDrive 2>&1
-$VerifyExitCode = $LASTEXITCODE
+$VerifyPath = "/content/drive/MyDrive/ECG-Ramba"
+$VerifyOutput = @()
+$VerifyExitCode = 1
+for ($Attempt = 1; $Attempt -le $VerifyAttempts; $Attempt++) {
+    $VerifyOutput = & wsl.exe -d $Distro --exec $ColabExecutable `
+        "--auth=$Auth" ls -s $Session $VerifyPath 2>&1
+    $VerifyExitCode = $LASTEXITCODE
+    if ($VerifyExitCode -eq 0) {
+        break
+    }
+    if ($Attempt -lt $VerifyAttempts) {
+        if ($Attempt -eq 1 -or $Attempt % 10 -eq 0) {
+            Write-Host (
+                "Drive is mounted but the ECG-Ramba project root is not visible yet " +
+                "(attempt $Attempt/$VerifyAttempts). Waiting for DriveFS..."
+            )
+        }
+        Start-Sleep -Seconds $VerifyDelaySeconds
+    }
+}
 if (
     $Process.ExitCode -ne 0 -or
     $ObservedMountError -or
@@ -99,7 +120,7 @@ if (
     throw (
         "Colab Drive mount verification failed. " +
         "cli_exit=$($Process.ExitCode) observed_mount_error=$ObservedMountError " +
-        "verify_exit=$VerifyExitCode"
+        "verify_exit=$VerifyExitCode verify_path=$VerifyPath"
     )
 }
-Write-Host "Google Drive mounted for Colab session: $Session"
+Write-Host "Google Drive and ECG-Ramba project root are readable for Colab session: $Session"

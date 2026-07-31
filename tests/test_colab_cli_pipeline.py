@@ -101,7 +101,10 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn("RedirectStandardInput = $true", source)
         self.assertIn("^https://accounts\\.google\\.com/", source)
         self.assertIn("AutoConfirmAfterSeconds", source)
-        self.assertIn("/content/drive/MyDrive", source)
+        self.assertIn('/content/drive/MyDrive/ECG-Ramba', source)
+        self.assertIn("VerifyAttempts", source)
+        self.assertIn("VerifyDelaySeconds", source)
+        self.assertIn("Waiting for DriveFS", source)
         self.assertIn("$ObservedMountError", source)
         self.assertIn("$VerifyExitCode", source)
 
