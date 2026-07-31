@@ -3422,7 +3422,7 @@ def integrate_notebook07_final_gate() -> None:
 # restore so a fresh runtime cannot be blocked by the previous release SHA.
 run(
     f'python -u scripts/revision/artifact_mirror.py publish '
-    f'--verify-existing full --source-conflict-policy mirror '
+    f'--verify-existing full --source-conflict-policy newer '
     f'--refresh-existing-prefix manifests/notebook_code_authority.json '
     f'--include-path manifests/notebook_code_authority.json '
     f'--mirror-root "{MIRROR_REVISION_ROOT}"',

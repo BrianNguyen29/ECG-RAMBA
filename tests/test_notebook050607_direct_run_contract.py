@@ -807,7 +807,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         for token in (
             "FORENSIC_AUTHORITY_MIRROR_REATTESTATION",
             "scoped_direct_canonical_v1",
-            "--source-conflict-policy mirror",
+            "--source-conflict-policy newer",
             "--refresh-existing-prefix manifests/notebook_code_authority.json",
             "--include-path manifests/notebook_code_authority.json",
             "final_authority_mirror_reattestation.log",
