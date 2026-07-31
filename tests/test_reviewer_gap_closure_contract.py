@@ -233,6 +233,11 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                             "stressed_adv_ci_low": 0.02,
                             "stressed_adv_ci_high": 0.10,
                             "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                            "inference_scope": self.module.ROBUSTNESS_INFERENCE_SCOPE,
+                            "null_test": self.module.ROBUSTNESS_NULL_TEST,
+                            "multiplicity_adjustment": (
+                                self.module.ROBUSTNESS_MULTIPLICITY_ADJUSTMENT
+                            ),
                             "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
                             "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
                             "macro_class_support_policy": (
@@ -250,6 +255,9 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                 "output_profile": "canonical",
                 "runner_sha256": self.runner_sha("21_robustness_multicomparator.py"),
                 "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                "inference_scope": self.module.ROBUSTNESS_INFERENCE_SCOPE,
+                "null_test": self.module.ROBUSTNESS_NULL_TEST,
+                "multiplicity_adjustment": self.module.ROBUSTNESS_MULTIPLICITY_ADJUSTMENT,
                 "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
                 "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
                 "metric_cache_schema_version": self.module.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
@@ -266,6 +274,9 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
                 "output_profile": "canonical",
                 "runner_sha256": self.runner_sha("21_robustness_multicomparator.py"),
                 "ci_scope": self.module.ROBUSTNESS_CI_SCOPE,
+                "inference_scope": self.module.ROBUSTNESS_INFERENCE_SCOPE,
+                "null_test": self.module.ROBUSTNESS_NULL_TEST,
+                "multiplicity_adjustment": self.module.ROBUSTNESS_MULTIPLICITY_ADJUSTMENT,
                 "bootstrap_unit": self.module.ROBUSTNESS_BOOTSTRAP_UNIT,
                 "training_variability_scope": self.module.ROBUSTNESS_TRAINING_VARIABILITY_SCOPE,
                 "metric_cache_schema_version": self.module.ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION,
@@ -338,6 +349,28 @@ class ReviewerGapClosureContractTests(unittest.TestCase):
         status, _ = self.module.validate_robustness(self.args)
         self.assertEqual(status["status"], "incomplete")
         self.assertTrue(any("Non-finite" in issue for issue in status["issues"]))
+
+    def test_unsupported_robustness_significance_and_p_values_are_rejected(self):
+        with self.args.robustness_table.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        rows[0]["interpretation"] = "full_significantly_less_degraded"
+        rows[0]["p_value_two_sided"] = "0.01"
+        write_csv(self.args.robustness_table, rows)
+        manifest = json.loads(self.args.robustness_manifest.read_text(encoding="utf-8"))
+        manifest["artifact_sha256"]["table"] = self.module.sha256_file(
+            self.args.robustness_table
+        )
+        write_json(self.args.robustness_manifest, manifest)
+
+        status, _ = self.module.validate_robustness(self.args)
+        self.assertEqual(status["status"], "incomplete")
+        self.assertTrue(
+            any(
+                "unsupported significance wording" in issue
+                or "unsupported finite p-value" in issue
+                for issue in status["issues"]
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -55,6 +55,9 @@ PROTOCOL = "robustness_multicomparator_aggregation_v2_source_bound"
 BOOTSTRAP_ENGINE = "paired_record_resample_presorted_rank_sparse_ece_weighted_counts_v2"
 METRIC_CACHE_SCHEMA_VERSION = ROBUSTNESS_METRIC_CACHE_SCHEMA_VERSION
 CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+INFERENCE_SCOPE = "pointwise_percentile_ci_effect_size_only"
+NULL_TEST = "not_run"
+MULTIPLICITY_ADJUSTMENT = "not_applicable_no_null_test"
 BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
 COMPARATOR_STRESS_PROTOCOL = "comparator_stress_predictions_v2_source_bound_same_folds_power_mean_v2_q3"
@@ -1373,6 +1376,9 @@ def main() -> None:
         "bootstrap_independence_contract": bootstrap_independence_contract,
         "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
         "ci_scope": CI_SCOPE,
+        "inference_scope": INFERENCE_SCOPE,
+        "null_test": NULL_TEST,
+        "multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT,
         "endpoint_definition": (
             "difference_in_signed_clean_to_stress_benefit_change_full_minus_comparator"
         ),
@@ -1445,6 +1451,9 @@ def main() -> None:
                     "bootstrap_unit": BOOTSTRAP_UNIT,
                     "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
                     "ci_scope": CI_SCOPE,
+                    "inference_scope": INFERENCE_SCOPE,
+                    "null_test": NULL_TEST,
+                    "multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT,
                     "macro_class_support_policy": MACRO_CLASS_SUPPORT_POLICY,
                     "perturbation_realization_scope": "single_fixed_seed_conditional_stress_audit",
                 }
@@ -1581,6 +1590,9 @@ def main() -> None:
         "bootstrap_independence_contract": bootstrap_independence_contract,
         "training_variability_scope": TRAINING_VARIABILITY_SCOPE,
         "ci_scope": CI_SCOPE,
+        "inference_scope": INFERENCE_SCOPE,
+        "null_test": NULL_TEST,
+        "multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT,
         "endpoint_definition": (
             "difference_in_signed_clean_to_stress_benefit_change_full_minus_comparator"
         ),

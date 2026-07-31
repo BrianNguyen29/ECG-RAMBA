@@ -22,6 +22,24 @@ FINAL_EVIDENCE = importlib.import_module("scripts.revision.13_final_evidence_mat
 
 
 class RobustnessMulticomparatorContractTests(unittest.TestCase):
+    def test_outputs_declare_pointwise_effect_size_inference_only(self):
+        self.assertEqual(
+            ROBUSTNESS.INFERENCE_SCOPE,
+            "pointwise_percentile_ci_effect_size_only",
+        )
+        self.assertEqual(ROBUSTNESS.NULL_TEST, "not_run")
+        self.assertEqual(
+            ROBUSTNESS.MULTIPLICITY_ADJUSTMENT,
+            "not_applicable_no_null_test",
+        )
+        source = Path(ROBUSTNESS.__file__).read_text(encoding="utf-8")
+        for field in (
+            '"inference_scope": INFERENCE_SCOPE',
+            '"null_test": NULL_TEST',
+            '"multiplicity_adjustment": MULTIPLICITY_ADJUSTMENT',
+        ):
+            self.assertIn(field, source)
+
     def test_legacy_significance_labels_are_not_accepted_as_nominal_ci_evidence(self):
         row = {
             "stress_test": "snr5db",

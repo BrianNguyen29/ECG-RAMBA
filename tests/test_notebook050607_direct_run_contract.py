@@ -799,6 +799,10 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "ptbxl_adaptation_analysis_lock.json",
             "ptbxl_fold_protocol_audit.json",
             "table_ptbxl_unsupported_only_sensitivity.csv",
+            "predictions/minirocket_only_oof_predictions.npz",
+            "predictions/resnet1d_cnn_oof_predictions.npz",
+            "predictions/raw_mamba_oof_predictions.npz",
+            "authenticated_patient_record_bootstrap",
         ):
             self.assertIn(token, source)
 

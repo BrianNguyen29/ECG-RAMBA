@@ -53,6 +53,9 @@ STRESSES = (
 )
 METRICS = ("pr_auc_macro", "roc_auc_macro", "f1_macro", "brier_macro", "ece_macro")
 ROBUSTNESS_CI_SCOPE = "nominal_95_percentile_paired_record_bootstrap_unadjusted"
+ROBUSTNESS_INFERENCE_SCOPE = "pointwise_percentile_ci_effect_size_only"
+ROBUSTNESS_NULL_TEST = "not_run"
+ROBUSTNESS_MULTIPLICITY_ADJUSTMENT = "not_applicable_no_null_test"
 ROBUSTNESS_BOOTSTRAP_UNIT = AUTHENTICATED_RECORD_BOOTSTRAP_UNIT
 ROBUSTNESS_TRAINING_VARIABILITY_SCOPE = (
     "fixed_trained_folds_and_checkpoints_not_retrained_within_bootstrap"
@@ -624,6 +627,12 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
         for label, payload in (("pairwise", pairwise), ("manifest", manifest)):
             if payload.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
                 issues.append(f"{label} robustness CI scope is stale or missing")
+            if payload.get("inference_scope") != ROBUSTNESS_INFERENCE_SCOPE:
+                issues.append(f"{label} robustness inference scope is stale or missing")
+            if payload.get("null_test") != ROBUSTNESS_NULL_TEST:
+                issues.append(f"{label} robustness null-test declaration is stale or missing")
+            if payload.get("multiplicity_adjustment") != ROBUSTNESS_MULTIPLICITY_ADJUSTMENT:
+                issues.append(f"{label} robustness multiplicity declaration is stale or missing")
             if payload.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
                 issues.append(f"{label} robustness bootstrap unit is stale or missing")
             if payload.get("training_variability_scope") != ROBUSTNESS_TRAINING_VARIABILITY_SCOPE:
@@ -678,6 +687,30 @@ def validate_robustness(args: argparse.Namespace) -> tuple[dict[str, Any], list[
                 float_value(row, key)
             if row.get("ci_scope") != ROBUSTNESS_CI_SCOPE:
                 issues.append("canonical robustness table contains a stale CI scope")
+                break
+            if row.get("inference_scope") != ROBUSTNESS_INFERENCE_SCOPE:
+                issues.append("canonical robustness table contains a stale inference scope")
+                break
+            if row.get("null_test") != ROBUSTNESS_NULL_TEST:
+                issues.append("canonical robustness table contains an unsupported null test")
+                break
+            if row.get("multiplicity_adjustment") != ROBUSTNESS_MULTIPLICITY_ADJUSTMENT:
+                issues.append("canonical robustness table contains a stale multiplicity declaration")
+                break
+            for key, value in row.items():
+                key_lower = str(key).lower()
+                value_lower = str(value).lower()
+                if "significant" in value_lower:
+                    issues.append("canonical robustness table contains unsupported significance wording")
+                    break
+                if "p_value" in key_lower or key_lower.startswith("pvalue"):
+                    try:
+                        if math.isfinite(float(value)):
+                            issues.append("canonical robustness table contains an unsupported finite p-value")
+                            break
+                    except (TypeError, ValueError):
+                        pass
+            if issues:
                 break
             if row.get("bootstrap_unit") != ROBUSTNESS_BOOTSTRAP_UNIT:
                 issues.append("canonical robustness table contains a stale bootstrap unit")
