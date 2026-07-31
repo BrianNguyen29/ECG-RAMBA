@@ -69,6 +69,13 @@ class ColabCliPipelineTests(unittest.TestCase):
     def test_oauth2_is_the_default_authentication_mode(self):
         self.assertEqual(self.manifest["default_auth"], "oauth2")
 
+    def test_notebook07_uses_supported_snapshot_submission_mode(self):
+        stage = self.module.stage_by_id(self.manifest, "nb07_cpu")
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_SUBMISSION_MODE"],
+            "snapshot",
+        )
+
     def test_windows_drive_mount_bridge_uses_official_cli(self):
         source = (
             ROOT / "scripts" / "colab_cli" / "mount_drive_interactive.ps1"

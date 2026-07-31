@@ -3408,6 +3408,34 @@ def integrate_notebook07_final_gate() -> None:
     notebook = load(name)
     for cell in notebook["cells"]:
         text = source(cell)
+        cell_changed = False
+        if (
+            "EVIDENCE_RESTORE_PATHS = [" in text
+            and "FORENSIC_AUTHORITY_MIRROR_REATTESTATION" not in text
+        ):
+            restore_anchor = "import pandas as pd\n\nrevision_root = Path('reports/revision')\n"
+            if restore_anchor not in text:
+                raise RuntimeError("Notebook 07 targeted-restore insertion anchor not found")
+            authority_reattestation = r"""FORENSIC_AUTHORITY_MIRROR_REATTESTATION = 'scoped_direct_canonical_v1'
+# Notebook 00 rotates this small authority file directly under a single-writer
+# lock. Re-attest its current canonical bytes before any manifest-authenticated
+# restore so a fresh runtime cannot be blocked by the previous release SHA.
+run(
+    f'python -u scripts/revision/artifact_mirror.py publish '
+    f'--verify-existing full --source-conflict-policy mirror '
+    f'--refresh-existing-prefix manifests/notebook_code_authority.json '
+    f'--include-path manifests/notebook_code_authority.json '
+    f'--mirror-root "{MIRROR_REVISION_ROOT}"',
+    log_path='reports/revision/logs/final_authority_mirror_reattestation.log',
+)
+
+"""
+            text = text.replace(
+                restore_anchor,
+                authority_reattestation + restore_anchor,
+                1,
+            )
+            cell_changed = True
         updated = text.replace(
             "pre_specified_before_test_metric_evaluation",
             "ADAPTATION_PRIMARY_FRACTION_POLICY",
@@ -3446,7 +3474,7 @@ def integrate_notebook07_final_gate() -> None:
                 "    'matched_cross_fitted_calibration',\n" + calibration_capability,
                 1,
             )
-        if updated != text:
+        if updated != text or cell_changed:
             set_source(cell, updated)
     gate_marker = "FORENSIC_NOTEBOOK07_FINAL_GATE = 'strict_full_sha_authority_update_v3'"
     target = None

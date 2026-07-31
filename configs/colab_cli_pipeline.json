@@ -281,7 +281,7 @@
         "nb06_a100"
       ],
       "environment": {
-        "ECG_RAMBA_SUBMISSION_MODE": "clean"
+        "ECG_RAMBA_SUBMISSION_MODE": "snapshot"
       }
     }
   ]

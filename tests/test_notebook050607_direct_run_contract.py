@@ -802,6 +802,22 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
+    def test_notebook07_reattests_direct_authority_before_targeted_restore(self):
+        _, source = notebook_source("07_results_freeze.ipynb")
+        for token in (
+            "FORENSIC_AUTHORITY_MIRROR_REATTESTATION",
+            "scoped_direct_canonical_v1",
+            "--source-conflict-policy mirror",
+            "--refresh-existing-prefix manifests/notebook_code_authority.json",
+            "--include-path manifests/notebook_code_authority.json",
+            "final_authority_mirror_reattestation.log",
+        ):
+            self.assertIn(token, source)
+        self.assertLess(
+            source.index("FORENSIC_AUTHORITY_MIRROR_REATTESTATION"),
+            source.index("final_evidence_targeted_restore"),
+        )
+
     def test_notebook07_uses_stable_final_generator_capabilities(self):
         _, source = notebook_source("07_results_freeze.ipynb")
         generator_source = (
