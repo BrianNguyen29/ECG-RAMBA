@@ -9,10 +9,14 @@ match the contract consumed by ``21_robustness_multicomparator.py``.
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
 import sys
+import zipfile
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,12 +38,15 @@ from scripts.revision.common import (  # noqa: E402
     save_npz_compressed_atomic,
     sha256_file,
 )
+from scripts.revision.artifact_mirror import PublishLock  # noqa: E402
 from src.aggregation import POWER_MEAN_IMPLEMENTATION, aggregate_record_probabilities  # noqa: E402
 from src.training_data import build_slice_index  # noqa: E402
 
 
 PROTOCOL = "comparator_stress_predictions_v2_source_bound_same_folds_power_mean_v2_q3"
 SOURCE_BUNDLE_SCHEMA_VERSION = 1
+DISK_BACKED_RAW_CACHE_CAPABILITY = "source_bound_npz_member_memmap_v1"
+DISK_BACKED_PERTURBATION_CAPABILITY = "chunk_exact_local_memmap_v1"
 DEFAULT_OOF = PREDICTION_DIR / "oof_final_ema_predictions.npz"
 DEFAULT_FREEZE = MANIFEST_DIR / "oof_final_ema_freeze_manifest.json"
 DEFAULT_RESNET_CKPT_DIR = PROJECT_ROOT / "reports" / "revision" / "experimental" / "resnet1d_cnn_checkpoints"
@@ -66,6 +73,7 @@ SOURCE_BUNDLE_PATHS = (
     "scripts/revision/14_resnet1d_cnn_baseline.py",
     "scripts/revision/16_raw_mamba_baseline.py",
     "scripts/revision/24_transformer_ecg_baseline.py",
+    "scripts/revision/artifact_mirror.py",
     "src/aggregation.py",
     "src/training_data.py",
     "configs/config.py",
@@ -112,6 +120,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--freeze-manifest", type=Path, default=DEFAULT_FREEZE)
     parser.add_argument("--expected-checkpoint-kind", default="final_ema")
     parser.add_argument("--raw-cache", type=Path, default=None)
+    parser.add_argument(
+        "--disk-backed-raw-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Extract the authenticated X.npy member to local scratch and mmap it instead of loading all ECGs into RAM.",
+    )
+    parser.add_argument(
+        "--raw-cache-mmap-dir",
+        type=Path,
+        default=Path(os.environ.get("ECG_RAMBA_RAW_CACHE_MMAP_DIR", "/content/ecg_ramba_runtime/raw_cache")),
+    )
+    parser.add_argument(
+        "--perturbation-mmap-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "ECG_RAMBA_PERTURBATION_MMAP_DIR",
+                "/content/ecg_ramba_runtime/robustness_perturbations",
+            )
+        ),
+    )
+    parser.add_argument(
+        "--keep-perturbation-mmaps",
+        action="store_true",
+        help="Keep completed local stressed-signal memmaps after their predictions are written.",
+    )
     parser.add_argument("--resnet-checkpoint-dir", type=Path, default=DEFAULT_RESNET_CKPT_DIR)
     parser.add_argument("--raw-mamba-checkpoint-dir", type=Path, default=DEFAULT_RAW_MAMBA_CKPT_DIR)
     parser.add_argument("--transformer-checkpoint-dir", type=Path, default=DEFAULT_TRANSFORMER_CKPT_DIR)
@@ -228,6 +262,446 @@ def validate_checkpoint_set(comparator: str, paths: list[Path]) -> list[str]:
             raise RuntimeError(f"{comparator} fold {fold} checkpoint SHA mismatch")
         hashes.append(actual_sha)
     return hashes
+
+
+def expected_raw_cache_sha256(comparators: list[str]) -> str:
+    """Require every selected learned comparator to name the same training raw cache."""
+    declared: dict[str, str] = {}
+    for comparator in comparators:
+        manifest_name, _expected_protocol = BASELINE_CHECKPOINT_CONTRACTS[comparator]
+        manifest_path = MANIFEST_DIR / manifest_name
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        value = str((payload.get("load_info") or {}).get("raw_cache_sha256") or "")
+        if not value:
+            raise RuntimeError(f"{comparator} baseline manifest does not declare raw_cache_sha256")
+        declared[comparator] = value
+    unique = sorted(set(declared.values()))
+    if len(unique) != 1:
+        raise RuntimeError(f"Comparator baseline raw-cache SHA mismatch: {declared}")
+    return unique[0]
+
+
+def npz_member_contract(path: Path, member: str) -> tuple[tuple[int, ...], np.dtype, int]:
+    """Read an NPY member header without materializing its array."""
+    with zipfile.ZipFile(path) as archive:
+        if member not in archive.namelist():
+            raise KeyError(f"Missing {member} in raw cache: {path}")
+        info = archive.getinfo(member)
+        with archive.open(member) as stream:
+            version = np.lib.format.read_magic(stream)
+            if version == (1, 0):
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+            elif version in {(2, 0), (3, 0)}:
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+            else:
+                raise ValueError(f"Unsupported NPY member version {version}: {path}!{member}")
+    return tuple(int(value) for value in shape), np.dtype(dtype), int(info.file_size)
+
+
+def remove_stale_partials(destination: Path) -> list[str]:
+    """Remove process-local scratch partials left by interrupted runtimes."""
+    removed: list[str] = []
+    for partial in destination.parent.glob(f".{destination.name}.partial.*"):
+        if partial.is_file():
+            partial.unlink()
+            removed.append(str(partial))
+    if removed:
+        print(f"Removed {len(removed)} stale local partial(s) for {destination.name}", flush=True)
+    return removed
+
+
+def cleanup_stale_scratch_partials(root: Path) -> list[str]:
+    """Sweep interrupted local scratch writes while excluding active writers."""
+    root = resolve(root)
+    root.mkdir(parents=True, exist_ok=True)
+    run_id = f"startup-cleanup-{os.getpid()}"
+    removed: list[str] = []
+    with PublishLock(root, run_id=run_id):
+        for partial in root.glob(".*.partial.*"):
+            if partial.is_file():
+                partial.unlink()
+                removed.append(str(partial))
+    if removed:
+        print(f"Removed {len(removed)} interrupted scratch partial(s) under {root}", flush=True)
+    return removed
+
+
+def extract_npz_member_atomic(
+    source: Path,
+    member: str,
+    destination: Path,
+    *,
+    source_sha256: str,
+) -> dict[str, Any]:
+    """Serialize validation, extraction, and commit for one local raw-cache member."""
+    destination = Path(destination)
+    run_id = f"raw-{hashlib.sha256(str(destination).encode('utf-8')).hexdigest()[:16]}-{os.getpid()}"
+    with PublishLock(destination.parent, run_id=run_id):
+        return _extract_npz_member_atomic_locked(
+            source,
+            member,
+            destination,
+            source_sha256=source_sha256,
+        )
+
+
+def _extract_npz_member_atomic_locked(
+    source: Path,
+    member: str,
+    destination: Path,
+    *,
+    source_sha256: str,
+) -> dict[str, Any]:
+    """Stream an NPY member to local scratch and bind reuse to its content hash."""
+    shape, dtype, expected_size = npz_member_contract(source, member)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    contract_path = destination.with_suffix(destination.suffix + ".contract.json")
+    expected_contract = {
+        "capability": DISK_BACKED_RAW_CACHE_CAPABILITY,
+        "source_npz_sha256": source_sha256,
+        "source_npz_size_bytes": source.stat().st_size,
+        "member": member,
+        "member_size_bytes": expected_size,
+        "shape": list(shape),
+        "dtype": str(dtype),
+    }
+    if destination.is_file() and contract_path.is_file():
+        try:
+            stored = json.loads(contract_path.read_text(encoding="utf-8"))
+            base_matches = all(stored.get(key) == value for key, value in expected_contract.items())
+            content_sha = str(stored.get("member_npy_sha256") or "")
+            if (
+                base_matches
+                and destination.stat().st_size == expected_size
+                and content_sha
+                and sha256_file(destination) == content_sha
+            ):
+                remove_stale_partials(destination)
+                return stored
+        except Exception as exc:
+            print(f"Rejecting local raw memmap contract: {type(exc).__name__}: {exc}", flush=True)
+    destination.unlink(missing_ok=True)
+    contract_path.unlink(missing_ok=True)
+    remove_stale_partials(destination)
+    free_bytes = shutil.disk_usage(destination.parent).free
+    if free_bytes < expected_size + 512 * 1024 * 1024:
+        raise RuntimeError(
+            f"Insufficient local scratch for raw ECG memmap: free={free_bytes}, required>{expected_size}"
+        )
+    partial = destination.with_name(f".{destination.name}.partial.{os.getpid()}")
+    if partial.exists():
+        partial.unlink()
+    print(f"Extracting authenticated {member} to local memmap scratch: {destination}", flush=True)
+    with zipfile.ZipFile(source) as archive, archive.open(member) as src, partial.open("wb") as dst:
+        shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+        dst.flush()
+        os.fsync(dst.fileno())
+    if partial.stat().st_size != expected_size:
+        raise RuntimeError(
+            f"Raw ECG member extraction size mismatch: {partial.stat().st_size} != {expected_size}"
+        )
+    source_sha_after = sha256_file(source)
+    if source_sha_after != source_sha256:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Raw ECG source changed during member extraction: "
+            f"before={source_sha256} after={source_sha_after}"
+        )
+    contract = {
+        **expected_contract,
+        "member_npy_sha256": sha256_file(partial),
+    }
+    os.replace(partial, destination)
+    save_json(contract_path, contract)
+    return contract
+
+
+def load_disk_backed_raw_cache(
+    *,
+    expected_y: np.ndarray,
+    expected_record_fingerprint: str,
+    explicit_cache: Path | None,
+    limit_records: int,
+    comparators: list[str],
+    mmap_dir: Path,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Authenticate the baseline NPZ, then mmap its X member from local scratch."""
+    expected_sha = expected_raw_cache_sha256(comparators)
+    checked: list[str] = []
+    for candidate in resnet_helpers.candidate_raw_cache_paths(explicit_cache):
+        path = resolve(Path(candidate)).resolve()
+        checked.append(str(path))
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        print(f"Authenticating disk-backed raw ECG cache candidate: {path}", flush=True)
+        try:
+            x_shape, x_dtype, _member_size = npz_member_contract(path, "X.npy")
+            with np.load(path, allow_pickle=False) as data:
+                required = {"X", "y", "subjects"}
+                missing = required - set(data.files)
+                if missing:
+                    raise ValueError(f"missing keys {sorted(missing)}")
+                y_cache = np.asarray(data["y"], dtype=np.float32)
+                subjects = np.asarray(data["subjects"]).astype(str)
+                stored_fingerprint = str(resnet_helpers.npz_scalar(data, "record_order_fingerprint", "") or "")
+        except Exception as exc:
+            print(f"  rejected: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        if x_shape != (len(y_cache), 12, 5000) or x_dtype != np.dtype(np.float32):
+            print(f"  rejected: unexpected X contract shape={x_shape} dtype={x_dtype}", flush=True)
+            continue
+        computed_fingerprint = resnet_helpers.record_order_fingerprint(subjects)
+        if stored_fingerprint and stored_fingerprint != computed_fingerprint:
+            print("  rejected: stored and computed record fingerprints differ", flush=True)
+            continue
+        if expected_record_fingerprint and computed_fingerprint != expected_record_fingerprint:
+            print("  rejected: record fingerprint differs from frozen OOF", flush=True)
+            continue
+        if len(y_cache) < len(expected_y) or not np.array_equal(y_cache[: len(expected_y)], expected_y):
+            print("  rejected: labels differ from frozen OOF", flush=True)
+            continue
+        actual_sha = sha256_file(path)
+        if actual_sha != expected_sha:
+            print(f"  rejected: raw-cache SHA {actual_sha} != baseline contract {expected_sha}", flush=True)
+            continue
+
+        mmap_path = resolve(mmap_dir) / (
+            f"chapman_clean_x_{actual_sha[:16]}_{computed_fingerprint}_N{len(y_cache)}.npy"
+        )
+        mmap_contract = extract_npz_member_atomic(
+            path,
+            "X.npy",
+            mmap_path,
+            source_sha256=actual_sha,
+        )
+        X = np.load(mmap_path, mmap_mode="r", allow_pickle=False)
+        if X.shape != x_shape or X.dtype != np.float32:
+            raise RuntimeError(f"Extracted raw ECG memmap contract mismatch: {X.shape}, {X.dtype}")
+        if limit_records > 0:
+            X = X[:limit_records]
+            y_cache = y_cache[:limit_records]
+            subjects = subjects[:limit_records]
+        info = {
+            "raw_cache": str(path),
+            "raw_cache_sha256": actual_sha,
+            "raw_cache_kind": "record_fingerprinted_disk_backed_npz_member",
+            "raw_cache_record_order_fingerprint": computed_fingerprint,
+            "raw_cache_stored_record_order_fingerprint": stored_fingerprint,
+            "raw_cache_shape": list(X.shape),
+            "raw_cache_mmap_path": str(mmap_path),
+            "raw_cache_mmap_capability": DISK_BACKED_RAW_CACHE_CAPABILITY,
+            "raw_cache_mmap_sha256": mmap_contract["member_npy_sha256"],
+        }
+        print(f"Using disk-backed raw ECG cache: {path}", flush=True)
+        print(f"Raw ECG memmap: {mmap_path} shape={X.shape}", flush=True)
+        return X, info
+    raise FileNotFoundError(
+        "No manuscript-safe disk-backed raw ECG cache found. Checked:\n- " + "\n- ".join(checked)
+    )
+
+
+def perturb_signals_disk_backed(
+    X: np.ndarray,
+    spec: dict[str, Any],
+    *,
+    out_dir: Path,
+    raw_cache_sha256: str,
+    source_bundle_sha256: str,
+) -> tuple[np.ndarray, dict[str, Any], Path]:
+    """Serialize validation, generation, and commit for one perturbation memmap."""
+    out_dir = resolve(out_dir)
+    lock = perturbation_writer_lock(
+        X,
+        spec,
+        out_dir=out_dir,
+        raw_cache_sha256=raw_cache_sha256,
+        source_bundle_sha256=source_bundle_sha256,
+    )
+    with lock:
+        return _perturb_signals_disk_backed_locked(
+            X,
+            spec,
+            out_dir=out_dir,
+            raw_cache_sha256=raw_cache_sha256,
+            source_bundle_sha256=source_bundle_sha256,
+        )
+
+
+def perturbation_writer_lock(
+    X: np.ndarray,
+    spec: dict[str, Any],
+    *,
+    out_dir: Path,
+    raw_cache_sha256: str,
+    source_bundle_sha256: str,
+) -> PublishLock:
+    """Return the single-writer lease used through perturbation consumption."""
+    out_dir = resolve(out_dir)
+    lock_key = json.dumps(
+        {
+            "stress": spec,
+            "raw_cache_sha256": raw_cache_sha256,
+            "source_bundle_sha256": source_bundle_sha256,
+            "shape": list(X.shape),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    run_id = f"perturb-{hashlib.sha256(lock_key.encode('utf-8')).hexdigest()[:16]}-{os.getpid()}"
+    return PublishLock(out_dir, run_id=run_id)
+
+
+def _perturb_signals_disk_backed_locked(
+    X: np.ndarray,
+    spec: dict[str, Any],
+    *,
+    out_dir: Path,
+    raw_cache_sha256: str,
+    source_bundle_sha256: str,
+) -> tuple[np.ndarray, dict[str, Any], Path]:
+    """Apply the canonical perturbation in identical chunks into a local NPY memmap."""
+    out_dir = resolve(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    spec_hash = robust_helpers.stable_hash(spec)
+    output = out_dir / (
+        f"{spec['name']}_{spec_hash}_{raw_cache_sha256[:16]}_"
+        f"{source_bundle_sha256[:16]}_N{len(X)}.npy"
+    )
+    contract_path = output.with_suffix(output.suffix + ".contract.json")
+    contract_base = {
+        "capability": DISK_BACKED_PERTURBATION_CAPABILITY,
+        "raw_cache_sha256": raw_cache_sha256,
+        "implementation_source_bundle_sha256": source_bundle_sha256,
+        "stress_spec": spec,
+        "shape": list(X.shape),
+        "dtype": "float32",
+    }
+    if output.is_file() and contract_path.is_file():
+        try:
+            stored = json.loads(contract_path.read_text(encoding="utf-8"))
+            base_matches = all(stored.get(key) == value for key, value in contract_base.items())
+            output_sha = str(stored.get("output_npy_sha256") or "")
+            metadata = stored.get("metadata") or {}
+            sidecar_path = Path(str(metadata.get("lead_indices_file") or ""))
+            sidecar_valid = True
+            if metadata.get("lead_indices_file"):
+                sidecar_valid = (
+                    sidecar_path.is_file()
+                    and sha256_file(sidecar_path)
+                    == str(metadata.get("lead_indices_file_sha256") or "")
+                )
+            if (
+                base_matches
+                and output_sha
+                and sha256_file(output) == output_sha
+                and sidecar_valid
+            ):
+                cached = np.load(output, mmap_mode="r", allow_pickle=False)
+                if cached.shape == X.shape and cached.dtype == np.float32:
+                    remove_stale_partials(output)
+                    print(f"Reusing completed local perturbation memmap: {output}", flush=True)
+                    return cached, metadata, output
+        except Exception as exc:
+            print(f"Rejecting local perturbation cache: {type(exc).__name__}: {exc}", flush=True)
+    output.unlink(missing_ok=True)
+    contract_path.unlink(missing_ok=True)
+    remove_stale_partials(output)
+
+    required_bytes = int(np.prod(X.shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+    free_bytes = shutil.disk_usage(out_dir).free
+    if free_bytes < required_bytes + 512 * 1024 * 1024:
+        raise RuntimeError(
+            f"Insufficient local scratch for perturbed ECG memmap: free={free_bytes}, required>{required_bytes}"
+        )
+    partial = output.with_name(f".{output.name}.partial.{os.getpid()}.npy")
+    if partial.exists():
+        partial.unlink()
+    out = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32, shape=X.shape)
+    meta: dict[str, Any] = {
+        "spec": dict(spec),
+        "disk_backed": True,
+        "perturbation_mmap_path": str(output),
+        "perturbation_mmap_capability": DISK_BACKED_PERTURBATION_CAPABILITY,
+        "implementation_source_bundle_sha256": source_bundle_sha256,
+    }
+    kind = spec["kind"]
+    if kind == "additive_noise":
+        rng = np.random.default_rng(int(spec["seed"]))
+        target = 10.0 ** (float(spec["snr_db"]) / 10.0)
+        for start in robust_helpers.tqdm(range(0, len(X), 128), desc=f"perturb {spec['name']}"):
+            stop = min(len(X), start + 128)
+            xb = np.asarray(X[start:stop], dtype=np.float32)
+            power = np.mean(xb * xb, axis=(1, 2), keepdims=True)
+            noise_std = np.sqrt(np.maximum(power / target, 1e-12)).astype(np.float32)
+            noise = rng.standard_normal(size=xb.shape).astype(np.float32) * noise_std
+            out[start:stop] = xb + noise
+        meta["snr_db"] = float(spec["snr_db"])
+    elif kind == "random_lead_dropout":
+        rng = np.random.default_rng(int(spec["seed"]))
+        n_drop = int(spec["n_drop"])
+        dropped = np.empty((len(X), n_drop), dtype=np.int16)
+        for index in robust_helpers.tqdm(range(len(X)), desc=f"perturb {spec['name']}"):
+            out[index] = X[index]
+            leads = np.sort(rng.choice(X.shape[1], size=n_drop, replace=False)).astype(np.int16)
+            out[index, leads, :] = 0.0
+            dropped[index] = leads
+        map_dir = robust_helpers.EXPERIMENTAL_DIR / "robustness_perturbations"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        map_path = map_dir / (
+            f"{spec['name']}_{spec_hash}_{raw_cache_sha256[:16]}_"
+            f"{source_bundle_sha256[:16]}_N{len(X)}_dropped_leads.npz"
+        )
+        save_npz_compressed_atomic(
+            map_path,
+            dropped_leads=dropped,
+            stress_json=np.asarray(json.dumps(spec, sort_keys=True)),
+            record_count=np.asarray(len(X), dtype=np.int64),
+            raw_cache_sha256=np.asarray(raw_cache_sha256),
+            implementation_source_bundle_sha256=np.asarray(source_bundle_sha256),
+        )
+        meta["dropped_leads_shape"] = list(dropped.shape)
+        meta["dropped_leads_sha256"] = hashlib.sha256(
+            np.ascontiguousarray(dropped).view(np.uint8)
+        ).hexdigest()
+        meta["lead_indices_file"] = str(map_path)
+        meta["lead_indices_file_sha256"] = sha256_file(map_path)
+    elif kind == "fixed_lead_dropout":
+        leads = np.asarray(spec["lead_indices"], dtype=np.int64)
+        for start in robust_helpers.tqdm(range(0, len(X), 128), desc=f"perturb {spec['name']}"):
+            stop = min(len(X), start + 128)
+            out[start:stop] = X[start:stop]
+            out[start:stop, leads, :] = 0.0
+        meta["lead_indices"] = leads.astype(int).tolist()
+    elif kind == "resample_down_up":
+        from scipy.signal import resample_poly
+
+        for start in robust_helpers.tqdm(range(0, len(X), 64), desc=f"perturb {spec['name']}"):
+            stop = min(len(X), start + 64)
+            down = resample_poly(X[start:stop], up=1, down=2, axis=-1).astype(np.float32)
+            restored = resample_poly(down, up=2, down=1, axis=-1).astype(np.float32)
+            if restored.shape[-1] < X.shape[-1]:
+                pad = X.shape[-1] - restored.shape[-1]
+                restored = np.pad(restored, ((0, 0), (0, 0), (0, pad)), mode="constant")
+            out[start:stop] = restored[..., : X.shape[-1]]
+        meta["source_hz"] = int(spec["source_hz"])
+        meta["target_hz"] = int(spec["target_hz"])
+        meta["length_restored_to"] = int(X.shape[-1])
+    else:
+        raise ValueError(f"Unhandled perturbation kind: {kind}")
+    out.flush()
+    del out
+    with partial.open("r+b") as handle:
+        os.fsync(handle.fileno())
+    output_sha256 = sha256_file(partial)
+    os.replace(partial, output)
+    contract = {
+        **contract_base,
+        "output_npy_sha256": output_sha256,
+        "metadata": meta,
+    }
+    save_json(contract_path, contract)
+    stressed = np.load(output, mmap_mode="r", allow_pickle=False)
+    return stressed, meta, output
 
 
 def scalar(data: Any, key: str, default: Any = "") -> Any:
@@ -521,6 +995,7 @@ def main() -> None:
             "absent": absent,
             "sha256": hashes,
         }
+    expected_raw_sha256 = expected_raw_cache_sha256(comparators)
 
     if args.finalize_manifest_only:
         artifacts: list[dict[str, Any]] = []
@@ -547,6 +1022,7 @@ def main() -> None:
                     freeze_contract=freeze_contract,
                     checkpoint_hashes=contract["sha256"],
                     source_bundle_sha256=str(source_bundle["sha256"]),
+                    raw_cache_sha256=expected_raw_sha256,
                 ):
                     missing.append(f"{comparator}/{stress} missing or stale prediction: {out}")
                     continue
@@ -581,36 +1057,97 @@ def main() -> None:
             raise RuntimeError("Missing/stale comparator stress artifacts prevent manifest finalization.")
         return
 
-    raw_x, raw_cache_info = resnet_helpers.load_raw_cache(
-        expected_y=y,
-        expected_record_fingerprint=oof_info.get("dataset_record_order_fingerprint", ""),
-        explicit_cache=args.raw_cache,
-        limit_records=int(args.limit_records),
-    )
-
+    raw_x: np.ndarray | None = None
+    raw_cache_info: dict[str, Any] | None = None
     artifacts: list[dict[str, Any]] = []
     missing: list[str] = []
+    if args.disk_backed_raw_cache:
+        cleanup_stale_scratch_partials(args.raw_cache_mmap_dir)
+        cleanup_stale_scratch_partials(args.perturbation_mmap_dir)
     for spec in stresses:
         stress = spec["name"]
+        reuse_by_comparator: dict[str, bool] = {}
+        for comparator in comparators:
+            contract = checkpoint_contracts[comparator]
+            out = output_path(comparator, stress)
+            reuse_by_comparator[comparator] = bool(
+                args.reuse_existing
+                and not contract["absent"]
+                and validate_existing(
+                    out,
+                    y,
+                    fold_id,
+                    record_id,
+                    class_names,
+                    comparator=comparator,
+                    stress=stress,
+                    stress_spec=spec,
+                    freeze_contract=freeze_contract,
+                    checkpoint_hashes=contract["sha256"],
+                    source_bundle_sha256=str(source_bundle["sha256"]),
+                    raw_cache_sha256=expected_raw_sha256,
+                )
+            )
+        if all(reuse_by_comparator.values()):
+            for comparator in comparators:
+                out = output_path(comparator, stress)
+                print(f"Reusing existing {comparator}/{stress}: {out}", flush=True)
+                artifacts.append(
+                    {
+                        "comparator": comparator,
+                        "stress": stress,
+                        "path": project_relative(out),
+                        "sha256": sha256_file(out),
+                        "reused": True,
+                    }
+                )
+            continue
+
+        if raw_x is None:
+            if args.disk_backed_raw_cache:
+                raw_x, raw_cache_info = load_disk_backed_raw_cache(
+                    expected_y=y,
+                    expected_record_fingerprint=oof_info.get("dataset_record_order_fingerprint", ""),
+                    explicit_cache=args.raw_cache,
+                    limit_records=int(args.limit_records),
+                    comparators=comparators,
+                    mmap_dir=args.raw_cache_mmap_dir,
+                )
+            else:
+                raw_x, raw_cache_info = resnet_helpers.load_raw_cache(
+                    expected_y=y,
+                    expected_record_fingerprint=oof_info.get("dataset_record_order_fingerprint", ""),
+                    explicit_cache=args.raw_cache,
+                    limit_records=int(args.limit_records),
+                )
+            if str(raw_cache_info.get("raw_cache_sha256") or "") != expected_raw_sha256:
+                raise RuntimeError("Loaded raw cache differs from the shared comparator baseline contract")
+
         print(f"\nStress {stress}: perturbing raw ECG", flush=True)
-        stressed_x, stress_meta = robust_helpers.perturb_signals(raw_x, spec)
+        perturbation_path: Path | None = None
+        perturbation_lock: PublishLock | None = None
+        if args.disk_backed_raw_cache:
+            perturbation_lock = perturbation_writer_lock(
+                raw_x,
+                spec,
+                out_dir=args.perturbation_mmap_dir,
+                raw_cache_sha256=expected_raw_sha256,
+                source_bundle_sha256=str(source_bundle["sha256"]),
+            )
+            perturbation_lock.acquire()
+            stressed_x, stress_meta, perturbation_path = _perturb_signals_disk_backed_locked(
+                raw_x,
+                spec,
+                out_dir=args.perturbation_mmap_dir,
+                raw_cache_sha256=expected_raw_sha256,
+                source_bundle_sha256=str(source_bundle["sha256"]),
+            )
+        else:
+            stressed_x, stress_meta = robust_helpers.perturb_signals(raw_x, spec)
         for comparator in comparators:
             out = output_path(comparator, stress)
             contract = checkpoint_contracts[comparator]
-            if args.reuse_existing and not contract["absent"] and validate_existing(
-                out,
-                y,
-                fold_id,
-                record_id,
-                class_names,
-                comparator=comparator,
-                stress=stress,
-                stress_spec=spec,
-                freeze_contract=freeze_contract,
-                checkpoint_hashes=contract["sha256"],
-                source_bundle_sha256=str(source_bundle["sha256"]),
-                raw_cache_sha256=str(raw_cache_info.get("raw_cache_sha256") or ""),
-            ):
+            if reuse_by_comparator[comparator]:
                 print(f"Reusing existing {comparator}/{stress}: {out}", flush=True)
                 artifacts.append({"comparator": comparator, "stress": stress, "path": project_relative(out), "sha256": sha256_file(out), "reused": True})
                 continue
@@ -672,6 +1209,18 @@ def main() -> None:
             )
             print(f"Wrote {comparator}/{stress}: {out}", flush=True)
             artifacts.append({"comparator": comparator, "stress": stress, "path": project_relative(out), "sha256": sha256_file(out), "reused": False})
+        del stressed_x
+        gc.collect()
+        if perturbation_path is not None and not args.keep_perturbation_mmaps:
+            contract_path = perturbation_path.with_suffix(perturbation_path.suffix + ".contract.json")
+            perturbation_path.unlink(missing_ok=True)
+            contract_path.unlink(missing_ok=True)
+        if perturbation_lock is not None:
+            perturbation_lock.release()
+
+    if raw_x is not None:
+        del raw_x
+        gc.collect()
 
     payload = {
         "status": "complete" if not missing else "blocked_missing_checkpoints",

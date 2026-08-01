@@ -3477,6 +3477,242 @@ def integrate_notebook05_hrv_group_contract() -> None:
     save(name, notebook)
 
 
+def integrate_notebook05_disk_backed_comparator_stress() -> None:
+    """Keep learned-comparator stress inference within Colab RAM and scratch limits."""
+
+    name = "05_hrv_domain_and_robustness.ipynb"
+    notebook = load(name)
+
+    setup_cells = [
+        cell
+        for cell in notebook["cells"]
+        if "compatibility_tokens_05 = {" in source(cell)
+        and "scripts/revision/23_generate_comparator_stress_predictions.py" in source(cell)
+    ]
+    if len(setup_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 05 comparator-stress compatibility candidates={len(setup_cells)}, expected 1"
+        )
+    setup = setup_cells[0]
+    setup_text = source(setup)
+    capability_anchor = "        'robustness_{stem}_{stress}_predictions.npz',\n"
+    capability_tokens = (
+        "DISK_BACKED_RAW_CACHE_CAPABILITY",
+        "DISK_BACKED_PERTURBATION_CAPABILITY",
+        "--disk-backed-raw-cache",
+        "--raw-cache-mmap-dir",
+        "--perturbation-mmap-dir",
+    )
+    if capability_anchor not in setup_text:
+        raise RuntimeError("Notebook 05 comparator-stress capability anchor missing")
+    insertion = capability_anchor
+    for token in capability_tokens:
+        line = f"        {token!r},\n"
+        if line not in setup_text:
+            insertion += line
+    if insertion != capability_anchor:
+        setup_text = setup_text.replace(capability_anchor, insertion, 1)
+
+    refresh_pattern = re.compile(
+        r"\n\ndef refresh_transformer_aware_scripts_05\(\):\n.*?\n    return remaining\n",
+        flags=re.DOTALL,
+    )
+    setup_text = refresh_pattern.sub("", setup_text, count=1)
+    compatibility_pattern = re.compile(
+        r"compatibility_failures_05 = transformer_compatibility_failures_05\(\)\n"
+        r"if compatibility_failures_05:\n"
+        r"    compatibility_failures_05 = refresh_transformer_aware_scripts_05\(\)\n"
+        r"if compatibility_failures_05:\n"
+        r"    raise RuntimeError\(\n.*?\n    \)\n"
+        r"print\('Notebook 05 robustness script preflight: OK'\)\n",
+        flags=re.DOTALL,
+    )
+    fail_closed_block = '''compatibility_failures_05 = transformer_compatibility_failures_05()
+if compatibility_failures_05:
+    authority = (CODE_AUTHORITY or {}).get('git_commit', 'unknown')
+    raise RuntimeError(
+        f'Notebook 05 is incompatible with pinned authority {authority}: '
+        + ' ; '.join(compatibility_failures_05)
+        + '. Do not replace tracked files from mutable origin/main after authority pinning. '
+          'Commit and review the required code, publish a new versioned release, then rotate authority through Notebook 00.'
+    )
+print('Notebook 05 robustness script preflight: OK')
+'''
+    setup_text, compatibility_replacements = compatibility_pattern.subn(
+        fail_closed_block,
+        setup_text,
+        count=1,
+    )
+    if compatibility_replacements == 0 and fail_closed_block not in setup_text:
+        raise RuntimeError("Notebook 05 mutable compatibility-refresh block was not found")
+    for forbidden in (
+        "refresh_transformer_aware_scripts_05",
+        "git checkout origin/{branch}",
+        "raw.githubusercontent.com/BrianNguyen29/ECG-RAMBA/{BRANCH}",
+    ):
+        if forbidden in setup_text:
+            raise RuntimeError(f"Notebook 05 still mutates pinned authority via: {forbidden}")
+    for token in capability_tokens:
+        if f"        {token!r},\n" not in setup_text:
+            raise RuntimeError(f"Notebook 05 compatibility token was not integrated: {token}")
+    set_source(setup, setup_text)
+
+    stress_cells = [
+        cell
+        for cell in notebook["cells"]
+        if "comparator_stress_command = (" in source(cell)
+        and "COMPARATOR_STRESS_NUM_WORKERS" in source(cell)
+    ]
+    if len(stress_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 05 comparator-stress command candidates={len(stress_cells)}, expected 1"
+        )
+    stress_cell = stress_cells[0]
+    stress_text = source(stress_cell)
+    runtime_pattern = re.compile(
+        r"# (?:A100 High-RAM|T4-safe default).*?\n"
+        r"COMPARATOR_STRESS_BATCH_SIZE = .*?\n"
+        r"COMPARATOR_STRESS_NUM_WORKERS = 0\n"
+        r".*?(?=COMPARATOR_STRESS_STRICT =)",
+        flags=re.DOTALL,
+    )
+    runtime_block = '''# T4-safe default; set ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE=512 on A100 after a successful preflight.
+COMPARATOR_STRESS_BATCH_SIZE = int(os.environ.get('ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE', '256'))
+COMPARATOR_STRESS_NUM_WORKERS = 0
+COMPARATOR_STRESS_DISK_BACKED = os.environ.get('ECG_RAMBA_COMPARATOR_STRESS_DISK_BACKED', '1') == '1'
+COMPARATOR_STRESS_RAW_CACHE = DRIVE_ROOT / 'ecg_data_27c_subject.npz'
+COMPARATOR_STRESS_RAW_MMAP_DIR = Path(os.environ.get(
+    'ECG_RAMBA_RAW_CACHE_MMAP_DIR',
+    '/content/ecg_ramba_runtime/raw_cache',
+))
+COMPARATOR_STRESS_PERTURBATION_MMAP_DIR = Path(os.environ.get(
+    'ECG_RAMBA_PERTURBATION_MMAP_DIR',
+    '/content/ecg_ramba_runtime/robustness_perturbations',
+))
+COMPARATOR_STRESS_DISK_FLAG = (
+    '--disk-backed-raw-cache'
+    if COMPARATOR_STRESS_DISK_BACKED
+    else '--no-disk-backed-raw-cache'
+)
+'''
+    stress_text, runtime_replacements = runtime_pattern.subn(runtime_block, stress_text, count=1)
+    if runtime_replacements != 1:
+        raise RuntimeError("Notebook 05 comparator-stress runtime block could not be normalized")
+
+    list_pattern = re.compile(
+        r"comparator_stress_parts = .*?\n"
+        r"comparator_checkpoint_candidates = \[",
+        flags=re.DOTALL,
+    )
+    list_block = '''comparator_stress_parts = [item.strip() for item in COMPARATOR_STRESS_COMPARATORS.split(',') if item.strip()]
+if not comparator_stress_parts:
+    raise ValueError('ECG_RAMBA_COMPARATOR_STRESS_COMPARATORS must contain at least one comparator.')
+unsupported_comparator_stress = sorted(set(comparator_stress_parts) - SUPPORTED_COMPARATOR_STRESS)
+if unsupported_comparator_stress:
+    raise ValueError(
+        'Unsupported comparator stress request: '
+        + ', '.join(unsupported_comparator_stress)
+        + '. Current generator supports only resnet,raw_mamba,transformer.'
+    )
+
+comparator_stress_list = [item.strip() for item in COMPARATOR_STRESS_TESTS.split(',') if item.strip()]
+if not comparator_stress_list:
+    raise ValueError('ECG_RAMBA_COMPARATOR_STRESS_TESTS must contain at least one stress test.')
+COMPARATOR_STRESS_COMPARATORS_ARG = ','.join(comparator_stress_parts)
+COMPARATOR_STRESS_TESTS_ARG = ','.join(comparator_stress_list)
+comparator_checkpoint_candidates = ['''
+    stress_text, list_replacements = list_pattern.subn(list_block, stress_text, count=1)
+    if list_replacements != 1:
+        raise RuntimeError("Notebook 05 comparator/stress list block could not be normalized")
+
+    print_anchor = "print('Comparator stress batch size:', COMPARATOR_STRESS_BATCH_SIZE)\n"
+    print_block = '''print('Comparator stress disk-backed:', COMPARATOR_STRESS_DISK_BACKED)
+print('Comparator stress raw cache:', COMPARATOR_STRESS_RAW_CACHE)
+print('Comparator stress raw mmap dir:', COMPARATOR_STRESS_RAW_MMAP_DIR)
+print('Comparator stress perturbation mmap dir:', COMPARATOR_STRESS_PERTURBATION_MMAP_DIR)
+'''
+    if print_anchor not in stress_text:
+        raise RuntimeError("Notebook 05 comparator-stress print anchor missing")
+    for line in print_block.splitlines(keepends=True):
+        if line not in stress_text:
+            stress_text = stress_text.replace(print_anchor, print_anchor + line, 1)
+
+    command_pattern = re.compile(
+        r"comparator_stress_command = \(\n.*?\n\)\n(?=if FORCE_RERUN_COMPARATOR_STRESS_PREDICTIONS:)",
+        flags=re.DOTALL,
+    )
+    command_block = '''comparator_stress_command = (
+    'python -u scripts/revision/23_generate_comparator_stress_predictions.py '
+    f'--comparators {COMPARATOR_STRESS_COMPARATORS_ARG} '
+    f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG} '
+    '--oof-predictions reports/revision/predictions/oof_final_ema_predictions.npz '
+    '--freeze-manifest reports/revision/manifests/oof_final_ema_freeze_manifest.json '
+    '--expected-checkpoint-kind final_ema '
+    f'--resnet-checkpoint-dir "{COMPARATOR_STRESS_CHECKPOINT_DIRS["resnet"]}" '
+    f'--raw-mamba-checkpoint-dir "{COMPARATOR_STRESS_CHECKPOINT_DIRS["raw_mamba"]}" '
+    f'--transformer-checkpoint-dir "{COMPARATOR_STRESS_CHECKPOINT_DIRS["transformer"]}" '
+    f'--raw-cache "{COMPARATOR_STRESS_RAW_CACHE}" '
+    f'{COMPARATOR_STRESS_DISK_FLAG} '
+    f'--raw-cache-mmap-dir "{COMPARATOR_STRESS_RAW_MMAP_DIR}" '
+    f'--perturbation-mmap-dir "{COMPARATOR_STRESS_PERTURBATION_MMAP_DIR}" '
+    f'--batch-size {COMPARATOR_STRESS_BATCH_SIZE} --num-workers {COMPARATOR_STRESS_NUM_WORKERS} '
+    '--device cuda --amp --allow-tf32 --reuse-existing'
+)
+'''
+    stress_text, command_replacements = command_pattern.subn(command_block, stress_text, count=1)
+    if command_replacements != 1:
+        raise RuntimeError("Notebook 05 comparator-stress command block could not be normalized")
+    stress_text = stress_text.replace(
+        "f'--stress-tests {COMPARATOR_STRESS_TESTS}',",
+        "f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG}',",
+    )
+    for required in (
+        "ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE', '256'",
+        "COMPARATOR_STRESS_RAW_CACHE = DRIVE_ROOT / 'ecg_data_27c_subject.npz'",
+        "COMPARATOR_STRESS_COMPARATORS_ARG = ','.join(comparator_stress_parts)",
+        "COMPARATOR_STRESS_TESTS_ARG = ','.join(comparator_stress_list)",
+        "f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG}',",
+        "f'--raw-cache \"{COMPARATOR_STRESS_RAW_CACHE}\" '",
+        "f'{COMPARATOR_STRESS_DISK_FLAG} '",
+        "'/content/ecg_ramba_runtime/raw_cache'",
+        "'/content/ecg_ramba_runtime/robustness_perturbations'",
+    ):
+        if required not in stress_text:
+            raise RuntimeError(f"Notebook 05 disk-backed command postcondition missing: {required}")
+    set_source(stress_cell, stress_text)
+
+    markdown_cells = [
+        cell
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "markdown"
+        and "## Comparator Stress Prediction Generation" in source(cell)
+    ]
+    if len(markdown_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 05 comparator-stress markdown candidates={len(markdown_cells)}, expected 1"
+        )
+    markdown = markdown_cells[0]
+    markdown_text = source(markdown)
+    disk_note = (
+        "\nThe default path authenticates the source NPZ against the baseline manifests, streams its "
+        "`X.npy` member to local scratch, and creates one exact perturbation memmap at a time. "
+        "This avoids materializing two 10+ GB signal arrays in system RAM. The perturbation memmap is "
+        "cleared after each completed stress while the authenticated raw memmap remains in local scratch "
+        "for reuse until the runtime ends; prediction artifacts are published to canonical Drive.\n"
+    )
+    disk_note_pattern = re.compile(
+        r"\n?The default path authenticates the source NPZ.*?published to canonical Drive\.\n?",
+        flags=re.DOTALL,
+    )
+    if disk_note_pattern.search(markdown_text):
+        markdown_text = disk_note_pattern.sub(disk_note, markdown_text, count=1)
+    else:
+        markdown_text = markdown_text.rstrip() + disk_note
+    set_source(markdown, markdown_text)
+
+    save(name, notebook)
+
+
 def integrate_notebook00_full_sha_audit() -> None:
     """Run the bootstrap storage inventory with full hashes without requiring completion."""
 
@@ -4355,6 +4591,7 @@ def main() -> None:
     integrate_notebook04_same_fold_and_calibration()
     integrate_notebook06_authenticated_cache_restore()
     integrate_notebook05_hrv_group_contract()
+    integrate_notebook05_disk_backed_comparator_stress()
     integrate_notebook00_full_sha_audit()
     normalize_bootstrap_contracts()
     integrate_shared_contract_versions()

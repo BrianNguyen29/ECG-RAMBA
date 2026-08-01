@@ -1,7 +1,10 @@
 import ast
 import hashlib
+import importlib.util
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -213,12 +216,67 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "raw_mamba_needs_inference",
             "--refresh-existing-prefix predictions/robustness_",
             "All requested comparator stress artifacts passed provenance validation",
+            "DISK_BACKED_RAW_CACHE_CAPABILITY",
+            "DISK_BACKED_PERTURBATION_CAPABILITY",
+            "COMPARATOR_STRESS_DISK_BACKED",
+            "--disk-backed-raw-cache",
+            "--raw-cache-mmap-dir",
+            "--perturbation-mmap-dir",
+            "ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE', '256'",
+            "COMPARATOR_STRESS_RAW_CACHE = DRIVE_ROOT / 'ecg_data_27c_subject.npz'",
+            "COMPARATOR_STRESS_COMPARATORS_ARG = ','.join(comparator_stress_parts)",
+            "COMPARATOR_STRESS_TESTS_ARG = ','.join(comparator_stress_list)",
+            "f'--comparators {COMPARATOR_STRESS_COMPARATORS_ARG} '",
+            "f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG} '",
+            "f'--raw-cache \"{COMPARATOR_STRESS_RAW_CACHE}\" '",
+            "f'{COMPARATOR_STRESS_DISK_FLAG} '",
+            "'/content/ecg_ramba_runtime/raw_cache'",
+            "'/content/ecg_ramba_runtime/robustness_perturbations'",
+            "Do not replace tracked files from mutable origin/main after authority pinning.",
         ):
             self.assertIn(token, source)
+        for forbidden in (
+            "def refresh_transformer_aware_scripts_05():",
+            "git checkout origin/{branch}",
+            "raw.githubusercontent.com/BrianNguyen29/ECG-RAMBA/{BRANCH}",
+        ):
+            self.assertNotIn(forbidden, source)
         self.assertNotIn(
             "All requested comparator stress prediction artifacts are present; skipping GPU inference.",
             source,
         )
+
+    def test_notebook05_normalizes_environment_lists_before_shell_construction(self):
+        import pandas as pd
+
+        cells, _ = notebook_source("05_hrv_domain_and_robustness.ipynb")
+        stress_cell = next(
+            cell
+            for cell in cells
+            if "comparator_stress_command = (" in cell
+            and "COMPARATOR_STRESS_NUM_WORKERS" in cell
+        )
+        prefix = stress_cell.split("comparator_stress_ran = False", 1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            namespace = {
+                "os": os,
+                "Path": Path,
+                "pd": pd,
+                "DRIVE_ROOT": root,
+                "CANONICAL_CHECKPOINT_ROOT": root / "checkpoints",
+                "ROBUSTNESS_STRESS_TESTS": "snr5db,precordial_dropout",
+                "revision_root": root / "revision",
+            }
+            environment = {
+                "ECG_RAMBA_COMPARATOR_STRESS_COMPARATORS": "resnet, raw_mamba, transformer",
+                "ECG_RAMBA_COMPARATOR_STRESS_TESTS": "snr5db, precordial_dropout",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                exec(prefix, namespace, namespace)
+        argv = shlex.split(namespace["comparator_stress_command"])
+        self.assertEqual(argv[argv.index("--comparators") + 1], "resnet,raw_mamba,transformer")
+        self.assertEqual(argv[argv.index("--stress-tests") + 1], "snr5db,precordial_dropout")
 
     def test_notebook05_finds_current_notebook02_mamba_installer(self):
         _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
@@ -797,6 +855,57 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         first = notebook_hashes()
         subprocess.run([sys.executable, str(integrator)], cwd=PROJECT_ROOT, check=True)
         self.assertEqual(first, notebook_hashes())
+
+    def test_notebook05_integrator_repairs_partial_state_idempotently(self):
+        spec = importlib.util.spec_from_file_location("forensic_integrator_partial_test", FORENSIC_INTEGRATOR)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            notebook_dir = Path(tmpdir) / "notebooks"
+            notebook_dir.mkdir(parents=True)
+            target = notebook_dir / "05_hrv_domain_and_robustness.ipynb"
+            shutil.copy2(PROJECT_ROOT / "notebooks" / target.name, target)
+            payload = json.loads(target.read_text(encoding="utf-8"))
+            setup = next(
+                cell
+                for cell in payload["cells"]
+                if "compatibility_tokens_05 = {" in "".join(cell.get("source", []))
+            )
+            setup_text = "".join(setup["source"]).replace(
+                "        'DISK_BACKED_PERTURBATION_CAPABILITY',\n",
+                "",
+                1,
+            )
+            setup["source"] = setup_text.splitlines(keepends=True)
+            stress = next(
+                cell
+                for cell in payload["cells"]
+                if "comparator_stress_command = (" in "".join(cell.get("source", []))
+                and "COMPARATOR_STRESS_NUM_WORKERS" in "".join(cell.get("source", []))
+            )
+            stress_text = "".join(stress["source"]).replace(
+                "f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG} '",
+                "f'--stress-tests {COMPARATOR_STRESS_TESTS} '",
+                1,
+            )
+            stress["source"] = stress_text.splitlines(keepends=True)
+            target.write_text(json.dumps(payload, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            original_notebook_dir = module.NOTEBOOK_DIR
+            try:
+                module.NOTEBOOK_DIR = notebook_dir
+                module.integrate_notebook05_disk_backed_comparator_stress()
+                first_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+                module.integrate_notebook05_disk_backed_comparator_stress()
+                second_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+            finally:
+                module.NOTEBOOK_DIR = original_notebook_dir
+            repaired = target.read_text(encoding="utf-8")
+            self.assertIn("        'DISK_BACKED_PERTURBATION_CAPABILITY',", repaired)
+            self.assertIn("f'--stress-tests {COMPARATOR_STRESS_TESTS_ARG} '", repaired)
+            self.assertEqual(first_hash, second_hash)
 
     def test_notebook07_uses_targeted_restore_and_exports_profiles(self):
         _, source = notebook_source("07_results_freeze.ipynb")
