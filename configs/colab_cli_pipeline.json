@@ -228,7 +228,7 @@
         "## Robustness Stress-Test Ledger",
         "## Comparator Stress Prediction Generation"
       ],
-      "hardware": "a100",
+      "hardware": "gpu",
       "timeout_seconds": 86400,
       "enabled": true,
       "depends_on": [

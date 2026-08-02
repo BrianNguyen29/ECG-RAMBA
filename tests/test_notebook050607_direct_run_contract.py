@@ -159,7 +159,9 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "reviewer_minimal",
             "core_final",
             "artifact_mirror.py publish --verify-existing size",
-            "--refresh-existing-cache-dirs",
+            "--refresh-existing-prefix metrics/robustness_multicomparator_metric_cache",
+            "stress_publish_selection",
+            "hrv_publish_selection",
             "oof_label_fold_contract_sha256",
             "hrv_only_oof_reuse_attestation.json",
             "semantic_contract_match",
@@ -214,7 +216,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "Missing/stale comparator stress pairs:",
             "Only affected stress groups will run",
             "raw_mamba_needs_inference",
-            "--refresh-existing-prefix predictions/robustness_",
+            "stress_publish_selection",
+            "--source-conflict-policy source",
             "All requested comparator stress artifacts passed provenance validation",
             "DISK_BACKED_RAW_CACHE_CAPABILITY",
             "DISK_BACKED_PERTURBATION_CAPABILITY",
@@ -286,6 +289,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "len(installer_candidates) == 1",
         ):
             self.assertIn(token, source)
+        self.assertNotIn("--refresh-existing-cache-dirs", source)
         self.assertNotIn("'INSTALL_MODEL_DEPS = True' in source", source)
 
     def test_notebook06_can_refresh_semantically_equivalent_embedding_on_cpu(self):

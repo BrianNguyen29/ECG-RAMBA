@@ -87,6 +87,16 @@ class ColabCliPipelineTests(unittest.TestCase):
             {"full", "minirocket", "resnet", "raw_mamba", "transformer"},
         )
 
+    def test_notebook05_prediction_stage_accepts_t4_gpu_runtime(self):
+        stage = self.module.stage_by_id(
+            self.manifest, "nb05_predictions_a100"
+        )
+        self.assertEqual(stage["hardware"], "gpu")
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE"],
+            "256",
+        )
+
     def test_windows_drive_mount_bridge_uses_official_cli(self):
         source = (
             ROOT / "scripts" / "colab_cli" / "mount_drive_interactive.ps1"
