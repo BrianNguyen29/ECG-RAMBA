@@ -1996,6 +1996,8 @@ def main() -> None:
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "protocol": PROTOCOL,
+        "runner_sha256": sha256_file(Path(__file__)),
+        "source_bundle": source_bundle_contract(),
         "statistical_inference": {
             "ci_scope": CI_SCOPE,
             "inference_scope": INFERENCE_SCOPE,
@@ -2046,9 +2048,12 @@ def main() -> None:
     }
     save_json(comparison_json, json_safe(payload))
     manifest = {
+        "status": True,
         "created_utc": now_utc(),
         "git_commit": git_commit(),
         "protocol": PROTOCOL,
+        "runner_sha256": sha256_file(Path(__file__)),
+        "source_bundle": source_bundle_contract(),
         "args": vars(args),
         "artifact_sha256": {
             "summary_csv": sha256_file(summary_csv),

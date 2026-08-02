@@ -1,4 +1,5 @@
 import csv
+import ast
 import importlib
 import json
 import tempfile
@@ -21,7 +22,28 @@ READINESS = importlib.import_module("scripts.revision.28_claim_readiness_gates")
 FINAL_EVIDENCE = importlib.import_module("scripts.revision.13_final_evidence_matrix")
 
 
+def literal_module_assignment(path: Path, name: str):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(isinstance(target, ast.Name) and target.id == name for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"Assignment not found: {path}:{name}")
+
+
 class RobustnessMulticomparatorContractTests(unittest.TestCase):
+    def test_learned_stress_producer_and_ledger_bind_the_same_source_bundle(self):
+        producer_paths = literal_module_assignment(
+            ROBUSTNESS.PROJECT_ROOT
+            / "scripts/revision/23_generate_comparator_stress_predictions.py",
+            "SOURCE_BUNDLE_PATHS",
+        )
+        self.assertEqual(
+            ROBUSTNESS.COMPARATOR_STRESS_SOURCE_PATHS,
+            producer_paths,
+        )
+
     def test_outputs_declare_pointwise_effect_size_inference_only(self):
         self.assertEqual(
             ROBUSTNESS.INFERENCE_SCOPE,

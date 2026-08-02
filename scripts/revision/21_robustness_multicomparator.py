@@ -64,10 +64,10 @@ COMPARATOR_STRESS_PROTOCOL = "comparator_stress_predictions_v2_source_bound_same
 COMPARATOR_STRESS_SOURCE_PATHS = (
     "scripts/revision/23_generate_comparator_stress_predictions.py",
     "scripts/revision/12_robustness_stress.py",
-    "scripts/revision/common.py",
     "scripts/revision/14_resnet1d_cnn_baseline.py",
     "scripts/revision/16_raw_mamba_baseline.py",
     "scripts/revision/24_transformer_ecg_baseline.py",
+    "scripts/revision/artifact_mirror.py",
     "src/aggregation.py",
     "src/training_data.py",
     "configs/config.py",

@@ -103,6 +103,16 @@ def authority_block_source(name: str, *, occurrence: int = 0) -> str:
 
 
 class Notebook050607DirectRunContractTests(unittest.TestCase):
+    def test_colab_pipeline_uses_effect_size_bootstrap_count_for_robustness(self):
+        manifest = json.loads(
+            (PROJECT_ROOT / "configs/colab_cli_pipeline.json").read_text(encoding="utf-8")
+        )
+        stage = next(item for item in manifest["stages"] if item["id"] == "nb05_finalize_cpu")
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_ROBUSTNESS_MULTI_FINAL_N_BOOT"],
+            "1000",
+        )
+
     def test_notebook_source_token_preflights_match_the_pinned_repository(self):
         checks = (
             ("00_colab_bootstrap.ipynb", "required_source_tokens"),
@@ -186,6 +196,11 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "ECG_RAMBA_ROBUSTNESS_MULTI_BOOTSTRAP_JOBS must be auto or a positive integer.",
             "ROBUSTNESS_MULTI_INNER_THREADS",
             "total paired metric jobs",
+            "_robustness_prediction_contract",
+            "source_bound_contract_ready",
+            "source_bundle_sha256_mismatch",
+            "_robustness_aggregate_contract_ready",
+            "Authenticated Full/MiniRocket robustness output contract:",
         ):
             self.assertIn(token, source)
         self.assertNotIn(
