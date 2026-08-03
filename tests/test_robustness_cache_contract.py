@@ -56,6 +56,51 @@ class RobustnessCacheContractTests(unittest.TestCase):
             self.assertEqual(info["preprocessing_source_sha256"], "source")
             ROBUSTNESS.close_memmap(indexed.base)
 
+    def test_legacy_disk_backed_cache_requires_frozen_oof_identity_attestation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "legacy_clean.npz"
+            signals = np.zeros((6, 12, ROBUSTNESS.SEQ_LEN), dtype=np.float32)
+            labels = np.ones((6, len(ROBUSTNESS.CLASSES)), dtype=np.float32)
+            raw_amp = np.zeros((6, 5), dtype=np.float32)
+            subjects = np.asarray([f"record-{index}" for index in range(6)])
+            record_fp = ROBUSTNESS.record_order_fingerprint(subjects)
+            np.savez_compressed(
+                cache_path,
+                X=signals,
+                y=labels,
+                X_raw_amp=raw_amp,
+                subjects=subjects,
+                record_order_fingerprint=np.asarray(record_fp),
+            )
+            expected = {
+                "path": str(cache_path.resolve()),
+                "size_bytes": cache_path.stat().st_size,
+                "record_order_fingerprint": record_fp,
+                "source_config_hash": "config",
+                "oof_run_manifest_sha256": "manifest",
+            }
+            info = ROBUSTNESS.inspect_disk_backed_chapman_cache(
+                expected_y=labels,
+                expected_record_fingerprint=record_fp,
+                expected_archive_sha256="a" * 64,
+                explicit_cache=cache_path,
+                limit_records=0,
+                expected_cache_contract=expected,
+            )
+            self.assertEqual(info["provenance_mode"], "frozen_oof_legacy_cache_content_bound")
+            self.assertEqual(info["legacy_cache_attestation"], expected)
+
+            rejected = dict(expected, size_bytes=cache_path.stat().st_size + 1)
+            with self.assertRaises(FileNotFoundError):
+                ROBUSTNESS.inspect_disk_backed_chapman_cache(
+                    expected_y=labels,
+                    expected_record_fingerprint=record_fp,
+                    expected_archive_sha256="a" * 64,
+                    explicit_cache=cache_path,
+                    limit_records=0,
+                    expected_cache_contract=rejected,
+                )
+
     def test_disk_backed_perturbations_match_in_memory_reference(self):
         rng = np.random.default_rng(123)
         signals = rng.normal(size=(5, 12, 40)).astype(np.float32)

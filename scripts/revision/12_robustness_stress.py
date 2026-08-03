@@ -353,6 +353,7 @@ def inspect_disk_backed_chapman_cache(
     expected_archive_sha256: str,
     explicit_cache: Path | None,
     limit_records: int,
+    expected_cache_contract: dict | None = None,
 ) -> dict:
     """Authenticate clean-cache metadata and derive the exact cleaned row mapping."""
 
@@ -409,12 +410,32 @@ def inspect_disk_backed_chapman_cache(
         if stored_record_fp and stored_record_fp != raw_record_fp:
             print("  rejected: stored raw-cache record fingerprint mismatch", flush=True)
             continue
+        provenance_mode = "archive_metadata_bound"
         if expected_archive_sha256 and stored_archive_sha != expected_archive_sha256:
-            print(
-                f"  rejected: archive SHA {stored_archive_sha} != frozen {expected_archive_sha256}",
-                flush=True,
-            )
-            continue
+            if stored_archive_sha:
+                print(
+                    f"  rejected: archive SHA {stored_archive_sha} != frozen {expected_archive_sha256}",
+                    flush=True,
+                )
+                continue
+            expected_cache_contract = expected_cache_contract or {}
+            expected_path = expected_cache_contract.get("path")
+            expected_size = expected_cache_contract.get("size_bytes")
+            expected_fp = expected_cache_contract.get("record_order_fingerprint")
+            if (
+                not expected_path
+                or Path(str(expected_path)).expanduser().resolve() != path
+                or int(expected_size or -1) != int(path.stat().st_size)
+                or not expected_fp
+                or str(expected_fp) != str(expected_record_fingerprint)
+            ):
+                print(
+                    "  rejected: legacy cache lacks archive SHA and does not match the "
+                    "SHA-frozen OOF run-manifest path/size/order contract",
+                    flush=True,
+                )
+                continue
+            provenance_mode = "frozen_oof_legacy_cache_content_bound"
 
         keep_classes = y_cache.sum(axis=0) >= 5
         y_clean = y_cache[:, keep_classes]
@@ -462,6 +483,12 @@ def inspect_disk_backed_chapman_cache(
             "record_order_fingerprint": cleaned_record_fp,
             "raw_record_order_fingerprint": raw_record_fp,
             "archive_sha256": stored_archive_sha,
+            "provenance_mode": provenance_mode,
+            "legacy_cache_attestation": (
+                dict(expected_cache_contract or {})
+                if provenance_mode == "frozen_oof_legacy_cache_content_bound"
+                else None
+            ),
             "cache_schema_version": cache_schema_version,
             "preprocessing_source_sha256": preprocessing_source_sha,
             "preprocessing_config_sha256": preprocessing_config_sha,
@@ -1032,6 +1059,41 @@ def validate_clean_prediction_contract(
         },
     })
     return contract
+
+
+def frozen_oof_raw_cache_contract(args: argparse.Namespace, contract: dict) -> dict:
+    """Authenticate the legacy clean-cache identity recorded by the frozen OOF run."""
+
+    manifest_path = resolve_path(args.oof_run_manifest)
+    if not manifest_path.is_file() or manifest_path.stat().st_size <= 0:
+        raise FileNotFoundError(f"Missing frozen OOF run manifest: {manifest_path}")
+    manifest_sha = sha256_file(manifest_path)
+    freeze_path = Path(contract["freeze_manifest"]["path"])
+    freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
+    frozen_sha = (freeze.get("generation_provenance") or {}).get("run_manifest_sha256")
+    if not frozen_sha or manifest_sha != frozen_sha:
+        raise RuntimeError(
+            "OOF run manifest is not authenticated by the freeze generation provenance: "
+            f"observed={manifest_sha} frozen={frozen_sha}"
+        )
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    cache = ((payload.get("config") or {}).get("paths") or {}).get("data_cache") or {}
+    path = cache.get("path")
+    size_bytes = cache.get("size_bytes")
+    record_fp = payload.get("dataset_record_order_fingerprint")
+    source_config_hash = (payload.get("config") or {}).get("source_runtime_config_hash")
+    if not path or int(size_bytes or -1) <= 0 or not record_fp or not source_config_hash:
+        raise RuntimeError("Frozen OOF run manifest lacks the legacy clean-cache identity contract.")
+    return {
+        "path": str(Path(str(path)).expanduser().resolve()),
+        "size_bytes": int(size_bytes),
+        "record_order_fingerprint": str(record_fp),
+        "source_config_hash": str(source_config_hash),
+        "oof_run_manifest_path": str(manifest_path),
+        "oof_run_manifest_sha256": manifest_sha,
+        "attestation_scope": "path_size_record_order_plus_exact_label_equality",
+    }
 
 
 def fold_list_from_fold_id(fold_id: np.ndarray) -> list[dict[str, np.ndarray]]:
@@ -2202,6 +2264,9 @@ def main() -> None:
         args,
         require_minirocket=not args.features_only,
     )
+    raw_cache_contract = (
+        frozen_oof_raw_cache_contract(args, contract) if args.disk_backed_signals else None
+    )
     y = full_clean["y_true"]
     fold_id = np.asarray(full_clean["fold_id"], dtype=np.int16)
     folds = fold_list_from_fold_id(fold_id)
@@ -2228,6 +2293,7 @@ def main() -> None:
                 expected_archive_sha256=str(
                     contract["freeze_manifest"].get("source_archive_sha256") or ""
                 ),
+                expected_cache_contract=raw_cache_contract,
                 explicit_cache=args.raw_cache,
                 limit_records=args.limit_records,
             )
@@ -2503,6 +2569,7 @@ def main() -> None:
                 expected_archive_sha256=str(
                     contract["freeze_manifest"].get("source_archive_sha256") or ""
                 ),
+                expected_cache_contract=raw_cache_contract,
                 explicit_cache=args.raw_cache,
                 limit_records=args.limit_records,
             )
