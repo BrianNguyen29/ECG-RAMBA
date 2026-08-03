@@ -26,6 +26,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -44,7 +45,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from configs.config import CLASSES, CONFIG, EVALUATION_CONFIG_HASH, PATHS  # noqa: E402
+from configs.config import CLASSES, CONFIG, EVALUATION_CONFIG_HASH, PATHS, SEQ_LEN  # noqa: E402
 from scripts.revision.common import (  # noqa: E402
     EXPERIMENTAL_DIR,
     MANIFEST_DIR,
@@ -68,7 +69,11 @@ from src.features import (  # noqa: E402
     extract_global_record_stats,
     extract_hrv_features,
 )
-from src.provenance import record_order_fingerprint  # noqa: E402
+from src.provenance import (  # noqa: E402
+    exclusive_cache_writer,
+    ndarray_sha256,
+    record_order_fingerprint,
+)
 
 
 PROTOCOL = "robustness_full_vs_fixed_seed_rocket_perturbation_v2_source_bound"
@@ -174,6 +179,54 @@ def parse_args() -> argparse.Namespace:
             "inside the canonical revision-artifact Drive root."
         ),
     )
+    parser.add_argument(
+        "--raw-cache",
+        type=Path,
+        default=None,
+        help="Authenticated Chapman clean-cache NPZ. Defaults to configs.config.PATHS['data_cache'].",
+    )
+    parser.add_argument(
+        "--disk-backed-signals",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Extract only X.npy from the authenticated clean-cache NPZ into local scratch and mmap it. "
+            "This is required for full-size Colab runs because the cleaned signals exceed CPU-runtime RAM."
+        ),
+    )
+    parser.add_argument(
+        "--raw-cache-mmap-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "ECG_RAMBA_ROBUSTNESS_RAW_MMAP_DIR",
+                "/content/ecg_ramba_runtime/robustness_raw_cache",
+            )
+        ),
+        help="Local scratch directory for the authenticated clean-signal memmap.",
+    )
+    parser.add_argument(
+        "--perturbation-mmap-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "ECG_RAMBA_ROBUSTNESS_PERTURB_MMAP_DIR",
+                "/content/ecg_ramba_runtime/robustness_perturbations",
+            )
+        ),
+        help="Local scratch directory for one exact perturbed-signal memmap at a time.",
+    )
+    parser.add_argument(
+        "--feature-work-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "ECG_RAMBA_ROBUSTNESS_FEATURE_WORK_DIR",
+                "/content/ecg_ramba_runtime/robustness_feature_work",
+            )
+        ),
+        help="Local scratch directory for bounded-memory ROCKET-family feature assembly.",
+    )
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -250,6 +303,384 @@ def log_path(path: Path) -> str:
         return project_relative(path)
     except ValueError:
         return str(resolve_path(path))
+
+
+class IndexedSignalRows:
+    """Expose cleaned Chapman rows without materializing the 10+ GiB signal array."""
+
+    def __init__(self, base: np.ndarray, row_indices: np.ndarray):
+        self.base = base
+        self.row_indices = np.asarray(row_indices, dtype=np.int64)
+        self.shape = (len(self.row_indices), *base.shape[1:])
+        self.dtype = base.dtype
+
+    def __len__(self) -> int:
+        return len(self.row_indices)
+
+    def __getitem__(self, key):
+        return self.base[self.row_indices[key]]
+
+
+def npz_member_contract(path: Path, member: str) -> tuple[tuple[int, ...], np.dtype, int]:
+    """Read an NPY member header from an NPZ without materializing its array."""
+
+    with zipfile.ZipFile(path) as archive:
+        if member not in archive.namelist():
+            raise KeyError(f"Missing {member} in Chapman clean cache: {path}")
+        info = archive.getinfo(member)
+        with archive.open(member) as stream:
+            version = np.lib.format.read_magic(stream)
+            if version == (1, 0):
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_1_0(stream)
+            elif version in {(2, 0), (3, 0)}:
+                shape, _fortran_order, dtype = np.lib.format.read_array_header_2_0(stream)
+            else:
+                raise ValueError(f"Unsupported NPY member version {version}: {path}!{member}")
+    return tuple(int(value) for value in shape), np.dtype(dtype), int(info.file_size)
+
+
+def npz_scalar(payload: np.lib.npyio.NpzFile, key: str, default=None):
+    if key not in payload.files:
+        return default
+    value = payload[key]
+    return value.item() if np.ndim(value) == 0 else value
+
+
+def inspect_disk_backed_chapman_cache(
+    *,
+    expected_y: np.ndarray,
+    expected_record_fingerprint: str,
+    expected_archive_sha256: str,
+    explicit_cache: Path | None,
+    limit_records: int,
+) -> dict:
+    """Authenticate clean-cache metadata and derive the exact cleaned row mapping."""
+
+    candidates = []
+    if explicit_cache is not None:
+        candidates.append(resolve_path(explicit_cache))
+    candidates.append(Path(PATHS["data_cache"]))
+    checked: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        path = Path(candidate).expanduser().resolve()
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        checked.append(str(path))
+        if not path.is_file() or path.stat().st_size == 0:
+            continue
+        print(f"Authenticating disk-backed Chapman clean cache: {path}", flush=True)
+        try:
+            x_shape, x_dtype, x_member_size = npz_member_contract(path, "X.npy")
+            with np.load(path, allow_pickle=True) as payload:
+                required = {"y", "X_raw_amp", "subjects"}
+                missing = required - set(payload.files)
+                if missing:
+                    raise KeyError(f"missing keys {sorted(missing)}")
+                y_cache = np.asarray(payload["y"], dtype=np.float32)
+                raw_amp = np.asarray(payload["X_raw_amp"], dtype=np.float32)
+                subjects = np.asarray(payload["subjects"]).astype(str)
+                stored_archive_sha = str(npz_scalar(payload, "archive_sha256", "") or "")
+                preprocessing_config_sha = str(
+                    npz_scalar(payload, "preprocessing_config_sha256", "") or ""
+                )
+                preprocessing_source_sha = str(
+                    npz_scalar(payload, "preprocessing_source_sha256", "") or ""
+                )
+                cache_schema_version = int(npz_scalar(payload, "cache_schema_version", 0) or 0)
+                stored_record_fp = str(npz_scalar(payload, "record_order_fingerprint", "") or "")
+        except Exception as exc:
+            print(f"  rejected: {type(exc).__name__}: {exc}", flush=True)
+            continue
+        if x_shape != (len(y_cache), 12, int(SEQ_LEN)) or x_dtype != np.dtype(np.float32):
+            print(f"  rejected: unexpected X contract shape={x_shape} dtype={x_dtype}", flush=True)
+            continue
+        if raw_amp.shape != (len(y_cache), 5) or subjects.shape != (len(y_cache),):
+            print("  rejected: y/X_raw_amp/subjects shape mismatch", flush=True)
+            continue
+        if not np.isfinite(y_cache).all() or not np.isfinite(raw_amp).all():
+            print("  rejected: non-finite labels or amplitude features", flush=True)
+            continue
+        if not np.logical_or(y_cache == 0, y_cache == 1).all():
+            print("  rejected: labels are not binary", flush=True)
+            continue
+        raw_record_fp = record_order_fingerprint(subjects)
+        if stored_record_fp and stored_record_fp != raw_record_fp:
+            print("  rejected: stored raw-cache record fingerprint mismatch", flush=True)
+            continue
+        if expected_archive_sha256 and stored_archive_sha != expected_archive_sha256:
+            print(
+                f"  rejected: archive SHA {stored_archive_sha} != frozen {expected_archive_sha256}",
+                flush=True,
+            )
+            continue
+
+        keep_classes = y_cache.sum(axis=0) >= 5
+        y_clean = y_cache[:, keep_classes]
+        row_indices = np.arange(len(y_cache), dtype=np.int64)
+        if not keep_classes.all():
+            valid_rows = y_clean.sum(axis=1) > 0
+            row_indices = row_indices[valid_rows]
+            y_clean = y_clean[valid_rows]
+            raw_amp = raw_amp[valid_rows]
+            subjects = subjects[valid_rows]
+        if y_clean.shape[1] != len(CLASSES):
+            print(f"  rejected: cleaned class count {y_clean.shape[1]} != {len(CLASSES)}", flush=True)
+            continue
+        if limit_records > 0:
+            row_indices = row_indices[:limit_records]
+            y_clean = y_clean[:limit_records]
+            raw_amp = raw_amp[:limit_records]
+            subjects = subjects[:limit_records]
+        if y_clean.shape != expected_y.shape or not np.array_equal(y_clean, expected_y):
+            print(
+                f"  rejected: cleaned labels differ from frozen OOF: {y_clean.shape} != {expected_y.shape}",
+                flush=True,
+            )
+            continue
+        cleaned_record_fp = record_order_fingerprint(subjects)
+        if limit_records == 0 and expected_record_fingerprint and cleaned_record_fp != expected_record_fingerprint:
+            print(
+                f"  rejected: cleaned record fingerprint {cleaned_record_fp} != frozen "
+                f"{expected_record_fingerprint}",
+                flush=True,
+            )
+            continue
+        source_sha = sha256_file(path)
+        return {
+            "path": path,
+            "sha256": source_sha,
+            "size_bytes": path.stat().st_size,
+            "x_shape": x_shape,
+            "x_dtype": str(x_dtype),
+            "x_member_size_bytes": x_member_size,
+            "row_indices": row_indices,
+            "y": y_clean.astype(np.float32),
+            "X_raw_amp": raw_amp.astype(np.float32),
+            "subjects": subjects,
+            "record_order_fingerprint": cleaned_record_fp,
+            "raw_record_order_fingerprint": raw_record_fp,
+            "archive_sha256": stored_archive_sha,
+            "cache_schema_version": cache_schema_version,
+            "preprocessing_source_sha256": preprocessing_source_sha,
+            "preprocessing_config_sha256": preprocessing_config_sha,
+        }
+    raise FileNotFoundError(
+        "No authenticated Chapman clean cache satisfies the frozen OOF contract. Checked:\n- "
+        + "\n- ".join(checked)
+    )
+
+
+def open_disk_backed_chapman_signals(cache: dict, mmap_dir: Path) -> IndexedSignalRows:
+    """Extract X.npy atomically to local scratch and return only the cleaned indexed rows."""
+
+    source = Path(cache["path"])
+    mmap_dir = resolve_path(mmap_dir)
+    mmap_dir.mkdir(parents=True, exist_ok=True)
+    destination = mmap_dir / (
+        f"chapman_clean_x_{cache['sha256'][:16]}_N{cache['x_shape'][0]}.npy"
+    )
+    contract_path = destination.with_suffix(destination.suffix + ".contract.json")
+    expected_contract = {
+        "schema_version": 1,
+        "source_npz_sha256": cache["sha256"],
+        "source_npz_size_bytes": cache["size_bytes"],
+        "member": "X.npy",
+        "member_size_bytes": cache["x_member_size_bytes"],
+        "shape": list(cache["x_shape"]),
+        "dtype": cache["x_dtype"],
+    }
+    with exclusive_cache_writer(destination):
+        reusable = False
+        if destination.is_file() and contract_path.is_file():
+            try:
+                stored = json.loads(contract_path.read_text(encoding="utf-8"))
+                reusable = (
+                    all(stored.get(key) == value for key, value in expected_contract.items())
+                    and destination.stat().st_size == cache["x_member_size_bytes"]
+                    and sha256_file(destination) == stored.get("member_npy_sha256")
+                )
+            except Exception as exc:
+                print(f"Rejecting local Chapman memmap contract: {type(exc).__name__}: {exc}", flush=True)
+        if not reusable:
+            destination.unlink(missing_ok=True)
+            contract_path.unlink(missing_ok=True)
+            required = int(cache["x_member_size_bytes"]) + 512 * 1024 * 1024
+            free = shutil.disk_usage(mmap_dir).free
+            if free < required:
+                raise RuntimeError(
+                    f"Insufficient local scratch for Chapman X.npy: free={free}, required>{required}"
+                )
+            partial = destination.with_name(f".{destination.name}.partial.{os.getpid()}")
+            partial.unlink(missing_ok=True)
+            print(f"Extracting authenticated X.npy to local scratch: {destination}", flush=True)
+            with zipfile.ZipFile(source) as archive, archive.open("X.npy") as src, partial.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=8 * 1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if partial.stat().st_size != cache["x_member_size_bytes"]:
+                partial.unlink(missing_ok=True)
+                raise RuntimeError("Extracted Chapman X.npy size mismatch")
+            member_sha = sha256_file(partial)
+            os.replace(partial, destination)
+            save_json(contract_path, {**expected_contract, "member_npy_sha256": member_sha})
+    base = np.load(destination, mmap_mode="r", allow_pickle=False)
+    if base.shape != tuple(cache["x_shape"]) or base.dtype != np.float32:
+        raise RuntimeError(f"Local Chapman memmap contract mismatch: {base.shape}, {base.dtype}")
+    print(
+        f"Using disk-backed Chapman signals: raw={base.shape[0]} cleaned={len(cache['row_indices'])} "
+        f"path={destination}",
+        flush=True,
+    )
+    return IndexedSignalRows(base, cache["row_indices"])
+
+
+def perturb_signals_disk_backed(
+    X: IndexedSignalRows | np.ndarray,
+    spec: dict,
+    *,
+    out_dir: Path,
+    raw_cache_sha256: str,
+    source_bundle_sha256: str,
+) -> tuple[np.memmap, dict, Path]:
+    """Apply the canonical perturbation in bounded chunks into one local memmap."""
+
+    out_dir = resolve_path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output = out_dir / (
+        f"{spec['name']}_{stable_hash(spec)}_{raw_cache_sha256[:16]}_"
+        f"{source_bundle_sha256[:16]}_N{len(X)}.npy"
+    )
+    contract_path = output.with_suffix(output.suffix + ".contract.json")
+    expected = {
+        "schema_version": 1,
+        "raw_cache_sha256": raw_cache_sha256,
+        "source_bundle_sha256": source_bundle_sha256,
+        "stress_spec": spec,
+        "shape": list(X.shape),
+        "dtype": "float32",
+    }
+    with exclusive_cache_writer(output):
+        reusable = False
+        metadata: dict = {}
+        if output.is_file() and contract_path.is_file():
+            try:
+                stored = json.loads(contract_path.read_text(encoding="utf-8"))
+                reusable = (
+                    all(stored.get(key) == value for key, value in expected.items())
+                    and sha256_file(output) == stored.get("output_npy_sha256")
+                )
+                metadata = stored.get("metadata") or {}
+            except Exception as exc:
+                print(f"Rejecting local perturbation memmap: {type(exc).__name__}: {exc}", flush=True)
+        if not reusable:
+            output.unlink(missing_ok=True)
+            contract_path.unlink(missing_ok=True)
+            required = int(np.prod(X.shape, dtype=np.int64)) * np.dtype(np.float32).itemsize
+            free = shutil.disk_usage(out_dir).free
+            if free < required + 512 * 1024 * 1024:
+                raise RuntimeError(
+                    f"Insufficient local scratch for perturbed ECG: free={free}, required>{required}"
+                )
+            partial = output.with_name(f".{output.name}.partial.{os.getpid()}.npy")
+            partial.unlink(missing_ok=True)
+            out = np.lib.format.open_memmap(partial, mode="w+", dtype=np.float32, shape=X.shape)
+            metadata = {"spec": dict(spec), "disk_backed": True}
+            kind = spec["kind"]
+            if kind == "additive_noise":
+                rng = np.random.default_rng(int(spec["seed"]))
+                target = 10.0 ** (float(spec["snr_db"]) / 10.0)
+                for start in tqdm(range(0, len(X), 128), desc=f"perturb {spec['name']}"):
+                    stop = min(len(X), start + 128)
+                    xb = np.asarray(X[start:stop], dtype=np.float32)
+                    power = np.mean(xb * xb, axis=(1, 2), keepdims=True)
+                    noise_std = np.sqrt(np.maximum(power / target, 1e-12)).astype(np.float32)
+                    out[start:stop] = xb + rng.standard_normal(size=xb.shape).astype(np.float32) * noise_std
+                metadata["snr_db"] = float(spec["snr_db"])
+            elif kind == "random_lead_dropout":
+                rng = np.random.default_rng(int(spec["seed"]))
+                n_drop = int(spec["n_drop"])
+                dropped = np.empty((len(X), n_drop), dtype=np.int16)
+                for index in tqdm(range(len(X)), desc=f"perturb {spec['name']}"):
+                    out[index] = X[index]
+                    leads = np.sort(rng.choice(X.shape[1], size=n_drop, replace=False)).astype(np.int16)
+                    out[index, leads, :] = 0.0
+                    dropped[index] = leads
+                map_dir = EXPERIMENTAL_DIR / "robustness_perturbations"
+                map_dir.mkdir(parents=True, exist_ok=True)
+                map_path = map_dir / f"{spec['name']}_{stable_hash(spec)}_dropped_leads.npz"
+                save_npz_compressed_atomic(
+                    map_path,
+                    dropped_leads=dropped,
+                    stress_json=np.asarray(json.dumps(spec, sort_keys=True)),
+                    record_count=np.asarray(len(X), dtype=np.int64),
+                )
+                metadata.update(
+                    {
+                        "dropped_leads_shape": list(dropped.shape),
+                        "dropped_leads_sha256": hashlib.sha256(
+                            np.ascontiguousarray(dropped).view(np.uint8)
+                        ).hexdigest(),
+                        "lead_indices_file": str(map_path),
+                        "lead_indices_file_sha256": sha256_file(map_path),
+                    }
+                )
+            elif kind == "fixed_lead_dropout":
+                leads = np.asarray(spec["lead_indices"], dtype=np.int64)
+                for start in tqdm(range(0, len(X), 128), desc=f"perturb {spec['name']}"):
+                    stop = min(len(X), start + 128)
+                    out[start:stop] = X[start:stop]
+                    out[start:stop, leads, :] = 0.0
+                metadata["lead_indices"] = leads.astype(int).tolist()
+            elif kind == "resample_down_up":
+                from scipy.signal import resample_poly
+
+                for start in tqdm(range(0, len(X), 64), desc=f"perturb {spec['name']}"):
+                    stop = min(len(X), start + 64)
+                    down = resample_poly(X[start:stop], up=1, down=2, axis=-1).astype(np.float32)
+                    restored = resample_poly(down, up=2, down=1, axis=-1).astype(np.float32)
+                    if restored.shape[-1] < X.shape[-1]:
+                        restored = np.pad(
+                            restored,
+                            ((0, 0), (0, 0), (0, X.shape[-1] - restored.shape[-1])),
+                        )
+                    out[start:stop] = restored[..., : X.shape[-1]]
+                metadata.update(
+                    {
+                        "source_hz": int(spec["source_hz"]),
+                        "target_hz": int(spec["target_hz"]),
+                        "length_restored_to": int(X.shape[-1]),
+                    }
+                )
+            else:
+                raise ValueError(f"Unhandled perturbation kind: {kind}")
+            out.flush()
+            del out
+            with partial.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            output_sha = sha256_file(partial)
+            os.replace(partial, output)
+            save_json(
+                contract_path,
+                {**expected, "output_npy_sha256": output_sha, "metadata": metadata},
+            )
+    stressed = np.load(output, mmap_mode="r", allow_pickle=False)
+    if stressed.shape != X.shape or stressed.dtype != np.float32:
+        raise RuntimeError(f"Perturbed memmap contract mismatch: {stressed.shape}, {stressed.dtype}")
+    return stressed, metadata, output
+
+
+def close_memmap(array) -> None:
+    mmap = getattr(array, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+
+
+def remove_local_perturbation(array, path: Path) -> None:
+    close_memmap(array)
+    Path(path).unlink(missing_ok=True)
+    Path(path).with_suffix(Path(path).suffix + ".contract.json").unlink(missing_ok=True)
 
 
 def json_safe(value):
@@ -637,6 +1068,22 @@ def stress_feature_hash(stress: dict, contract: dict, record_fp: str) -> str:
     )
 
 
+def feature_cache_hash(stress_hash: str, raw_cache: dict | None) -> str:
+    """Bind cached features to the exact raw-cache bytes and preprocessing provenance."""
+
+    if raw_cache is None:
+        return stable_hash({"stress_hash": stress_hash, "raw_cache": "in_memory_unbound"})
+    return stable_hash(
+        {
+            "stress_hash": stress_hash,
+            "raw_cache_sha256": raw_cache.get("sha256"),
+            "raw_cache_schema_version": raw_cache.get("cache_schema_version"),
+            "preprocessing_source_sha256": raw_cache.get("preprocessing_source_sha256"),
+            "preprocessing_config_sha256": raw_cache.get("preprocessing_config_sha256"),
+        }
+    )
+
+
 def expected_weights_kind(checkpoint_kind: str) -> str | None:
     if checkpoint_kind.endswith("_ema"):
         return "ema"
@@ -819,6 +1266,98 @@ def robust_feature_cache_path(
     return cache_dir / f"{prefix}_{stress_name}_{stress_hash}_N{n_records}_R{record_fp}.npz"
 
 
+def feature_cache_contract_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(cache_path.suffix + ".contract.json")
+
+
+def inspect_feature_cache(
+    cache_path: Path,
+    *,
+    feature_kind: str,
+    expected_shape: tuple[int, ...],
+    expected_dtype: np.dtype,
+    stress_name: str,
+    stress_hash: str,
+    record_fp: str,
+) -> dict | None:
+    """Validate an atomic source-bound feature cache without loading its large X array."""
+
+    cache_path = resolve_path(cache_path)
+    sidecar_path = feature_cache_contract_path(cache_path)
+    if not cache_path.is_file() or not sidecar_path.is_file():
+        return None
+    expected = {
+        "schema_version": 1,
+        "feature_kind": feature_kind,
+        "shape": list(expected_shape),
+        "storage_dtype": str(np.dtype(expected_dtype)),
+        "stress_name": stress_name,
+        "stress_hash": stress_hash,
+        "record_order_fingerprint": record_fp,
+    }
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        if not all(sidecar.get(key) == value for key, value in expected.items()):
+            return None
+        if sha256_file(cache_path) != sidecar.get("cache_file_sha256"):
+            return None
+        shape, dtype, _member_size = npz_member_contract(cache_path, "X.npy")
+        if shape != expected_shape or dtype != np.dtype(expected_dtype):
+            return None
+        with np.load(cache_path, allow_pickle=False) as payload:
+            if str(npz_scalar(payload, "stress_name", "")) != stress_name:
+                return None
+            if str(npz_scalar(payload, "stress_hash", "")) != stress_hash:
+                return None
+            if str(npz_scalar(payload, "record_order_fingerprint", "")) != record_fp:
+                return None
+        return {
+            "path": str(cache_path),
+            "sha256": sidecar["cache_file_sha256"],
+            "cache_hit": True,
+            "storage_dtype": str(dtype),
+            "feature_array_sha256": sidecar.get("feature_array_sha256"),
+            "contract_path": str(sidecar_path),
+            "contract_sha256": sha256_file(sidecar_path),
+        }
+    except Exception as exc:
+        print(f"Rejecting feature cache {cache_path.name}: {type(exc).__name__}: {exc}", flush=True)
+        return None
+
+
+def write_feature_cache_contract(
+    cache_path: Path,
+    *,
+    feature_kind: str,
+    features: np.ndarray,
+    stress_name: str,
+    stress_hash: str,
+    record_fp: str,
+) -> dict:
+    sidecar_path = feature_cache_contract_path(cache_path)
+    contract = {
+        "schema_version": 1,
+        "feature_kind": feature_kind,
+        "shape": list(features.shape),
+        "storage_dtype": str(features.dtype),
+        "stress_name": stress_name,
+        "stress_hash": stress_hash,
+        "record_order_fingerprint": record_fp,
+        "feature_array_sha256": ndarray_sha256(features),
+        "cache_file_sha256": sha256_file(cache_path),
+    }
+    save_json(sidecar_path, contract)
+    return {
+        "path": str(cache_path),
+        "sha256": contract["cache_file_sha256"],
+        "cache_hit": False,
+        "storage_dtype": str(features.dtype),
+        "feature_array_sha256": contract["feature_array_sha256"],
+        "contract_path": str(sidecar_path),
+        "contract_sha256": sha256_file(sidecar_path),
+    }
+
+
 def generate_minirocket_features(
     X: np.ndarray,
     *,
@@ -830,7 +1369,9 @@ def generate_minirocket_features(
     save_cache: bool,
     cache_dir: Path,
     require_existing: bool = False,
-) -> tuple[np.ndarray, dict]:
+    materialize: bool = True,
+    work_dir: Path | None = None,
+) -> tuple[np.ndarray | None, dict]:
     cache_path = robust_feature_cache_path(
         cache_dir,
         "robust_minirocket_raw",
@@ -839,31 +1380,24 @@ def generate_minirocket_features(
         len(X),
         record_fp,
     )
-    if cache_path.exists():
+    cached_info = inspect_feature_cache(
+        cache_path,
+        feature_kind="fixed_seed_rocket_family_max_ppv",
+        expected_shape=(len(X), 20000),
+        expected_dtype=np.dtype(np.float16),
+        stress_name=stress_name,
+        stress_hash=stress_hash,
+        record_fp=record_fp,
+    )
+    if cached_info is not None:
+        print(f"Loaded perturbed ROCKET-family cache contract: {cache_path}", flush=True)
+        if not materialize:
+            return None, cached_info
         with np.load(cache_path, allow_pickle=False) as payload:
-            feats = np.asarray(payload["X"])
-            cached_hash = str(payload["stress_hash"].item()) if "stress_hash" in payload.files else ""
-            cached_stress = str(payload["stress_name"].item()) if "stress_name" in payload.files else ""
-            cached_record_fp = (
-                str(payload["record_order_fingerprint"].item())
-                if "record_order_fingerprint" in payload.files
-                else ""
-            )
-        if (
-            feats.shape == (len(X), 20000)
-            and cached_hash == stress_hash
-            and cached_stress == stress_name
-            and cached_record_fp == record_fp
-            and np.isfinite(feats).all()
-        ):
-            print(f"Loaded perturbed MiniRocket cache: {cache_path}", flush=True)
-            return feats.astype(np.float32), {
-                "path": str(cache_path),
-                "sha256": sha256_file(cache_path),
-                "cache_hit": True,
-                "storage_dtype": str(feats.dtype),
-            }
-        print(f"Perturbed MiniRocket cache mismatch, regenerating: {cache_path}", flush=True)
+            feats = np.asarray(payload["X"], dtype=np.float32)
+        if not np.isfinite(feats).all():
+            raise RuntimeError(f"Authenticated ROCKET-family cache contains non-finite values: {cache_path}")
+        return feats, cached_info
 
     if require_existing:
         raise FileNotFoundError(
@@ -872,35 +1406,64 @@ def generate_minirocket_features(
 
     device = torch.device(device_name)
     model = MiniRocketNative(c_in=X.shape[1], seq_len=X.shape[-1], num_kernels=10000, seed=42).to(device).eval()
-    feats = []
-    with torch.no_grad():
-        for start in tqdm(range(0, len(X), batch_size), desc=f"MiniRocket {stress_name}", unit="batch"):
-            xb = torch.as_tensor(X[start : start + batch_size], dtype=torch.float32, device=device)
-            out = model(xb).detach().cpu().numpy()
-            feats.append(out)
-    X_rocket = np.vstack(feats).astype(np.float32)
-    if X_rocket.shape != (len(X), 20000) or not np.isfinite(X_rocket).all():
-        raise RuntimeError(f"Invalid perturbed MiniRocket output: {X_rocket.shape}")
-    info = {
-        "path": str(cache_path),
-        "sha256": None,
-        "cache_hit": False,
-        "feature_device": device_name,
-    }
-    if save_cache:
+    work_dir = resolve_path(work_dir or Path("/tmp/ecg_ramba_robustness_feature_work"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+    work_path = work_dir / f"rocket_{stress_name}_{stress_hash}_N{len(X)}.f16.npy"
+    work_path.unlink(missing_ok=True)
+    feature_store = np.lib.format.open_memmap(
+        work_path,
+        mode="w+",
+        dtype=np.float16,
+        shape=(len(X), 20000),
+    )
+    try:
+        with torch.no_grad():
+            for start in tqdm(
+                range(0, len(X), batch_size),
+                desc=f"ROCKET-family {stress_name}",
+                unit="batch",
+            ):
+                stop = min(len(X), start + batch_size)
+                signal_batch = np.array(X[start:stop], dtype=np.float32, copy=True, order="C")
+                xb = torch.as_tensor(signal_batch, dtype=torch.float32, device=device)
+                feature_store[start:stop] = model(xb).detach().cpu().numpy().astype(np.float16)
+        feature_store.flush()
+        for start in range(0, len(feature_store), 256):
+            if not np.isfinite(feature_store[start : start + 256]).all():
+                raise RuntimeError(f"ROCKET-family extraction produced non-finite values near row {start}")
+        if not save_cache:
+            if materialize:
+                return np.asarray(feature_store, dtype=np.float32), {
+                    "path": str(cache_path),
+                    "sha256": None,
+                    "cache_hit": False,
+                    "feature_device": device_name,
+                }
+            raise ValueError("materialize=False requires save_cache=True")
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         save_npz_compressed_atomic(
             cache_path,
-            X=X_rocket.astype(np.float16),
+            X=feature_store,
             storage_dtype=np.asarray("float16"),
             consumer_dtype=np.asarray("float32"),
             stress_name=np.asarray(stress_name),
             stress_hash=np.asarray(stress_hash),
             record_order_fingerprint=np.asarray(record_fp),
         )
-        info["sha256"] = sha256_file(cache_path)
-        print(f"Saved perturbed MiniRocket cache: {cache_path}", flush=True)
-    return X_rocket, info
+        info = write_feature_cache_contract(
+            cache_path,
+            feature_kind="fixed_seed_rocket_family_max_ppv",
+            features=feature_store,
+            stress_name=stress_name,
+            stress_hash=stress_hash,
+            record_fp=record_fp,
+        )
+        info["feature_device"] = device_name
+        print(f"Saved perturbed ROCKET-family cache: {cache_path}", flush=True)
+        return (np.asarray(feature_store, dtype=np.float32) if materialize else None), info
+    finally:
+        close_memmap(feature_store)
+        work_path.unlink(missing_ok=True)
 
 
 def generate_hrv36_features(
@@ -913,7 +1476,8 @@ def generate_hrv36_features(
     save_cache: bool,
     cache_dir: Path,
     require_existing: bool = False,
-) -> tuple[np.ndarray, dict]:
+    materialize: bool = True,
+) -> tuple[np.ndarray | None, dict]:
     cache_path = robust_feature_cache_path(
         cache_dir,
         "robust_hrv36",
@@ -922,31 +1486,24 @@ def generate_hrv36_features(
         len(X),
         record_fp,
     )
-    if cache_path.exists():
+    cached_info = inspect_feature_cache(
+        cache_path,
+        feature_kind="hrv36_perturbed_signal_amp_contract",
+        expected_shape=(len(X), int(CONFIG["hrv_dim"])),
+        expected_dtype=np.dtype(np.float16),
+        stress_name=stress_name,
+        stress_hash=stress_hash,
+        record_fp=record_fp,
+    )
+    if cached_info is not None:
+        print(f"Loaded perturbed HRV36 cache contract: {cache_path}", flush=True)
+        if not materialize:
+            return None, cached_info
         with np.load(cache_path, allow_pickle=False) as payload:
-            feats = np.asarray(payload["X"])
-            cached_hash = str(payload["stress_hash"].item()) if "stress_hash" in payload.files else ""
-            cached_stress = str(payload["stress_name"].item()) if "stress_name" in payload.files else ""
-            cached_record_fp = (
-                str(payload["record_order_fingerprint"].item())
-                if "record_order_fingerprint" in payload.files
-                else ""
-            )
-        if (
-            feats.shape == (len(X), int(CONFIG["hrv_dim"]))
-            and cached_hash == stress_hash
-            and cached_stress == stress_name
-            and cached_record_fp == record_fp
-            and np.isfinite(feats).all()
-        ):
-            print(f"Loaded perturbed HRV36 cache: {cache_path}", flush=True)
-            return feats.astype(np.float32), {
-                "path": str(cache_path),
-                "sha256": sha256_file(cache_path),
-                "cache_hit": True,
-                "storage_dtype": str(feats.dtype),
-            }
-        print(f"Perturbed HRV36 cache mismatch, regenerating: {cache_path}", flush=True)
+            feats = np.asarray(payload["X"], dtype=np.float32)
+        if not np.isfinite(feats).all():
+            raise RuntimeError(f"Authenticated HRV36 cache contains non-finite values: {cache_path}")
+        return feats, cached_info
 
     if require_existing:
         raise FileNotFoundError(
@@ -974,9 +1531,17 @@ def generate_hrv36_features(
             record_order_fingerprint=np.asarray(record_fp),
             hrv_contract=np.asarray("hrv_and_global_recomputed_on_perturbed_signal_amp_uses_existing_pipeline_contract"),
         )
-        info["sha256"] = sha256_file(cache_path)
+        stored_features = feats.astype(np.float16)
+        info = write_feature_cache_contract(
+            cache_path,
+            feature_kind="hrv36_perturbed_signal_amp_contract",
+            features=stored_features,
+            stress_name=stress_name,
+            stress_hash=stress_hash,
+            record_fp=record_fp,
+        )
         print(f"Saved perturbed HRV36 cache: {cache_path}", flush=True)
-    return feats, info
+    return (feats if materialize else None), info
 
 
 def fit_or_load_minirocket_heads(
@@ -1655,13 +2220,29 @@ def main() -> None:
     if args.features_only:
         if not args.save_perturbed_caches:
             raise ValueError("--features-only requires --save-perturbed-caches.")
-        gen = load_revision_module(
-            "01_generate_predictions.py",
-            "_ecg_ramba_generate_predictions_data_for_robustness_features",
-        )
-        X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(
-            limit_records=args.limit_records
-        )
+        raw_cache_info = None
+        if args.disk_backed_signals:
+            raw_cache_info = inspect_disk_backed_chapman_cache(
+                expected_y=y,
+                expected_record_fingerprint=str(expected_fp or ""),
+                expected_archive_sha256=str(
+                    contract["freeze_manifest"].get("source_archive_sha256") or ""
+                ),
+                explicit_cache=args.raw_cache,
+                limit_records=args.limit_records,
+            )
+            y_loaded = raw_cache_info["y"]
+            X_raw_amp = raw_cache_info["X_raw_amp"]
+            subjects = raw_cache_info["subjects"]
+            X = None
+        else:
+            gen = load_revision_module(
+                "01_generate_predictions.py",
+                "_ecg_ramba_generate_predictions_data_for_robustness_features",
+            )
+            X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(
+                limit_records=args.limit_records
+            )
         if y_loaded.shape != y.shape or not np.array_equal(y_loaded, y):
             raise ValueError("Loaded Chapman labels do not match frozen OOF y_true.")
         record_fp = record_order_fingerprint(subjects)
@@ -1675,47 +2256,128 @@ def main() -> None:
             )
 
         feature_rows = []
+        source_bundle = source_bundle_contract()
         for stress in specs:
             stress_name = stress["name"]
             stress_hash = stress_feature_hash(stress, contract, record_fp)
+            cache_hash = feature_cache_hash(stress_hash, raw_cache_info)
             print("\n" + "=" * 80, flush=True)
-            print(f"Feature cache stage: {stress_name} | hash={stress_hash}", flush=True)
+            print(
+                f"Feature cache stage: {stress_name} | stress_hash={stress_hash} "
+                f"cache_hash={cache_hash}",
+                flush=True,
+            )
             print("=" * 80, flush=True)
-            X_stress, perturb_meta = perturb_signals(X, stress)
+            rocket_path = robust_feature_cache_path(
+                args.feature_cache_dir,
+                "robust_minirocket_raw",
+                stress_name,
+                cache_hash,
+                len(y),
+                record_fp,
+            )
+            hrv_path = robust_feature_cache_path(
+                args.feature_cache_dir,
+                "robust_hrv36",
+                stress_name,
+                cache_hash,
+                len(y),
+                record_fp,
+            )
+            rocket_info = inspect_feature_cache(
+                rocket_path,
+                feature_kind="fixed_seed_rocket_family_max_ppv",
+                expected_shape=(len(y), 20000),
+                expected_dtype=np.dtype(np.float16),
+                stress_name=stress_name,
+                stress_hash=cache_hash,
+                record_fp=record_fp,
+            )
+            hrv_info = inspect_feature_cache(
+                hrv_path,
+                feature_kind="hrv36_perturbed_signal_amp_contract",
+                expected_shape=(len(y), int(CONFIG["hrv_dim"])),
+                expected_dtype=np.dtype(np.float16),
+                stress_name=stress_name,
+                stress_hash=cache_hash,
+                record_fp=record_fp,
+            )
+            if rocket_info is not None and hrv_info is not None:
+                print(f"Reusing complete source-bound feature pair: {stress_name}", flush=True)
+                feature_rows.append(
+                    {
+                        "stress_test": stress_name,
+                        "stress_hash": stress_hash,
+                        "feature_cache_hash": cache_hash,
+                        "stress_spec": stress,
+                        "perturbation": {"spec": stress, "reused_feature_pair": True},
+                        "rocket_family": rocket_info,
+                        "hrv36": hrv_info,
+                    }
+                )
+                continue
+            if X is None:
+                assert raw_cache_info is not None
+                X = open_disk_backed_chapman_signals(raw_cache_info, args.raw_cache_mmap_dir)
+            perturbation_path = None
+            if args.disk_backed_signals:
+                assert raw_cache_info is not None
+                X_stress, perturb_meta, perturbation_path = perturb_signals_disk_backed(
+                    X,
+                    stress,
+                    out_dir=args.perturbation_mmap_dir,
+                    raw_cache_sha256=raw_cache_info["sha256"],
+                    source_bundle_sha256=source_bundle["sha256"],
+                )
+            else:
+                X_stress, perturb_meta = perturb_signals(X, stress)
             X_rocket, rocket_info = generate_minirocket_features(
                 X_stress,
                 stress_name=stress_name,
-                stress_hash=stress_hash,
+                stress_hash=cache_hash,
                 record_fp=record_fp,
                 batch_size=args.minirocket_feature_batch_size,
                 device_name=args.minirocket_feature_device,
                 save_cache=True,
                 cache_dir=args.feature_cache_dir,
+                materialize=False,
+                work_dir=args.feature_work_dir,
             )
             X_hrv, hrv_info = generate_hrv36_features(
                 X_stress,
                 X_raw_amp,
                 stress_name=stress_name,
-                stress_hash=stress_hash,
+                stress_hash=cache_hash,
                 record_fp=record_fp,
                 save_cache=True,
                 cache_dir=args.feature_cache_dir,
+                materialize=False,
             )
             feature_rows.append(
                 {
                     "stress_test": stress_name,
                     "stress_hash": stress_hash,
+                    "feature_cache_hash": cache_hash,
                     "stress_spec": stress,
                     "perturbation": perturb_meta,
                     "rocket_family": rocket_info,
                     "hrv36": hrv_info,
                 }
             )
+            if perturbation_path is not None:
+                remove_local_perturbation(X_stress, perturbation_path)
             del X_stress, X_rocket, X_hrv
             gc.collect()
 
+        raw_manifest = None
+        if raw_cache_info is not None:
+            raw_manifest = {
+                key: json_safe(value)
+                for key, value in raw_cache_info.items()
+                if key not in {"row_indices", "y", "X_raw_amp", "subjects"}
+            }
         feature_manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "complete",
             "mode": "features_only",
             "created_utc": now_utc(),
@@ -1723,8 +2385,10 @@ def main() -> None:
             "source_bundle": source_bundle_contract(),
             "freeze_manifest": contract["freeze_manifest"],
             "record_order_fingerprint": record_fp,
-            "n_records": int(len(X)),
+            "n_records": int(len(y)),
             "cache_dir": str(resolve_path(args.feature_cache_dir)),
+            "disk_backed_signals": bool(args.disk_backed_signals),
+            "raw_cache": raw_manifest,
             "stress_rows": feature_rows,
         }
         feature_manifest_path = MANIFEST_DIR / "robustness_feature_cache_manifest.json"
@@ -1799,6 +2463,7 @@ def main() -> None:
                 existing_stress_probs[stress_name] = (full_prob, mini_prob)
 
     aggregation_only = bool(args.reuse_existing and not missing_existing)
+    raw_cache_info = None
     heads = reusable_heads if aggregation_only else None
     if args.require_existing_stress_predictions and (missing_existing or heads is None):
         missing = list(missing_existing)
@@ -1830,9 +2495,29 @@ def main() -> None:
         X = None
         X_raw_amp = None
     else:
-        gen = load_revision_module("01_generate_predictions.py", "_ecg_ramba_generate_predictions_data_for_robustness")
         mini = load_revision_module("10_minirocket_only_baseline.py", "_ecg_ramba_minirocket_data_for_robustness")
-        X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(limit_records=args.limit_records)
+        if args.disk_backed_signals:
+            raw_cache_info = inspect_disk_backed_chapman_cache(
+                expected_y=y,
+                expected_record_fingerprint=str(expected_fp or ""),
+                expected_archive_sha256=str(
+                    contract["freeze_manifest"].get("source_archive_sha256") or ""
+                ),
+                explicit_cache=args.raw_cache,
+                limit_records=args.limit_records,
+            )
+            X = open_disk_backed_chapman_signals(raw_cache_info, args.raw_cache_mmap_dir)
+            y_loaded = raw_cache_info["y"]
+            X_raw_amp = raw_cache_info["X_raw_amp"]
+            subjects = raw_cache_info["subjects"]
+        else:
+            gen = load_revision_module(
+                "01_generate_predictions.py",
+                "_ecg_ramba_generate_predictions_data_for_robustness",
+            )
+            X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(
+                limit_records=args.limit_records
+            )
         if y_loaded.shape != y.shape or not np.array_equal(y_loaded, y):
             raise ValueError("Loaded Chapman labels do not match frozen OOF y_true.")
         record_fp = record_order_fingerprint(subjects)
@@ -1901,9 +2586,13 @@ def main() -> None:
 
     for stress in specs:
         stress_hash = stress_feature_hash(stress, contract, record_fp)
+        cache_hash = feature_cache_hash(stress_hash, raw_cache_info)
         stress_name = stress["name"]
         print("\n" + "=" * 80, flush=True)
-        print(f"Stress test: {stress_name} | hash={stress_hash}", flush=True)
+        print(
+            f"Stress test: {stress_name} | stress_hash={stress_hash} cache_hash={cache_hash}",
+            flush=True,
+        )
         print("=" * 80, flush=True)
         full_pred_path = PREDICTION_DIR / f"robustness_full_{stress_name}_predictions.npz"
         mini_pred_path = PREDICTION_DIR / f"robustness_minirocket_{stress_name}_predictions.npz"
@@ -1941,23 +2630,36 @@ def main() -> None:
             ) if args.reuse_existing else None
         feature_infos = {}
         perturb_meta = {}
+        perturbation_path = None
         if full_prob is None or mini_prob is None:
             if X is None or X_raw_amp is None:
                 raise RuntimeError(
                     f"Missing reusable predictions for {stress_name} during low-memory aggregation. "
                     "Run this stress individually first or disable --require-existing-stress-predictions."
                 )
-            X_stress, perturb_meta = perturb_signals(X, stress)
+            if args.disk_backed_signals:
+                if raw_cache_info is None:
+                    raise RuntimeError("Disk-backed signal contract is unavailable for stress inference.")
+                X_stress, perturb_meta, perturbation_path = perturb_signals_disk_backed(
+                    X,
+                    stress,
+                    out_dir=args.perturbation_mmap_dir,
+                    raw_cache_sha256=raw_cache_info["sha256"],
+                    source_bundle_sha256=source_bundle_contract()["sha256"],
+                )
+            else:
+                X_stress, perturb_meta = perturb_signals(X, stress)
             X_rocket, rocket_info = generate_minirocket_features(
                 X_stress,
                 stress_name=stress_name,
-                stress_hash=stress_hash,
+                stress_hash=cache_hash,
                 record_fp=record_fp,
                 batch_size=args.minirocket_feature_batch_size,
                 device_name=args.minirocket_feature_device,
                 save_cache=args.save_perturbed_caches,
                 cache_dir=args.feature_cache_dir,
                 require_existing=args.inference_only,
+                work_dir=args.feature_work_dir,
             )
             feature_infos["minirocket"] = rocket_info
             if full_prob is None:
@@ -1965,7 +2667,7 @@ def main() -> None:
                     X_stress,
                     X_raw_amp,
                     stress_name=stress_name,
-                    stress_hash=stress_hash,
+                    stress_hash=cache_hash,
                     record_fp=record_fp,
                     save_cache=args.save_perturbed_caches,
                     cache_dir=args.feature_cache_dir,
@@ -2002,6 +2704,10 @@ def main() -> None:
                         "slice_count_max": int(slice_count.max()),
                     },
                 )
+            if perturbation_path is not None:
+                remove_local_perturbation(X_stress, perturbation_path)
+            del X_stress
+            gc.collect()
             if mini_prob is None:
                 mini_prob = predict_minirocket_heads(
                     X_rocket,
@@ -2027,7 +2733,9 @@ def main() -> None:
                         "minirocket_heads_manifest": heads.manifest,
                     },
                 )
-            del X_stress
+            del X_rocket
+            if "X_hrv" in locals():
+                del X_hrv
             gc.collect()
 
         full_pred_sha = sha256_file(full_pred_path)
@@ -2055,6 +2763,7 @@ def main() -> None:
             {
                 "stress_test": stress_name,
                 "stress_hash": stress_hash,
+                "feature_cache_hash": cache_hash,
                 "stress_json": json.dumps(stress, sort_keys=True),
                 "perturbation_metadata": json.dumps(perturb_meta, sort_keys=True),
             }

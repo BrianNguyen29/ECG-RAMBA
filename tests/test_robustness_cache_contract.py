@@ -16,6 +16,116 @@ COMPARATOR_STRESS = importlib.import_module(
 
 
 class RobustnessCacheContractTests(unittest.TestCase):
+    def test_disk_backed_chapman_loader_preserves_cleaned_order_without_materializing_x(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_path = root / "clean.npz"
+            signals = np.arange(6 * 12 * ROBUSTNESS.SEQ_LEN, dtype=np.float32).reshape(
+                6, 12, ROBUSTNESS.SEQ_LEN
+            )
+            labels = np.ones((6, len(ROBUSTNESS.CLASSES)), dtype=np.float32)
+            raw_amp = np.arange(30, dtype=np.float32).reshape(6, 5)
+            subjects = np.asarray([f"record-{index}" for index in range(6)])
+            archive_sha = "a" * 64
+            np.savez_compressed(
+                cache_path,
+                X=signals,
+                y=labels,
+                X_raw_amp=raw_amp,
+                subjects=subjects,
+                archive_sha256=np.asarray(archive_sha),
+                cache_schema_version=np.asarray(3, dtype=np.int16),
+                preprocessing_source_sha256=np.asarray("source"),
+                preprocessing_config_sha256=np.asarray("config"),
+                record_order_fingerprint=np.asarray(
+                    ROBUSTNESS.record_order_fingerprint(subjects)
+                ),
+            )
+            info = ROBUSTNESS.inspect_disk_backed_chapman_cache(
+                expected_y=labels,
+                expected_record_fingerprint=ROBUSTNESS.record_order_fingerprint(subjects),
+                expected_archive_sha256=archive_sha,
+                explicit_cache=cache_path,
+                limit_records=0,
+            )
+            indexed = ROBUSTNESS.open_disk_backed_chapman_signals(info, root / "mmap")
+            self.assertIsInstance(indexed.base, np.memmap)
+            self.assertEqual(indexed.shape, signals.shape)
+            np.testing.assert_array_equal(indexed[2:4], signals[2:4])
+            self.assertEqual(info["cache_schema_version"], 3)
+            self.assertEqual(info["preprocessing_source_sha256"], "source")
+            ROBUSTNESS.close_memmap(indexed.base)
+
+    def test_disk_backed_perturbations_match_in_memory_reference(self):
+        rng = np.random.default_rng(123)
+        signals = rng.normal(size=(5, 12, 40)).astype(np.float32)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(ROBUSTNESS, "EXPERIMENTAL_DIR", root / "experimental"):
+                for spec in ROBUSTNESS.stress_specs(
+                    [
+                        "snr20db",
+                        "random_3_lead_dropout",
+                        "precordial_dropout",
+                        "resample_250hz",
+                    ],
+                    42,
+                ):
+                    expected, _ = ROBUSTNESS.perturb_signals(signals, spec)
+                    observed, _metadata, path = ROBUSTNESS.perturb_signals_disk_backed(
+                        signals,
+                        spec,
+                        out_dir=root / "perturbed",
+                        raw_cache_sha256="a" * 64,
+                        source_bundle_sha256="b" * 64,
+                    )
+                    np.testing.assert_allclose(observed, expected, rtol=0.0, atol=0.0)
+                    ROBUSTNESS.remove_local_perturbation(observed, path)
+
+    def test_feature_cache_sidecar_rejects_content_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache_path = root / "features.npz"
+            features = np.arange(24, dtype=np.float16).reshape(3, 8)
+            np.savez_compressed(
+                cache_path,
+                X=features,
+                stress_name=np.asarray("snr20db"),
+                stress_hash=np.asarray("stress"),
+                record_order_fingerprint=np.asarray("records"),
+            )
+            ROBUSTNESS.write_feature_cache_contract(
+                cache_path,
+                feature_kind="test_features",
+                features=features,
+                stress_name="snr20db",
+                stress_hash="stress",
+                record_fp="records",
+            )
+            self.assertIsNotNone(
+                ROBUSTNESS.inspect_feature_cache(
+                    cache_path,
+                    feature_kind="test_features",
+                    expected_shape=features.shape,
+                    expected_dtype=np.dtype(np.float16),
+                    stress_name="snr20db",
+                    stress_hash="stress",
+                    record_fp="records",
+                )
+            )
+            cache_path.write_bytes(cache_path.read_bytes() + b"mutation")
+            self.assertIsNone(
+                ROBUSTNESS.inspect_feature_cache(
+                    cache_path,
+                    feature_kind="test_features",
+                    expected_shape=features.shape,
+                    expected_dtype=np.dtype(np.float16),
+                    stress_name="snr20db",
+                    stress_hash="stress",
+                    record_fp="records",
+                )
+            )
+
     def test_features_only_contract_does_not_require_minirocket_predictions(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -106,6 +216,24 @@ class RobustnessCacheContractTests(unittest.TestCase):
             base,
             ROBUSTNESS.stress_feature_hash(stress, contract, "records-b"),
         )
+
+    def test_feature_cache_hash_binds_exact_raw_cache_and_preprocessing(self):
+        base = {
+            "sha256": "raw-a",
+            "cache_schema_version": 3,
+            "preprocessing_source_sha256": "source-a",
+            "preprocessing_config_sha256": "config-a",
+        }
+        observed = ROBUSTNESS.feature_cache_hash("stress", base)
+        for key, changed in [
+            ("sha256", "raw-b"),
+            ("cache_schema_version", 4),
+            ("preprocessing_source_sha256", "source-b"),
+            ("preprocessing_config_sha256", "config-b"),
+        ]:
+            mutated = dict(base)
+            mutated[key] = changed
+            self.assertNotEqual(observed, ROBUSTNESS.feature_cache_hash("stress", mutated))
 
     def test_inference_only_rejects_missing_feature_cache_before_transform(self):
         with tempfile.TemporaryDirectory() as tmp:
