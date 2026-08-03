@@ -235,6 +235,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "REQUIRED_REVISION_ARTIFACTS_FOR_05",
         )
         self.assertIn("manifests/oof_final_ema_group_sidecar.npz", required)
+        self.assertIn("predictions/minirocket_only_oof_predictions.npz", required)
 
     def test_notebook05_validates_stress_provenance_before_gpu_reuse(self):
         _, source = notebook_source("05_hrv_domain_and_robustness.ipynb")
