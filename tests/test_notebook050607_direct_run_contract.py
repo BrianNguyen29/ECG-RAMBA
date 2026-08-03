@@ -201,6 +201,12 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "source_bundle_sha256_mismatch",
             "_robustness_aggregate_contract_ready",
             "Authenticated Full/MiniRocket robustness output contract:",
+            "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE",
+            "ROBUSTNESS_FEATURE_CACHE_DIR",
+            "--features-only",
+            "--inference-only",
+            "robustness_feature_cache_manifest.json",
+            "Feature-cache stage intentionally stops before prediction aggregation.",
         ):
             self.assertIn(token, source)
         self.assertNotIn(

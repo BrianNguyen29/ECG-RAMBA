@@ -15,6 +15,49 @@ COMPARATOR_STRESS = importlib.import_module(
 
 
 class RobustnessCacheContractTests(unittest.TestCase):
+    def test_stress_feature_hash_binds_archive_freeze_and_record_order(self):
+        stress = ROBUSTNESS.stress_specs(["snr20db"], 42)[0]
+        contract = {
+            "freeze_manifest": {
+                "sha256": "freeze-a",
+                "source_archive_sha256": "archive-a",
+            }
+        }
+        base = ROBUSTNESS.stress_feature_hash(stress, contract, "records-a")
+        self.assertNotEqual(
+            base,
+            ROBUSTNESS.stress_feature_hash(
+                stress,
+                {
+                    "freeze_manifest": {
+                        "sha256": "freeze-a",
+                        "source_archive_sha256": "archive-b",
+                    }
+                },
+                "records-a",
+            ),
+        )
+        self.assertNotEqual(
+            base,
+            ROBUSTNESS.stress_feature_hash(stress, contract, "records-b"),
+        )
+
+    def test_inference_only_rejects_missing_feature_cache_before_transform(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            signals = np.zeros((2, 12, 32), dtype=np.float32)
+            with self.assertRaisesRegex(FileNotFoundError, "ROCKET-family cache"):
+                ROBUSTNESS.generate_minirocket_features(
+                    signals,
+                    stress_name="snr20db",
+                    stress_hash="stress-hash",
+                    record_fp="records",
+                    batch_size=2,
+                    device_name="cpu",
+                    save_cache=True,
+                    cache_dir=Path(tmp),
+                    require_existing=True,
+                )
+
     def test_minirocket_cache_requires_matching_head_and_clean_prediction(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "mini.npz"

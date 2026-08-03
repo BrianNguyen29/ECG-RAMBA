@@ -148,6 +148,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minirocket-weight-decay", type=float, default=1e-4)
     parser.add_argument("--minirocket-device", default="auto")
     parser.add_argument("--minirocket-feature-device", choices=["cpu", "cuda"], default="cpu")
+    execution_group = parser.add_mutually_exclusive_group()
+    execution_group.add_argument(
+        "--features-only",
+        action="store_true",
+        help=(
+            "Generate and validate source-bound perturbed ROCKET-family and HRV feature caches, "
+            "then exit before loading any ECG-RAMBA checkpoint. Intended for a CPU High-RAM stage."
+        ),
+    )
+    execution_group.add_argument(
+        "--inference-only",
+        action="store_true",
+        help=(
+            "Require existing source-bound perturbation feature caches and run prediction inference only. "
+            "Missing or stale caches are blockers instead of being recomputed on the GPU runtime."
+        ),
+    )
+    parser.add_argument(
+        "--feature-cache-dir",
+        type=Path,
+        default=PREDICTION_DIR / "robustness_feature_cache",
+        help=(
+            "Durable directory for source-bound perturbation feature caches. In Colab this should point "
+            "inside the canonical revision-artifact Drive root."
+        ),
+    )
     parser.add_argument("--allow-tf32", action="store_true")
     parser.add_argument("--reuse-existing", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument(
@@ -535,6 +561,7 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
             "checkpoint_kind": freeze.get("checkpoint_kind"),
             "validated_records": freeze.get("validated_records"),
             "dataset_record_order_fingerprint": freeze.get("dataset_record_order_fingerprint"),
+            "source_archive_sha256": (group_contract.get("source_archive") or {}).get("sha256"),
         },
         "group_contract": {
             "status": group_contract.get("status"),
@@ -578,6 +605,22 @@ def stable_hash(payload: dict) -> str:
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:16]
+
+
+def stress_feature_hash(stress: dict, contract: dict, record_fp: str) -> str:
+    """Bind perturbation caches to data content, ordering, code, and protocol."""
+
+    freeze = contract["freeze_manifest"]
+    return stable_hash(
+        {
+            "stress": stress,
+            "protocol": PROTOCOL,
+            "source_bundle_sha256": source_bundle_contract()["sha256"],
+            "freeze_manifest_sha256": freeze["sha256"],
+            "source_archive_sha256": freeze.get("source_archive_sha256"),
+            "record_order_fingerprint": record_fp,
+        }
+    )
 
 
 def expected_weights_kind(checkpoint_kind: str) -> str | None:
@@ -750,8 +793,15 @@ def perturb_signals(X: np.ndarray, spec: dict) -> tuple[np.ndarray, dict]:
     raise ValueError(f"Unhandled perturbation kind: {kind}")
 
 
-def robust_feature_cache_path(prefix: str, stress_name: str, stress_hash: str, n_records: int, record_fp: str) -> Path:
-    cache_dir = Path(PATHS["cache_dir"]) / "revision_feature_cache"
+def robust_feature_cache_path(
+    cache_dir: Path,
+    prefix: str,
+    stress_name: str,
+    stress_hash: str,
+    n_records: int,
+    record_fp: str,
+) -> Path:
+    cache_dir = resolve_path(cache_dir)
     return cache_dir / f"{prefix}_{stress_name}_{stress_hash}_N{n_records}_R{record_fp}.npz"
 
 
@@ -764,13 +814,34 @@ def generate_minirocket_features(
     batch_size: int,
     device_name: str,
     save_cache: bool,
+    cache_dir: Path,
+    require_existing: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    cache_path = robust_feature_cache_path("robust_minirocket_raw", stress_name, stress_hash, len(X), record_fp)
+    cache_path = robust_feature_cache_path(
+        cache_dir,
+        "robust_minirocket_raw",
+        stress_name,
+        stress_hash,
+        len(X),
+        record_fp,
+    )
     if cache_path.exists():
         with np.load(cache_path, allow_pickle=False) as payload:
             feats = np.asarray(payload["X"])
             cached_hash = str(payload["stress_hash"].item()) if "stress_hash" in payload.files else ""
-        if feats.shape == (len(X), 20000) and cached_hash == stress_hash and np.isfinite(feats).all():
+            cached_stress = str(payload["stress_name"].item()) if "stress_name" in payload.files else ""
+            cached_record_fp = (
+                str(payload["record_order_fingerprint"].item())
+                if "record_order_fingerprint" in payload.files
+                else ""
+            )
+        if (
+            feats.shape == (len(X), 20000)
+            and cached_hash == stress_hash
+            and cached_stress == stress_name
+            and cached_record_fp == record_fp
+            and np.isfinite(feats).all()
+        ):
             print(f"Loaded perturbed MiniRocket cache: {cache_path}", flush=True)
             return feats.astype(np.float32), {
                 "path": str(cache_path),
@@ -779,6 +850,11 @@ def generate_minirocket_features(
                 "storage_dtype": str(feats.dtype),
             }
         print(f"Perturbed MiniRocket cache mismatch, regenerating: {cache_path}", flush=True)
+
+    if require_existing:
+        raise FileNotFoundError(
+            f"Required source-bound perturbed ROCKET-family cache is missing or invalid: {cache_path}"
+        )
 
     device = torch.device(device_name)
     model = MiniRocketNative(c_in=X.shape[1], seq_len=X.shape[-1], num_kernels=10000, seed=42).to(device).eval()
@@ -821,13 +897,34 @@ def generate_hrv36_features(
     stress_hash: str,
     record_fp: str,
     save_cache: bool,
+    cache_dir: Path,
+    require_existing: bool = False,
 ) -> tuple[np.ndarray, dict]:
-    cache_path = robust_feature_cache_path("robust_hrv36", stress_name, stress_hash, len(X), record_fp)
+    cache_path = robust_feature_cache_path(
+        cache_dir,
+        "robust_hrv36",
+        stress_name,
+        stress_hash,
+        len(X),
+        record_fp,
+    )
     if cache_path.exists():
         with np.load(cache_path, allow_pickle=False) as payload:
             feats = np.asarray(payload["X"])
             cached_hash = str(payload["stress_hash"].item()) if "stress_hash" in payload.files else ""
-        if feats.shape == (len(X), int(CONFIG["hrv_dim"])) and cached_hash == stress_hash and np.isfinite(feats).all():
+            cached_stress = str(payload["stress_name"].item()) if "stress_name" in payload.files else ""
+            cached_record_fp = (
+                str(payload["record_order_fingerprint"].item())
+                if "record_order_fingerprint" in payload.files
+                else ""
+            )
+        if (
+            feats.shape == (len(X), int(CONFIG["hrv_dim"]))
+            and cached_hash == stress_hash
+            and cached_stress == stress_name
+            and cached_record_fp == record_fp
+            and np.isfinite(feats).all()
+        ):
             print(f"Loaded perturbed HRV36 cache: {cache_path}", flush=True)
             return feats.astype(np.float32), {
                 "path": str(cache_path),
@@ -836,6 +933,11 @@ def generate_hrv36_features(
                 "storage_dtype": str(feats.dtype),
             }
         print(f"Perturbed HRV36 cache mismatch, regenerating: {cache_path}", flush=True)
+
+    if require_existing:
+        raise FileNotFoundError(
+            f"Required source-bound perturbed HRV cache is missing or invalid: {cache_path}"
+        )
 
     feats = np.zeros((len(X), int(CONFIG["hrv_dim"])), dtype=np.float32)
     for i, sig in enumerate(tqdm(X, desc=f"HRV36 {stress_name}")):
@@ -1498,11 +1600,16 @@ def main() -> None:
     print("=" * 80, flush=True)
     print(f"stress_tests={args.stress_tests}", flush=True)
     print(f"n_boot={args.n_boot} threshold={args.threshold} n_bins={args.n_bins}", flush=True)
+    execution_mode = "features_only" if args.features_only else "inference_only" if args.inference_only else "combined"
+    print(f"execution_mode={execution_mode}", flush=True)
+    print(f"feature_cache_dir={resolve_path(args.feature_cache_dir)}", flush=True)
     print(f"python={sys.version}", flush=True)
     print(f"platform={platform.platform()}", flush=True)
     print(f"torch={torch.__version__} cuda={torch.version.cuda} available={torch.cuda.is_available()}", flush=True)
     if torch.cuda.is_available():
         print(f"gpu={torch.cuda.get_device_name(0)}", flush=True)
+    if args.inference_only and not torch.cuda.is_available():
+        raise RuntimeError("--inference-only requires a CUDA runtime for Full ECG-RAMBA checkpoint inference.")
 
     full_clean = load_prediction_npz(args.full_clean_predictions, "Full clean")
     mini_clean_canonical = load_prediction_npz(args.minirocket_clean_predictions, "MiniRocket canonical clean")
@@ -1632,6 +1739,68 @@ def main() -> None:
                 flush=True,
             )
 
+        if args.features_only:
+            if not args.save_perturbed_caches:
+                raise ValueError("--features-only requires --save-perturbed-caches.")
+            feature_rows = []
+            for stress in specs:
+                stress_name = stress["name"]
+                stress_hash = stress_feature_hash(stress, contract, record_fp)
+                print("\n" + "=" * 80, flush=True)
+                print(f"Feature cache stage: {stress_name} | hash={stress_hash}", flush=True)
+                print("=" * 80, flush=True)
+                X_stress, perturb_meta = perturb_signals(X, stress)
+                X_rocket, rocket_info = generate_minirocket_features(
+                    X_stress,
+                    stress_name=stress_name,
+                    stress_hash=stress_hash,
+                    record_fp=record_fp,
+                    batch_size=args.minirocket_feature_batch_size,
+                    device_name=args.minirocket_feature_device,
+                    save_cache=True,
+                    cache_dir=args.feature_cache_dir,
+                )
+                X_hrv, hrv_info = generate_hrv36_features(
+                    X_stress,
+                    X_raw_amp,
+                    stress_name=stress_name,
+                    stress_hash=stress_hash,
+                    record_fp=record_fp,
+                    save_cache=True,
+                    cache_dir=args.feature_cache_dir,
+                )
+                feature_rows.append(
+                    {
+                        "stress_test": stress_name,
+                        "stress_hash": stress_hash,
+                        "stress_spec": stress,
+                        "perturbation": perturb_meta,
+                        "rocket_family": rocket_info,
+                        "hrv36": hrv_info,
+                    }
+                )
+                del X_stress, X_rocket, X_hrv
+                gc.collect()
+
+            feature_manifest = {
+                "schema_version": 1,
+                "status": "complete",
+                "mode": "features_only",
+                "created_utc": now_utc(),
+                "protocol": PROTOCOL,
+                "source_bundle": source_bundle_contract(),
+                "freeze_manifest": contract["freeze_manifest"],
+                "record_order_fingerprint": record_fp,
+                "n_records": int(len(X)),
+                "cache_dir": str(resolve_path(args.feature_cache_dir)),
+                "stress_rows": feature_rows,
+            }
+            feature_manifest_path = MANIFEST_DIR / "robustness_feature_cache_manifest.json"
+            save_json(feature_manifest_path, feature_manifest)
+            print(f"Wrote feature-cache manifest: {feature_manifest_path}", flush=True)
+            print(f"Feature-only stage complete: {len(feature_rows)}/{len(specs)} stresses", flush=True)
+            return
+
         # Debug subsets still consume the manuscript full-record cache and slice it
         # inside the MiniRocket loader. This avoids looking for an artificial
         # N=<limit> cache keyed by the subset fingerprint.
@@ -1687,13 +1856,7 @@ def main() -> None:
     )
 
     for stress in specs:
-        stress_hash = stable_hash(
-            {
-                "stress": stress,
-                "source_bundle_sha256": source_bundle_contract()["sha256"],
-                "record_order_fingerprint": record_fp,
-            }
-        )
+        stress_hash = stress_feature_hash(stress, contract, record_fp)
         stress_name = stress["name"]
         print("\n" + "=" * 80, flush=True)
         print(f"Stress test: {stress_name} | hash={stress_hash}", flush=True)
@@ -1749,6 +1912,8 @@ def main() -> None:
                 batch_size=args.minirocket_feature_batch_size,
                 device_name=args.minirocket_feature_device,
                 save_cache=args.save_perturbed_caches,
+                cache_dir=args.feature_cache_dir,
+                require_existing=args.inference_only,
             )
             feature_infos["minirocket"] = rocket_info
             if full_prob is None:
@@ -1759,6 +1924,8 @@ def main() -> None:
                     stress_hash=stress_hash,
                     record_fp=record_fp,
                     save_cache=args.save_perturbed_caches,
+                    cache_dir=args.feature_cache_dir,
+                    require_existing=args.inference_only,
                 )
                 feature_infos["hrv36"] = hrv_info
                 full_prob, slice_count, full_fold_rows = predict_full_model(

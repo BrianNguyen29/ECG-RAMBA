@@ -86,6 +86,32 @@ class ColabCliPipelineTests(unittest.TestCase):
             set(comparators),
             {"full", "minirocket", "resnet", "raw_mamba", "transformer"},
         )
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
+            "aggregate_only",
+        )
+
+    def test_notebook05_cpu_feature_stage_precedes_gpu_inference(self):
+        feature_stage = self.module.stage_by_id(
+            self.manifest, "nb05_features_cpu"
+        )
+        prediction_stage = self.module.stage_by_id(
+            self.manifest, "nb05_predictions_a100"
+        )
+        self.assertEqual(feature_stage["hardware"], "cpu")
+        self.assertEqual(
+            feature_stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
+            "features_only",
+        )
+        self.assertNotIn(
+            "## Comparator Stress Prediction Generation",
+            feature_stage["sections"],
+        )
+        self.assertEqual(prediction_stage["depends_on"], ["nb05_features_cpu"])
+        self.assertEqual(
+            prediction_stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
+            "inference_only",
+        )
 
     def test_notebook05_prediction_stage_accepts_t4_gpu_runtime(self):
         stage = self.module.stage_by_id(

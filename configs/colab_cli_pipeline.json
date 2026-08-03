@@ -217,6 +217,28 @@
       }
     },
     {
+      "id": "nb05_features_cpu",
+      "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## HRV Domain Evidence",
+        "## Robustness Stress-Test Ledger"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb04_a100"
+      ],
+      "environment": {
+        "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE": "features_only",
+        "ECG_RAMBA_ROBUSTNESS_BATCH_SIZE": "64"
+      }
+    },
+    {
       "id": "nb05_predictions_a100",
       "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
       "mode": "sections",
@@ -232,9 +254,10 @@
       "timeout_seconds": 86400,
       "enabled": true,
       "depends_on": [
-        "nb04_a100"
+        "nb05_features_cpu"
       ],
       "environment": {
+        "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE": "inference_only",
         "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
         "ECG_RAMBA_COMPARATOR_STRESS_COMPARATORS": "resnet,raw_mamba,transformer",
         "ECG_RAMBA_COMPARATOR_STRESS_TESTS": "snr20db,snr10db,snr5db,random_3_lead_dropout,precordial_dropout,resample_250hz",
@@ -252,6 +275,7 @@
         "nb05_predictions_a100"
       ],
       "environment": {
+        "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE": "aggregate_only",
         "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
         "ECG_RAMBA_ROBUSTNESS_MULTI_COMPARATORS": "full,minirocket,resnet,raw_mamba,transformer",
         "ECG_RAMBA_ROBUSTNESS_MULTI_FINAL_N_BOOT": "1000",
