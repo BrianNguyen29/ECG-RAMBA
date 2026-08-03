@@ -85,6 +85,7 @@ TRAINING_VARIABILITY_SCOPE = "fixed_trained_folds_and_checkpoints_not_retrained_
 PERTURBATION_REALIZATION_SCOPE = "single_fixed_seed_conditional_stress_audit"
 MINIROCKET_HEAD_PROTOCOL = "minirocket_clean_heads_for_robustness_v1"
 EXPECTED_MINIROCKET_PROTOCOL = "minirocket_raw_standardized_torch_linear_same_folds_threshold_0.5"
+FEATURE_MATH_CONTRACT = "float32_tf32_disabled_cudnn_deterministic_float16_storage_v1"
 DEFAULT_STRESS_TESTS = [
     "snr20db",
     "snr10db",
@@ -1130,11 +1131,23 @@ def stress_feature_hash(stress: dict, contract: dict, record_fp: str) -> str:
     )
 
 
-def feature_cache_hash(stress_hash: str, raw_cache: dict | None) -> str:
+def feature_cache_hash(
+    stress_hash: str,
+    raw_cache: dict | None,
+    *,
+    feature_device: str,
+) -> str:
     """Bind cached features to the exact raw-cache bytes and preprocessing provenance."""
 
     if raw_cache is None:
-        return stable_hash({"stress_hash": stress_hash, "raw_cache": "in_memory_unbound"})
+        return stable_hash(
+            {
+                "stress_hash": stress_hash,
+                "raw_cache": "in_memory_unbound",
+                "feature_device": feature_device,
+                "feature_math_contract": FEATURE_MATH_CONTRACT,
+            }
+        )
     return stable_hash(
         {
             "stress_hash": stress_hash,
@@ -1142,6 +1155,8 @@ def feature_cache_hash(stress_hash: str, raw_cache: dict | None) -> str:
             "raw_cache_schema_version": raw_cache.get("cache_schema_version"),
             "preprocessing_source_sha256": raw_cache.get("preprocessing_source_sha256"),
             "preprocessing_config_sha256": raw_cache.get("preprocessing_config_sha256"),
+            "feature_device": feature_device,
+            "feature_math_contract": FEATURE_MATH_CONTRACT,
         }
     )
 
@@ -1467,6 +1482,15 @@ def generate_minirocket_features(
         )
 
     device = torch.device(device_name)
+    prior_cuda_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    prior_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    prior_cudnn_deterministic = torch.backends.cudnn.deterministic
+    prior_cudnn_benchmark = torch.backends.cudnn.benchmark
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
     model = MiniRocketNative(c_in=X.shape[1], seq_len=X.shape[-1], num_kernels=10000, seed=42).to(device).eval()
     work_dir = resolve_path(work_dir or Path("/tmp/ecg_ramba_robustness_feature_work"))
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1521,11 +1545,17 @@ def generate_minirocket_features(
             record_fp=record_fp,
         )
         info["feature_device"] = device_name
+        info["feature_math_contract"] = FEATURE_MATH_CONTRACT
         print(f"Saved perturbed ROCKET-family cache: {cache_path}", flush=True)
         return (np.asarray(feature_store, dtype=np.float32) if materialize else None), info
     finally:
         close_memmap(feature_store)
         work_path.unlink(missing_ok=True)
+        if device.type == "cuda":
+            torch.backends.cuda.matmul.allow_tf32 = prior_cuda_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = prior_cudnn_tf32
+            torch.backends.cudnn.deterministic = prior_cudnn_deterministic
+            torch.backends.cudnn.benchmark = prior_cudnn_benchmark
 
 
 def generate_hrv36_features(
@@ -2249,6 +2279,11 @@ def main() -> None:
     print(f"torch={torch.__version__} cuda={torch.version.cuda} available={torch.cuda.is_available()}", flush=True)
     if torch.cuda.is_available():
         print(f"gpu={torch.cuda.get_device_name(0)}", flush=True)
+    if args.minirocket_feature_device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "--minirocket-feature-device cuda requires a CUDA runtime. "
+            "Use the nb05_features_a100 stage or explicitly select cpu for the slow fallback."
+        )
     if args.inference_only and not torch.cuda.is_available():
         raise RuntimeError("--inference-only requires a CUDA runtime for Full ECG-RAMBA checkpoint inference.")
 
@@ -2326,7 +2361,11 @@ def main() -> None:
         for stress in specs:
             stress_name = stress["name"]
             stress_hash = stress_feature_hash(stress, contract, record_fp)
-            cache_hash = feature_cache_hash(stress_hash, raw_cache_info)
+            cache_hash = feature_cache_hash(
+                stress_hash,
+                raw_cache_info,
+                feature_device=args.minirocket_feature_device,
+            )
             print("\n" + "=" * 80, flush=True)
             print(
                 f"Feature cache stage: {stress_name} | stress_hash={stress_hash} "
@@ -2653,7 +2692,11 @@ def main() -> None:
 
     for stress in specs:
         stress_hash = stress_feature_hash(stress, contract, record_fp)
-        cache_hash = feature_cache_hash(stress_hash, raw_cache_info)
+        cache_hash = feature_cache_hash(
+            stress_hash,
+            raw_cache_info,
+            feature_device=args.minirocket_feature_device,
+        )
         stress_name = stress["name"]
         print("\n" + "=" * 80, flush=True)
         print(

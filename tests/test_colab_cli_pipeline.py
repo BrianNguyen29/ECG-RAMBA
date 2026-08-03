@@ -91,14 +91,20 @@ class ColabCliPipelineTests(unittest.TestCase):
             "aggregate_only",
         )
 
-    def test_notebook05_cpu_feature_stage_precedes_gpu_inference(self):
-        feature_stage = self.module.stage_by_id(
+    def test_notebook05_a100_feature_stage_precedes_gpu_inference(self):
+        cpu_fallback = self.module.stage_by_id(
             self.manifest, "nb05_features_cpu"
+        )
+        feature_stage = self.module.stage_by_id(
+            self.manifest, "nb05_features_a100"
         )
         prediction_stage = self.module.stage_by_id(
             self.manifest, "nb05_predictions_a100"
         )
-        self.assertEqual(feature_stage["hardware"], "cpu")
+        self.assertFalse(cpu_fallback["enabled"])
+        self.assertEqual(cpu_fallback["hardware"], "cpu")
+        self.assertEqual(feature_stage["hardware"], "a100")
+        self.assertTrue(feature_stage["enabled"])
         self.assertEqual(
             feature_stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
             "features_only",
@@ -107,17 +113,21 @@ class ColabCliPipelineTests(unittest.TestCase):
             "## Comparator Stress Prediction Generation",
             feature_stage["sections"],
         )
-        self.assertEqual(prediction_stage["depends_on"], ["nb05_features_cpu"])
+        self.assertEqual(
+            feature_stage["environment"]["ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE"],
+            "cuda",
+        )
+        self.assertEqual(prediction_stage["depends_on"], ["nb05_features_a100"])
         self.assertEqual(
             prediction_stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
             "inference_only",
         )
 
-    def test_notebook05_prediction_stage_accepts_t4_gpu_runtime(self):
+    def test_notebook05_prediction_stage_uses_a100_runtime(self):
         stage = self.module.stage_by_id(
             self.manifest, "nb05_predictions_a100"
         )
-        self.assertEqual(stage["hardware"], "gpu")
+        self.assertEqual(stage["hardware"], "a100")
         self.assertEqual(
             stage["environment"]["ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE"],
             "256",

@@ -269,7 +269,7 @@ class RobustnessCacheContractTests(unittest.TestCase):
             "preprocessing_source_sha256": "source-a",
             "preprocessing_config_sha256": "config-a",
         }
-        observed = ROBUSTNESS.feature_cache_hash("stress", base)
+        observed = ROBUSTNESS.feature_cache_hash("stress", base, feature_device="cuda")
         for key, changed in [
             ("sha256", "raw-b"),
             ("cache_schema_version", 4),
@@ -278,7 +278,14 @@ class RobustnessCacheContractTests(unittest.TestCase):
         ]:
             mutated = dict(base)
             mutated[key] = changed
-            self.assertNotEqual(observed, ROBUSTNESS.feature_cache_hash("stress", mutated))
+            self.assertNotEqual(
+                observed,
+                ROBUSTNESS.feature_cache_hash("stress", mutated, feature_device="cuda"),
+            )
+        self.assertNotEqual(
+            observed,
+            ROBUSTNESS.feature_cache_hash("stress", base, feature_device="cpu"),
+        )
 
     def test_inference_only_rejects_missing_feature_cache_before_transform(self):
         with tempfile.TemporaryDirectory() as tmp:
