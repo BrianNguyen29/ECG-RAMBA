@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -15,6 +16,70 @@ COMPARATOR_STRESS = importlib.import_module(
 
 
 class RobustnessCacheContractTests(unittest.TestCase):
+    def test_features_only_contract_does_not_require_minirocket_predictions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            full_path = root / "full.npz"
+            full_path.write_bytes(b"full-prediction-contract")
+            sidecar_path = root / "groups.npz"
+            np.savez_compressed(sidecar_path, group_id=np.asarray(["a", "b"]))
+            freeze_path = root / "freeze.json"
+            relative_full = "reports/revision/predictions/oof_final_ema_predictions.npz"
+            freeze_path.write_text(
+                json.dumps(
+                    {
+                        "status": "frozen",
+                        "manuscript_ready": True,
+                        "checkpoint_kind": "final_ema",
+                        "validated_records": 2,
+                        "dataset_record_order_fingerprint": "records",
+                        "artifacts": [
+                            {
+                                "path": relative_full,
+                                "sha256": ROBUSTNESS.sha256_file(full_path),
+                            }
+                        ],
+                        "group_contract": {
+                            "status": "verified",
+                            "one_record_per_group": True,
+                            "n_records": 2,
+                            "n_groups": 2,
+                            "bootstrap_unit": "chapman_record_subject",
+                            "group_semantics": "one_record_per_subject",
+                            "source_archive": {"sha256": "archive"},
+                            "sidecar": {
+                                "path": str(sidecar_path),
+                                "sha256": ROBUSTNESS.sha256_file(sidecar_path),
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            full = {
+                "path": full_path,
+                "sha256": ROBUSTNESS.sha256_file(full_path),
+                "y_true": np.zeros((2, 2), dtype=np.float32),
+                "record_id": np.asarray([0, 1], dtype=np.int64),
+                "class_names": ["A", "B"],
+                "fold_id": np.asarray([1, 2], dtype=np.int16),
+            }
+            args = SimpleNamespace(
+                freeze_manifest=freeze_path,
+                expected_checkpoint_kind="final_ema",
+                minirocket_manifest=root / "missing_manifest.json",
+                minirocket_summary=root / "missing_summary.json",
+            )
+            with patch.object(ROBUSTNESS, "project_relative", return_value=relative_full):
+                contract = ROBUSTNESS.validate_clean_prediction_contract(
+                    full,
+                    None,
+                    args,
+                    require_minirocket=False,
+                )
+            self.assertEqual(contract["freeze_manifest"]["validated_records"], 2)
+            self.assertNotIn("minirocket_manifest", contract)
+
     def test_stress_feature_hash_binds_archive_freeze_and_record_order(self):
         stress = ROBUSTNESS.stress_specs(["snr20db"], 42)[0]
         contract = {

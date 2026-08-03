@@ -480,16 +480,24 @@ def load_prediction_npz(path: Path, label: str) -> dict:
     return payload
 
 
-def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Namespace) -> dict:
-    if not np.array_equal(full["y_true"], mini["y_true"]):
+def validate_clean_prediction_contract(
+    full: dict,
+    mini: dict | None,
+    args: argparse.Namespace,
+    *,
+    require_minirocket: bool = True,
+) -> dict:
+    if require_minirocket and mini is None:
+        raise ValueError("MiniRocket clean predictions are required outside features-only mode.")
+    if mini is not None and not np.array_equal(full["y_true"], mini["y_true"]):
         raise ValueError("Full and MiniRocket clean y_true arrays differ.")
-    if not np.array_equal(full["record_id"], mini["record_id"]):
+    if mini is not None and not np.array_equal(full["record_id"], mini["record_id"]):
         raise ValueError("Full and MiniRocket clean record_id arrays differ.")
-    if full["class_names"] != mini["class_names"]:
+    if mini is not None and full["class_names"] != mini["class_names"]:
         raise ValueError("Full and MiniRocket class_names differ.")
     if full["fold_id"] is None:
         raise ValueError("Full clean predictions must include fold_id.")
-    if mini["fold_id"] is not None and not np.array_equal(full["fold_id"], mini["fold_id"]):
+    if mini is not None and mini["fold_id"] is not None and not np.array_equal(full["fold_id"], mini["fold_id"]):
         raise ValueError("Full and MiniRocket clean fold_id arrays differ.")
 
     freeze_path = resolve_path(args.freeze_manifest)
@@ -531,6 +539,29 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
     if int(group_contract.get("n_groups", -1)) != int(full["y_true"].shape[0]):
         raise RuntimeError("Robustness record bootstrap requires the reviewed one-record-per-group contract.")
 
+    contract = {
+        "freeze_manifest": {
+            "path": str(freeze_path),
+            "sha256": sha256_file(freeze_path),
+            "checkpoint_kind": freeze.get("checkpoint_kind"),
+            "validated_records": freeze.get("validated_records"),
+            "dataset_record_order_fingerprint": freeze.get("dataset_record_order_fingerprint"),
+            "source_archive_sha256": (group_contract.get("source_archive") or {}).get("sha256"),
+        },
+        "group_contract": {
+            "status": group_contract.get("status"),
+            "one_record_per_group": group_contract.get("one_record_per_group"),
+            "n_records": group_contract.get("n_records"),
+            "n_groups": group_contract.get("n_groups"),
+            "bootstrap_unit": group_contract.get("bootstrap_unit"),
+            "group_semantics": group_contract.get("group_semantics"),
+            "sidecar_path": str(sidecar_path),
+            "sidecar_sha256": sidecar_sha256,
+        },
+    }
+    if not require_minirocket:
+        return contract
+
     mini_manifest = resolve_path(args.minirocket_manifest)
     mini_summary = resolve_path(args.minirocket_summary)
     if not mini_manifest.exists() or not mini_summary.exists():
@@ -554,25 +585,7 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
         raise RuntimeError(
             f"MiniRocket prediction SHA mismatch: manifest {manifest_prediction_sha} != file {mini['sha256']}"
         )
-    return {
-        "freeze_manifest": {
-            "path": str(freeze_path),
-            "sha256": sha256_file(freeze_path),
-            "checkpoint_kind": freeze.get("checkpoint_kind"),
-            "validated_records": freeze.get("validated_records"),
-            "dataset_record_order_fingerprint": freeze.get("dataset_record_order_fingerprint"),
-            "source_archive_sha256": (group_contract.get("source_archive") or {}).get("sha256"),
-        },
-        "group_contract": {
-            "status": group_contract.get("status"),
-            "one_record_per_group": group_contract.get("one_record_per_group"),
-            "n_records": group_contract.get("n_records"),
-            "n_groups": group_contract.get("n_groups"),
-            "bootstrap_unit": group_contract.get("bootstrap_unit"),
-            "group_semantics": group_contract.get("group_semantics"),
-            "sidecar_path": str(sidecar_path),
-            "sidecar_sha256": sidecar_sha256,
-        },
+    contract.update({
         "minirocket_manifest": {
             "path": str(mini_manifest),
             "sha256": sha256_file(mini_manifest),
@@ -586,7 +599,8 @@ def validate_clean_prediction_contract(full: dict, mini: dict, args: argparse.Na
             "manuscript_ready": mini_summary_payload.get("manuscript_ready"),
             "n_records": mini_summary_payload.get("n_records"),
         },
-    }
+    })
+    return contract
 
 
 def fold_list_from_fold_id(fold_id: np.ndarray) -> list[dict[str, np.ndarray]]:
@@ -1612,11 +1626,17 @@ def main() -> None:
         raise RuntimeError("--inference-only requires a CUDA runtime for Full ECG-RAMBA checkpoint inference.")
 
     full_clean = load_prediction_npz(args.full_clean_predictions, "Full clean")
-    mini_clean_canonical = load_prediction_npz(args.minirocket_clean_predictions, "MiniRocket canonical clean")
-    contract = validate_clean_prediction_contract(full_clean, mini_clean_canonical, args)
-    checkpoint_contract_payload = load_oof_checkpoint_contract(args)
-    checkpoint_contract = checkpoint_contract_payload.get("checkpoints", {})
-    pca_contract = checkpoint_contract_payload.get("pca_objects", {})
+    mini_clean_canonical = (
+        None
+        if args.features_only
+        else load_prediction_npz(args.minirocket_clean_predictions, "MiniRocket canonical clean")
+    )
+    contract = validate_clean_prediction_contract(
+        full_clean,
+        mini_clean_canonical,
+        args,
+        require_minirocket=not args.features_only,
+    )
     y = full_clean["y_true"]
     fold_id = np.asarray(full_clean["fold_id"], dtype=np.int16)
     folds = fold_list_from_fold_id(fold_id)
@@ -1625,11 +1645,98 @@ def main() -> None:
         y = y[keep]
         fold_id = fold_id[keep]
         full_clean["y_prob"] = full_clean["y_prob"][keep]
-        mini_clean_canonical["y_prob"] = mini_clean_canonical["y_prob"][keep]
+        if mini_clean_canonical is not None:
+            mini_clean_canonical["y_prob"] = mini_clean_canonical["y_prob"][keep]
         folds = fold_list_from_fold_id(fold_id)
         print(f"Debug limit active: {len(y)} records", flush=True)
 
     specs = stress_specs(args.stress_tests.split(","), args.seed)
+    expected_fp = contract["freeze_manifest"].get("dataset_record_order_fingerprint")
+    if args.features_only:
+        if not args.save_perturbed_caches:
+            raise ValueError("--features-only requires --save-perturbed-caches.")
+        gen = load_revision_module(
+            "01_generate_predictions.py",
+            "_ecg_ramba_generate_predictions_data_for_robustness_features",
+        )
+        X, y_loaded, X_raw_amp, subjects = gen.prepare_clean_chapman(
+            limit_records=args.limit_records
+        )
+        if y_loaded.shape != y.shape or not np.array_equal(y_loaded, y):
+            raise ValueError("Loaded Chapman labels do not match frozen OOF y_true.")
+        record_fp = record_order_fingerprint(subjects)
+        if args.limit_records == 0 and expected_fp and record_fp != expected_fp:
+            raise RuntimeError(f"Loaded Chapman record fingerprint {record_fp} != frozen {expected_fp}")
+        if args.limit_records > 0:
+            print(
+                "Debug limit active: skipping full-record fingerprint equality check "
+                f"(subset fingerprint={record_fp}, frozen full fingerprint={expected_fp}).",
+                flush=True,
+            )
+
+        feature_rows = []
+        for stress in specs:
+            stress_name = stress["name"]
+            stress_hash = stress_feature_hash(stress, contract, record_fp)
+            print("\n" + "=" * 80, flush=True)
+            print(f"Feature cache stage: {stress_name} | hash={stress_hash}", flush=True)
+            print("=" * 80, flush=True)
+            X_stress, perturb_meta = perturb_signals(X, stress)
+            X_rocket, rocket_info = generate_minirocket_features(
+                X_stress,
+                stress_name=stress_name,
+                stress_hash=stress_hash,
+                record_fp=record_fp,
+                batch_size=args.minirocket_feature_batch_size,
+                device_name=args.minirocket_feature_device,
+                save_cache=True,
+                cache_dir=args.feature_cache_dir,
+            )
+            X_hrv, hrv_info = generate_hrv36_features(
+                X_stress,
+                X_raw_amp,
+                stress_name=stress_name,
+                stress_hash=stress_hash,
+                record_fp=record_fp,
+                save_cache=True,
+                cache_dir=args.feature_cache_dir,
+            )
+            feature_rows.append(
+                {
+                    "stress_test": stress_name,
+                    "stress_hash": stress_hash,
+                    "stress_spec": stress,
+                    "perturbation": perturb_meta,
+                    "rocket_family": rocket_info,
+                    "hrv36": hrv_info,
+                }
+            )
+            del X_stress, X_rocket, X_hrv
+            gc.collect()
+
+        feature_manifest = {
+            "schema_version": 1,
+            "status": "complete",
+            "mode": "features_only",
+            "created_utc": now_utc(),
+            "protocol": PROTOCOL,
+            "source_bundle": source_bundle_contract(),
+            "freeze_manifest": contract["freeze_manifest"],
+            "record_order_fingerprint": record_fp,
+            "n_records": int(len(X)),
+            "cache_dir": str(resolve_path(args.feature_cache_dir)),
+            "stress_rows": feature_rows,
+        }
+        feature_manifest_path = MANIFEST_DIR / "robustness_feature_cache_manifest.json"
+        save_json(feature_manifest_path, feature_manifest)
+        print(f"Wrote feature-cache manifest: {feature_manifest_path}", flush=True)
+        print(f"Feature-only stage complete: {len(feature_rows)}/{len(specs)} stresses", flush=True)
+        return
+
+    assert mini_clean_canonical is not None
+    checkpoint_contract_payload = load_oof_checkpoint_contract(args)
+    checkpoint_contract = checkpoint_contract_payload.get("checkpoints", {})
+    pca_contract = checkpoint_contract_payload.get("pca_objects", {})
     reusable_heads = (
         load_existing_minirocket_clean_reference(y=y, fold_id=fold_id)
         if args.reuse_existing
@@ -1707,7 +1814,6 @@ def main() -> None:
             + "; ".join(missing)
         )
 
-    expected_fp = contract["freeze_manifest"].get("dataset_record_order_fingerprint")
     if aggregation_only and heads is not None:
         print(
             "All requested stress predictions and MiniRocket clean reference are reusable; "
@@ -1738,68 +1844,6 @@ def main() -> None:
                 f"(subset fingerprint={record_fp}, frozen full fingerprint={expected_fp}).",
                 flush=True,
             )
-
-        if args.features_only:
-            if not args.save_perturbed_caches:
-                raise ValueError("--features-only requires --save-perturbed-caches.")
-            feature_rows = []
-            for stress in specs:
-                stress_name = stress["name"]
-                stress_hash = stress_feature_hash(stress, contract, record_fp)
-                print("\n" + "=" * 80, flush=True)
-                print(f"Feature cache stage: {stress_name} | hash={stress_hash}", flush=True)
-                print("=" * 80, flush=True)
-                X_stress, perturb_meta = perturb_signals(X, stress)
-                X_rocket, rocket_info = generate_minirocket_features(
-                    X_stress,
-                    stress_name=stress_name,
-                    stress_hash=stress_hash,
-                    record_fp=record_fp,
-                    batch_size=args.minirocket_feature_batch_size,
-                    device_name=args.minirocket_feature_device,
-                    save_cache=True,
-                    cache_dir=args.feature_cache_dir,
-                )
-                X_hrv, hrv_info = generate_hrv36_features(
-                    X_stress,
-                    X_raw_amp,
-                    stress_name=stress_name,
-                    stress_hash=stress_hash,
-                    record_fp=record_fp,
-                    save_cache=True,
-                    cache_dir=args.feature_cache_dir,
-                )
-                feature_rows.append(
-                    {
-                        "stress_test": stress_name,
-                        "stress_hash": stress_hash,
-                        "stress_spec": stress,
-                        "perturbation": perturb_meta,
-                        "rocket_family": rocket_info,
-                        "hrv36": hrv_info,
-                    }
-                )
-                del X_stress, X_rocket, X_hrv
-                gc.collect()
-
-            feature_manifest = {
-                "schema_version": 1,
-                "status": "complete",
-                "mode": "features_only",
-                "created_utc": now_utc(),
-                "protocol": PROTOCOL,
-                "source_bundle": source_bundle_contract(),
-                "freeze_manifest": contract["freeze_manifest"],
-                "record_order_fingerprint": record_fp,
-                "n_records": int(len(X)),
-                "cache_dir": str(resolve_path(args.feature_cache_dir)),
-                "stress_rows": feature_rows,
-            }
-            feature_manifest_path = MANIFEST_DIR / "robustness_feature_cache_manifest.json"
-            save_json(feature_manifest_path, feature_manifest)
-            print(f"Wrote feature-cache manifest: {feature_manifest_path}", flush=True)
-            print(f"Feature-only stage complete: {len(feature_rows)}/{len(specs)} stresses", flush=True)
-            return
 
         # Debug subsets still consume the manuscript full-record cache and slice it
         # inside the MiniRocket loader. This avoids looking for an artificial
