@@ -169,6 +169,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "reviewer_minimal",
             "core_final",
             "artifact_mirror.py publish --verify-existing size",
+            "--refresh-existing-prefix metrics/robustness_metric_cache",
             "--refresh-existing-prefix metrics/robustness_multicomparator_metric_cache",
             "stress_publish_selection",
             "hrv_publish_selection",
