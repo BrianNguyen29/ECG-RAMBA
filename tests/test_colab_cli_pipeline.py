@@ -141,6 +141,7 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn("script -qefc", source)
         self.assertIn("/dev/tty", source)
         self.assertIn("$ProcessInfo.ArgumentList.Add", source)
+        self.assertIn("$ProcessInfo.PSObject.Properties['ArgumentList']", source)
         self.assertIn("$null -ne $ProcessInfo.ArgumentList", source)
         self.assertIn("$ProcessInfo.Arguments =", source)
         self.assertIn("Windows PowerShell 5.1", source)
@@ -153,6 +154,7 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn("Waiting for DriveFS", source)
         self.assertIn("$ObservedMountError", source)
         self.assertIn("$VerifyExitCode", source)
+        self.assertIn("Colab Drive mount process did not expose redirected input/output streams", source)
 
     def test_cpu_feature_stage_does_not_include_gpu_inference(self):
         stage = self.module.stage_by_id(

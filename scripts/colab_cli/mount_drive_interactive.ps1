@@ -39,7 +39,11 @@ $PtyCommand = "exec script -qefc $(Quote-Bash $ColabCommand) /dev/null"
 
 $ProcessInfo = [System.Diagnostics.ProcessStartInfo]::new()
 $ProcessInfo.FileName = "wsl.exe"
-if ($null -ne $ProcessInfo.ArgumentList) {
+$HasArgumentList = (
+    $null -ne $ProcessInfo.PSObject.Properties['ArgumentList'] -and
+    $null -ne $ProcessInfo.ArgumentList
+)
+if ($HasArgumentList) {
     # PowerShell 7 / modern .NET: preserve each argument without shell re-parsing.
     $ProcessInfo.ArgumentList.Add("-d")
     $ProcessInfo.ArgumentList.Add($Distro)
@@ -61,10 +65,26 @@ $ProcessInfo.RedirectStandardError = $false
 
 $Process = [System.Diagnostics.Process]::new()
 $Process.StartInfo = $ProcessInfo
-[void]$Process.Start()
+try {
+    $Started = $Process.Start()
+} catch {
+    throw "Could not start wsl.exe for the Colab Drive mount: $($_.Exception.Message)"
+}
+if (-not $Started) {
+    throw "wsl.exe did not start the Colab Drive mount process."
+}
+$OutputReader = $Process.StandardOutput
+$InputWriter = $Process.StandardInput
+if ($null -eq $OutputReader -or $null -eq $InputWriter) {
+    $Process.WaitForExit()
+    throw (
+        "Colab Drive mount process did not expose redirected input/output streams. " +
+        "exit_code=$($Process.ExitCode). Verify wsl.exe, the selected distro, and the Colab CLI installation."
+    )
+}
 
 $ObservedMountError = $false
-while (($Line = $Process.StandardOutput.ReadLine()) -ne $null) {
+while (($Line = $OutputReader.ReadLine()) -ne $null) {
     Write-Host $Line
     if (
         $Line -match "\[colab\] Error propagating:" -or
@@ -83,8 +103,8 @@ while (($Line = $Process.StandardOutput.ReadLine()) -ne $null) {
         } else {
             [void](Read-Host "Approve Google Drive access in the browser, then press Enter here")
         }
-        $Process.StandardInput.WriteLine()
-        $Process.StandardInput.Flush()
+        $InputWriter.WriteLine()
+        $InputWriter.Flush()
     }
 }
 
