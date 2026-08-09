@@ -3285,6 +3285,147 @@ def paired_comparator_source_current_04(manifest_path):
     save(name, notebook)
 
 
+def integrate_notebook04_reviewed_baseline_runner_reuse() -> None:
+    """Keep auto baseline runners from retraining an attested immutable package."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    scope = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "def baseline_manifest_matches_current_freeze" in source(cell)
+        ),
+        None,
+    )
+    if scope is None:
+        raise RuntimeError("Notebook 04 baseline manifest helper cell not found")
+    text = source(scope)
+    start = text.find("def baseline_manifest_matches_current_freeze")
+    end = text.find("BASELINE_PAIR_PROVENANCE_04 = {", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("Notebook 04 baseline manifest helper boundaries not found")
+    replacement = '''def baseline_manifest_matches_current_freeze(manifest_path):
+    """Accept a direct binding or an exact reviewed immutable package.
+
+    The fallback is deliberately narrower than ordinary cache reuse: it needs
+    the semantic OOF payload check and the baseline provenance attestation in
+    paired_comparator_source_current_04. It never rewrites historical runner
+    metadata, fold caches, or checkpoint contracts.
+    """
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists() or manifest_path.stat().st_size == 0:
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+        contract = payload.get('freeze_contract') or (payload.get('load_info') or {}).get('freeze_contract') or {}
+        checkpoint_contract = payload.get('checkpoint_contract') or {}
+        checkpoint_rows = checkpoint_contract.get('checkpoints') or []
+        checkpoint_folds = sorted(int(row.get('fold', -1)) for row in checkpoint_rows)
+        checkpoint_contract_complete = bool(
+            checkpoint_contract.get('status') == 'complete'
+            and checkpoint_folds == [1, 2, 3, 4, 5]
+            and all(row.get('sha256') for row in checkpoint_rows)
+        )
+        direct_current = bool(
+            contract.get('checkpoint_kind') == 'final_ema'
+            and contract.get('oof_predictions_sha256') == pred_sha
+            and contract.get('freeze_manifest_sha256') == freeze_sha
+            and int(contract.get('validated_records', -1)) == int(freeze.get('validated_records', -2))
+            and checkpoint_contract_complete
+        )
+        if direct_current:
+            return True
+    except Exception as exc:
+        print('Baseline manifest contract rejected:', manifest_path, repr(exc))
+        return False
+    reviewed_current, reason = paired_comparator_source_current_04(manifest_path)
+    if reviewed_current:
+        print('Baseline runner reuse accepted through reviewed immutable attestation:', manifest_path.name)
+        return True
+    print('Baseline manifest is neither directly current nor reviewed-attested:', manifest_path.name, reason)
+    return False
+
+'''
+    set_source(scope, text[:start] + replacement + text[end:])
+
+    mini = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "def _minirocket_artifacts_current" in source(cell)
+        ),
+        None,
+    )
+    if mini is None:
+        raise RuntimeError("Notebook 04 MiniRocket reuse helper cell not found")
+    text = source(mini)
+    old_return = "        return freeze_contract_current and artifact_contract_current and prediction_contract_current\n"
+    new_return = '''        if freeze_contract_current and artifact_contract_current and prediction_contract_current:
+            return True
+        reviewed_current, reviewed_reason = paired_comparator_source_current_04(MINIROCKET_REQUIRED_OUTPUTS[-1])
+        if reviewed_current and artifact_contract_current and prediction_contract_current:
+            print('MiniRocket-only reuse accepted through reviewed immutable attestation.')
+            return True
+        if not freeze_contract_current:
+            print('MiniRocket-only direct freeze binding is stale:', reviewed_reason)
+        return False
+'''
+    if old_return not in text:
+        raise RuntimeError("Notebook 04 MiniRocket return contract anchor missing")
+    set_source(mini, text.replace(old_return, new_return, 1))
+
+    learned_controls = (
+        (
+            "RUN_RESNET1D_CNN_BASELINE =",
+            "missing_resnet_baseline_artifacts_contract_current",
+            "missing_resnet_fold_cache_folds",
+            "resnet_fold_manifest_mismatch_folds",
+            "ResNet1D/CNN",
+        ),
+        (
+            "RUN_RAW_MAMBA_BASELINE =",
+            "missing_raw_mamba_baseline_artifacts_contract_current",
+            "missing_raw_mamba_fold_cache_folds",
+            "raw_mamba_fold_manifest_mismatch_folds",
+            "Raw Mamba",
+        ),
+        (
+            "RUN_TRANSFORMER_ECG_BASELINE =",
+            "missing_transformer_baseline_artifacts_contract_current",
+            "missing_transformer_fold_cache_folds",
+            "transformer_fold_manifest_mismatch_folds",
+            "Transformer ECG",
+        ),
+        (
+            "RUN_HYBRID_MORPHOLOGY_BASELINE =",
+            "missing_hybrid_final_contract_current",
+            "missing_hybrid_folds",
+            "hybrid_fold_manifest_mismatch_folds",
+            "Frozen-transform morphology MLP",
+        ),
+    )
+    for cell_marker, contract_name, fold_name, repair_name, label in learned_controls:
+        cell = next((cell for cell in notebook["cells"] if cell_marker in source(cell)), None)
+        if cell is None:
+            raise RuntimeError(f"Notebook 04 learned baseline cell missing: {cell_marker}")
+        text = source(cell)
+        anchor = f"if not {contract_name} and not "
+        if anchor not in text:
+            raise RuntimeError(f"Notebook 04 learned baseline reuse anchor missing: {contract_name}")
+        preflight = (
+            f"if {contract_name}:\n"
+            f"    if {fold_name} or {repair_name}:\n"
+            f"        print('{label} fold cache reuse is covered by the final hash-attested baseline package; no GPU rerun is scheduled.')\n"
+            f"    {fold_name} = []\n"
+            f"    {repair_name} = []\n"
+        )
+        if preflight not in text:
+            text = text.replace(anchor, preflight + anchor, 1)
+        set_source(cell, text)
+    save(name, notebook)
+
+
 def integrate_notebook03_strict_inputs() -> None:
     name = "03_calibration_and_ci.ipynb"
     notebook = load(name)
@@ -4715,6 +4856,7 @@ def main() -> None:
     integrate_notebook04_baseline_provenance_inputs()
     integrate_notebook04_paired_reuse_contract()
     integrate_notebook04_reviewed_baseline_pair_preflight()
+    integrate_notebook04_reviewed_baseline_runner_reuse()
     integrate_notebook03_strict_inputs()
     integrate_notebook03_cpu_only_setup()
     integrate_notebook04_same_fold_and_calibration()

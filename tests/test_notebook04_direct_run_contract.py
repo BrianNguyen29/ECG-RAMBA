@@ -168,6 +168,15 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, self.source)
 
+    def test_baseline_auto_mode_does_not_retrain_an_attested_package(self):
+        for token in (
+            "Baseline runner reuse accepted through reviewed immutable attestation",
+            "fold cache reuse is covered by the final hash-attested baseline package",
+            "MiniRocket-only reuse accepted through reviewed immutable attestation",
+            "It never rewrites historical runner",
+        ):
+            self.assertIn(token, self.source)
+
     def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
         for token in (
             "39_morphology_learnability_control.py",
