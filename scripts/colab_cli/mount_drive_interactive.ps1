@@ -94,10 +94,15 @@ while (($Line = $OutputReader.ReadLine()) -ne $null) {
     ) {
         $ObservedMountError = $true
     }
-    if (-not $ConsentRequested -and $Line -match $ConsentUrlPattern) {
+    $ConsentUrlMatch = [regex]::Match($Line, $ConsentUrlPattern)
+    $ConsentPromptSeen = $Line -match "Press Enter after you have granted access"
+    if (-not $ConsentRequested -and ($ConsentUrlMatch.Success -or $ConsentPromptSeen)) {
         $ConsentRequested = $true
-        $ConsentUrl = $Matches[0]
-        Start-Process $ConsentUrl
+        if ($ConsentUrlMatch.Success) {
+            Start-Process $ConsentUrlMatch.Value
+        } else {
+            Write-Host "Colab displayed its consent prompt without a URL on stdout. Complete the already-open browser consent flow, then continue here."
+        }
         if ($AutoConfirmAfterSeconds -gt 0) {
             Write-Host (
                 "Approve Google Drive access in the browser. " +

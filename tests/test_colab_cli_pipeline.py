@@ -148,6 +148,8 @@ class ColabCliPipelineTests(unittest.TestCase):
         self.assertIn("RedirectStandardInput = $true", source)
         self.assertIn("$ConsentUrlPattern", source)
         self.assertIn("$ConsentRequested", source)
+        self.assertIn("Press Enter after you have granted access", source)
+        self.assertIn("$ConsentPromptSeen", source)
         self.assertIn("AutoConfirmAfterSeconds", source)
         self.assertIn('/content/drive/MyDrive/ECG-Ramba', source)
         self.assertIn("VerifyAttempts", source)
