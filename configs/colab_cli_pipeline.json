@@ -217,6 +217,53 @@
       }
     },
     {
+      "id": "nb04_preflight_cpu",
+      "notebook": "notebooks/04_baselines_and_component_checks.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## No-Skill Reference Baselines",
+        "## Same-Fold Comparator Completion Matrix"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 7200,
+      "enabled": true,
+      "depends_on": [
+        "nb03_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_RESTORE_OPTIONAL_BASELINE_ARTIFACTS": "1"
+      }
+    },
+    {
+      "id": "nb04_pairs_cpu",
+      "notebook": "notebooks/04_baselines_and_component_checks.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## No-Skill Reference Baselines",
+        "## Same-Fold Comparator Completion Matrix",
+        "## Paired Full vs MiniRocket Evidence",
+        "## Paired Full vs ResNet1D/CNN Evidence",
+        "## Paired Full vs Raw Mamba Evidence",
+        "## Paired Full vs Transformer ECG Evidence",
+        "## Paired Full vs Frozen-Transform Morphology MLP Evidence"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 172800,
+      "enabled": false,
+      "depends_on": [
+        "nb04_preflight_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_RESTORE_OPTIONAL_BASELINE_ARTIFACTS": "1"
+      }
+    },
+    {
       "id": "nb05_features_cpu",
       "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
       "mode": "sections",
