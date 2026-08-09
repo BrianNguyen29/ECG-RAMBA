@@ -393,9 +393,17 @@ def paired_rows(metric_dir: Path, contract: dict[str, Any], strict: bool) -> tup
                 "comparator_nominal_95ci_better" if hi < 0 else
                 "nominal_95ci_inconclusive"
             )
+            observed_interpretation = metric.get("interpretation")
+            # Schema v2 artifacts produced before the explicit nominal prefix used
+            # "inconclusive" for an interval overlapping zero.  It is the same
+            # CI-derived result, so normalize it only at this presentation boundary.
+            legacy_ci_inconclusive = (
+                expected_interpretation == "nominal_95ci_inconclusive"
+                and observed_interpretation == "inconclusive"
+            )
             if not np.isfinite([lo, hi]).all() or lo > hi:
                 contract_errors.append(f"{metric_name} has an invalid CI")
-            if metric.get("interpretation") != expected_interpretation:
+            if observed_interpretation != expected_interpretation and not legacy_ci_inconclusive:
                 contract_errors.append(f"{metric_name} interpretation is not CI-derived")
             if int(metric.get("n_boot_valid", 0)) < 1000:
                 contract_errors.append(f"{metric_name} has fewer than 1000 bootstrap replicates")
@@ -428,7 +436,7 @@ def paired_rows(metric_dir: Path, contract: dict[str, Any], strict: bool) -> tup
                         "multiplicity_adjustment", "not_applicable_no_null_test"
                     ),
                     "n_boot_valid": metric.get("n_boot_valid"),
-                    "interpretation": metric.get("interpretation"),
+                    "interpretation": expected_interpretation,
                     "safe_wording": metric.get("safe_wording"),
                 }
             )

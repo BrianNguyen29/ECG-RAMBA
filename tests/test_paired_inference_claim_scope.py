@@ -125,6 +125,15 @@ class PairedInferenceClaimScopeTests(unittest.TestCase):
             "full_nominal_95ci_better",
         )
 
+    def test_baseline_pair_ci_overlap_uses_explicit_nominal_inconclusive_label(self) -> None:
+        minirocket = load_paired_helpers()
+        resnet = load_revision_script("resnet_pair_ci_label", "15_paired_full_vs_resnet.py")
+        for helper in (minirocket, resnet):
+            self.assertEqual(
+                helper.interpretation_from_ci(-0.01, 0.01),
+                "nominal_95ci_inconclusive",
+            )
+
     def test_reviewer_runners_do_not_advertise_bootstrap_tail_significance(self) -> None:
         names = [
             "11_paired_full_vs_minirocket.py",

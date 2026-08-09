@@ -451,7 +451,7 @@ def interpretation_from_ci(ci_low: float, ci_high: float) -> str:
         return "full_nominal_95ci_better"
     if ci_high < 0.0:
         return "comparator_nominal_95ci_better"
-    return "inconclusive"
+    return "nominal_95ci_inconclusive"
 
 
 def save_csv(path: Path, rows: list[dict]) -> None:
