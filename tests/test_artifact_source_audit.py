@@ -29,6 +29,9 @@ class ArtifactSourceAuditTest(unittest.TestCase):
             if cell.get("cell_type") == "code"
         )
         for token in (
+            "SOURCE_AUDIT_MODE = os.environ.get('ECG_RAMBA_RUN_SOURCE_AUDIT', 'auto')",
+            "{'auto', 'always', 'never'}",
+            "Reusing the last canonical source audit.",
             "--refresh-existing-prefix manifests/notebook_code_authority.json",
             "--include-path manifests/artifact_source_audit.json",
             "--include-path tables/table_artifact_source_audit.csv",
