@@ -3188,9 +3188,12 @@ def integrate_notebook04_reviewed_baseline_pair_preflight() -> None:
     if target is None:
         raise RuntimeError("Notebook 04 paired baseline preflight helper cell not found")
     text = source(target)
-    start = text.find("def paired_comparator_source_current_04")
+    function_start = text.find("def paired_comparator_source_current_04")
+    start = text.find("BASELINE_PAIR_PROVENANCE_04 = {")
+    if start < 0:
+        start = function_start
     end = text.find("def baseline_prediction_checkpoint_contract_current", start)
-    if start < 0 or end < 0:
+    if function_start < 0 or end < 0:
         raise RuntimeError("Notebook 04 paired baseline preflight boundaries not found")
 
     replacement = '''BASELINE_PAIR_PROVENANCE_04 = {
@@ -3371,9 +3374,10 @@ def integrate_notebook04_reviewed_baseline_runner_reuse() -> None:
             print('MiniRocket-only direct freeze binding is stale:', reviewed_reason)
         return False
 '''
-    if old_return not in text:
+    if old_return in text:
+        set_source(mini, text.replace(old_return, new_return, 1))
+    elif "MiniRocket-only reuse accepted through reviewed immutable attestation." not in text:
         raise RuntimeError("Notebook 04 MiniRocket return contract anchor missing")
-    set_source(mini, text.replace(old_return, new_return, 1))
 
     learned_controls = (
         (
