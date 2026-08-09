@@ -157,6 +157,17 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             direct_cell,
         )
 
+    def test_paired_preflight_allows_only_reviewed_semantic_revalidation(self):
+        for token in (
+            "BASELINE_PAIR_PROVENANCE_04",
+            "validate_baseline_producer_provenance",
+            "prediction_payload_matches_current_oof_04(descriptor['prediction'])",
+            "accepted_reviewed_runner_compatibility",
+            "reviewed_immutable_baseline_semantically_revalidated",
+            "baseline_freeze_sha256_is_stale_without_reviewed_immutable_attestation",
+        ):
+            self.assertIn(token, self.source)
+
     def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
         for token in (
             "39_morphology_learnability_control.py",

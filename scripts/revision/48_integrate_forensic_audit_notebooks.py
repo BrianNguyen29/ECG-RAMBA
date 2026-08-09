@@ -3164,6 +3164,127 @@ def integrate_notebook04_paired_reuse_contract() -> None:
     save(name, notebook)
 
 
+def integrate_notebook04_reviewed_baseline_pair_preflight() -> None:
+    """Permit only hash-pinned, semantically paired historical baselines.
+
+    A refreshed Full OOF manifest can legitimately obtain a new file SHA after
+    group-sidecar/provenance upgrades while the ordered prediction cohort is
+    unchanged. The paired runners already have an exact-package and reviewed
+    source-bundle attestation for this case. The notebook preflight must use
+    the same gate; otherwise it incorrectly forces expensive retraining before
+    a runner has a chance to validate the immutable baseline package.
+    """
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    target = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "def paired_comparator_source_current_04" in source(cell)
+        ),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("Notebook 04 paired baseline preflight helper cell not found")
+    text = source(target)
+    start = text.find("def paired_comparator_source_current_04")
+    end = text.find("def baseline_prediction_checkpoint_contract_current", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("Notebook 04 paired baseline preflight boundaries not found")
+
+    replacement = '''BASELINE_PAIR_PROVENANCE_04 = {
+    'minirocket_only_baseline_manifest.json': {
+        'baseline_key': 'minirocket',
+        'runner': '10_minirocket_only_baseline.py',
+        'summary': revision_root / 'metrics' / 'minirocket_only_baseline_summary.json',
+        'prediction': revision_root / 'predictions' / 'minirocket_only_oof_predictions.npz',
+    },
+    'resnet1d_cnn_baseline_manifest.json': {
+        'baseline_key': 'resnet',
+        'runner': '14_resnet1d_cnn_baseline.py',
+        'summary': revision_root / 'metrics' / 'resnet1d_cnn_baseline_summary.json',
+        'prediction': revision_root / 'predictions' / 'resnet1d_cnn_oof_predictions.npz',
+    },
+    'raw_mamba_baseline_manifest.json': {
+        'baseline_key': 'raw_mamba',
+        'runner': '16_raw_mamba_baseline.py',
+        'summary': revision_root / 'metrics' / 'raw_mamba_baseline_summary.json',
+        'prediction': revision_root / 'predictions' / 'raw_mamba_oof_predictions.npz',
+    },
+    'transformer_ecg_baseline_manifest.json': {
+        'baseline_key': 'transformer',
+        'runner': '24_transformer_ecg_baseline.py',
+        'summary': revision_root / 'metrics' / 'transformer_ecg_baseline_summary.json',
+        'prediction': revision_root / 'predictions' / 'transformer_ecg_oof_predictions.npz',
+    },
+    'hybrid_morphology_baseline_manifest.json': {
+        'baseline_key': 'hybrid',
+        'runner': '26_hybrid_morphology_baseline.py',
+        'summary': revision_root / 'metrics' / 'hybrid_morphology_baseline_summary.json',
+        'prediction': revision_root / 'predictions' / 'hybrid_morphology_oof_predictions.npz',
+    },
+}
+
+def paired_comparator_source_current_04(manifest_path):
+    """Authenticate a direct or reviewed immutable baseline package.
+
+    Exact current OOF/freeze SHA bindings are preferred. A historical package
+    is eligible only when (1) the ordered evaluable units exactly match the
+    frozen OOF payload and (2) baseline_artifact_provenance authenticates its
+    exact artifact hashes and reviewed executable source bundle. This does not
+    rewrite producer metadata or assert that the current runner generated it.
+    """
+    manifest_path = Path(manifest_path)
+    descriptor = BASELINE_PAIR_PROVENANCE_04.get(manifest_path.name)
+    if descriptor is None:
+        return False, f'unregistered_baseline_manifest:{manifest_path.name}'
+    required = [manifest_path, descriptor['summary'], descriptor['prediction']]
+    missing = [str(path) for path in required if not path.exists() or path.stat().st_size == 0]
+    if missing:
+        return False, 'missing_or_empty_baseline_package:' + ', '.join(missing)
+    prediction_ok, prediction_reason = prediction_payload_matches_current_oof_04(descriptor['prediction'])
+    if not prediction_ok:
+        return False, prediction_reason
+    try:
+        payload = json.loads(manifest_path.read_text(encoding='utf-8'))
+        summary = json.loads(descriptor['summary'].read_text(encoding='utf-8'))
+        contract = payload.get('freeze_contract') or (payload.get('load_info') or {}).get('freeze_contract') or {}
+        if contract.get('checkpoint_kind') != 'final_ema':
+            return False, 'checkpoint_kind_is_not_final_ema'
+        if int(contract.get('validated_records', -1)) != int(freeze.get('validated_records', -2)):
+            return False, 'baseline_record_count_is_stale'
+        from scripts.revision.baseline_artifact_provenance import validate_baseline_producer_provenance
+        provenance = validate_baseline_producer_provenance(
+            baseline_key=descriptor['baseline_key'],
+            producer_path=Path('scripts/revision') / descriptor['runner'],
+            summary_path=descriptor['summary'],
+            manifest_path=manifest_path,
+            prediction_path=descriptor['prediction'],
+            summary=summary,
+            manifest=payload,
+        )
+    except Exception as exc:
+        return False, f'baseline_provenance_rejected:{exc!r}'
+    exact_binding = (
+        contract.get('oof_predictions_sha256') == pred_sha
+        and contract.get('freeze_manifest_sha256') == freeze_sha
+    )
+    provenance_status = provenance.get('status', 'unknown')
+    if exact_binding:
+        return True, f'direct_current_freeze_contract; producer_provenance={provenance_status}'
+    if provenance_status != 'accepted_reviewed_runner_compatibility':
+        return False, 'baseline_freeze_sha256_is_stale_without_reviewed_immutable_attestation'
+    return True, (
+        'reviewed_immutable_baseline_semantically_revalidated; '
+        f'producer_provenance={provenance_status}; {provenance.get("claim_boundary", "")}'
+    )
+
+'''
+    set_source(target, text[:start] + replacement + text[end:])
+    save(name, notebook)
+
+
 def integrate_notebook03_strict_inputs() -> None:
     name = "03_calibration_and_ci.ipynb"
     notebook = load(name)
@@ -4593,6 +4714,7 @@ def main() -> None:
     integrate_remaining_run_history()
     integrate_notebook04_baseline_provenance_inputs()
     integrate_notebook04_paired_reuse_contract()
+    integrate_notebook04_reviewed_baseline_pair_preflight()
     integrate_notebook03_strict_inputs()
     integrate_notebook03_cpu_only_setup()
     integrate_notebook04_same_fold_and_calibration()
