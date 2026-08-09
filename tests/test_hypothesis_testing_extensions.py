@@ -181,7 +181,7 @@ class HypothesisTestingExtensionTests(unittest.TestCase):
             result = generator.summarize_physiological_probe(
                 {
                     "status": "blocked_missing_reliable_interval_metadata",
-                    "protocol": "fold_held_out_measured_physiological_interval_probe_v3",
+                    "protocol": "checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4",
                 },
                 manifest,
                 required_paths=(*artifacts, tex_path, manifest_path),

@@ -3863,10 +3863,17 @@ run(
             "ADAPTATION_PRIMARY_FRACTION_POLICY",
         ).replace(
             "required_generator_schema = 10",
-            "required_generator_schema = 12",
+            "required_generator_schema = 13",
         ).replace(
             "required_generator_schema = 11",
+            "required_generator_schema = 13",
+        ).replace(
             "required_generator_schema = 12",
+            "required_generator_schema = 13",
+        )
+        updated = updated.replace(
+            "'physiological_interval_probe_v3'",
+            "'physiological_interval_probe_v4'",
         )
         updated = updated.replace("    'matched_monotone_calibration_v3',\n", "")
         updated = updated.replace(
@@ -4511,7 +4518,7 @@ def validate() -> None:
         "strict_full_sha_authority_update_v3",
         "--source-conflict-policy source",
         "final_pipeline_storage_audit_post_publish_strict_full_sha.log",
-        "required_generator_schema = 12",
+        "required_generator_schema = 13",
         "authenticated_matched_calibration_v5",
         "post_initial_review_adaptation_analysis_lock",
         "ADAPTATION_PRIMARY_FRACTION_POLICY",

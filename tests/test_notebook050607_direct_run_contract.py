@@ -365,7 +365,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         _, source = notebook_source("06_pooling_and_representation.ipynb")
         for token in (
             "scripts/revision/44_physiological_interval_probe.py",
-            "fold_held_out_measured_physiological_interval_probe_v3",
+            "checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4",
             "RUNNER_SOURCE_PATH",
             "independent_of_ecg_ramba_feature_cache",
             "metadata_sha256",
@@ -998,7 +998,7 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
             "matched_structured_ablation_fresh_full",
             "post_initial_review_adaptation_analysis_lock",
             "physiological_interval_probe_gate",
-            "physiological_interval_probe_v3",
+            "physiological_interval_probe_v4",
             "true_fewshot_frozen_encoder_head_v2",
             "representation_probe_v3",
             "reviewer_presentation_assets",
@@ -1009,8 +1009,8 @@ class Notebook050607DirectRunContractTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
             self.assertIn(token, generator_source)
-        self.assertIn("required_generator_schema = 12", source)
-        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 12", generator_source)
+        self.assertIn("required_generator_schema = 13", source)
+        self.assertIn("FINAL_EVIDENCE_SCHEMA_VERSION = 13", generator_source)
         self.assertNotIn("def summarize_fewshot", source)
         self.assertNotIn("def combine_fewshot_summaries", source)
 

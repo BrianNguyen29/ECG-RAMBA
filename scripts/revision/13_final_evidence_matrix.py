@@ -65,7 +65,7 @@ PTBXL_ADAPTATION_LOCK_NAME = "ptbxl_adaptation_analysis_lock.json"
 # Stable capability contract consumed by Notebook 07. Keep this declarative so
 # the notebook can validate generator support without depending on internal
 # helper names, which may change during refactors.
-FINAL_EVIDENCE_SCHEMA_VERSION = 12
+FINAL_EVIDENCE_SCHEMA_VERSION = 13
 FINAL_EVIDENCE_CAPABILITIES = (
     "adaptation_learning_curve",
     "claim_readiness_gates",
@@ -79,7 +79,7 @@ FINAL_EVIDENCE_CAPABILITIES = (
     "matched_structured_ablation_fresh_full",
     "post_initial_review_adaptation_analysis_lock",
     "physiological_interval_probe_gate",
-    "physiological_interval_probe_v3",
+    "physiological_interval_probe_v4",
     "representation_probe_v3",
     "reviewer_presentation_assets",
     "reviewer_gap_closure_v1",
@@ -499,7 +499,7 @@ def summarize_physiological_probe(
     status = str(summary.get("status", "missing"))
     blocked_status = status == "blocked_missing_reliable_interval_metadata"
     issues = []
-    if summary and summary.get("protocol") != "fold_held_out_measured_physiological_interval_probe_v3":
+    if summary and summary.get("protocol") != "checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4":
         issues.append("protocol mismatch")
     if summary and manifest.get("status") != status:
         issues.append("manifest status mismatch")

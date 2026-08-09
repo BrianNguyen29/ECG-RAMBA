@@ -410,8 +410,8 @@ if physiology_summary_path.is_file() and physiology_manifest_path.is_file():
     existing_inputs = existing_manifest.get('inputs') or {}
     existing_outputs = existing_manifest.get('outputs') or {}
     physiology_reusable = (
-        existing_summary.get('protocol') == 'fold_held_out_measured_physiological_interval_probe_v3'
-        and existing_manifest.get('protocol') == 'fold_held_out_measured_physiological_interval_probe_v3'
+        existing_summary.get('protocol') == 'checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4'
+        and existing_manifest.get('protocol') == 'checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4'
         and (existing_manifest.get('runner') or {}).get('sha256') == sha256_file(physiology_runner_path)
         and (existing_inputs.get('embedding') or {}).get('sha256') == sha256_file(physiology_embedding_path)
         and (existing_inputs.get('embedding_manifest') or {}).get('sha256')
@@ -574,14 +574,14 @@ def main() -> None:
         NOTEBOOK_DIR / "07_results_freeze.ipynb",
         "    'physiological_interval_probe_gate',\n",
         "    'physiological_interval_probe_gate',\n"
-        "    'physiological_interval_probe_v3',\n",
+        "    'physiological_interval_probe_v4',\n",
         marker="required_generator_capabilities = {",
     )
     replace_in_notebook(
         NOTEBOOK_DIR / "06_pooling_and_representation.ipynb",
         "'fold_held_out_measured_physiological_interval_probe_v2', 'RUNNER_SOURCE_PATH',\n"
         "        '--embedding-manifest', 'independent_of_model_outputs',",
-        "'fold_held_out_measured_physiological_interval_probe_v3', 'RUNNER_SOURCE_PATH',\n"
+        "'checkpoint_local_fold_held_out_measured_physiological_interval_probe_v4', 'RUNNER_SOURCE_PATH',\n"
         "        '--embedding-manifest', 'independent_of_model_outputs',\n"
         "        'independent_of_ecg_ramba_feature_cache', 'metadata_sha256',",
     )
