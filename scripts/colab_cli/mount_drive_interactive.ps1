@@ -85,7 +85,7 @@ if ($null -eq $OutputReader -or $null -eq $InputWriter) {
 
 $ObservedMountError = $false
 $ConsentRequested = $false
-$ConsentUrlPattern = "https://(?:accounts\\.google\\.com|colab\\.research\\.google\\.com)/\\S+"
+$ConsentUrlPattern = "https://(?:accounts\.google\.com|colab\.research\.google\.com)/\S+"
 while (($Line = $OutputReader.ReadLine()) -ne $null) {
     Write-Host $Line
     if (
