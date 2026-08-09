@@ -596,6 +596,17 @@ class ColabCliPipelineTests(unittest.TestCase):
             "Notebook 07, immediately before the final evidence export", notebook00
         )
 
+    def test_notebook02_does_not_upgrade_a_compatible_numeric_stack(self):
+        notebook02 = (ROOT / "notebooks" / "02_predictions_and_external_eval.ipynb").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("without upgrading a compatible Colab numeric stack", notebook02)
+        self.assertIn("Do not use --upgrade here", notebook02)
+        self.assertNotIn(
+            'pip_install(["--upgrade", "--upgrade-strategy", "only-if-needed"]',
+            notebook02,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
