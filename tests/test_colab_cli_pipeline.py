@@ -586,6 +586,16 @@ class ColabCliPipelineTests(unittest.TestCase):
                 0,
             )
 
+    def test_notebook00_defers_full_sha_to_finalization_by_default(self):
+        notebook00 = (ROOT / "notebooks" / "00_colab_bootstrap.ipynb").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ECG_RAMBA_NB00_FULL_SHA", notebook00)
+        self.assertIn("manifest-fast", notebook00)
+        self.assertIn(
+            "Notebook 07, immediately before the final evidence export", notebook00
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
