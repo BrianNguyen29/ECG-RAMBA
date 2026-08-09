@@ -84,6 +84,8 @@ if ($null -eq $OutputReader -or $null -eq $InputWriter) {
 }
 
 $ObservedMountError = $false
+$ConsentRequested = $false
+$ConsentUrlPattern = "https://(?:accounts\\.google\\.com|colab\\.research\\.google\\.com)/\\S+"
 while (($Line = $OutputReader.ReadLine()) -ne $null) {
     Write-Host $Line
     if (
@@ -92,8 +94,10 @@ while (($Line = $OutputReader.ReadLine()) -ne $null) {
     ) {
         $ObservedMountError = $true
     }
-    if ($Line -match "^https://accounts\.google\.com/") {
-        Start-Process $Line
+    if (-not $ConsentRequested -and $Line -match $ConsentUrlPattern) {
+        $ConsentRequested = $true
+        $ConsentUrl = $Matches[0]
+        Start-Process $ConsentUrl
         if ($AutoConfirmAfterSeconds -gt 0) {
             Write-Host (
                 "Approve Google Drive access in the browser. " +
