@@ -2,8 +2,8 @@
   "schema_version": 1,
   "pipeline_id": "ecg_ramba_revision_colab_cli_v1",
   "authority": {
-    "git_commit": "8945378725c5fd7c61569d8250e075056e2c2638",
-    "git_ref": "refs/tags/ecg-ramba-revision-20260810-v66"
+    "git_commit": "c63f9ee942a2b54e0c1b7c8d02ea3db6bbdf343c",
+    "git_ref": "refs/tags/ecg-ramba-revision-20260810-v67"
   },
   "canonical_drive_root": "/content/drive/MyDrive/ECG-Ramba",
   "default_auth": "oauth2",
@@ -247,6 +247,7 @@
         "## Revision Plan Alignment",
         "## No-Skill Reference Baselines",
         "## Same-Fold Comparator Completion Matrix",
+        "## Controlled Frozen-vs-Partially-Learnable Morphology Bank",
         "## Paired Full vs MiniRocket Evidence",
         "## Paired Full vs ResNet1D/CNN Evidence",
         "## Paired Full vs Raw Mamba Evidence",
@@ -273,6 +274,7 @@
         "## Revision Plan Alignment",
         "## No-Skill Reference Baselines",
         "## Same-Fold Comparator Completion Matrix",
+        "## Controlled Frozen-vs-Partially-Learnable Morphology Bank",
         "## Paired Full vs MiniRocket Evidence",
         "## Paired Full vs ResNet1D/CNN Evidence",
         "## Paired Full vs Raw Mamba Evidence",
