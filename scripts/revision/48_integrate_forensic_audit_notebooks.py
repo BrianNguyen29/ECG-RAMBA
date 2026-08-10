@@ -2794,6 +2794,70 @@ def integrate_notebook00() -> None:
             replacement = f'''import json\nimport os\nfrom pathlib import Path\n\nINSTALL_MAMBA_IN_NOTEBOOK00 = os.environ.get('ECG_RAMBA_INSTALL_MAMBA_IN_NOTEBOOK00', '0') == '1'\nif not INSTALL_MAMBA_IN_NOTEBOOK00:\n    print('Skipping Mamba installation in Notebook 00. CPU storage/protocol audit is complete; Notebook 02 installs Mamba only when GPU inference is required.')\nelse:\n    import torch\n    if not torch.cuda.is_available():\n        raise RuntimeError('ECG_RAMBA_INSTALL_MAMBA_IN_NOTEBOOK00=1 requires a CUDA runtime.')\n    installer_path = REPO_DIR / 'notebooks' / '02_predictions_and_external_eval.ipynb'\n    installer_nb = json.loads(installer_path.read_text(encoding='utf-8'))\n    candidates = []\n    for cell_index, installer_cell in enumerate(installer_nb['cells']):\n        if installer_cell.get('cell_type') != 'code':\n            continue\n        installer_text = ''.join(installer_cell.get('source', []))\n        if {MAMBA_MARKER!r} in installer_text and {MAMBA_SCHEMA_MARKER!r} in installer_text:\n            candidates.append((cell_index, installer_text))\n    if len(candidates) != 1:\n        raise RuntimeError(f'Canonical Mamba installer candidate_count={{len(candidates)}}; expected exactly one capability/schema marker pair.')\n    print('Running canonical Mamba installer from Notebook 02 cell', candidates[0][0])\n    exec(compile(candidates[0][1], str(installer_path) + ':model-deps', 'exec'), globals(), globals())\n'''
             set_source(cell, replacement)
     install_run_history(notebook)
+    dependency_cells = [
+        cell
+        for cell in notebook["cells"]
+        if cell.get("cell_type") == "code"
+        and (
+            "!pip install -q" in source(cell)
+            or "FORENSIC_NOTEBOOK00_DEPENDENCY_BOOTSTRAP_V2" in source(cell)
+        )
+    ]
+    if len(dependency_cells) != 1:
+        raise RuntimeError(
+            f"Notebook 00 dependency bootstrap candidate_count={len(dependency_cells)}, expected 1"
+        )
+    dependency_bootstrap = '''# FORENSIC_NOTEBOOK00_DEPENDENCY_BOOTSTRAP_V2
+# Notebook 00 is a CPU-only storage/protocol audit. It must not block a fresh
+# runtime on a broad, silent package resolution. Version-pinned numerical and
+# model dependencies remain the responsibility of Notebook 02 when GPU
+# inference or retraining is actually requested.
+import importlib.util
+import os
+import subprocess
+import sys
+
+INSTALL_NOTEBOOK00_OPTIONAL_DEPS = (
+    os.environ.get('ECG_RAMBA_INSTALL_NOTEBOOK00_OPTIONAL_DEPS', '0') == '1'
+)
+NOTEBOOK00_OPTIONAL_DEPENDENCIES = {
+    'wfdb': 'wfdb==4.1.2',
+    'neurokit2': 'neurokit2',
+    'iterstrat': 'iterative-stratification',
+    'thop': 'thop',
+}
+
+if not INSTALL_NOTEBOOK00_OPTIONAL_DEPS:
+    print(
+        'Skipping optional Notebook 00 packages. Set '
+        'ECG_RAMBA_INSTALL_NOTEBOOK00_OPTIONAL_DEPS=1 only for an explicit '
+        'dependency prewarm; Notebook 02 owns version-pinned execution dependencies.'
+    )
+else:
+    missing_specs = [
+        package_spec
+        for module_name, package_spec in NOTEBOOK00_OPTIONAL_DEPENDENCIES.items()
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if not missing_specs:
+        print('Notebook 00 optional dependencies already available.')
+    else:
+        command = [
+            sys.executable, '-m', 'pip', 'install', '--prefer-binary',
+            '--disable-pip-version-check', '--no-input', '--timeout', '60',
+            '--retries', '2', *missing_specs,
+        ]
+        print('Installing missing optional Notebook 00 dependencies:', missing_specs)
+        try:
+            subprocess.run(command, check=True, timeout=900)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                'Notebook 00 optional dependency prewarm exceeded 900 seconds. '
+                'Retry it explicitly or continue with Notebook 02 dependency setup.'
+            ) from exc
+'''
+    set_source(dependency_cells[0], dependency_bootstrap)
+
     save(name, notebook)
 
 
@@ -4802,8 +4866,23 @@ def validate() -> None:
                 raise RuntimeError(f"Drive mount guard token missing from {name}: {token}")
         if name != "00_colab_bootstrap.ipynb" and "_AUTHORITY_BOOTSTRAP_ALLOWED = True" in text:
             raise RuntimeError(f"Downstream notebook may not establish or rotate authority: {name}")
-    for name in (
+    notebook00_text = "\n".join(source(cell) for cell in load("00_colab_bootstrap.ipynb")["cells"])
+    for token in (
+        "FORENSIC_NOTEBOOK00_DEPENDENCY_BOOTSTRAP_V2",
+        "ECG_RAMBA_INSTALL_NOTEBOOK00_OPTIONAL_DEPS",
+        "Notebook 02 owns version-pinned execution dependencies.",
+        "--timeout', '60'",
+        "timeout=900",
+    ):
+        if token not in notebook00_text:
+            raise RuntimeError(f"Notebook 00 dependency bootstrap token missing: {token}")
+    if "!pip install -q" in notebook00_text:
+        raise RuntimeError(
+            "Notebook 00 retains an unbounded silent dependency installation command"
+        )
+
         "03_calibration_and_ci.ipynb",
+    for name in (
         "05_hrv_domain_and_robustness.ipynb",
         "07_results_freeze.ipynb",
     ):
