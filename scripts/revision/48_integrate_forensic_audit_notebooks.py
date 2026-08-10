@@ -955,9 +955,18 @@ def _pin_forensic_code_authority():
     release_ref_object_id = None
 
     if reset_requested:
-        expected_commit = requested_commit
+        # A reset remains reproducible only when the requested SHA is bound to
+        # the reviewed annotated release tag supplied by the stage manifest.
+        release_ref = requested_release_ref
+        release_commit, release_ref_object_id = resolve_annotated_release_ref(release_ref)
+        if release_commit != requested_commit:
+            raise RuntimeError(
+                'Authority reset SHA does not match the requested annotated release tag: '
+                f'sha={{requested_commit}} tag={{release_ref}} resolves_to={{release_commit}}.'
+            )
+        expected_commit = release_commit
         authority_update_needed = True
-        update_reason = 'explicit_environment_sha'
+        update_reason = 'explicit_verified_versioned_release'
     elif manifest is None:
         if not _AUTHORITY_BOOTSTRAP_ALLOWED:
             raise FileNotFoundError(
@@ -1041,11 +1050,7 @@ def _pin_forensic_code_authority():
             'branch': str(BRANCH),
             'established_utc': _authority_datetime.now(_authority_timezone.utc).isoformat(),
             'established_by': '00_colab_bootstrap.ipynb',
-            'selection': (
-                'explicit_environment_sha'
-                if release_ref is None
-                else 'verified_annotated_versioned_release_tag'
-            ),
+            'selection': 'verified_annotated_versioned_release_tag',
             'authority_ref': release_ref,
             'authority_ref_kind': None if release_ref is None else 'annotated_git_tag',
             'authority_ref_object_id': release_ref_object_id,
