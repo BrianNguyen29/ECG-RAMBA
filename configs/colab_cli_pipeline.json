@@ -255,6 +255,28 @@
       }
     },
     {
+      "id": "nb04_morphology_a100",
+      "notebook": "notebooks/04_baselines_and_component_checks.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## No-Skill Reference Baselines",
+        "## Controlled Frozen-vs-Partially-Learnable Morphology Bank",
+        "## Paired Frozen-vs-Partially-Learnable Kernel Evidence"
+      ],
+      "hardware": "a100",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb03_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_RESTORE_OPTIONAL_BASELINE_ARTIFACTS": "1"
+      }
+    },
+    {
       "id": "nb04_pairs_cpu",
       "notebook": "notebooks/04_baselines_and_component_checks.ipynb",
       "mode": "sections",
