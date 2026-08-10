@@ -21,6 +21,23 @@
       }
     },
     {
+      "id": "nb00_authority_cpu",
+      "notebook": "notebooks/00_colab_bootstrap.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Purpose",
+        "## Verify Drive Artifacts",
+        "## Clone Or Update Repo"
+      ],
+      "hardware": "cpu",
+      "timeout_seconds": 1800,
+      "enabled": true,
+      "depends_on": [],
+      "environment": {
+        "ECG_RAMBA_INSTALL_MAMBA_IN_NOTEBOOK00": "0"
+      }
+    },
+    {
       "id": "nb01_cpu",
       "notebook": "notebooks/01_a0_protocol_audit.ipynb",
       "mode": "full",
