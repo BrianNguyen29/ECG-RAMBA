@@ -3562,6 +3562,50 @@ os.environ['ECG_RAMBA_SAVE_CLEAN_CACHE'] = '0'
     save(name, notebook)
 
 
+def integrate_notebook04_output_summary_paths() -> None:
+    """Make Notebook 04's CPU finalization summary independent of runner cells."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    target = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "reviewer_required_baseline_outputs" in source(cell)
+        ),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("Notebook 04 output summary cell not found")
+    text = source(target)
+    marker = "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS"
+    if marker in text:
+        return
+    prefix = '''# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS
+# The CPU finalization stage intentionally skips expensive baseline-runner
+# cells. Resolve the canonical checkpoint paths here so this summary can run
+# in a fresh CPU runtime after a disconnect.
+RESNET_CHECKPOINT_DIR = globals().get('RESNET_CHECKPOINT_DIR') or (
+    CANONICAL_CHECKPOINT_ROOT / 'resnet1d_cnn_checkpoints'
+)
+RAW_MAMBA_CHECKPOINT_DIR = globals().get('RAW_MAMBA_CHECKPOINT_DIR') or (
+    CANONICAL_CHECKPOINT_ROOT / 'raw_mamba_checkpoints'
+)
+TRANSFORMER_CHECKPOINT_DIR = globals().get('TRANSFORMER_CHECKPOINT_DIR') or (
+    CANONICAL_CHECKPOINT_ROOT / 'transformer_ecg_checkpoints'
+)
+HYBRID_MORPHOLOGY_CHECKPOINT_DIR = globals().get('HYBRID_MORPHOLOGY_CHECKPOINT_DIR') or (
+    CANONICAL_CHECKPOINT_ROOT / 'hybrid_morphology_checkpoints'
+)
+MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(
+    'MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR'
+) or (CANONICAL_CHECKPOINT_ROOT / 'morphology_learnability_checkpoints')
+
+'''
+    set_source(target, prefix + text)
+    save(name, notebook)
+
+
 def integrate_notebook04_same_fold_and_calibration() -> None:
     """Use accurate comparator terminology and run calibration after baseline production."""
 
@@ -4842,6 +4886,12 @@ def validate() -> None:
         "scripts/revision/baseline_artifact_provenance.py",
         "reviewed_baseline_source_bundle_compatibility_attestation_v2",
         "'manifests/oof_final_ema_group_sidecar.npz'",
+        "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS",
+        "RESNET_CHECKPOINT_DIR = globals().get('RESNET_CHECKPOINT_DIR')",
+        "RAW_MAMBA_CHECKPOINT_DIR = globals().get('RAW_MAMBA_CHECKPOINT_DIR')",
+        "TRANSFORMER_CHECKPOINT_DIR = globals().get('TRANSFORMER_CHECKPOINT_DIR')",
+        "HYBRID_MORPHOLOGY_CHECKPOINT_DIR = globals().get('HYBRID_MORPHOLOGY_CHECKPOINT_DIR')",
+        "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(",
     ):
         if token not in notebook04_text:
             raise RuntimeError(f"Notebook 04 Raw Mamba installer contract token missing: {token}")
@@ -4862,6 +4912,7 @@ def main() -> None:
     integrate_notebook04_reviewed_baseline_pair_preflight()
     integrate_notebook04_reviewed_baseline_runner_reuse()
     integrate_notebook03_strict_inputs()
+    integrate_notebook04_output_summary_paths()
     integrate_notebook03_cpu_only_setup()
     integrate_notebook04_same_fold_and_calibration()
     integrate_notebook06_authenticated_cache_restore()

@@ -210,5 +210,20 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             self.assertIn(token, summary_cell)
 
 
+    def test_output_summary_resolves_checkpoint_paths_without_runner_cells(self):
+        summary_cell = next(
+            cell for cell in self.code_cells if "reviewer_required_baseline_outputs" in cell
+        )
+        for token in (
+            "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS",
+            "RESNET_CHECKPOINT_DIR = globals().get('RESNET_CHECKPOINT_DIR')",
+            "RAW_MAMBA_CHECKPOINT_DIR = globals().get('RAW_MAMBA_CHECKPOINT_DIR')",
+            "TRANSFORMER_CHECKPOINT_DIR = globals().get('TRANSFORMER_CHECKPOINT_DIR')",
+            "HYBRID_MORPHOLOGY_CHECKPOINT_DIR = globals().get('HYBRID_MORPHOLOGY_CHECKPOINT_DIR')",
+            "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(",
+            "CANONICAL_CHECKPOINT_ROOT / 'morphology_learnability_checkpoints'",
+        ):
+            self.assertIn(token, summary_cell)
+
 if __name__ == "__main__":
     unittest.main()
