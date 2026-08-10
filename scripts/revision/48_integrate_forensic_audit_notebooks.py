@@ -3128,6 +3128,15 @@ def integrate_notebook04_baseline_provenance_inputs() -> None:
     elif "scripts/revision/baseline_artifact_provenance.py" not in text:
         anchor = "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {\n"
         text = text.replace(anchor, anchor + provenance_entry, 1)
+    cache_aggregator_entry = (
+        "    'scripts/revision/53_aggregate_morphology_learnability_cache.py': (\n"
+        "        'MORPHOLOGY LEARNABILITY AUTHENTICATED CACHE AGGREGATION',\n"
+        "        'authenticated_cache_only',\n"
+        "    ),\n"
+    )
+    if "scripts/revision/53_aggregate_morphology_learnability_cache.py" not in text:
+        anchor = "DIRECT_RUN_SOURCE_REQUIREMENTS_04 = {\n"
+        text = text.replace(anchor, anchor + cache_aggregator_entry, 1)
     set_source(direct, text)
     save(name, notebook)
 
@@ -3667,6 +3676,92 @@ MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(
 
 '''
     set_source(target, prefix + text)
+    save(name, notebook)
+
+
+def integrate_notebook04_morphology_cache_finalizer() -> None:
+    """Finalize authenticated morphology folds on CPU instead of retraining them."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    target = next(
+        cell
+        for cell in notebook["cells"]
+        if "RUN_MORPHOLOGY_LEARNABILITY_CONTROL =" in source(cell)
+    )
+    text = source(target)
+    marker = "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER"
+    if marker in text:
+        return
+    command_anchor = "if MORPHOLOGY_LEARNABILITY_FORCE_RERUN:\n    morphology_learnability_base_command += ' --force-rerun'\n"
+    if command_anchor not in text:
+        raise RuntimeError("Notebook 04 morphology command anchor missing")
+    finalizer = '''# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER
+# Cache aggregation validates the producer runner SHA, OOF/freeze/raw-cache
+# contract, validation membership, checkpoint SHA and matched initialization.
+# It is intentionally the only CPU path; any missing fold remains A100-only.
+morphology_learnability_cache_finalizer_command = (
+    'python -u scripts/revision/53_aggregate_morphology_learnability_cache.py '
+    '--oof-predictions reports/revision/predictions/oof_final_ema_predictions.npz '
+    '--freeze-manifest reports/revision/manifests/oof_final_ema_freeze_manifest.json '
+    '--expected-checkpoint-kind final_ema '
+    f'--num-kernels {MORPHOLOGY_LEARNABILITY_NUM_KERNELS} '
+    f'--trainable-fraction {MORPHOLOGY_LEARNABILITY_TRAINABLE_FRACTION} '
+    f'--dilations {MORPHOLOGY_LEARNABILITY_DILATIONS} '
+    f'--kernel-length {MORPHOLOGY_LEARNABILITY_KERNEL_LENGTH} '
+    f'--epochs {MORPHOLOGY_LEARNABILITY_EPOCHS} '
+    f'--hidden-dim {MORPHOLOGY_LEARNABILITY_HIDDEN_DIM} '
+    f'--dropout {MORPHOLOGY_LEARNABILITY_DROPOUT} '
+    f'--lr {MORPHOLOGY_LEARNABILITY_LR} '
+    f'--weight-decay {MORPHOLOGY_LEARNABILITY_WEIGHT_DECAY} '
+    '--threshold 0.5 --n-bins 15 '
+    f'--fold-cache-dir "{MORPHOLOGY_LEARNABILITY_FOLD_CACHE_DIR}" '
+    f'--checkpoint-dir "{MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR}"'
+)
+'''
+    text = text.replace(command_anchor, command_anchor + "\n" + finalizer, 1)
+    start = text.index("if morphology_learnability_should_run:\n")
+    end = text.index("\nelse:\n    print('Controlled morphology learnability artifacts are reusable; runner skipped.')", start)
+    replacement = '''if morphology_learnability_should_run:
+    if missing_morphology_learnability_folds:
+        require_cuda_runtime_for_baseline('Controlled morphology kernel learnability')
+        fold_tokens = [token.strip() for token in str(MORPHOLOGY_LEARNABILITY_ONLY_FOLDS).split(',') if token.strip()]
+        for token in fold_tokens:
+            if not token.isdigit() or int(token) not in range(1, 6):
+                raise ValueError(f'Invalid morphology learnability fold: {token!r}')
+            fold = int(token)
+            run(
+                morphology_learnability_base_command + f' --only-folds {fold}',
+                log_path=f'reports/revision/logs/morphology_learnability_fold{fold}.log',
+            )
+            publish_morphology_learnability(f'fold{fold}', fold=fold)
+        missing_after = []
+        for fold in range(1, 6):
+            for variant in MORPHOLOGY_LEARNABILITY_VARIANTS:
+                cache, checkpoint = morphology_learnability_fold_paths(variant, fold)
+                if not cache.exists() or cache.stat().st_size == 0 or not checkpoint.exists() or checkpoint.stat().st_size == 0:
+                    missing_after.append(f'{variant}/fold{fold}')
+        if missing_after:
+            print('Aggregate pass deferred; rerun this cell after completing:', missing_after)
+        else:
+            run(
+                morphology_learnability_cache_finalizer_command,
+                log_path='reports/revision/logs/morphology_learnability_cache_aggregate.log',
+            )
+            publish_morphology_learnability('aggregate')
+    else:
+        print('All morphology fold artifacts exist; running authenticated CPU cache aggregation.')
+        run(
+            morphology_learnability_cache_finalizer_command,
+            log_path='reports/revision/logs/morphology_learnability_cache_aggregate.log',
+        )
+        publish_morphology_learnability('aggregate')
+    package_current, package_reason = morphology_learnability_package_current()
+    if not package_current:
+        raise RuntimeError('Morphology learnability aggregate package failed validation: ' + package_reason)
+'''
+    text = text[:start] + replacement + text[end:]
+    set_source(target, text)
     save(name, notebook)
 
 
@@ -4971,6 +5066,9 @@ def validate() -> None:
         "TRANSFORMER_CHECKPOINT_DIR = globals().get('TRANSFORMER_CHECKPOINT_DIR')",
         "HYBRID_MORPHOLOGY_CHECKPOINT_DIR = globals().get('HYBRID_MORPHOLOGY_CHECKPOINT_DIR')",
         "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(",
+        "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER",
+        "53_aggregate_morphology_learnability_cache.py",
+        "All morphology fold artifacts exist; running authenticated CPU cache aggregation.",
     ):
         if token not in notebook04_text:
             raise RuntimeError(f"Notebook 04 Raw Mamba installer contract token missing: {token}")
@@ -4992,6 +5090,7 @@ def main() -> None:
     integrate_notebook04_reviewed_baseline_runner_reuse()
     integrate_notebook03_strict_inputs()
     integrate_notebook04_output_summary_paths()
+    integrate_notebook04_morphology_cache_finalizer()
     integrate_notebook03_cpu_only_setup()
     integrate_notebook04_same_fold_and_calibration()
     integrate_notebook06_authenticated_cache_restore()

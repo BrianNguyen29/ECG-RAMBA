@@ -180,6 +180,7 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
     def test_controlled_morphology_learnability_is_fold_resumable_and_paired(self):
         for token in (
             "39_morphology_learnability_control.py",
+            "53_aggregate_morphology_learnability_cache.py",
             "40_paired_morphology_learnability.py",
             "MORPHOLOGY_LEARNABILITY_FOLD_CACHE_DIR",
             "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR",
@@ -188,6 +189,9 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             "fold{fold}_morphology_learnability_{variant}_final.pt",
             "paired_morphology_learnability_bootstrap_samples.csv",
             "--n-boot 1000",
+            "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER",
+            "All morphology fold artifacts exist; running authenticated CPU cache aggregation.",
+            "authenticated_cache_only",
         ):
             self.assertIn(token, self.source)
 
