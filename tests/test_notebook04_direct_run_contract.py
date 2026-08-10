@@ -190,6 +190,9 @@ class Notebook04DirectRunContractTests(unittest.TestCase):
             "paired_morphology_learnability_bootstrap_samples.csv",
             "--n-boot 1000",
             "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER",
+            "# FORENSIC_NOTEBOOK04_MORPHOLOGY_STALENESS_GUARD_V2",
+            "canonical OOF SHA changed",
+            "producer runner SHA changed",
             "All morphology fold artifacts exist; running authenticated CPU cache aggregation.",
             "authenticated_cache_only",
         ):

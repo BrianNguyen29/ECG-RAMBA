@@ -3765,6 +3765,93 @@ morphology_learnability_cache_finalizer_command = (
     save(name, notebook)
 
 
+def integrate_notebook04_morphology_staleness_guard() -> None:
+    """Treat a stale fold cache as missing before selecting CPU or A100 work."""
+
+    name = "04_baselines_and_component_checks.ipynb"
+    notebook = load(name)
+    target = next(
+        cell
+        for cell in notebook["cells"]
+        if "RUN_MORPHOLOGY_LEARNABILITY_CONTROL =" in source(cell)
+    )
+    text = source(target)
+    marker = "# FORENSIC_NOTEBOOK04_MORPHOLOGY_STALENESS_GUARD_V2"
+    if marker in text:
+        return
+    start = text.find("missing_morphology_learnability_folds = []\n")
+    end = text.find("\n\nif str(MORPHOLOGY_LEARNABILITY_ONLY_FOLDS)", start)
+    if start < 0 or end < 0:
+        raise RuntimeError("Notebook 04 morphology stale-cache anchor missing")
+    guard = '''# FORENSIC_NOTEBOOK04_MORPHOLOGY_STALENESS_GUARD_V2
+# File presence is not cache validity. Check the cheap immutable bindings here
+# before scheduling CPU aggregation or an A100 fold rerun. The producer runner
+# performs the complete raw-cache/checkpoint contract validation before reuse.
+import numpy as np
+
+_morphology_current_oof_sha = sha256_file(
+    revision_root / 'predictions/oof_final_ema_predictions.npz'
+)
+_morphology_current_freeze_sha = sha256_file(
+    revision_root / 'manifests/oof_final_ema_freeze_manifest.json'
+)
+_morphology_producer_runner_sha = sha256_file(
+    Path('scripts/revision/39_morphology_learnability_control.py')
+)
+
+def morphology_learnability_fold_contract_current(variant, fold):
+    cache, checkpoint = morphology_learnability_fold_paths(variant, fold)
+    if not cache.is_file() or cache.stat().st_size == 0:
+        return False, 'cache missing'
+    if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
+        return False, 'checkpoint missing'
+    try:
+        with np.load(cache, allow_pickle=False) as payload:
+            required = {
+                'oof_predictions_sha256', 'freeze_manifest_sha256',
+                'runner_sha256', 'checkpoint_sha256', 'val_indices', 'y_prob',
+            }
+            missing = sorted(required - set(payload.files))
+            if missing:
+                return False, 'cache fields missing=' + ','.join(missing)
+            scalar = lambda key: str(payload[key].item())
+            observed = {
+                'oof': scalar('oof_predictions_sha256'),
+                'freeze': scalar('freeze_manifest_sha256'),
+                'runner': scalar('runner_sha256'),
+                'checkpoint': scalar('checkpoint_sha256'),
+            }
+        expected_checkpoint = sha256_file(checkpoint)
+        if observed['oof'] != _morphology_current_oof_sha:
+            return False, 'canonical OOF SHA changed'
+        if observed['freeze'] != _morphology_current_freeze_sha:
+            return False, 'freeze manifest SHA changed'
+        if observed['runner'] != _morphology_producer_runner_sha:
+            return False, 'producer runner SHA changed'
+        if observed['checkpoint'] != expected_checkpoint:
+            return False, 'checkpoint SHA changed'
+        return True, 'cheap immutable bindings match'
+    except Exception as exc:
+        return False, f'cache inspection failed: {exc!r}'
+
+missing_morphology_learnability_folds = []
+morphology_learnability_fold_contract_reasons = {}
+for fold in range(1, 6):
+    reasons = []
+    for variant in MORPHOLOGY_LEARNABILITY_VARIANTS:
+        current, reason = morphology_learnability_fold_contract_current(variant, fold)
+        if not current:
+            reasons.append(f'{variant}: {reason}')
+    if reasons:
+        missing_morphology_learnability_folds.append(fold)
+        morphology_learnability_fold_contract_reasons[fold] = reasons
+if morphology_learnability_fold_contract_reasons:
+    print('Stale/missing morphology fold contracts:', morphology_learnability_fold_contract_reasons)
+'''
+    set_source(target, text[:start] + guard + text[end:])
+    save(name, notebook)
+
+
 def integrate_notebook04_same_fold_and_calibration() -> None:
     """Use accurate comparator terminology and run calibration after baseline production."""
 
@@ -5067,6 +5154,7 @@ def validate() -> None:
         "HYBRID_MORPHOLOGY_CHECKPOINT_DIR = globals().get('HYBRID_MORPHOLOGY_CHECKPOINT_DIR')",
         "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(",
         "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER",
+        "# FORENSIC_NOTEBOOK04_MORPHOLOGY_STALENESS_GUARD_V2",
         "53_aggregate_morphology_learnability_cache.py",
         "All morphology fold artifacts exist; running authenticated CPU cache aggregation.",
     ):
@@ -5091,6 +5179,7 @@ def main() -> None:
     integrate_notebook03_strict_inputs()
     integrate_notebook04_output_summary_paths()
     integrate_notebook04_morphology_cache_finalizer()
+    integrate_notebook04_morphology_staleness_guard()
     integrate_notebook03_cpu_only_setup()
     integrate_notebook04_same_fold_and_calibration()
     integrate_notebook06_authenticated_cache_restore()
