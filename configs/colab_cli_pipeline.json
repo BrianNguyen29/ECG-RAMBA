@@ -412,6 +412,59 @@
       }
     },
     {
+      "id": "nb05_features_t4",
+      "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## HRV Domain Evidence",
+        "## Robustness Stress-Test Ledger"
+      ],
+      "hardware": "gpu",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb04_finalize_cpu"
+      ],
+      "environment": {
+        "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE": "features_only",
+        "ECG_RAMBA_ROBUSTNESS_BATCH_SIZE": "64",
+        "ECG_RAMBA_ROBUSTNESS_FEATURE_BATCH_SIZE": "64",
+        "ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE": "cuda"
+      }
+    },
+    {
+      "id": "nb05_predictions_t4_cuda_features",
+      "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
+      "mode": "sections",
+      "sections": [
+        "## Setup",
+        "## Scope And Contracts",
+        "## Revision Plan Alignment",
+        "## HRV Domain Evidence",
+        "## Robustness Stress-Test Ledger",
+        "## Comparator Stress Prediction Generation"
+      ],
+      "hardware": "gpu",
+      "timeout_seconds": 86400,
+      "enabled": true,
+      "depends_on": [
+        "nb05_features_t4"
+      ],
+      "environment": {
+        "ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE": "inference_only",
+        "ECG_RAMBA_ROBUSTNESS_FEATURE_BATCH_SIZE": "64",
+        "ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE": "cuda",
+        "ECG_RAMBA_ROBUSTNESS_MULTI_PROFILE": "canonical_resume",
+        "ECG_RAMBA_COMPARATOR_STRESS_COMPARATORS": "resnet,raw_mamba,transformer",
+        "ECG_RAMBA_COMPARATOR_STRESS_TESTS": "snr20db,snr10db,snr5db,random_3_lead_dropout,precordial_dropout,resample_250hz",
+        "ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE": "128",
+        "ECG_RAMBA_ROBUSTNESS_BATCH_SIZE": "32"
+      }
+    },
+    {
       "id": "nb05_predictions_t4_cpu_features",
       "notebook": "notebooks/05_hrv_domain_and_robustness.ipynb",
       "mode": "sections",

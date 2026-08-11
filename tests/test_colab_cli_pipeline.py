@@ -123,6 +123,29 @@ class ColabCliPipelineTests(unittest.TestCase):
             "inference_only",
         )
 
+    def test_notebook05_t4_cuda_feature_and_inference_stages_match(self):
+        feature_stage = self.module.stage_by_id(self.manifest, "nb05_features_t4")
+        prediction_stage = self.module.stage_by_id(
+            self.manifest, "nb05_predictions_t4_cuda_features"
+        )
+        self.assertEqual(feature_stage["hardware"], "gpu")
+        self.assertEqual(
+            feature_stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
+            "features_only",
+        )
+        self.assertEqual(
+            feature_stage["environment"]["ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE"],
+            "cuda",
+        )
+        self.assertEqual(prediction_stage["depends_on"], ["nb05_features_t4"])
+        self.assertEqual(
+            prediction_stage["environment"]["ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE"],
+            "cuda",
+        )
+        self.assertEqual(
+            prediction_stage["environment"]["ECG_RAMBA_ROBUSTNESS_BATCH_SIZE"], "32"
+        )
+
     def test_notebook05_t4_inference_reuses_cpu_features(self):
         stage = self.module.stage_by_id(
             self.manifest, "nb05_predictions_t4_cpu_features"
