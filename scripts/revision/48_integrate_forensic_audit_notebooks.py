@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260811-v74"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260811-v75"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -4390,6 +4390,26 @@ if (
             raise RuntimeError("Notebook 05 aggregate-only guard anchor not found")
         text = text.replace(anchor, anchor + guard, 1)
         set_source(target, text)
+
+    comparator_cell = next(
+        cell for cell in notebook["cells"]
+        if "RUN_COMPARATOR_STRESS_PREDICTIONS =" in source(cell)
+        and "Comparator stress prediction generation disabled" in source(cell)
+    )
+    comparator_text = source(comparator_cell)
+    comparator_marker = "FORENSIC_AGGREGATE_ONLY_NO_COMPARATOR_INFERENCE_GUARD = 'v1'"
+    if comparator_marker not in comparator_text:
+        comparator_anchor = "FORCE_RERUN_COMPARATOR_STRESS_PREDICTIONS = False\n"
+        if comparator_anchor not in comparator_text:
+            raise RuntimeError("Notebook 05 comparator aggregate-only guard anchor not found")
+        comparator_guard = (
+            "FORENSIC_AGGREGATE_ONLY_NO_COMPARATOR_INFERENCE_GUARD = 'v1'\n"
+            "if globals().get('robustness_execution_phase') == 'aggregate_only':\n"
+            "    RUN_COMPARATOR_STRESS_PREDICTIONS = False\n"
+            "    print('Skipping learned-comparator GPU inference during aggregate_only CPU finalization.')\n\n"
+        )
+        comparator_text = comparator_text.replace(comparator_anchor, comparator_guard + comparator_anchor, 1)
+        set_source(comparator_cell, comparator_text)
     save(name, notebook)
 
 
@@ -5319,6 +5339,8 @@ def validate() -> None:
     )
     for token in (
         "FORENSIC_AGGREGATE_ONLY_NO_INFERENCE_GUARD",
+        "FORENSIC_AGGREGATE_ONLY_NO_COMPARATOR_INFERENCE_GUARD",
+        "Skipping learned-comparator GPU inference during aggregate_only CPU finalization.",
         "aggregate_only refuses to regenerate missing/stale stress predictions",
         "run the A100 inference_only stage",
     ):
