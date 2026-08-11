@@ -3641,7 +3641,14 @@ os.environ['ECG_RAMBA_SAVE_CLEAN_CACHE'] = '0'
 
 
 def integrate_notebook04_output_summary_paths() -> None:
-    """Make Notebook 04's CPU finalization summary independent of runner cells."""
+    """Make Notebook 04's CPU finalization summary independent of runner cells.
+
+    A CPU-only resume may deliberately defer the A100-only morphology
+    learnability control.  That must remain a visible reviewer blocker, but it
+    must not turn the otherwise read-only CPU finalizer into a misleading cell
+    failure or, worse, allow stale morphology artifacts to be treated as
+    complete evidence.
+    """
 
     name = "04_baselines_and_component_checks.ipynb"
     notebook = load(name)
@@ -3656,7 +3663,8 @@ def integrate_notebook04_output_summary_paths() -> None:
     if target is None:
         raise RuntimeError("Notebook 04 output summary cell not found")
     text = source(target)
-    marker = "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS"
+    marker = "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS_V2"
+    legacy_marker = "# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS"
     if marker in text:
         return
     prefix = '''# FORENSIC_NOTEBOOK04_OUTPUT_SUMMARY_PATHS
@@ -3680,7 +3688,50 @@ MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(
 ) or (CANONICAL_CHECKPOINT_ROOT / 'morphology_learnability_checkpoints')
 
 '''
-    set_source(target, prefix + text)
+    if legacy_marker in text:
+        text = text.replace(legacy_marker, marker, 1)
+    else:
+        text = prefix.replace(legacy_marker, marker) + text
+
+    old_guard = '''missing_reviewer_outputs = [
+    str(path) for path in reviewer_required_baseline_outputs
+    if not path.exists() or path.stat().st_size == 0
+]
+if missing_reviewer_outputs:
+    raise FileNotFoundError(
+        'Notebook 04 reviewer-complete baseline/paired package is incomplete: '
+        + '; '.join(missing_reviewer_outputs)
+    )
+'''
+    new_guard = '''missing_reviewer_outputs = [
+    str(path) for path in reviewer_required_baseline_outputs
+    if not path.exists() or path.stat().st_size == 0
+]
+morphology_control_deferred = bool(globals().get('morphology_learnability_deferred_gpu', False))
+missing_non_morphology = [
+    path for path in missing_reviewer_outputs
+    if 'morphology_learnability' not in path
+]
+if missing_non_morphology:
+    raise FileNotFoundError(
+        'Notebook 04 required same-fold baseline/paired package is incomplete: '
+        + '; '.join(missing_non_morphology)
+    )
+if morphology_control_deferred:
+    print(
+        'R1-C2 remains incomplete: controlled frozen-versus-partially-learnable '
+        'morphology evidence is deferred pending an A100 rerun. The notebook will '
+        'not publish or claim the stale morphology package.'
+    )
+elif missing_reviewer_outputs:
+    raise FileNotFoundError(
+        'Notebook 04 reviewer-complete baseline/paired package is incomplete: '
+        + '; '.join(missing_reviewer_outputs)
+    )
+'''
+    if old_guard not in text:
+        raise RuntimeError("Notebook 04 reviewer-output guard anchor missing")
+    set_source(target, text.replace(old_guard, new_guard, 1))
     save(name, notebook)
 
 
