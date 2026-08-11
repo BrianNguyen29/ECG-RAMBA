@@ -3695,13 +3695,14 @@ def integrate_notebook04_morphology_cache_finalizer() -> None:
         if "RUN_MORPHOLOGY_LEARNABILITY_CONTROL =" in source(cell)
     )
     text = source(target)
-    marker = "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER"
+    marker = "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER_V3"
+    legacy_marker = "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER"
     if marker in text:
         return
     command_anchor = "if MORPHOLOGY_LEARNABILITY_FORCE_RERUN:\n    morphology_learnability_base_command += ' --force-rerun'\n"
     if command_anchor not in text:
         raise RuntimeError("Notebook 04 morphology command anchor missing")
-    finalizer = '''# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER
+    finalizer = '''# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER_V3
 # Cache aggregation validates the producer runner SHA, OOF/freeze/raw-cache
 # contract, validation membership, checkpoint SHA and matched initialization.
 # It is intentionally the only CPU path; any missing fold remains A100-only.
@@ -3724,36 +3725,58 @@ morphology_learnability_cache_finalizer_command = (
     f'--checkpoint-dir "{MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR}"'
 )
 '''
-    text = text.replace(command_anchor, command_anchor + "\n" + finalizer, 1)
+    if legacy_marker in text:
+        text = text.replace(legacy_marker, marker, 1)
+    else:
+        text = text.replace(command_anchor, command_anchor + "\n" + finalizer, 1)
     start = text.index("if morphology_learnability_should_run:\n")
     end = text.index("\nelse:\n    print('Controlled morphology learnability artifacts are reusable; runner skipped.')", start)
-    replacement = '''if morphology_learnability_should_run:
+    replacement = '''morphology_learnability_deferred_gpu = False
+if morphology_learnability_should_run:
     if missing_morphology_learnability_folds:
-        require_cuda_runtime_for_baseline('Controlled morphology kernel learnability')
-        fold_tokens = [token.strip() for token in str(MORPHOLOGY_LEARNABILITY_ONLY_FOLDS).split(',') if token.strip()]
-        for token in fold_tokens:
-            if not token.isdigit() or int(token) not in range(1, 6):
-                raise ValueError(f'Invalid morphology learnability fold: {token!r}')
-            fold = int(token)
-            run(
-                morphology_learnability_base_command + f' --only-folds {fold}',
-                log_path=f'reports/revision/logs/morphology_learnability_fold{fold}.log',
+        try:
+            import torch as _morphology_torch
+            morphology_cuda_available = bool(_morphology_torch.cuda.is_available())
+        except Exception:
+            morphology_cuda_available = False
+        requested_morphology_run = (
+            RUN_MORPHOLOGY_LEARNABILITY_CONTROL is True
+            or bool(MORPHOLOGY_LEARNABILITY_FORCE_RERUN)
+        )
+        if not morphology_cuda_available and not requested_morphology_run:
+            morphology_learnability_deferred_gpu = True
+            morphology_learnability_should_run = False
+            print(
+                'Controlled morphology learnability is deferred: stale/missing fold contracts '
+                'require A100 CUDA. CPU finalization will preserve this as an incomplete reviewer item '
+                'and will not reuse the stale package.'
             )
-            publish_morphology_learnability(f'fold{fold}', fold=fold)
-        missing_after = []
-        for fold in range(1, 6):
-            for variant in MORPHOLOGY_LEARNABILITY_VARIANTS:
-                cache, checkpoint = morphology_learnability_fold_paths(variant, fold)
-                if not cache.exists() or cache.stat().st_size == 0 or not checkpoint.exists() or checkpoint.stat().st_size == 0:
-                    missing_after.append(f'{variant}/fold{fold}')
-        if missing_after:
-            print('Aggregate pass deferred; rerun this cell after completing:', missing_after)
         else:
-            run(
-                morphology_learnability_cache_finalizer_command,
-                log_path='reports/revision/logs/morphology_learnability_cache_aggregate.log',
-            )
-            publish_morphology_learnability('aggregate')
+            require_cuda_runtime_for_baseline('Controlled morphology kernel learnability')
+            fold_tokens = [token.strip() for token in str(MORPHOLOGY_LEARNABILITY_ONLY_FOLDS).split(',') if token.strip()]
+            for token in fold_tokens:
+                if not token.isdigit() or int(token) not in range(1, 6):
+                    raise ValueError(f'Invalid morphology learnability fold: {token!r}')
+                fold = int(token)
+                run(
+                    morphology_learnability_base_command + f' --only-folds {fold}',
+                    log_path=f'reports/revision/logs/morphology_learnability_fold{fold}.log',
+                )
+                publish_morphology_learnability(f'fold{fold}', fold=fold)
+            missing_after = []
+            for fold in range(1, 6):
+                for variant in MORPHOLOGY_LEARNABILITY_VARIANTS:
+                    cache, checkpoint = morphology_learnability_fold_paths(variant, fold)
+                    if not cache.exists() or cache.stat().st_size == 0 or not checkpoint.exists() or checkpoint.stat().st_size == 0:
+                        missing_after.append(f'{variant}/fold{fold}')
+            if missing_after:
+                print('Aggregate pass deferred; rerun this cell after completing:', missing_after)
+            else:
+                run(
+                    morphology_learnability_cache_finalizer_command,
+                    log_path='reports/revision/logs/morphology_learnability_cache_aggregate.log',
+                )
+                publish_morphology_learnability('aggregate')
     else:
         print('All morphology fold artifacts exist; running authenticated CPU cache aggregation.')
         run(
@@ -3762,8 +3785,10 @@ morphology_learnability_cache_finalizer_command = (
         )
         publish_morphology_learnability('aggregate')
     package_current, package_reason = morphology_learnability_package_current()
-    if not package_current:
+    if not morphology_learnability_deferred_gpu and not package_current:
         raise RuntimeError('Morphology learnability aggregate package failed validation: ' + package_reason)
+    if morphology_learnability_deferred_gpu:
+        print('R1-C2 status: deferred pending A100 control rerun; no stale morphology claim will be emitted.')
 '''
     text = text[:start] + replacement + text[end:]
     set_source(target, text)
@@ -5186,6 +5211,7 @@ def validate() -> None:
         "MORPHOLOGY_LEARNABILITY_CHECKPOINT_DIR = globals().get(",
         "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER",
         "# FORENSIC_NOTEBOOK04_MORPHOLOGY_STALENESS_GUARD_V2",
+        "# FORENSIC_NOTEBOOK04_MORPHOLOGY_CACHE_FINALIZER_V3",
         "53_aggregate_morphology_learnability_cache.py",
         "All morphology fold artifacts exist; running authenticated CPU cache aggregation.",
     ):
