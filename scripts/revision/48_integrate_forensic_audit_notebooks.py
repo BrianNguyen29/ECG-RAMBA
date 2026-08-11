@@ -17,7 +17,7 @@ BASE_INSTALLER_SCHEMA_MARKER = "BASE_INSTALLER_SCHEMA_VERSION = 1"
 RUN_HISTORY_MARKER = "FORENSIC_RUN_HISTORY_CAPABILITY = 'stage_run_id_v1'"
 AUTHORITY_MARKER = "FORENSIC_CODE_AUTHORITY_CAPABILITY = 'canonical_versioned_git_release_v2'"
 AUTHORITY_SCHEMA_MARKER = "FORENSIC_CODE_AUTHORITY_SCHEMA_VERSION = 2"
-AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260723-v13"
+AUTHORITY_RELEASE_REF = "refs/tags/ecg-ramba-revision-20260811-v74"
 AUTHORITY_BLOCK_START = "# BEGIN FORENSIC CODE AUTHORITY PIN"
 AUTHORITY_BLOCK_END = "# END FORENSIC CODE AUTHORITY PIN"
 AUTHENTICATED_BOOTSTRAP_UNIT = "authenticated_source_patient_record"
@@ -4350,6 +4350,49 @@ print('Comparator stress perturbation mmap dir:', COMPARATOR_STRESS_PERTURBATION
     save(name, notebook)
 
 
+def integrate_notebook05_aggregate_only_guard() -> None:
+    """Prevent a CPU finalization pass from silently regenerating stress predictions."""
+
+    name = "05_hrv_domain_and_robustness.ipynb"
+    notebook = load(name)
+    target = next(
+        (
+            cell
+            for cell in notebook["cells"]
+            if "Resolved robustness execution phase:" in source(cell)
+            and "needs_robustness_regeneration" in source(cell)
+            and "robustness_predictions_complete" in source(cell)
+        ),
+        None,
+    )
+    if target is None:
+        raise RuntimeError("Notebook 05 robustness execution-phase cell not found")
+    text = source(target)
+    marker = "FORENSIC_AGGREGATE_ONLY_NO_INFERENCE_GUARD = 'v1'"
+    guard = """FORENSIC_AGGREGATE_ONLY_NO_INFERENCE_GUARD = 'v1'
+# A CPU aggregate-only resume may consume cached predictions and bootstrap
+# metrics, but it must never drift into feature extraction or model inference.
+if (
+    needs_robustness_regeneration
+    and robustness_execution_phase == 'aggregate_only'
+    and not robustness_predictions_complete
+):
+    missing_summary = sorted(set(missing_robustness_stresses))
+    raise RuntimeError(
+        'aggregate_only refuses to regenerate missing/stale stress predictions. '
+        f'Missing stresses={missing_summary}; run the A100 inference_only stage, publish it, then resume CPU aggregation.'
+    )
+
+"""
+    anchor = "print('Resolved robustness execution phase:', robustness_execution_phase)\n"
+    if marker not in text:
+        if anchor not in text:
+            raise RuntimeError("Notebook 05 aggregate-only guard anchor not found")
+        text = text.replace(anchor, anchor + guard, 1)
+        set_source(target, text)
+    save(name, notebook)
+
+
 def integrate_notebook00_full_sha_audit() -> None:
     """Run the bootstrap storage inventory with full hashes without requiring completion."""
 
@@ -5271,6 +5314,17 @@ def validate() -> None:
     if "'Mamba wheel environment' in candidate_source" in notebook04_text:
         raise RuntimeError("Notebook 04 Raw Mamba installer still uses a legacy descriptive selector")
 
+    notebook05_text = "\n".join(
+        source(cell) for cell in load("05_hrv_domain_and_robustness.ipynb")["cells"]
+    )
+    for token in (
+        "FORENSIC_AGGREGATE_ONLY_NO_INFERENCE_GUARD",
+        "aggregate_only refuses to regenerate missing/stale stress predictions",
+        "run the A100 inference_only stage",
+    ):
+        if token not in notebook05_text:
+            raise RuntimeError(f"Notebook 05 aggregate-only guard missing: {token}")
+
 
 def main() -> None:
     integrate_notebook02()
@@ -5293,6 +5347,7 @@ def main() -> None:
     integrate_notebook06_authenticated_cache_restore()
     integrate_notebook05_hrv_group_contract()
     integrate_notebook05_disk_backed_comparator_stress()
+    integrate_notebook05_aggregate_only_guard()
     integrate_notebook00_full_sha_audit()
     normalize_bootstrap_contracts()
     integrate_shared_contract_versions()
