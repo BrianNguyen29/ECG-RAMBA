@@ -4392,6 +4392,30 @@ def integrate_notebook07_final_gate() -> None:
     for cell in notebook["cells"]:
         text = source(cell)
         cell_changed = False
+        runtime_reconciliation_marker = (
+            "FORENSIC_RUNTIME_ATTESTATION_RECONCILIATION = "
+            "'known_non_evidence_runtime_attestation_manifest_reconciliation_v1'"
+        )
+        if (
+            "EVIDENCE_RESTORE_PATHS = [" in text
+            and runtime_reconciliation_marker not in text
+        ):
+            reconciliation_anchor = "import pandas as pd\n\nrevision_root = Path('reports/revision')\n"
+            if reconciliation_anchor not in text:
+                raise RuntimeError("Notebook 07 runtime-attestation reconciliation anchor not found")
+            reconciliation = r'''FORENSIC_RUNTIME_ATTESTATION_RECONCILIATION = 'known_non_evidence_runtime_attestation_manifest_reconciliation_v1'
+# This exact, pre-execution performance attestation is the only direct-canonical
+# runtime artifact allowed to be reconciled. The helper validates its fixed schema
+# and records an audit report; it never reattests predictions, metrics, or claims.
+run(
+    f'python -u scripts/revision/54_reconcile_runtime_attestation.py '
+    f'--canonical-root "{MIRROR_REVISION_ROOT}"',
+    log_path='reports/revision/logs/final_runtime_attestation_reconciliation.log',
+)
+
+'''
+            text = text.replace(reconciliation_anchor, reconciliation + reconciliation_anchor, 1)
+            cell_changed = True
         if (
             "EVIDENCE_RESTORE_PATHS = [" in text
             and "FORENSIC_AUTHORITY_MIRROR_REATTESTATION" not in text
@@ -5098,6 +5122,8 @@ def validate() -> None:
         "authenticated_matched_calibration_v5",
         "post_initial_review_adaptation_analysis_lock",
         "ADAPTATION_PRIMARY_FRACTION_POLICY",
+        "54_reconcile_runtime_attestation.py",
+        "FORENSIC_RUNTIME_ATTESTATION_RECONCILIATION",
     ):
         if token not in final_text:
             raise RuntimeError(f"Notebook 07 final gate token missing: {token}")
