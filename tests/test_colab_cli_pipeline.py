@@ -123,6 +123,28 @@ class ColabCliPipelineTests(unittest.TestCase):
             "inference_only",
         )
 
+    def test_notebook05_t4_inference_reuses_cpu_features(self):
+        stage = self.module.stage_by_id(
+            self.manifest, "nb05_predictions_t4_cpu_features"
+        )
+        self.assertEqual(stage["hardware"], "gpu")
+        self.assertTrue(stage["enabled"])
+        self.assertEqual(stage["depends_on"], ["nb05_features_cpu"])
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_ROBUSTNESS_EXECUTION_PHASE"],
+            "inference_only",
+        )
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_ROBUSTNESS_FEATURE_DEVICE"],
+            "cpu",
+        )
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_ROBUSTNESS_BATCH_SIZE"], "32"
+        )
+        self.assertEqual(
+            stage["environment"]["ECG_RAMBA_COMPARATOR_STRESS_BATCH_SIZE"], "128"
+        )
+
     def test_notebook05_prediction_stage_uses_a100_runtime(self):
         stage = self.module.stage_by_id(
             self.manifest, "nb05_predictions_a100"
